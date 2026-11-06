@@ -191,20 +191,31 @@ fn checkAccess(c: *Context) Context.Error!void {
         const step = path.steps[0];
         if (step.kind != .field) continue;
         const name = step.name orelse continue;
-        if (!backingName(name)) continue;
+        if (!try anyInternal(c, name)) continue;
         const holder = path.steps[1].node;
         const token = tree.lastToken(node);
         if (try typeValue(c, holder)) continue;
         if (try refuted(c, node, name)) continue;
         const k = (try requiredOwner(c, holder, access, token)) orelse continue;
-        if (backing(k, name)) try c.at(access, token, "published aegis backing field bypasses exposure/guard/ownership contract; review this access");
+        try reportInternal(c, token, try internalField(c, try c.facts.resolve(c.file, holder), k, name));
+    }
+}
+
+/// A read of a field only aegis touches: a finding where it is one, undecided where only some
+/// of the role's types keep it and the holder's type does not resolve.
+fn reportInternal(c: *Context, token: Ast.TokenIndex, found: Internal) Context.Error!void {
+    const tree = &c.project.at(c.file).file.tree;
+    switch (found) {
+        .yes => try c.at(access, token, "published aegis backing field bypasses exposure/guard/ownership contract; review this access"),
+        .unknown => try c.undecided(access, tree.tokenStart(token), .unresolved, "a field only some aegis types of this role keep behind their operations, on a value glint does not know to be one of them"),
+        .no => {},
     }
 }
 
 /// A backing field named by `@field`, as a member access names it: by a name it spells
 /// (`@field(g, "data")`, `"\x64ata"`, a `const` that holds it), by each field of a struct
 /// whose `field_names` it ranges over that is one; by a name it computes, any field of the
-/// holder, undecided where the holder's kind has a backing field.
+/// holder, undecided where the holder keeps a backing field.
 fn checkFieldBuiltin(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!void {
     if (!Facts.isBuiltin(tree, node, "@field")) return;
     var buffer: [2]Ast.Node.Index = undefined;
@@ -214,31 +225,43 @@ fn checkFieldBuiltin(c: *Context, tree: *const Ast, node: Ast.Node.Index) Contex
     const token = tree.nodeMainToken(node);
     const named = try c.facts.fieldName(c.file, args[1]);
     switch (named) {
-        .name => |name| if (!backingName(name)) return,
-        .each_of, .names => {
-            if (!backingNamed(c, named, null)) return;
-        },
+        .name => |name| if (!try anyInternal(c, name)) return,
+        .each_of, .names => if (!try anyNamedInternal(c, named)) return,
         .computed => {},
     }
     if (try typeValue(c, holder)) return;
     const k = (try requiredOwner(c, holder, access, token)) orelse return;
+    const value = try c.facts.resolve(c.file, holder);
     if (named == .computed) {
-        if (anyBacking(k)) try c.undecided(access, tree.tokenStart(token), .unresolved, "a name @field computes may be a published aegis backing field");
+        if (try keepsInternal(c, value, k) != .no) try c.undecided(access, tree.tokenStart(token), .unresolved, "a name @field computes may be a published aegis backing field");
         return;
     }
-    if (backingNamed(c, named, k)) try c.at(access, token, "published aegis backing field bypasses exposure/guard/ownership contract; review this access");
+    try reportInternal(c, token, try namedInternal(c, named, value, k));
 }
-/// Whether a name `@field` spells or ranges over is a backing field: of kind `k`, or of any.
-fn backingNamed(c: *Context, named: Facts.FieldName, k: ?Contract.Kind) bool {
+/// Whether a name `@field` spells or ranges over may be a field only aegis touches of any type.
+fn anyNamedInternal(c: *Context, named: Facts.FieldName) Context.Error!bool {
+    const found = try PackageRules.publication(c.facts, Contract.library);
+    for (found.entries) |entry| for (entry.internal) |name| if (c.facts.mayName(named, name)) return true;
+    return false;
+}
+/// Whether a name `@field` spells or ranges over is a field only aegis touches of `holder`
+/// (`internalField`): one it is makes the read one, one it may be makes it undecided.
+fn namedInternal(c: *Context, named: Facts.FieldName, holder: Facts.Value, k: Contract.Kind) Context.Error!Internal {
     switch (named) {
-        .name => |name| return if (k) |kind| backing(kind, name) else backingName(name),
-        .computed => return true,
+        .name => |name| return internalField(c, holder, k, name),
+        .computed => return .unknown,
         .each_of, .names => {
-            for (std.enums.values(Contract.Kind)) |each| {
-                if (k) |kind| if (each != kind) continue;
-                for (backingFields(each)) |name| if (c.facts.mayName(named, name)) return true;
-            }
-            return false;
+            var found: Internal = .no;
+            const entries = (try PackageRules.publication(c.facts, Contract.library)).entries;
+            for (entries) |entry| for (entry.internal) |name| {
+                if (!c.facts.mayName(named, name)) continue;
+                switch (try internalField(c, holder, k, name)) {
+                    .yes => return .yes,
+                    .unknown => found = .unknown,
+                    .no => {},
+                }
+            };
+            return found;
         },
     }
 }
@@ -281,17 +304,16 @@ fn checkByteRead(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Er
     if (try typeValue(c, place)) return;
     const token = tree.nodeMainToken(node);
     switch (try ownerKind(c, place, access)) {
-        .owner => |k| if (anyBacking(k)) {
-            if (maybe) |why| return c.unknown(access, node, why);
-            try c.at(access, token, "the bytes of a published aegis owner read whole bypass its exposure/guard/ownership contract; use its operations");
+        .owner => |k| switch (try keepsInternal(c, try c.facts.resolve(c.file, place), k)) {
+            .yes => {
+                if (maybe) |why| return c.unknown(access, node, why);
+                try c.at(access, token, "the bytes of a published aegis owner read whole bypass its exposure/guard/ownership contract; use its operations");
+            },
+            .unknown => try c.undecided(access, tree.tokenStart(token), .unresolved, "the bytes of a value of an aegis role only some of whose types keep fields behind their operations, whose type does not resolve"),
+            .no => {},
         },
         .other, .unknown => {},
     }
-}
-
-/// Whether a kind publishes any backing field (`backing`).
-fn anyBacking(k: Contract.Kind) bool {
-    return backingFields(k).len != 0;
 }
 /// The published types only their own constructor may make: `err.PublicSource`, whose
 /// `classify` takes the reviewed reason that a literal of it skips.
@@ -480,7 +502,7 @@ fn noLibraryHolder(c: *Context, name: []const u8, others: []const []const u8) Co
             if (decl.kind != .field or !std.mem.eql(u8, decl.name, name)) continue;
             const holder: Facts.Container = .{ .file = file, .scope = decl.scope };
             switch (try typed(c.facts, .{ .instance = holder }, 0)) {
-                .owner => |k| if (!backing(k, name)) continue,
+                .owner => |k| if (try internalField(c, .{ .instance = holder }, k, name) == .no) continue,
                 .other => continue,
                 .unknown => {},
             }
@@ -603,8 +625,7 @@ fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!b
     const found = try PackageRules.publication(c.facts, Contract.library);
     var any = false;
     for (found.entries) |entry| {
-        const k: Contract.Kind = @fromBackingInt(@intCast(entry.role));
-        if (!backing(k, name)) continue;
+        if (!among(entry.internal, name)) continue;
         // A type function whose containers are known: each is an entry of its own (`Facts.publication`).
         if (entry.target == .function) if (try c.facts.template(entry.target.function)) |made| if ((try Facts.returnedContainers(c.allocator, made)).len != 0) continue;
         const container = (try publishedContainer(c, entry.target)) orelse return false;
@@ -749,60 +770,41 @@ fn publishedContainer(c: *Context, target: PackageRules.Target) Context.Error!?F
     }
 }
 
-/// Whether `name` is a backing field of a published type of kind `k`: the one place the
-/// contract's field catalogue (`backingFields`) is read by name.
-fn backing(k: Contract.Kind, name: []const u8) bool {
-    for (backingFields(k)) |field| if (std.mem.eql(u8, name, field)) return true;
-    return false;
+/// Whether a name is a field only aegis touches (A001's): yes, no, or undecided.
+const Internal = enum { yes, no, unknown };
+/// Whether `name` is a field only aegis touches of `holder`, whose role is `k`: its type's own
+/// `.internal`, as aegis declares it, where its type resolves to one aegis gives a role. Where
+/// only the role is known, glint does not know which of that role's types it is: a field every
+/// one of them keeps is one, a field only some keep is undecided, a field none keeps is not.
+fn internalField(c: *Context, holder: Facts.Value, k: Contract.Kind, name: []const u8) Context.Error!Internal {
+    if (try PackageRules.internalOf(c.facts, Contract.library, holder)) |own| return if (among(own, name)) .yes else .no;
+    const found = try PackageRules.publication(c.facts, Contract.library);
+    var every = true;
+    var some = false;
+    for (found.entries) |entry| {
+        if (@as(Contract.Kind, @fromBackingInt(@intCast(entry.role))) != k) continue;
+        if (among(entry.internal, name)) some = true else every = false;
+    }
+    return if (!some) .no else if (every) .yes else .unknown;
 }
-
-/// The private state of the published types: the secret's material, the bytes' allocation, the
-/// guards' value and lock state, and after them what each type's source keeps
-/// behind its operations (the initialized prefix and its cursors, a budget's charge, an owner's
-/// payload and witness, a loan's copy, a staged payload, a machine's state, a scope's record,
-/// the checked pointer, the unparsed value, the decision bit).
-fn backingFields(k: Contract.Kind) []const []const u8 {
-    return switch (k) {
-        .secret => &.{"material"},
-        .bytes => &.{ "allocation", "used_len", "gpa" },
-        // The guarded value and the lock state of every guarded owner: a spin flag, a
-        // blocking mutex, a reader-writer lock and its admission count. An ordered owner's
-        // base lock too.
-        .guarded => &.{ "data", "lock", "mutex", "state", "admitted", "base" },
-        // A guard's owner; an ordered guard's base guard.
-        .guard, .ranked_guard => &.{ "owner", "base" },
-        // A value initialized once: its publication state, its election lock and waiters, and
-        // the value itself before the state says it is there.
-        .once => &.{ "state", "mutex", "changed", "data" },
-        // A value one logical task owns: the value and the identity that is checked.
-        .confined => &.{ "data", "owner" },
-        .inline_store => &.{ "storage", "used", "head" },
-        .buffer => &.{ "storage", "gpa", "maximum", "used", "head" },
-        .limit => &.{"maximum"},
-        .budget => &.{ "ceiling", "taken", "unsettled" },
-        .reservation => &.{ "budget", "amount", "live" },
-        .owned => &.{ "data", "state" },
-        .lent => &.{"data"},
-        .must_use => &.{ "data", "pending", "live" },
-        .shared => &.{ "block", "live" },
-        // 0.3's `SlotPool` and `RunPool` keep their region and their counts; 0.2's pools, their arrays.
-        .slots => &.{ "slots", "storage", "primary", "values", "keys", "free_head", "entries", "region", "count", "used", "retired", "items", "end", "free_spans", "runs" },
-        .stage => &.{ "live", "payload" },
-        .machine => &.{"state"},
-        .table => &.{ "slots", "free_head", "used_up", "open_count" },
-        .scope => &.{ "table", "generation", "index" },
-        .ref => &.{ "slot", "generation", "pointer" },
-        .untrusted => &.{"value"},
-        .choice => &.{"bit"},
-        .atomic => &.{"cell"},
-        .context => &.{ "stack", "used", "suspended", "owners" },
-        else => &.{},
-    };
+/// Whether `holder`, whose role is `k`, keeps any field only aegis touches: by its type's own
+/// `.internal`, or where only the role is known, yes where every type of that role keeps one,
+/// undecided where only some do.
+fn keepsInternal(c: *Context, holder: Facts.Value, k: Contract.Kind) Context.Error!Internal {
+    if (try PackageRules.internalOf(c.facts, Contract.library, holder)) |own| return if (own.len != 0) .yes else .no;
+    const found = try PackageRules.publication(c.facts, Contract.library);
+    var every = true;
+    var some = false;
+    for (found.entries) |entry| {
+        if (@as(Contract.Kind, @fromBackingInt(@intCast(entry.role))) != k) continue;
+        if (entry.internal.len != 0) some = true else every = false;
+    }
+    return if (!some) .no else if (every) .yes else .unknown;
 }
-
-/// Whether `name` is a backing field of any published type.
-fn backingName(name: []const u8) bool {
-    for (std.enums.values(Contract.Kind)) |k| if (backing(k, name)) return true;
+/// Whether `name` is a field only aegis touches of any type aegis gives a role.
+fn anyInternal(c: *Context, name: []const u8) Context.Error!bool {
+    const found = try PackageRules.publication(c.facts, Contract.library);
+    for (found.entries) |entry| if (among(entry.internal, name)) return true;
     return false;
 }
 
