@@ -333,8 +333,8 @@ const flat_root_tail =
 /// guard inside `Guarded`'s container.
 fn flatRules(comptime guard_member: []const u8) []const u8 {
     return "pub const lint_rules = .{ .version = 1, .roles = .{\n" ++
-        "    .{ .type = Secret, .role = .secret }, .{ .type = SecretBytes, .role = .bytes },\n" ++
-        "    .{ .type = Guarded, .role = .guarded }, .{ .type = .{ .generic = Guarded, .member = ." ++ guard_member ++ " }, .role = .guard },\n" ++
+        "    .{ .type = Secret, .role = .secret, .internal = .{.material} }, .{ .type = SecretBytes, .role = .bytes, .internal = .{ .allocation, .used_len } },\n" ++
+        "    .{ .type = Guarded, .role = .guarded, .internal = .{ .lock, .data } }, .{ .type = .{ .generic = Guarded, .member = ." ++ guard_member ++ " }, .role = .guard, .internal = .{.owner} },\n" ++
         "    .{ .type = int.Checked, .role = .scalar }, .{ .type = int.Saturating, .role = .scalar }, .{ .type = int.Ranged, .role = .scalar },\n" ++
         "    .{ .type = id.Id, .role = .scalar }, .{ .type = id.NonZero, .role = .scalar }, .{ .type = id.Counter, .role = .issuer },\n" ++
         "    .{ .type = units.Count, .role = .scalar }, .{ .type = units.Bytes, .role = .scalar }, .{ .type = units.Bits, .role = .scalar }, .{ .type = units.Duration, .role = .scalar }, .{ .type = units.Instant, .role = .scalar },\n" ++
