@@ -3175,7 +3175,8 @@ fn publicContainer(tree: *const Ast, model: *const Model, node: Ast.Node.Index) 
 /// the program switches on to choose what it does, whatever holds it (`stateHold`): an enum; a
 /// tagged union's active tag (a store of another is a transition); std's `atomic.Value` of
 /// either (`load` reads it; `store`, `swap`, `cmpxchg*` move it); an integer switched on with
-/// literal prongs or as its enum. A field is read by meaning: a read `x.state` or
+/// literal prongs or as its enum. One that is not an enum is a state only where the program
+/// chooses among literals for it, never moving it by arithmetic (`literalState`). A field is read by meaning: a read `x.state` or
 /// `@field(x, "state")`, through any holder of the type, and what carries it on (`carried`: a
 /// local, a destructure, `&`, a capture, a conversion, a comparison, a value a switch on it
 /// chooses, a parameter it is given as, a getter's or a predicate's calls); a write as
@@ -3208,6 +3209,8 @@ pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
         for (uses.items) |use| switched = switched or switchedOn(&c.project.at(use.file).file.tree, &c.project.at(use.file).model, use.node, hold);
         if (!switched) continue;
         try stateWrites(c, .{ .file = c.file, .index = @fromBackingInt(@intCast(index)) }, hold, &writes);
+        const state: LiteralState = if (hold == .enumerated) .state else try literalState(c, hold, decl.name, .{ .file = c.file, .node = written }, writes.items, uses.items);
+        if (state == .value) continue;
         const fixed = try fixedFunctions(c, writes.items);
         var writers: std.ArrayList(Facts.Key) = .empty;
         var unseen = false;
@@ -3232,8 +3235,152 @@ pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
             },
             .yes => {},
         }
+        if (state == .unknown) {
+            try c.undecided(rule, tree.tokenStart(decl.token), .unresolved, "a state written with a name that does not resolve: whether the program chooses among literals for it is not known");
+            continue;
+        }
         try c.at(rule, decl.token, try c.allocator.print("'{s}' is a state machine kept by hand: written in {d} functions, moved on its own value and switched on; aegis state.Machine states which transitions there are", .{ decl.name, writers.items.len }));
     }
+}
+
+/// Whether a state that is not an enum's is one the program chooses among (main's ruling,
+/// 11-06): a write gives it a literal choice (an enum literal, a union's tag `.tag` or
+/// `.{ .tag = ... }`, an integer literal; a choice of them), and none moves it by arithmetic on
+/// its own value (`pos += 1`, `at = at - 1`): that is a counter. A field given only whole
+/// values from elsewhere is a value. A write whose value is not read decides neither.
+/// What `literalState` finds a field to be: a state; a value; or not known, where a write's
+/// value names what does not resolve and no write gives it a literal.
+const LiteralState = enum { state, value, unknown };
+
+fn literalState(c: *Context, hold: StateHold, name: []const u8, type_expr: Facts.Key, writes: []const StateWrite, uses: []const Facts.Key) Context.Error!LiteralState {
+    // The field's default, what a literal of its holder that names it not gives it.
+    const model = &c.project.at(type_expr.file).model;
+    const tree_of_field = &c.project.at(type_expr.file).file.tree;
+    const default: ?Ast.Node.Index = if (model.parentOf(type_expr.node)) |field| if (tree_of_field.fullContainerField(field)) |full| full.ast.value_expr.unwrap() else null else null;
+    var literal = false;
+    var unknown = false;
+    for (writes) |write| {
+        const tree = &c.project.at(write.file).file.tree;
+        if (opArithmetic(tree, write.node) or opArithmetic(tree, c.project.at(write.file).model.parentOf(write.node) orelse write.node)) return .value;
+        // A write whose value is not read (through the field's address, by a destructure of no
+        // literal, by a call that does not resolve) may give it a literal choice: not known.
+        const value = if (write.unseen) null else write.value;
+        const read = value orelse {
+            unknown = true;
+            continue;
+        };
+        if (readsSelf(tree, write.file, read, uses, 0)) return .value;
+        const choice = try literalChoice(c, write.file, read, hold, name, 0);
+        switch (if (choice == .default) if (default) |d| try literalChoice(c, type_expr.file, d, hold, name, 0) else .other else choice) {
+            .literal => literal = true,
+            .unknown => unknown = true,
+            .other, .default => {},
+        }
+    }
+    return if (literal) .state else if (unknown) .unknown else .value;
+}
+
+/// Whether a node is a store that computes its target's new value from its old one by
+/// arithmetic or bits (`+=`, `-%=`, `<<=`, `|=`).
+fn opArithmetic(tree: *const Ast, node: Ast.Node.Index) bool {
+    return switch (tree.nodeTag(node)) {
+        .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat, .assign_bit_and, .assign_bit_or, .assign_bit_xor => true,
+        else => false,
+    };
+}
+
+/// Whether `node` computes by arithmetic or bits over a read of the state (`uses`).
+fn readsSelf(tree: *const Ast, file: Project.FileId, node: Ast.Node.Index, uses: []const Facts.Key, depth: u8) bool {
+    if (depth == 8) return false;
+    switch (tree.nodeTag(node)) {
+        .grouped_expression => return readsSelf(tree, file, tree.nodeData(node).node_and_token[0], uses, depth + 1),
+        .add, .sub, .mul, .div, .mod, .shl, .shr, .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .shl_sat, .bit_and, .bit_or, .bit_xor => {
+            const first = tree.firstToken(node);
+            const last = tree.lastToken(node);
+            for (uses) |use| {
+                if (use.file != file) continue;
+                const token = tree.nodeMainToken(use.node);
+                if (token >= first and token <= last) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
+/// Whether a written value is a literal choice of the state `hold` (`literalState`): an enum
+/// literal or a declared tag (`.idle`, `Phase.idle`), a union's tag literal (`.{ .busy = n }`),
+/// an integer literal or an enum tag's integer (`@intFromEnum(Phase.idle)`), or a choice of
+/// them; in a literal of the field's holder (`.{ .len = 1 }`), what it gives the field, or
+/// `default` where it names it not.
+fn literalChoice(c: *Context, file: Project.FileId, node: Ast.Node.Index, hold: StateHold, name: []const u8, depth: u8) Context.Error!enum { literal, default, unknown, other } {
+    if (depth == 8) return .other;
+    const tree = &c.project.at(file).file.tree;
+    if (tree.fullIf(node)) |branch| {
+        const then = try literalChoice(c, file, branch.ast.then_expr, hold, name, depth + 1);
+        if (then == .literal) return .literal;
+        const otherwise = if (branch.ast.else_expr.unwrap()) |other| try literalChoice(c, file, other, hold, name, depth + 1) else .other;
+        return if (otherwise == .literal) .literal else if (then == .unknown or otherwise == .unknown) .unknown else .other;
+    }
+    if (tree.fullSwitch(node)) |choice| {
+        var unknown = false;
+        for (choice.ast.cases) |case_node| switch (try literalChoice(c, file, tree.fullSwitchCase(case_node).?.ast.target_expr, hold, name, depth + 1)) { // unreachable: a switch's cases are cases.
+            .literal => return .literal,
+            .unknown => unknown = true,
+            .other, .default => {},
+        };
+        return if (unknown) .unknown else .other;
+    }
+    var structs: [2]Ast.Node.Index = undefined;
+    if (tree.fullStructInit(&structs, node)) |init| {
+        // A literal of the holder: what it gives the field.
+        for (init.ast.fields) |field| {
+            const label = tree.firstToken(field) - 2;
+            if (tree.tokenTag(label) == .identifier and std.mem.eql(u8, tree.tokenSlice(label), name)) return literalChoice(c, file, field, hold, name, depth + 1);
+        }
+        // A union's own literal, of one tag; else the holder's, which gives the field its default.
+        if (hold != .integral and init.ast.type_expr == .none and init.ast.fields.len == 1) return .literal;
+        return .default;
+    }
+    return switch (tree.nodeTag(node)) {
+        .grouped_expression => literalChoice(c, file, tree.nodeData(node).node_and_token[0], hold, name, depth + 1),
+        .enum_literal => if (hold != .integral) .literal else .other,
+        .field_access => if (hold == .integral) .other else switch (try declaredTag(c, file, node)) {
+            .yes => .literal,
+            .no => .other,
+            .unknown => .unknown,
+        },
+        .number_literal, .char_literal => if (hold == .integral) .literal else .other,
+        .builtin_call_two, .builtin_call_two_comma => {
+            const builtin = tree.tokenSlice(tree.nodeMainToken(node));
+            const argument = tree.nodeData(node).opt_node_and_opt_node[0].unwrap() orelse return .other;
+            if (std.mem.eql(u8, builtin, "@as")) return literalChoice(c, file, tree.nodeData(node).opt_node_and_opt_node[1].unwrap() orelse return .other, hold, name, depth + 1);
+            // An enum tag's integer, for a state held as one.
+            if (hold == .integral and (std.mem.eql(u8, builtin, "@intFromEnum") or std.mem.eql(u8, builtin, "@backingInt"))) {
+                if (tree.nodeTag(argument) == .enum_literal) return .literal;
+                if (tree.nodeTag(argument) == .field_access) return switch (try declaredTag(c, file, argument)) {
+                    .yes => .literal,
+                    .no => .other,
+                    .unknown => .unknown,
+                };
+            }
+            return .other;
+        },
+        else => .other,
+    };
+}
+
+/// Whether `node` (`Phase.idle`) names an enum's tag by its declaration: a constant, not a
+/// value read from a place; not known where the name does not resolve.
+fn declaredTag(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!enum { yes, no, unknown } {
+    const decl = switch (try c.facts.definition(file, node)) {
+        .decl => |found| found,
+        .none => return .no,
+        .unknown => return .unknown,
+    };
+    const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+    if (record.kind != .field) return .no;
+    return if (isEnum(c, .{ .file = decl.file, .scope = record.scope })) .yes else .no;
 }
 
 /// Adds to `uses` the reads that carry a read of the state on, by what the value is: what is
