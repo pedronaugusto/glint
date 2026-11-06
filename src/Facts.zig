@@ -456,9 +456,11 @@ pub fn publication(self: *Facts, library: anytype) ResolveError!*const Publicati
                 .found => |target| {
                     const role_value: u32 = @intCast(@backingInt(listed.role));
                     try entries.append(self.gpa, .{ .role = role_value, .target = target });
-                    // The container a type function returns is also its type: instances declared with it are the role's.
-                    if (target == .function) if (try self.template(target.function)) |returned| if (returned == .container) {
-                        try entries.append(self.gpa, .{ .role = role_value, .target = .{ .container = .{ .file = returned.container.file, .scope = returned.container.scope } } });
+                    // The container a type function returns is also its type: instances declared with it are the role's,
+                    // each container it may return where it chooses one by a comptime option (aegis 0.3's
+                    // `SlotPool(T, Tag, options)`: `Keyed` or `Indexed`).
+                    if (target == .function) if (try self.template(target.function)) |returned| for (try returnedContainers(self.gpa, returned)) |made| {
+                        try entries.append(self.gpa, .{ .role = role_value, .target = .{ .container = .{ .file = made.file, .scope = made.scope } } });
                     };
                 },
                 .absent => if (listed.required) try gaps.append(self.gpa, .{ .module = module.name, .path = listed.path, .why = .unresolved, .root = root }),
@@ -478,6 +480,29 @@ pub fn publication(self: *Facts, library: anytype) ResolveError!*const Publicati
     result.* = .{ .entries = entries.items, .gaps = gaps.items, .files = files.items };
     try self.publications.put(self.gpa, key, result);
     return result;
+}
+
+/// The containers a type function's template is (`template`): the one it returns, or each it
+/// may choose by a comptime option (`if (options.generation) |G| Keyed(T, Tag, G) else
+/// Indexed(T, Tag)`) where every choice is one. None where it is anything else, a choice that is
+/// not a container among them: what its instances are is then not known from it.
+pub fn returnedContainers(gpa: std.mem.Allocator, made: Value) error{OutOfMemory}![]const Container {
+    switch (made) {
+        .container, .instance => |one| {
+            const found = try gpa.alloc(Container, 1);
+            found[0] = one;
+            return found;
+        },
+        .alternatives => |choices| {
+            const found = try gpa.alloc(Container, choices.len);
+            for (choices, found) |choice, *each| each.* = switch (choice) {
+                .container, .instance => |one| one,
+                else => return &.{},
+            };
+            return found;
+        },
+        else => return &.{},
+    }
 }
 
 /// A declaration literal called (`.init(...)`): the function its result location's container
@@ -6066,6 +6091,27 @@ fn findTemplate(self: *Facts, decl: Decl) ResolveError!?Value {
     // returned container, where only nested functions can contain one.
     _ = self.recursion(decl, body, last, 0) orelse return null;
     const returned = tree.nodeData(last).opt_node.unwrap() orelse return null;
+    // `return if (options.generation) |G| Keyed(T, Tag, G) else Indexed(T, Tag);`: a type function
+    // that chooses its container by a comptime option (aegis 0.3's `SlotPool`) makes one of
+    // two, each a branch's template. Any other choice makes no template, as before.
+    if (tree.fullIf(returned)) |choice| {
+        const otherwise = choice.ast.else_expr.unwrap() orelse return null;
+        const first = (try self.returnedTemplate(decl, choice.ast.then_expr)) orelse return null;
+        const second = (try self.returnedTemplate(decl, otherwise)) orelse return null;
+        if (first != .container or second != .container) return null;
+        if (first.container.file == second.container.file and first.container.scope == second.container.scope) return first;
+        const both = try self.gpa.alloc(Value, 2);
+        both[0] = first;
+        both[1] = second;
+        return .{ .alternatives = both };
+    }
+    return self.returnedTemplate(decl, returned);
+}
+
+/// The template of what a type function's final `return` gives (`findTemplate`): the container
+/// it declares, or the one another type function it calls makes.
+fn returnedTemplate(self: *Facts, decl: Decl, returned: Ast.Node.Index) ResolveError!?Value {
+    const tree = &self.project.at(decl.file).file.tree;
     var container_buffer: [2]Ast.Node.Index = undefined;
     if (tree.fullContainerDecl(&container_buffer, returned) == null) {
         // `return Owner(T, false, cleanup);`: the container another type function makes, the

@@ -1,6 +1,6 @@
 //! The pinned aegis revision's own sources, as glint project inputs for the pack's tests and
-//! benchmark. Only the files that publish the pack's members are present; every other import
-//! of theirs stays unmapped, as a program that does not use it would leave it.
+//! benchmark: every file of its module, so each import among them is mapped as aegis's build
+//! wires it; std and every other import stay unmapped.
 const std = @import("std");
 const glint = @import("glint");
 const Project = glint.Project;
@@ -8,163 +8,186 @@ const Project = glint.Project;
 const Source = struct { name: []const u8, bytes: []const u8 };
 const sources = [_]Source{
     .{ .name = "src/root.zig", .bytes = @embedFile("aegis-root") },
-    .{ .name = "src/secret.zig", .bytes = @embedFile("aegis-secret") },
-    .{ .name = "src/secret/inline.zig", .bytes = @embedFile("aegis-secret-inline") },
-    .{ .name = "src/secret/SecretBytes.zig", .bytes = @embedFile("aegis-secret-bytes") },
-    .{ .name = "src/sync.zig", .bytes = @embedFile("aegis-sync") },
-    .{ .name = "src/Guarded.zig", .bytes = @embedFile("aegis-guarded") },
-    .{ .name = "src/int.zig", .bytes = @embedFile("aegis-int") },
-    .{ .name = "src/id.zig", .bytes = @embedFile("aegis-id") },
-    .{ .name = "src/units.zig", .bytes = @embedFile("aegis-units") },
-    .{ .name = "src/scalar.zig", .bytes = @embedFile("aegis-scalar") },
-    .{ .name = "src/BlockingGuarded.zig", .bytes = @embedFile("aegis-blocking-guarded") },
-    .{ .name = "src/RwGuarded.zig", .bytes = @embedFile("aegis-rw-guarded") },
-    .{ .name = "src/SpinRwGuarded.zig", .bytes = @embedFile("aegis-spin-rw-guarded") },
-    .{ .name = "src/Condition.zig", .bytes = @embedFile("aegis-condition") },
-    .{ .name = "src/Once.zig", .bytes = @embedFile("aegis-once") },
-    .{ .name = "src/Lazy.zig", .bytes = @embedFile("aegis-lazy") },
-    .{ .name = "src/Confined.zig", .bytes = @embedFile("aegis-confined") },
+    .{ .name = "src/assert.zig", .bytes = @embedFile("aegis-assert") },
+    .{ .name = "src/Atomic.zig", .bytes = @embedFile("aegis-Atomic") },
+    .{ .name = "src/BlockingGuarded.zig", .bytes = @embedFile("aegis-BlockingGuarded") },
     .{ .name = "src/bounded.zig", .bytes = @embedFile("aegis-bounded") },
-    .{ .name = "src/own.zig", .bytes = @embedFile("aegis-own") },
-    .{ .name = "src/Shared.zig", .bytes = @embedFile("aegis-shared") },
+    .{ .name = "src/Condition.zig", .bytes = @embedFile("aegis-Condition") },
+    .{ .name = "src/Confined.zig", .bytes = @embedFile("aegis-Confined") },
+    .{ .name = "src/err.zig", .bytes = @embedFile("aegis-err") },
+    .{ .name = "src/flat.zig", .bytes = @embedFile("aegis-flat") },
+    .{ .name = "src/Guarded.zig", .bytes = @embedFile("aegis-Guarded") },
+    .{ .name = "src/handle.zig", .bytes = @embedFile("aegis-handle") },
+    .{ .name = "src/handle/dense.zig", .bytes = @embedFile("aegis-handle-dense") },
+    .{ .name = "src/handle/Domain.zig", .bytes = @embedFile("aegis-handle-Domain") },
+    .{ .name = "src/handle/index.zig", .bytes = @embedFile("aegis-handle-index") },
+    .{ .name = "src/handle/offset.zig", .bytes = @embedFile("aegis-handle-offset") },
+    .{ .name = "src/handle/overlap.zig", .bytes = @embedFile("aegis-handle-overlap") },
+    .{ .name = "src/handle/run_pool.zig", .bytes = @embedFile("aegis-handle-run_pool") },
+    .{ .name = "src/handle/secondary.zig", .bytes = @embedFile("aegis-handle-secondary") },
+    .{ .name = "src/handle/slot_pool.zig", .bytes = @embedFile("aegis-handle-slot_pool") },
+    .{ .name = "src/id.zig", .bytes = @embedFile("aegis-id") },
     .{ .name = "src/input.zig", .bytes = @embedFile("aegis-input") },
-    .{ .name = "src/secret/value.zig", .bytes = @embedFile("aegis-secret-value") },
-    .{ .name = "src/state.zig", .bytes = @embedFile("aegis-state") },
-    .{ .name = "src/state/edge.zig", .bytes = @embedFile("aegis-state-edge") },
-    .{ .name = "src/state/machine.zig", .bytes = @embedFile("aegis-state-machine") },
-    .{ .name = "src/state/stage.zig", .bytes = @embedFile("aegis-state-stage") },
-    .{ .name = "src/state/runtime.zig", .bytes = @embedFile("aegis-state-runtime") },
+    .{ .name = "src/int.zig", .bytes = @embedFile("aegis-int") },
+    .{ .name = "src/interior.zig", .bytes = @embedFile("aegis-interior") },
+    .{ .name = "src/Lazy.zig", .bytes = @embedFile("aegis-Lazy") },
+    .{ .name = "src/measure.zig", .bytes = @embedFile("aegis-measure") },
+    .{ .name = "src/move.zig", .bytes = @embedFile("aegis-move") },
+    .{ .name = "src/Once.zig", .bytes = @embedFile("aegis-Once") },
+    .{ .name = "src/Order.zig", .bytes = @embedFile("aegis-Order") },
+    .{ .name = "src/own.zig", .bytes = @embedFile("aegis-own") },
+    .{ .name = "src/parts.zig", .bytes = @embedFile("aegis-parts") },
+    .{ .name = "src/Region.zig", .bytes = @embedFile("aegis-Region") },
+    .{ .name = "src/RwGuarded.zig", .bytes = @embedFile("aegis-RwGuarded") },
+    .{ .name = "src/scalar.zig", .bytes = @embedFile("aegis-scalar") },
     .{ .name = "src/scope.zig", .bytes = @embedFile("aegis-scope") },
-    .{ .name = "src/scope/table.zig", .bytes = @embedFile("aegis-scope-table") },
     .{ .name = "src/scope/ref.zig", .bytes = @embedFile("aegis-scope-ref") },
     .{ .name = "src/scope/slot.zig", .bytes = @embedFile("aegis-scope-slot") },
-    .{ .name = "src/handle.zig", .bytes = @embedFile("aegis-handle") },
-    .{ .name = "src/handle/pool.zig", .bytes = @embedFile("aegis-handle-pool") },
-    .{ .name = "src/handle/slot_map.zig", .bytes = @embedFile("aegis-handle-slot-map") },
-    .{ .name = "src/handle/dense.zig", .bytes = @embedFile("aegis-handle-dense") },
-    .{ .name = "src/handle/secondary.zig", .bytes = @embedFile("aegis-handle-secondary") },
-    .{ .name = "src/handle/Domain.zig", .bytes = @embedFile("aegis-handle-domain") },
-    .{ .name = "src/handle/index.zig", .bytes = @embedFile("aegis-handle-index") },
-    .{ .name = "src/Atomic.zig", .bytes = @embedFile("aegis-atomic") },
-    .{ .name = "src/Order.zig", .bytes = @embedFile("aegis-order") },
-    .{ .name = "src/err.zig", .bytes = @embedFile("aegis-err") },
-    .{ .name = "src/assert.zig", .bytes = @embedFile("aegis-assert") },
-    .{ .name = "src/interior.zig", .bytes = @embedFile("aegis-interior") },
+    .{ .name = "src/scope/table.zig", .bytes = @embedFile("aegis-scope-table") },
+    .{ .name = "src/secret.zig", .bytes = @embedFile("aegis-secret") },
+    .{ .name = "src/secret/inline.zig", .bytes = @embedFile("aegis-secret-inline") },
+    .{ .name = "src/secret/machine.zig", .bytes = @embedFile("aegis-secret-machine") },
+    .{ .name = "src/secret/profiles.zig", .bytes = @embedFile("aegis-secret-profiles") },
+    .{ .name = "src/secret/SecretBytes.zig", .bytes = @embedFile("aegis-secret-SecretBytes") },
+    .{ .name = "src/secret/value.zig", .bytes = @embedFile("aegis-secret-value") },
+    .{ .name = "src/Shared.zig", .bytes = @embedFile("aegis-Shared") },
+    .{ .name = "src/SpinRwGuarded.zig", .bytes = @embedFile("aegis-SpinRwGuarded") },
+    .{ .name = "src/state.zig", .bytes = @embedFile("aegis-state") },
+    .{ .name = "src/state/carrying.zig", .bytes = @embedFile("aegis-state-carrying") },
+    .{ .name = "src/state/edge.zig", .bytes = @embedFile("aegis-state-edge") },
+    .{ .name = "src/state/machine.zig", .bytes = @embedFile("aegis-state-machine") },
+    .{ .name = "src/state/runtime.zig", .bytes = @embedFile("aegis-state-runtime") },
+    .{ .name = "src/state/stage.zig", .bytes = @embedFile("aegis-state-stage") },
+    .{ .name = "src/sync.zig", .bytes = @embedFile("aegis-sync") },
+    .{ .name = "src/units.zig", .bytes = @embedFile("aegis-units") },
 };
-const root = 1;
-const secret = 2;
-const secret_inline = 3;
-const secret_bytes = 4;
-const sync = 5;
-const guarded = 6;
-const int = 7;
-const id = 8;
-const units = 9;
-const scalar = 10;
-const blocking_guarded = 11;
-const rw_guarded = 12;
-const spin_rw_guarded = 13;
-const condition = 14;
-const once = 15;
-const lazy = 16;
-const confined = 17;
-const bounded = 18;
-const own = 19;
-const shared = 20;
-const input = 21;
-const secret_value = 22;
-const state = 23;
-const state_edge = 24;
-const state_machine = 25;
-const state_stage = 26;
-const state_runtime = 27;
-const scope = 28;
-const scope_table = 29;
-const scope_ref = 30;
-const scope_slot = 31;
-const handle = 32;
-const handle_pool = 33;
-const handle_slot_map = 34;
-const handle_dense = 35;
-const handle_secondary = 36;
-const handle_domain = 37;
-const handle_index = 38;
-const atomic = 39;
-const order = 40;
-const err = 41;
-const assert_file = 42;
-const interior = 43;
+/// Aegis's root, the module `aegis` (aegis exports no other).
+const root = blk: {
+    @setEvalBranchQuota(sources.len * 64);
+    break :blk index("src/root.zig");
+};
 
-/// Imports as aegis's own build wires them, then the ways the consumer (source 0) imports aegis.
-fn imports() [64]Project.Import {
-    return .{
-        .{ .from = root, .spelling = "secret.zig", .target = secret },
-        .{ .from = root, .spelling = "sync.zig", .target = sync },
-        .{ .from = root, .spelling = "int.zig", .target = int },
-        .{ .from = root, .spelling = "id.zig", .target = id },
-        .{ .from = root, .spelling = "units.zig", .target = units },
-        .{ .from = secret, .spelling = "secret/inline.zig", .target = secret_inline },
-        .{ .from = secret, .spelling = "secret/SecretBytes.zig", .target = secret_bytes },
-        .{ .from = sync, .spelling = "Guarded.zig", .target = guarded },
-        .{ .from = sync, .spelling = "BlockingGuarded.zig", .target = blocking_guarded },
-        .{ .from = sync, .spelling = "RwGuarded.zig", .target = rw_guarded },
-        .{ .from = sync, .spelling = "SpinRwGuarded.zig", .target = spin_rw_guarded },
-        .{ .from = sync, .spelling = "Condition.zig", .target = condition },
-        .{ .from = sync, .spelling = "Once.zig", .target = once },
-        .{ .from = sync, .spelling = "Lazy.zig", .target = lazy },
-        .{ .from = sync, .spelling = "Confined.zig", .target = confined },
-        .{ .from = once, .spelling = "Condition.zig", .target = condition },
-        .{ .from = int, .spelling = "scalar.zig", .target = scalar },
-        .{ .from = id, .spelling = "scalar.zig", .target = scalar },
-        .{ .from = id, .spelling = "units.zig", .target = units },
-        .{ .from = units, .spelling = "scalar.zig", .target = scalar },
-        .{ .from = units, .spelling = "int.zig", .target = int },
-        .{ .from = root, .spelling = "bounded.zig", .target = bounded },
-        .{ .from = root, .spelling = "own.zig", .target = own },
-        .{ .from = root, .spelling = "input.zig", .target = input },
-        .{ .from = root, .spelling = "state.zig", .target = state },
-        .{ .from = root, .spelling = "scope.zig", .target = scope },
-        .{ .from = root, .spelling = "handle.zig", .target = handle },
-        .{ .from = sync, .spelling = "Shared.zig", .target = shared },
-        .{ .from = secret, .spelling = "secret/value.zig", .target = secret_value },
-        .{ .from = state, .spelling = "state/edge.zig", .target = state_edge },
-        .{ .from = state, .spelling = "state/machine.zig", .target = state_machine },
-        .{ .from = state_machine, .spelling = "edge.zig", .target = state_edge },
-        .{ .from = state_machine, .spelling = "runtime.zig", .target = state_runtime },
-        .{ .from = state_machine, .spelling = "stage.zig", .target = state_stage },
-        .{ .from = scope, .spelling = "scope/ref.zig", .target = scope_ref },
-        .{ .from = scope, .spelling = "scope/slot.zig", .target = scope_slot },
-        .{ .from = scope, .spelling = "scope/table.zig", .target = scope_table },
-        .{ .from = scope_table, .spelling = "ref.zig", .target = scope_ref },
-        .{ .from = scope_table, .spelling = "slot.zig", .target = scope_slot },
-        .{ .from = scope_ref, .spelling = "slot.zig", .target = scope_slot },
-        .{ .from = handle, .spelling = "handle/dense.zig", .target = handle_dense },
-        .{ .from = handle, .spelling = "handle/Domain.zig", .target = handle_domain },
-        .{ .from = handle, .spelling = "handle/index.zig", .target = handle_index },
-        .{ .from = handle, .spelling = "handle/pool.zig", .target = handle_pool },
-        .{ .from = handle, .spelling = "handle/secondary.zig", .target = handle_secondary },
-        .{ .from = handle, .spelling = "handle/slot_map.zig", .target = handle_slot_map },
-        .{ .from = handle_slot_map, .spelling = "Domain.zig", .target = handle_domain },
-        .{ .from = handle_slot_map, .spelling = "pool.zig", .target = handle_pool },
-        .{ .from = handle_dense, .spelling = "Domain.zig", .target = handle_domain },
-        .{ .from = handle_dense, .spelling = "slot_map.zig", .target = handle_slot_map },
-        .{ .from = handle_pool, .spelling = "Domain.zig", .target = handle_domain },
-        .{ .from = sync, .spelling = "Atomic.zig", .target = atomic },
-        .{ .from = sync, .spelling = "Order.zig", .target = order },
-        .{ .from = order, .spelling = "Condition.zig", .target = condition },
-        .{ .from = root, .spelling = "err.zig", .target = err },
-        .{ .from = root, .spelling = "assert.zig", .target = assert_file },
-        .{ .from = shared, .spelling = "interior.zig", .target = interior },
-        .{ .from = lazy, .spelling = "interior.zig", .target = interior },
-        .{ .from = 0, .spelling = "aegis", .target = root },
-        .{ .from = 0, .spelling = "aegis.secret", .target = secret },
-        .{ .from = 0, .spelling = "aegis.sync", .target = sync },
-        .{ .from = 0, .spelling = "aegis.int", .target = int },
-        .{ .from = 0, .spelling = "aegis.id", .target = id },
-        .{ .from = 0, .spelling = "aegis.units", .target = units },
-    };
+/// Each import among aegis's files: the importing file, its spelling, the file it names.
+const wired = [_][3][]const u8{
+    .{ "src/BlockingGuarded.zig", "Condition.zig", "src/Condition.zig" },
+    .{ "src/bounded.zig", "move.zig", "src/move.zig" },
+    .{ "src/flat.zig", "assert.zig", "src/assert.zig" },
+    .{ "src/flat.zig", "bounded.zig", "src/bounded.zig" },
+    .{ "src/flat.zig", "input.zig", "src/input.zig" },
+    .{ "src/flat.zig", "measure.zig", "src/measure.zig" },
+    .{ "src/flat.zig", "Region.zig", "src/Region.zig" },
+    .{ "src/handle.zig", "handle/dense.zig", "src/handle/dense.zig" },
+    .{ "src/handle.zig", "handle/Domain.zig", "src/handle/Domain.zig" },
+    .{ "src/handle.zig", "handle/index.zig", "src/handle/index.zig" },
+    .{ "src/handle.zig", "handle/offset.zig", "src/handle/offset.zig" },
+    .{ "src/handle.zig", "handle/run_pool.zig", "src/handle/run_pool.zig" },
+    .{ "src/handle.zig", "handle/secondary.zig", "src/handle/secondary.zig" },
+    .{ "src/handle.zig", "handle/slot_pool.zig", "src/handle/slot_pool.zig" },
+    .{ "src/handle/dense.zig", "../move.zig", "src/move.zig" },
+    .{ "src/handle/dense.zig", "../Region.zig", "src/Region.zig" },
+    .{ "src/handle/dense.zig", "Domain.zig", "src/handle/Domain.zig" },
+    .{ "src/handle/dense.zig", "overlap.zig", "src/handle/overlap.zig" },
+    .{ "src/handle/dense.zig", "slot_pool.zig", "src/handle/slot_pool.zig" },
+    .{ "src/handle/offset.zig", "../Region.zig", "src/Region.zig" },
+    .{ "src/handle/run_pool.zig", "../assert.zig", "src/assert.zig" },
+    .{ "src/handle/run_pool.zig", "../Region.zig", "src/Region.zig" },
+    .{ "src/handle/run_pool.zig", "index.zig", "src/handle/index.zig" },
+    .{ "src/handle/run_pool.zig", "slot_pool.zig", "src/handle/slot_pool.zig" },
+    .{ "src/handle/secondary.zig", "../move.zig", "src/move.zig" },
+    .{ "src/handle/secondary.zig", "../Region.zig", "src/Region.zig" },
+    .{ "src/handle/secondary.zig", "overlap.zig", "src/handle/overlap.zig" },
+    .{ "src/handle/slot_pool.zig", "../assert.zig", "src/assert.zig" },
+    .{ "src/handle/slot_pool.zig", "../move.zig", "src/move.zig" },
+    .{ "src/handle/slot_pool.zig", "../Region.zig", "src/Region.zig" },
+    .{ "src/handle/slot_pool.zig", "Domain.zig", "src/handle/Domain.zig" },
+    .{ "src/handle/slot_pool.zig", "index.zig", "src/handle/index.zig" },
+    .{ "src/handle/slot_pool.zig", "overlap.zig", "src/handle/overlap.zig" },
+    .{ "src/id.zig", "scalar.zig", "src/scalar.zig" },
+    .{ "src/id.zig", "units.zig", "src/units.zig" },
+    .{ "src/int.zig", "scalar.zig", "src/scalar.zig" },
+    .{ "src/Lazy.zig", "interior.zig", "src/interior.zig" },
+    .{ "src/Once.zig", "Condition.zig", "src/Condition.zig" },
+    .{ "src/Order.zig", "Condition.zig", "src/Condition.zig" },
+    .{ "src/own.zig", "move.zig", "src/move.zig" },
+    .{ "src/own.zig", "units.zig", "src/units.zig" },
+    .{ "src/parts.zig", "assert.zig", "src/assert.zig" },
+    .{ "src/parts.zig", "measure.zig", "src/measure.zig" },
+    .{ "src/parts.zig", "units.zig", "src/units.zig" },
+    .{ "src/Region.zig", "bounded.zig", "src/bounded.zig" },
+    .{ "src/Region.zig", "units.zig", "src/units.zig" },
+    .{ "src/root.zig", "assert.zig", "src/assert.zig" },
+    .{ "src/root.zig", "bounded.zig", "src/bounded.zig" },
+    .{ "src/root.zig", "err.zig", "src/err.zig" },
+    .{ "src/root.zig", "flat.zig", "src/flat.zig" },
+    .{ "src/root.zig", "handle.zig", "src/handle.zig" },
+    .{ "src/root.zig", "id.zig", "src/id.zig" },
+    .{ "src/root.zig", "input.zig", "src/input.zig" },
+    .{ "src/root.zig", "int.zig", "src/int.zig" },
+    .{ "src/root.zig", "Order.zig", "src/Order.zig" },
+    .{ "src/root.zig", "own.zig", "src/own.zig" },
+    .{ "src/root.zig", "parts.zig", "src/parts.zig" },
+    .{ "src/root.zig", "Region.zig", "src/Region.zig" },
+    .{ "src/root.zig", "scope.zig", "src/scope.zig" },
+    .{ "src/root.zig", "secret.zig", "src/secret.zig" },
+    .{ "src/root.zig", "secret/inline.zig", "src/secret/inline.zig" },
+    .{ "src/root.zig", "secret/SecretBytes.zig", "src/secret/SecretBytes.zig" },
+    .{ "src/root.zig", "state.zig", "src/state.zig" },
+    .{ "src/root.zig", "sync.zig", "src/sync.zig" },
+    .{ "src/root.zig", "units.zig", "src/units.zig" },
+    .{ "src/scope.zig", "scope/ref.zig", "src/scope/ref.zig" },
+    .{ "src/scope.zig", "scope/slot.zig", "src/scope/slot.zig" },
+    .{ "src/scope.zig", "scope/table.zig", "src/scope/table.zig" },
+    .{ "src/scope/ref.zig", "slot.zig", "src/scope/slot.zig" },
+    .{ "src/scope/table.zig", "ref.zig", "src/scope/ref.zig" },
+    .{ "src/scope/table.zig", "slot.zig", "src/scope/slot.zig" },
+    .{ "src/secret.zig", "secret/machine.zig", "src/secret/machine.zig" },
+    .{ "src/secret.zig", "secret/profiles.zig", "src/secret/profiles.zig" },
+    .{ "src/secret.zig", "secret/value.zig", "src/secret/value.zig" },
+    .{ "src/secret/value.zig", "profiles.zig", "src/secret/profiles.zig" },
+    .{ "src/Shared.zig", "interior.zig", "src/interior.zig" },
+    .{ "src/Shared.zig", "move.zig", "src/move.zig" },
+    .{ "src/state.zig", "state/edge.zig", "src/state/edge.zig" },
+    .{ "src/state.zig", "state/machine.zig", "src/state/machine.zig" },
+    .{ "src/state/carrying.zig", "../move.zig", "src/move.zig" },
+    .{ "src/state/machine.zig", "carrying.zig", "src/state/carrying.zig" },
+    .{ "src/state/machine.zig", "edge.zig", "src/state/edge.zig" },
+    .{ "src/state/machine.zig", "runtime.zig", "src/state/runtime.zig" },
+    .{ "src/state/machine.zig", "stage.zig", "src/state/stage.zig" },
+    .{ "src/state/stage.zig", "../move.zig", "src/move.zig" },
+    .{ "src/sync.zig", "Atomic.zig", "src/Atomic.zig" },
+    .{ "src/sync.zig", "BlockingGuarded.zig", "src/BlockingGuarded.zig" },
+    .{ "src/sync.zig", "Condition.zig", "src/Condition.zig" },
+    .{ "src/sync.zig", "Confined.zig", "src/Confined.zig" },
+    .{ "src/sync.zig", "Guarded.zig", "src/Guarded.zig" },
+    .{ "src/sync.zig", "Lazy.zig", "src/Lazy.zig" },
+    .{ "src/sync.zig", "Once.zig", "src/Once.zig" },
+    .{ "src/sync.zig", "Order.zig", "src/Order.zig" },
+    .{ "src/sync.zig", "RwGuarded.zig", "src/RwGuarded.zig" },
+    .{ "src/sync.zig", "Shared.zig", "src/Shared.zig" },
+    .{ "src/sync.zig", "SpinRwGuarded.zig", "src/SpinRwGuarded.zig" },
+    .{ "src/units.zig", "assert.zig", "src/assert.zig" },
+    .{ "src/units.zig", "int.zig", "src/int.zig" },
+    .{ "src/units.zig", "scalar.zig", "src/scalar.zig" },
+};
+
+/// A pinned source's place among the project's inputs (the consumer is 0).
+fn index(comptime name: []const u8) u32 {
+    for (sources, 1..) |source, i| if (std.mem.eql(u8, source.name, name)) return i;
+    @compileError("not a pinned aegis source: " ++ name);
 }
 
+/// Imports as aegis's own build wires them, then the consumer's (source 0) of aegis.
+fn imports() [wired.len + 1]Project.Import {
+    return imported;
+}
+const imported = blk: {
+    // Each of the wired imports looks up two names among the sources.
+    @setEvalBranchQuota(4 * wired.len * sources.len * 64);
+    var all: [wired.len + 1]Project.Import = undefined;
+    for (wired, 0..) |entry, i| all[i] = .{ .from = index(entry[0]), .spelling = entry[1], .target = index(entry[2]) };
+    all[wired.len] = .{ .from = 0, .spelling = "aegis", .target = root };
+    break :blk all;
+};
 /// A project whose first source is `consumer`, followed by the aegis files, none of them selected.
 pub fn project(gpa: std.mem.Allocator, consumer: []const u8) !glint.Project {
     var inputs: [sources.len + 1]Project.Input = undefined;

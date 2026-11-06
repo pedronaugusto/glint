@@ -35,8 +35,6 @@ pub const Metrics = struct {
         /// `std.debug.assert`, checked in Debug and ReleaseSafe only.
         std_assert,
         invariant,
-        pre,
-        post,
         never,
         debug,
         debug_check,
@@ -46,8 +44,6 @@ pub const Metrics = struct {
             return switch (self) {
                 .std_assert => "std.debug.assert",
                 .invariant => "aegis.assert.invariant",
-                .pre => "aegis.assert.pre",
-                .post => "aegis.assert.post",
                 .never => "aegis.assert.never",
                 .debug => "aegis.assert.debug",
                 .debug_check => "aegis.assert.debugCheck",

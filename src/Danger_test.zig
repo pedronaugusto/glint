@@ -1265,7 +1265,7 @@ test "A015 finds std resources held by value in a field the program releases, or
         \\pub fn child() std.process.Child { return undefined; }
         \\pub fn borrowed(f: *std.Io.File) *std.Io.File { return f; }
         \\fn shut(d: *std.Io.Dir) void { _ = d; }
-        \\pub fn lent(o: *aegis.own.Owned(std.Io.Dir, shut)) aegis.own.Lent(std.Io.Dir) { return o.lend(); }
+        \\pub fn lent(o: *aegis.own.Owned(std.Io.Dir, shut)) std.Io.Dir { return o.borrow().*; }
     , 6);
     // A function each of whose returns reads what is already held hands over no owner:
     // shakedown's simulated working directory and standard streams, std's own stdio, a pipe end
@@ -1419,7 +1419,7 @@ test "A021 finds a second lock taken while a guard is held, unless both are rank
     try expect(pack.lock_order,
         \\const std = @import("std");
         \\const aegis = @import("aegis");
-        \\const L = aegis.sync.BlockingGuarded(u32);
+        \\const L = aegis.BlockingGuarded(u32);
         \\pub fn both(a: *L, b: *L, io: std.Io) void {
         \\    var ga = a.acquireUncancelable(io);
         \\    defer ga.deinit(io);
@@ -1435,7 +1435,7 @@ test "A021 finds a second lock taken while a guard is held, unless both are rank
         \\    gb.value().* += 1;
         \\    gb.deinit(io);
         \\}
-        \\const O = aegis.sync.Order(&.{ .{ .name = "a" }, .{ .name = "b", .after = &.{0} } });
+        \\const O = aegis.Order(&.{ .{ .name = "a" }, .{ .name = "b", .after = &.{0} } });
         \\const A = O.Ordered(L, 0);
         \\const B = O.Ordered(L, 1);
         \\pub fn ranked(a: *A, b: *B, c: *O.Context, io: std.Io) void {
@@ -4527,7 +4527,7 @@ test "an aegis owner or loan holds what it is given: input wrapped is input" {
         \\    const bytes = try dir.readFileAlloc(null, name, gpa, 100);
         \\    var held = Held.init(bytes);
         \\    defer held.deinit();
-        \\    const lent = held.lend().get();
+        \\    const lent = held.borrow().*;
         \\    const borrowed = held.borrow().*;
         \\    return lent[lent[0]] +% borrowed[borrowed[0]] +% table[name.len];
         \\}
@@ -9679,10 +9679,11 @@ test "A015 judges a public type's resource field where the program writes or rel
         \\pub fn borrowed(k: *lib.Keeper) void { const f = opened(); defer f.close(); k.keep(f); }
         \\pub fn read() lib.Reader { return .init(opened()); }
         \\pub fn maybe(k: *lib.Keeper, f: ?std.Io.File) void { const g = f orelse return; k.keep(g); }
-        \\pub fn lent(k: *lib.Keeper, l: aegis.own.Lent(std.Io.File)) void { k.keep(l.get()); }
+        \\pub fn lent(k: *lib.Keeper, o: *aegis.own.Owned(std.Io.File, shut)) void { k.keep(o.borrow().*); }
         \\pub fn stream() void { var r = opened().reader(undefined, &.{}); _ = &r; }
         \\pub fn done(r: *std.Io.File.Reader) void { r.file.close(); }
         \\const aegis = @import("aegis");
+        \\fn shut(_: *std.Io.File) void {}
     , &(std_files ++ [_]sources.Extra{lib}), imports);
     try std.testing.expectEqual(@as(usize, 0), found.undecided);
     try std.testing.expectEqualSlices(u32, &.{ 3, 4, 5, 6, 13 }, found.lines[0..found.findings]);

@@ -27,8 +27,6 @@ const aegis_members = blk: {
 };
 const assert_members = [_]Lib.Member{
     .{ .path = "invariant", .role = .invariant, .required = false },
-    .{ .path = "pre", .role = .pre, .required = false },
-    .{ .path = "post", .role = .post, .required = false },
     .{ .path = "never", .role = .never, .required = false },
     .{ .path = "debug", .role = .debug, .required = false },
     .{ .path = "debugCheck", .role = .debug_check, .required = false },

@@ -593,6 +593,8 @@ fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!b
     for (found.entries) |entry| {
         const k: Contract.Kind = @fromBackingInt(@intCast(entry.role));
         if (!backing(k, name)) continue;
+        // A type function whose containers are known: each is an entry of its own (`Facts.publication`).
+        if (entry.target == .function) if (try c.facts.template(entry.target.function)) |made| if ((try Facts.returnedContainers(c.allocator, made)).len != 0) continue;
         const container = (try publishedContainer(c, entry.target)) orelse return false;
         // A published type of this kind without such a field is no candidate.
         const decl = c.facts.member(container, name) orelse continue;

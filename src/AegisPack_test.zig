@@ -481,7 +481,7 @@ test "A004 reads a scalar's raw integer by meaning, through every place it is pu
 }
 
 test "a standalone aegis namespace module is recognized" {
-    var project = try fixture("const Id = @import(\"aegis.id\").Id; const Tag = struct {}; pub fn f() void { const v = Id(Tag, u32).fromRaw(1); _ = v.raw() + 2; }");
+    var project = try fixture("const Id = @import(\"aegis\").id.Id; const Tag = struct {}; pub fn f() void { const v = Id(Tag, u32).fromRaw(1); _ = v.raw() + 2; }");
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.scalar, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
@@ -1452,12 +1452,12 @@ test "every guarded owner's backing state and guard are its contract's, whicheve
     try std.testing.expectEqual(@as(usize, 1), count(report, pack.cleanup)); // safe: fixture counts are representable.
 }
 
-test "a guard read in a condition before its release, and one lent to a condition's wait, are decided" {
+test "a guard read in a condition before its release, and one waited on through its own wait, are decided" {
     const head = "const aegis = @import(\"aegis\");\n";
     // Read in an `if`'s condition and through its capture, then released.
     try expectJudged(head ++ "pub fn f(io: anytype, b: *aegis.BlockingGuarded(?u32)) void { var held = b.acquireUncancelable(io); if (held.value().*) |v| { _ = v; } held.deinit(io); }", pack.cleanup, true, 0);
-    // Acquired by `try`, its release deferred, lent to a wait that holds it again on return.
-    try expectJudged(head ++ "pub fn f(io: anytype, b: *aegis.BlockingGuarded(u32), c: *aegis.Condition) !void { var held = try b.acquire(io); defer held.deinit(io); while (held.value().* == 0) c.wait(io, &held, .none) catch |err| switch (err) { error.Timeout => return, else => |e| return e }; }", pack.cleanup, true, 0);
+    // Acquired by `try`, its release deferred, waited on through its own `wait`, which holds it again on return.
+    try expectJudged(head ++ "pub fn f(io: anytype, b: *aegis.BlockingGuarded(u32), c: *aegis.Condition) !void { var held = try b.acquire(io); defer held.deinit(io); while (held.value().* == 0) held.wait(c, io, .none) catch |err| switch (err) { error.Timeout => return, else => |e| return e }; }", pack.cleanup, true, 0);
     // Lent anywhere else, its release may move: undecided.
     try expectJudged(head ++ "var kept: ?*anyopaque = null;\nfn keep(g: anytype) void { kept = @ptrCast(g); }\npub fn f(io: anytype, b: *aegis.BlockingGuarded(u32)) !void { var held = try b.acquire(io); defer held.deinit(io); keep(&held); }", pack.cleanup, false, 0);
     // A guard never released is still a finding when it was read in a condition.
@@ -1468,7 +1468,7 @@ test "a guard lent to the program's own function is a borrow when every path han
     const head = "const aegis = @import(\"aegis\");\nconst B = aegis.BlockingGuarded(u32);\n";
     const owner = "pub fn f(io: anytype, b: *B, c: *aegis.Condition) void { var held = b.acquireUncancelable(io); defer held.deinit(io); give(io, b, c, &held); }";
     // Released and held again, a wait on the way, a loan on to another that does the same.
-    try expectJudged(head ++ "fn give(io: anytype, b: *B, c: *aegis.Condition, held: anytype) void { held.deinit(io); held.* = b.acquireUncancelable(io); again(io, b, c, held); }\nfn again(io: anytype, b: *B, c: *aegis.Condition, held: anytype) void { while (held.value().* == 0) { held.deinit(io); held.* = b.acquireUncancelable(io); c.wait(io, held, .none) catch return; } }\n" ++ owner, pack.cleanup, true, 0);
+    try expectJudged(head ++ "fn give(io: anytype, b: *B, c: *aegis.Condition, held: anytype) void { held.deinit(io); held.* = b.acquireUncancelable(io); again(io, b, c, held); }\nfn again(io: anytype, b: *B, c: *aegis.Condition, held: anytype) void { while (held.value().* == 0) { held.deinit(io); held.* = b.acquireUncancelable(io); held.wait(c, io, .none) catch return; } }\n" ++ owner, pack.cleanup, true, 0);
     // A method of the program's own, through its receiver.
     try expectJudged(head ++ "const S = struct { b: *B, fn give(s: *S, io: anytype, held: anytype) void { if (held.value().* == 0) return; held.deinit(io); held.* = s.b.acquireUncancelable(io); } };\npub fn f(io: anytype, s: *S) void { var held = s.b.acquireUncancelable(io); defer held.deinit(io); s.give(io, &held); }", pack.cleanup, true, 0);
     // One path returns with it released: no loan, undecided.
@@ -1489,7 +1489,7 @@ test "values initialized once and values one task owns keep their state behind t
     // A Once's and a Lazy's publication state, election lock, waiters and value.
     try expectJudged(head ++ "pub fn f(o: *aegis.Once(u32)) void { _ = o.state; _ = o.mutex; _ = o.changed; _ = o.data; }", pack.access, true, 4);
     try expectJudged(head ++ "pub fn f(l: *aegis.Lazy(u32)) void { _ = l.state; _ = l.data; }", pack.access, true, 2);
-    try expectJudged(head ++ "pub fn f(l: *aegis.sync.Lazy(u32)) ?aegis.Lazy(u32).Ref { return l.get(); }", pack.access, true, 0);
+    try expectJudged(head ++ "pub fn f(l: *aegis.Lazy(u32)) ?aegis.Lazy(u32).Ref { return l.get(); }", pack.access, true, 0);
     // A Confined value and the identity it checks.
     try expectJudged(head ++ "pub fn f(c: *aegis.Confined(u32)) void { _ = c.data; _ = c.owner; }", pack.access, true, 2);
     try expectJudged(head ++ "pub fn f(c: *aegis.Confined(u32), id: aegis.TaskIdentity) u32 { return c.value(id).*; }", pack.access, true, 0);
@@ -1560,7 +1560,7 @@ test "receivers through a list's items, an if or switch expression's capture and
 test "every published type after the guards is recognized where aegis is imported, with no drift" {
     try expectJudged(
         \\const aegis = @import("aegis");
-        \\pub fn f(a: *aegis.bounded.Array(u8, 4), q: *aegis.bounded.Queue(u8, 4), b: *aegis.bounded.Buffer(u8), l: aegis.bounded.Limit(u32), budget: *aegis.bounded.Budget(u32)) void {
+        \\pub fn f(a: *aegis.bounded.Array(u8, 4), q: *aegis.bounded.Ring(u8, 4), b: *aegis.bounded.Buffer(u8), l: aegis.bounded.Limit(u32), budget: *aegis.bounded.Budget(u32)) void {
         \\    _ = a.len(); _ = q.len(); _ = b.len(); _ = l.exceeds(1); _ = budget.remaining();
         \\}
     , pack.access, true, 0);
@@ -1569,15 +1569,11 @@ test "every published type after the guards is recognized where aegis is importe
 test "an aegis with one name each for its ring and ring buffer, as 0.3 has, is recognized in full; one without a name every revision publishes drifts" {
     const gpa = std.testing.allocator;
     const pinned = aegis_sources.pinned("src/bounded.zig").?;
-    const no_queue = try std.mem.replaceOwned(u8, gpa, pinned, "pub const Queue = Ring;\n", "");
-    defer gpa.free(no_queue);
-    const one_name = try std.mem.replaceOwned(u8, gpa, no_queue, "pub const QueueBuffer = RingBuffer;\n", "");
-    defer gpa.free(one_name);
-    try std.testing.expect(one_name.len < pinned.len);
+    try std.testing.expect(std.mem.find(u8, pinned, "pub const Queue") == null);
     const program = "const bounded = @import(\"aegis\").bounded;\npub fn f(r: *bounded.Ring(u8, 4), b: *bounded.RingBuffer(u8)) void { _ = r.head; _ = b.used; }";
     // Clean of drift: both backing reads found through the one name each.
     {
-        var project = try aegis_sources.projectRevised(gpa, program, "src/bounded.zig", one_name);
+        var project = try aegis_sources.project(gpa, program);
         defer project.deinit();
         var report = try glint.runConfigured(gpa, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
         defer report.deinit();
@@ -1585,8 +1581,9 @@ test "an aegis with one name each for its ring and ring buffer, as 0.3 has, is r
         try std.testing.expectEqual(@as(usize, 2), count(report, pack.access));
     }
     // `Ring` itself gone: drift, where aegis is imported.
-    const no_ring = try std.mem.replaceOwned(u8, gpa, one_name, "pub fn Ring(", "pub fn Circle(");
+    const no_ring = try std.mem.replaceOwned(u8, gpa, pinned, "pub fn Ring(", "pub fn Circle(");
     defer gpa.free(no_ring);
+    try std.testing.expect(!std.mem.eql(u8, no_ring, pinned));
     {
         var project = try aegis_sources.projectRevised(gpa, program, "src/bounded.zig", no_ring);
         defer project.deinit();
@@ -1601,16 +1598,12 @@ test "an aegis with one name each for its ring and ring buffer, as 0.3 has, is r
     }
 }
 
-test "an aegis whose pools are 0.3's SlotPool and RunPool, with 0.2's Pool and SlotMap gone, is recognized with no drift" {
+test "an aegis whose pools are 0.3's SlotPool and RunPool, with no Pool or SlotMap, is recognized with no drift" {
     const gpa = std.testing.allocator;
     const pinned = aegis_sources.pinned("src/handle.zig").?;
-    const no_pool = try std.mem.replaceOwned(u8, gpa, pinned, "pub const Pool = @import(\"handle/pool.zig\").Pool;\n", "");
-    defer gpa.free(no_pool);
-    const pools = try std.mem.replaceOwned(u8, gpa, no_pool, "pub const SlotMap = @import(\"handle/slot_map.zig\").SlotMap;\n", "pub fn SlotPool(comptime T: type) type {\n    return struct {\n        /// Private.\n        count: u32 = 0,\n        /// Private.\n        used: u32 = 0,\n        held: ?*T = null,\n        pub fn deinit(self: *@This()) void {\n            self.* = undefined;\n        }\n    };\n}\npub fn RunPool(comptime T: type) type {\n    return struct {\n        /// Private.\n        end: u32 = 0,\n        held: ?*T = null,\n        pub fn deinit(self: *@This()) void {\n            self.* = undefined;\n        }\n    };\n}\n");
-    defer gpa.free(pools);
-    try std.testing.expect(pools.len != no_pool.len);
-    const program = "const handle = @import(\"aegis\").handle;\npub fn f(p: *handle.SlotPool(u8), r: *handle.RunPool(u8)) u32 { return p.count + p.used + r.end; }";
-    var project = try aegis_sources.projectRevised(gpa, program, "src/handle.zig", pools);
+    try std.testing.expect(std.mem.find(u8, pinned, "pub const SlotMap") == null and std.mem.find(u8, pinned, "pub const Pool ") == null);
+    const program = "const handle = @import(\"aegis\").handle;\nconst Tag = struct {};\npub fn f(p: *handle.SlotPool(u8, Tag, .{}), r: *handle.RunPool(u8, Tag)) u32 { return p.count + p.used + r.end; }";
+    var project = try aegis_sources.project(gpa, program);
     defer project.deinit();
     var report = try glint.runConfigured(gpa, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
@@ -1665,10 +1658,10 @@ test "owners, result obligations and shared values are released once and never c
 test "generational storage, staged payloads, machines, scopes, unparsed input and decisions keep their contracts" {
     const head = "const aegis = @import(\"aegis\");\nconst Tag = struct {};\nconst S = enum { open, done };\nconst E = enum { finish };\nconst Machine = aegis.state.Machine(S, E, .{ .initial = .open, .terminal = &.{.done}, .edges = &.{.{ .from = .open, .on = .finish, .to = .done }} });\nconst Table = aegis.scope.Table(Tag);\n";
     // Slots behind keys; a copy of the map frees its storage twice.
-    try expectJudged(head ++ "pub fn f(p: *aegis.handle.Pool(u32, Tag), m: *aegis.handle.SlotMap(u32, Tag)) void { _ = p.slots; _ = m.storage; }", pack.access, true, 2);
-    try expectJudged(head ++ "pub fn f(gpa: @import(\"std\").mem.Allocator, i: aegis.handle.Instance) !void { var m = try aegis.handle.SlotMap(u32, Tag).init(gpa, i, .{}); const copy = m; _ = copy; _ = &m; }", pack.copies, true, 1);
-    try expectJudged(head ++ "fn none(_: *u32) void {}\npub fn f(gpa: @import(\"std\").mem.Allocator, i: aegis.handle.Instance) !void { var m = try aegis.handle.SlotMap(u32, Tag).init(gpa, i, .{}); defer m.deinit(none); }", pack.cleanup, true, 0);
-    try expectJudged(head ++ "pub fn f(gpa: @import(\"std\").mem.Allocator, i: aegis.handle.Instance) !void { var m = try aegis.handle.SlotMap(u32, Tag).init(gpa, i, .{}); _ = m.len(); }", pack.cleanup, true, 1);
+    try expectJudged(head ++ "pub fn f(p: *aegis.handle.SlotPool(u32, Tag, .{}), m: *aegis.handle.SlotPool(u32, Tag, .{ .generation = u64 })) void { _ = p.slots; _ = m.free_head; }", pack.access, true, 2);
+    try expectJudged(head ++ "pub fn f(region: aegis.Region, i: aegis.handle.Instance) !void { var m = try aegis.handle.SlotPool(u32, Tag, .{ .generation = u64 }).init(region, i); const copy = m; _ = copy; _ = &m; }", pack.copies, true, 1);
+    try expectJudged(head ++ "fn none(_: *u32) void {}\npub fn f(region: aegis.Region, i: aegis.handle.Instance) !void { var m = try aegis.handle.SlotPool(u32, Tag, .{ .generation = u64 }).init(region, i); defer m.deinit(none); }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f(region: aegis.Region, i: aegis.handle.Instance) !void { var m = try aegis.handle.SlotPool(u32, Tag, .{ .generation = u64 }).init(region, i); _ = m.len(); }", pack.cleanup, true, 1);
     // A domain copied issues its instances twice.
     try expectJudged(head ++ "pub fn f() void { var d = aegis.handle.Domain.init(1); const copy = d; _ = copy; _ = &d; }", pack.copies, true, 1);
     // A typed position's raw value in arithmetic.
@@ -1838,7 +1831,7 @@ test "the private fields of staged payloads, machines, scopes, references, secon
     const head = "const aegis = @import(\"aegis\");\nconst Tag = struct {};\nconst S = enum { open, done };\nconst E = enum { finish };\nconst Machine = aegis.state.Machine(S, E, .{ .initial = .open, .terminal = &.{.done}, .edges = &.{.{ .from = .open, .on = .finish, .to = .done }} });\n";
     try expectJudged(head ++ "pub fn f(s: *Machine.At(.open, u32), r: *Machine.Runtime(u32)) void { _ = s.payload; _ = r.payload; }", pack.access, true, 1);
     try expectJudged(head ++ "pub fn f(s: aegis.scope.Table(Tag).Scope, r: aegis.scope.Ref(Tag, *u32)) void { _ = s.index; _ = r.pointer; }", pack.access, true, 2);
-    try expectJudged(head ++ "pub fn f(m: *aegis.handle.SecondaryMap(aegis.handle.Index(Tag, u32), u8), u: aegis.input.Untrusted([]const u8)) void { _ = m.entries; _ = u.value; }", pack.access, true, 2);
+    try expectJudged(head ++ "pub fn f(m: *aegis.handle.SecondaryMap(aegis.handle.SlotPool(u32, Tag, .{ .generation = u64 }), u8), u: aegis.input.Untrusted([]const u8)) void { _ = m.free_head; _ = u.value; }", pack.access, true, 2);
     // The same names on other types are not these fields.
     try expectJudged(head ++ "const P = struct { payload: u8, state: u8, index: u8, pointer: u8, entries: u8, value: u8 };\npub fn f(p: P) void { _ = p.payload; _ = p.state; _ = p.index; _ = p.pointer; _ = p.entries; _ = p.value; }", pack.access, true, 0);
 }
@@ -1855,7 +1848,7 @@ test "type information of a type that does not resolve is still type information
 test "receivers through a guard's resolved type, builtins, destructuring, loop values and choices a build leaves out are decided" {
     const head = "const std = @import(\"std\");\nconst aegis = @import(\"aegis\");\nconst builtin = @import(\"builtin\");\nconst Shared = struct { closed: bool };\n";
     // A guard passed to a private `anytype` parameter is a guard by its resolved type.
-    try expectJudged(head ++ "fn wait(held: anytype) void { _ = held.value().closed; }\npub fn f(g: *aegis.sync.BlockingGuarded(Shared), io: std.Io) void { var held = g.acquireUncancelable(io); defer held.release(); wait(&held); }", pack.access, true, 0);
+    try expectJudged(head ++ "fn wait(held: anytype) void { _ = held.value().closed; }\npub fn f(g: *aegis.BlockingGuarded(Shared), io: std.Io) void { var held = g.acquireUncancelable(io); defer held.release(); wait(&held); }", pack.access, true, 0);
     // A builtin's bytes, a string literal sliced, a tuple and an array destructured.
     try expectJudged(head ++ "pub fn f(err: anyerror) usize { return @intFromPtr(@errorName(err).ptr); }", pack.access, true, 0);
     try expectJudged(head ++ "pub fn f() usize { const in = \"abc\"; return @intFromPtr(in[0..2].ptr); }", pack.access, true, 0);
@@ -1869,17 +1862,17 @@ test "receivers through a guard's resolved type, builtins, destructuring, loop v
 }
 
 test "atomics, task contexts, ordered locks and counters are in the contract" {
-    const head = "const std = @import(\"std\");\nconst aegis = @import(\"aegis\");\nconst O = aegis.sync.Order(&.{ .{ .name = \"a\" }, .{ .name = \"b\", .after = &.{0} } });\n";
+    const head = "const std = @import(\"std\");\nconst aegis = @import(\"aegis\");\nconst O = aegis.Order(&.{ .{ .name = \"a\" }, .{ .name = \"b\", .after = &.{0} } });\n";
     // An atomic's cell is private; a copy is a second cell.
-    try expectJudged(head ++ "pub fn f(a: *aegis.sync.Atomic(u32)) void { _ = a.cell; }", pack.access, true, 1);
-    try expectJudged(head ++ "pub fn f(a: aegis.sync.Atomic(u32)) u32 { const b = a; return a.load(.acquire) + b.load(.acquire); }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(a: *aegis.Atomic(u32)) void { _ = a.cell; }", pack.access, true, 1);
+    try expectJudged(head ++ "pub fn f(a: aegis.Atomic(u32)) u32 { const b = a; return a.load(.acquire) + b.load(.acquire); }", pack.copies, true, 1);
     // A task's context: private stack, a copy is a second context.
-    try expectJudged(head ++ "pub fn f(c: *O.Context, i: *aegis.sync.InitContext) usize { return c.used + i.used; }", pack.access, true, 2);
+    try expectJudged(head ++ "pub fn f(c: *O.Context, i: *aegis.InitContext) usize { return c.used + i.used; }", pack.access, true, 2);
     try expectJudged(head ++ "fn use(_: *const O.Context) void {}\npub fn f(c: O.Context) void { var d = c; _ = &d; use(&c); }", pack.copies, true, 1);
     // An ordered lock's base is private; its ordered acquisitions give guards released by `deinit`.
-    try expectJudged(head ++ "const L = O.Ordered(aegis.sync.BlockingGuarded(u32), 0);\npub fn f(l: *L) void { _ = l.base; }", pack.access, true, 1);
-    try expectJudged(head ++ "const L = O.Ordered(aegis.sync.BlockingGuarded(u32), 0);\npub fn f(l: *L, c: *O.Context, io: std.Io) void { var g = l.acquireOrderedUncancelable(io, c); g.value().* += 1; }", pack.cleanup, true, 1);
-    try expectJudged(head ++ "const L = O.Ordered(aegis.sync.BlockingGuarded(u32), 0);\npub fn f(l: *L, c: *O.Context, io: std.Io) void { var g = l.acquireOrderedUncancelable(io, c); defer g.deinit(io); g.value().* += 1; }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "const L = O.Ordered(aegis.BlockingGuarded(u32), 0);\npub fn f(l: *L) void { _ = l.base; }", pack.access, true, 1);
+    try expectJudged(head ++ "const L = O.Ordered(aegis.BlockingGuarded(u32), 0);\npub fn f(l: *L, c: *O.Context, io: std.Io) void { var g = l.acquireOrderedUncancelable(io, c); g.value().* += 1; }", pack.cleanup, true, 1);
+    try expectJudged(head ++ "const L = O.Ordered(aegis.BlockingGuarded(u32), 0);\npub fn f(l: *L, c: *O.Context, io: std.Io) void { var g = l.acquireOrderedUncancelable(io, c); defer g.deinit(io); g.value().* += 1; }", pack.cleanup, true, 0);
     // A counter issues ids: a copy issues them twice.
     try expectJudged(head ++ "const C = aegis.id.Counter(struct {}, u32);\npub fn f(c: C) !void { var d = c; var e = c; _ = try d.next(); _ = try e.next(); }", pack.copies, true, 2);
 }
@@ -2235,9 +2228,9 @@ test "an owner handed on by its move is transferred where the result is returned
     // A003 follows from there; returned on one branch and released on the other.
     try expectJudged(head ++ "pub fn f() !R { var o = O.init(1); errdefer o.deinit(); try g(); return .{ .o = o.move() }; }", pack.cleanup, true, 0);
     try expectJudged(head ++ "pub fn f(slot: *R) !void { var o = O.init(1); errdefer o.deinit(); try g(); slot.* = .{ .o = o.move() }; }", pack.cleanup, true, 0);
-    try expectJudged(head ++ "pub fn f() ?O { var o = O.init(1); if (ready(o.lend().get())) return o.move(); o.deinit(); return null; }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f() ?O { var o = O.init(1); if (ready(o.borrow().*)) return o.move(); o.deinit(); return null; }", pack.cleanup, true, 0);
     try expectJudged(head ++ "pub fn f() void { var o = O.init(1); var x = o.move(); x.deinit(); }", pack.cleanup, true, 0);
-    try expectJudged(head ++ "pub fn f() void { var o = O.init(1); var x = o.move(); _ = x.lend(); }", pack.cleanup, true, 1);
+    try expectJudged(head ++ "pub fn f() void { var o = O.init(1); var x = o.move(); _ = x.borrow(); }", pack.cleanup, true, 1);
     // Released after the move, or by an errdefer on an error exit after it, one in the same
     // literal included: a witness each.
     try expectJudged(head ++ "pub fn f(slot: *R) void { var o = O.init(1); slot.* = .{ .o = o.move() }; o.deinit(); }", pack.cleanup, true, 1);

@@ -383,7 +383,7 @@ test "publishing aegis's API turns the pack on and nothing more: a program file 
     defer old.close(std.testing.io);
     const root = try old.readFileAlloc(std.testing.io, "src/root.zig", a, .unlimited);
     defer a.free(root);
-    const lacking = try std.mem.replaceOwned(u8, a, root, "pub const Guarded =", "const Removed =");
+    const lacking = try std.mem.replaceOwned(u8, a, root, "pub const Guarded =", "const Guarded =");
     defer a.free(lacking);
     try std.testing.expect(!std.mem.eql(u8, root, lacking));
     try old.writeFile(std.testing.io, .{ .sub_path = "src/root.zig", .data = lacking });
@@ -465,7 +465,7 @@ test "the aegis pack is on where a file's import of aegis resolves to aegis, and
     try aegis_sources.writeTree(a, std.testing.io, part);
     const root = try part.readFileAlloc(std.testing.io, "src/root.zig", a, .unlimited);
     defer a.free(root);
-    const lacking = try std.mem.replaceOwned(u8, a, root, "pub const Guarded =", "const Removed =");
+    const lacking = try std.mem.replaceOwned(u8, a, root, "pub const Guarded =", "const Guarded =");
     defer a.free(lacking);
     try std.testing.expect(!std.mem.eql(u8, root, lacking));
     try part.writeFile(std.testing.io, .{ .sub_path = "src/root.zig", .data = lacking });

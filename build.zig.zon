@@ -6,8 +6,8 @@
     .paths = .{ "build.zig", "build.zig.zon", "src", "examples", "docs", "README.md", "CHANGELOG.md", "LICENSE" },
     .dependencies = .{
         .aegis = .{
-            .url = "git+https://github.com/pedronaugusto/aegis?ref=v0.2.1#6f2701b0e6e75faeaa18d46fb4755c159d22ec95",
-            .hash = "aegis-0.2.1-rsxoulPgCABd2jmLMptpC8vnp_m08bI4lN1ZCpPG5stV",
+            .url = "git+https://github.com/pedronaugusto/aegis#7fdf0a3a9ec9500ec6471f3e2bcb18c71809d2ec",
+            .hash = "aegis-0.2.4-rsxouvPECwAJgMW9YvNsAjubNskeITumC2lZslsH9aHS",
         },
 
         .ensign = .{
@@ -17,8 +17,8 @@
     },
     .dev_dependencies = .{
         .preflight = .{
-            .url = "git+https://github.com/pedronaugusto/preflight?ref=bay-zon-inputs#8d34d5782840534c5159900e28dd67967d68104f",
-            .hash = "preflight-0.18.6-LX1Zwl4UGAC-nadC030vzxG43P7pCwBDvmLDXMP-hjMw",
+            .url = "git+https://github.com/pedronaugusto/preflight?ref=concurrent-gate-3#041af5a86405ca35ea45215478b966daef6cf745",
+            .hash = "preflight-0.18.6-LX1ZwoYgGQCiGQ5d6U8YUr1adiwiE0wwVpdwKO74LSKg",
         },
 
         .shakedown = .{

@@ -205,15 +205,15 @@ The contract covers aegis's published types past the guards too, each by what it
 
 | Types | A001 private state | A002 copy is a second owner | A003 obligation of a local acquisition |
 |---|---|---|---|
-| `bounded.Array`, `Ring`/`Queue` | `storage`, `used`, `head` | no: a copy is its elements' (A002 does not read the element type) | none |
-| `bounded.Buffer`, `RingBuffer`/`QueueBuffer` | `storage`, `gpa`, `maximum`, `used`, `head` | yes | `deinit` |
+| `bounded.Array`, `Ring` | `storage`, `used`, `head` | no: a copy is its elements' (A002 does not read the element type) | none |
+| `bounded.Buffer`, `RingBuffer` | `storage`, `gpa`, `maximum`, `used`, `head` | yes | `deinit` |
 | `bounded.Limit` | `maximum` | no | none |
 | `bounded.Budget` | `ceiling`, `taken` | yes: the copy keeps its own count | none |
 | `Budget.Reservation` | `budget`, `amount`, `live` | yes | `release`, `consume` (its amount kept as consumed work), or `moveInto` |
 | `own.Owned`, `OwnedIo` | `data`, `state` | yes | `deinit`, or `take`/`moveInto` |
 | `own.MustUse` | `data`, `pending`, `live` | yes | `take` or `acknowledge` (its `deinit` checks that one ran) |
 | `Shared` | `block`, `live` | yes: a copy with `=` is a handle never retained | `release` (each handle, `create`d or `retain`ed) |
-| `handle.Pool`, `SlotMap`, `DenseSlotMap`, `SecondaryMap` | `slots`, `storage`, `primary`, `values`, `keys`, `free_head`, `entries` | yes | `deinit` |
+| `handle.SlotPool`, `RunPool`, `DenseSlotMap`, `SecondaryMap` | `region`, `slots`, `count`, `used`, `free_head`, `retired`, `items`, `end`, `free_spans`, `runs`, `primary`, `values`, `keys` | yes | `deinit` |
 | `handle.Domain`, `id.Counter` | none | yes: both issue the same instances (ids) | none |
 | `handle.Index` | a scalar: A004 | no | none |
 | `state.Machine.At` | `payload`, `live` | yes | none (a payload leaves by `take` or a transition) |
@@ -222,7 +222,7 @@ The contract covers aegis's published types past the guards too, each by what it
 | `Table.Scope` | `table`, `index`, `generation` | no | `end` |
 | `scope.Ref` | `pointer` (aegis 0.1.14), `slot`, `generation` | no | none |
 | `input.Untrusted` | `value` | no | none |
-| `sync.Atomic` | `cell` | yes: a second cell | none |
+| `Atomic` | `cell` | yes: a second cell | none |
 | `InitContext` | `stack`, `used`, `suspended`, `owners` | yes: a second task context | none |
 | `secret.Choice` | `bit` | no | none |
 
