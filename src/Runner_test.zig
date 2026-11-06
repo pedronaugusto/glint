@@ -220,6 +220,12 @@ test "review typed scalar aliases are values, not type acronyms" {
 test "review private imports used through the actual file identity are not dead" {
     try check(.Z013, "const Self = @This(); const object = @import(\"dep\"); pub const exports = struct { pub const exposed = Self.object; };", 0);
     try check(.Z013, "const object = @import(\"dep\"); const Other = struct { pub const object = 1; }; pub const exposed = Other.object;", 1);
+    // A member whose holder does not resolve may be each private import its own container
+    // declares under that name, in every container: none is reported. Named through a known
+    // container, the other is.
+    const two = "const A = struct { const dep = @import(\"dep\"); }; const B = struct { const dep = @import(\"other\"); }; ";
+    try check(.Z013, two ++ "pub fn f(x: anytype) void { _ = x.dep; }", 0);
+    try check(.Z013, two ++ "pub fn f() void { _ = A.dep; }", 1);
 }
 
 test "Z034 finds operators Zig 0.18 refuses to order without parentheses, and leaves the orders it keeps" {

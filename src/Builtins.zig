@@ -128,9 +128,8 @@ fn unusedImports(self: *Context) RunError!void {
     if (!self.config.has(.Z013)) return;
     const source = self.project.at(self.file);
     const tree = &source.file.tree;
-    const declarations = source.model.declarations;
-    var candidates: std.StringHashMapUnmanaged(void) = .empty;
-    defer candidates.deinit(self.allocator);
+    const model = &source.model;
+    const declarations = model.declarations;
     var indexes: std.ArrayList(Model.Declaration.Id) = .empty;
     for (declarations, 0..) |decl, index| {
         if (decl.kind != .variable or decl.public or decl.exported or decl.references != 0) continue;
@@ -150,37 +149,54 @@ fn unusedImports(self: *Context) RunError!void {
                 continue;
             },
         };
-        try candidates.put(self.allocator, decl.name, {});
         try indexes.append(self.allocator, @fromBackingInt(@intCast(index)));
     }
     if (indexes.items.len == 0) return;
     var used: Used = .empty;
-    var undecided: std.StringHashMapUnmanaged(void) = .empty;
-    defer undecided.deinit(self.allocator);
-    // One pass for all candidates: spelling filters work, declaration identity decides usage.
+    var undecided: Used = .empty;
+    // One pass for all candidates: a member reaches a candidate only as Zig's lookup in the
+    // candidate's own container finds it by that name; what it resolves to decides the use.
     for (tree.nodes.items(.tag), 0..) |tag, n| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
         if (tag != .field_access) {
-            try reflectedImport(self, node, candidates, indexes.items, &used, &undecided);
+            try reflectedImport(self, node, indexes.items, &used, &undecided);
             continue;
         }
         const pair = tree.nodeData(node).node_and_token;
         const name = try Model.identifier(self.allocator, tree.tokenSlice(pair[1]));
-        if (!candidates.contains(name)) continue;
+        if (!namedBy(model, indexes.items, name)) continue;
         switch (try self.facts.definition(self.file, node)) {
             .decl => |definition| if (definition.file == self.file) try used.put(self.allocator, definition.index, {}),
             // A member its holder does not declare, or of a number: no import of this file.
             .none => {},
             .unknown => |why| {
                 try unknown(self, .Z013, node, why);
-                try undecided.put(self.allocator, name, {});
+                try markNamed(self, model, indexes.items, name, &undecided);
             },
         }
     }
     for (indexes.items) |index| {
         const decl = declarations[@backingInt(index)];
-        if (!used.contains(index) and !undecided.contains(decl.name)) try self.at(.Z013, decl.token, try self.allocator.print("unused private import '{s}'", .{decl.name}));
+        if (!used.contains(index) and !undecided.contains(index)) try self.at(.Z013, decl.token, try self.allocator.print("unused private import '{s}'", .{decl.name}));
     }
+}
+
+/// Whether candidate `index` is the one its own container declares under `name`, as Zig's
+/// member lookup finds it (`Model.Scope.names`).
+fn declaresAs(model: *const Model, index: Model.Declaration.Id, name: []const u8) bool {
+    const scope = model.declarations[@backingInt(index)].scope;
+    return model.scopes[@backingInt(scope)].names.get(name) == index;
+}
+
+/// Whether a member spelled `name` may be one of the candidates.
+fn namedBy(model: *const Model, indexes: []const Model.Declaration.Id, name: []const u8) bool {
+    for (indexes) |index| if (declaresAs(model, index, name)) return true;
+    return false;
+}
+
+/// Puts in `into` every candidate a member spelled `name` may be.
+fn markNamed(self: *Context, model: *const Model, indexes: []const Model.Declaration.Id, name: []const u8, into: *Used) RunError!void {
+    for (indexes) |index| if (declaresAs(model, index, name)) try into.put(self.allocator, index, {});
 }
 
 /// Whether `value` is another file's root, or a choice of nothing but such roots.
@@ -205,7 +221,7 @@ fn importOf(self: *const Context, value: Facts.Value) Governed.Is {
 /// The candidate imports a selected file names.
 const Used = std.AutoHashMapUnmanaged(Model.Declaration.Id, void);
 
-fn reflectedImport(self: *Context, node: Ast.Node.Index, candidates: std.StringHashMapUnmanaged(void), indexes: []const Model.Declaration.Id, used: *Used, undecided: *std.StringHashMapUnmanaged(void)) RunError!void {
+fn reflectedImport(self: *Context, node: Ast.Node.Index, indexes: []const Model.Declaration.Id, used: *Used, undecided: *Used) RunError!void {
     const tree = &self.project.at(self.file).file.tree;
     var buffer: [2]Ast.Node.Index = undefined;
     const args = Facts.builtinArgs(tree, node, &buffer);
@@ -218,8 +234,9 @@ fn reflectedImport(self: *Context, node: Ast.Node.Index, candidates: std.StringH
         .name => |one| one,
         .each_of, .names, .computed => null,
     };
+    const model = &self.project.at(self.file).model;
     if (name) |one| {
-        if (!candidates.contains(one)) return;
+        if (!namedBy(model, indexes, one)) return;
         switch (try self.facts.reflected(self.file, node)) {
             .decl => |definition| {
                 if (definition.file == self.file) try used.put(self.allocator, definition.index, {});
@@ -240,10 +257,10 @@ fn reflectedImport(self: *Context, node: Ast.Node.Index, candidates: std.StringH
     };
     var affected = false;
     for (indexes) |index| {
-        const decl = self.project.at(self.file).model.declarations[@backingInt(index)];
-        if (name) |literal| if (!std.mem.eql(u8, literal, decl.name)) continue;
+        const decl = model.declarations[@backingInt(index)];
+        if (name) |literal| if (!declaresAs(model, index, literal)) continue;
         if (container) |known| if (!known.symbolic and (known.file != self.file or known.scope != decl.scope)) continue;
-        try undecided.put(self.allocator, decl.name, {});
+        try undecided.put(self.allocator, index, {});
         affected = true;
     }
     if (affected) try unknown(self, .Z013, node, if (value == .unknown) value.unknown else .comptime_dependent);
