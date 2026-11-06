@@ -14,7 +14,7 @@ const std = @import("std");
 const glint = @import("glint");
 const cli = glint.cli;
 const rule_readers: glint.Rule = @fromBackingInt(1000); // safe: this linter owns extension ID 1000, validated by glint.
-pub const rules = ruled(&allowed);
+pub const rules = ruled(&allowed) ++ tabled(&tables);
 fn ruled(comptime list: []const Allowed) [1]glint.ProjectRule {
     return .{.{ .definition = .{ .id = rule_readers, .name = "RULE_READERS", .group = .family_policy, .purpose = "a rule reads values, writes, calls and types only through glint's shared queries" }, .check = struct {
         fn run(context: *glint.RuleContext) glint.RuleContext.Error!void {
@@ -55,6 +55,92 @@ const allowed = [_]Allowed{
     .{ .file = "src/AegisPack.zig", .function = "Flow.repeat", .reason = "`while (true)` is the language's literal, which no declaration stands behind" },
     .{ .file = "src/Escapes.zig", .function = "compiledIn", .reason = "a literal as written is compiled into the program, never the frame's memory" },
 };
+
+/// NAME_TABLES: a table keyed by text, anywhere in glint (the shared queries' files included). A
+/// declaration found by its spelling in one misses what resolution sees, as a rule's comparison
+/// does (`copiesBy`, a table of generics by name, answered a call through a parameter by any
+/// function so spelled). A table of text that names no declaration (a path, a rule's id) is
+/// allowed with its reason; one of declarations is keyed by the declaration (`Facts.Decl`).
+const name_tables: glint.Rule = @fromBackingInt(1001); // safe: this linter owns extension ID 1001, validated by glint.
+fn tabled(comptime list: []const Allowed) [1]glint.ProjectRule {
+    return .{.{ .definition = .{ .id = name_tables, .name = "NAME_TABLES", .group = .family_policy, .purpose = "glint finds a declaration by what it resolves to, never by a table of its spelling" }, .check = struct {
+        fn run(context: *glint.RuleContext) glint.RuleContext.Error!void {
+            return checkTables(context, list);
+        }
+    }.run }};
+}
+
+/// std's maps keyed by text, by their declarations under std's root: the type functions, each
+/// given the value's type alone, and the plain structs, made by `init`.
+const text_maps = [_]struct { []const u8, usize }{ .{ "StringHashMapUnmanaged", 1 }, .{ "StringHashMap", 1 }, .{ "StringArrayHashMapUnmanaged", 1 }, .{ "StringArrayHashMap", 1 }, .{ "BufSet.init", 1 }, .{ "BufMap.init", 1 } };
+
+/// The text tables that name no declaration, each with its reason, by the place that makes the
+/// table (`place`). An entry no table of its file's is at is a finding itself.
+const tables = [_]Allowed{
+    .{ .file = "src/Model.zig", .function = "Scope.names", .reason = "Zig's own scope lookup: the resolver itself finds a declaration by its name in its scope" },
+    .{ .file = "src/cli.zig", .function = "Loader.paths", .reason = "file paths: a loaded file's canonical path is its identity" },
+    .{ .file = "src/cli.zig", .function = "Loader.manifests", .reason = "directory paths: each package directory's manifest" },
+    .{ .file = "src/Summary.zig", .function = "Names.files", .reason = "file names: the run's file under each name a summary writes" },
+    .{ .file = "src/Summary.zig", .function = "Writer.strings", .reason = "the summary's own string table: the text is what is written" },
+    .{ .file = "src/Runner.zig", .function = "emitted", .reason = "a finding's identity: its rule, span and message text" },
+    .{ .file = "src/Token.zig", .function = "recoverShaped", .reason = "import spellings: the token-level import walk before any model exists" },
+    .{ .file = "src/Token.zig", .function = "classify", .reason = "import spellings: the token-level import walk before any model exists" },
+    .{ .file = "src/Governed.zig", .function = "Lookups.found", .reason = "a configured declaration path is the query, its answer a resolved declaration; program uses match by the declaration it resolves to" },
+};
+
+fn checkTables(context: *glint.RuleContext, list: []const Allowed) glint.RuleContext.Error!void {
+    const tree = try context.project.syntax(try context.source());
+    const name = context.project.at(context.file).input.name;
+    const used = try context.allocator.alloc(bool, list.len);
+    @memset(used, false);
+    nodes: for (tree.nodes.items(.tag), 0..) |_, index| {
+        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(index));
+        if (context.inTest(tree.nodeMainToken(node))) continue;
+        var buffer: [1]std.zig.Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, node) orelse continue;
+        // A function a runtime value holds returns no type and makes no std struct of its own.
+        const callee = try context.facts.resolve(context.file, call.ast.fn_expr);
+        if (callee == .fn_type or (callee == .pointer and callee.pointer.child.* == .fn_type)) continue;
+        const map = for (text_maps) |each| {
+            if (call.ast.params.len != each[1]) continue;
+            switch (try glint.stdCall(context, node, each[0])) {
+                .no => {},
+                .yes => break each[0],
+                .unknown => |why| {
+                    try context.unknown(name_tables, node, why);
+                    continue :nodes;
+                },
+            }
+        } else continue;
+        const where = try place(context, tree, node);
+        for (list, used) |entry, *use| if (inFile(name, entry.file) and std.mem.eql(u8, entry.function, where)) {
+            use.* = true;
+            continue :nodes;
+        };
+        try context.at(name_tables, tree.nodeMainToken(node), try context.allocator.print("std's {s} at {s} keys a table by text: a declaration found by its spelling misses an alias, a per-build choice or a call through a value; key it by the declaration (Facts.Decl), or, naming no declaration, allow it with its reason", .{ map, if (where.len == 0) "the file's level" else where }));
+    }
+    for (list, used) |entry, use| if (inFile(name, entry.file) and !use) {
+        try context.at(name_tables, 0, try context.allocator.print("the allowed text table at {s} ({s}) is none of this file's: remove the entry", .{ entry.function, entry.reason }));
+    };
+}
+
+/// Where `node` is made: its function (`enclosing`), or else the containers and the field or
+/// constant that hold it (`Scope.names`, `copier_names`).
+fn place(context: *glint.RuleContext, tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) glint.RuleContext.Error![]const u8 {
+    const function = try enclosing(context, tree, node);
+    if (function.len != 0) return function;
+    const model = &context.project.at(context.file).model;
+    var names: std.ArrayList([]const u8) = .empty;
+    var at = model.parentOf(node);
+    while (at) |each| : (at = model.parentOf(each)) {
+        if (model.containerField(tree, each)) |field| {
+            if (names.items.len == 0) try names.insert(context.allocator, 0, tree.tokenSlice(field.ast.main_token));
+        } else if (tree.fullVarDecl(each)) |variable| {
+            try names.insert(context.allocator, 0, tree.tokenSlice(variable.ast.mut_token + 1));
+        }
+    }
+    return std.mem.join(context.allocator, ".", names.items);
+}
 
 /// std's functions that compare text: one given a declaration's name matches a declaration by it.
 const comparisons = [_][]const u8{ "mem.eql", "mem.startsWith", "mem.endsWith", "mem.find" };
@@ -328,6 +414,14 @@ fn readers(root: []const u8) !struct { usize, usize } {
 }
 /// As `readers`, with the reads `list` allows.
 fn readersAllowing(root: []const u8, comptime list: []const Allowed) !struct { usize, usize } {
+    return judge(root, rule_readers, &ruled(list));
+}
+/// A run of NAME_TABLES on `root`, with the tables `list` allows: its findings, and its undecided sites.
+fn tablesAllowing(root: []const u8, comptime list: []const Allowed) !struct { usize, usize } {
+    return judge(root, name_tables, &tabled(list));
+}
+/// A run of `rule`, one of `with`, on `root` beside the fixture std.
+fn judge(root: []const u8, rule: glint.Rule, with: []const glint.ProjectRule) !struct { usize, usize } {
     var project = try glint.Project.init(std.testing.allocator, &.{
         .{ .name = "root", .bytes = root },
         .{ .name = "standard", .bytes =
@@ -337,6 +431,8 @@ fn readersAllowing(root: []const u8, comptime list: []const Allowed) !struct { u
         \\    pub fn endsWith(comptime T: type, a: []const T, b: []const T) bool { return a.len >= b.len; }
         \\    pub fn find(comptime T: type, a: []const T, b: []const T) ?usize { return if (a.len >= b.len) 0 else null; }
         \\};
+        \\pub fn StringHashMapUnmanaged(comptime V: type) type { return struct { value: ?V = null }; }
+        \\pub fn AutoHashMapUnmanaged(comptime K: type, comptime V: type) type { return struct { key: ?K = null, value: ?V = null }; }
         \\pub fn MultiArrayList(comptime T: type) type {
         \\    return struct {
         \\        pub const Slice = struct {
@@ -358,13 +454,12 @@ fn readersAllowing(root: []const u8, comptime list: []const Allowed) !struct { u
         , .selected = false },
     }, &.{.{ .from = 0, .target = 1, .spelling = "std" }}, .{}); // safe: fixture constants fit the asserted integer widths.
     defer project.deinit();
-    const config: glint.Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule_readers, .level = .report }} };
-    const allowing = ruled(list);
-    var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = &allowing });
+    const config: glint.Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .report }} };
+    var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = with });
     defer report.deinit();
     var undecided: usize = 0;
-    for (report.coverage) |item| if (item.rule) |rule| {
-        if (rule == rule_readers) undecided += 1;
+    for (report.coverage) |item| if (item.rule) |each| {
+        if (each == rule) undecided += 1;
     };
     return .{ report.diagnostics.len, undecided };
 }
@@ -457,4 +552,30 @@ test "std's container field reading, which the model corrects, is a finding wher
     try std.testing.expectEqual(.{ 2, 0 }, try readers(source));
     // No entry allows it: the reading stays a finding, and the entry, allowing nothing, is one too.
     try std.testing.expectEqual(.{ 3, 0 }, try readersAllowing(source, &.{.{ .file = "root", .function = "field", .reason = "a style rule's fields" }}));
+}
+
+test "a table keyed by text is found wherever glint makes it, by what std's map is, unless allowed by where it is made" {
+    const source =
+        \\const std = @import("std");
+        \\const Map = std.StringHashMapUnmanaged;
+        \\names: std.StringHashMapUnmanaged(u32) = .{},
+        \\const Scope = struct { by_name: std.StringHashMapUnmanaged(u8) = .{} };
+        \\pub fn index() void { var held: Map(bool) = .{}; _ = &held; }
+        \\pub fn ids() void { var by_id: std.AutoHashMapUnmanaged(u32, u8) = .{}; _ = &by_id; }
+        \\fn StringHashMapUnmanaged(comptime V: type) type { return struct { value: ?V = null }; }
+        \\pub fn own() void { var mine: StringHashMapUnmanaged(u8) = .{}; _ = &mine; }
+        \\pub fn through(m: anytype) void { var maybe: m.StringHashMapUnmanaged(u8) = .{}; _ = &maybe; }
+        \\test { var t: std.StringHashMapUnmanaged(u8) = .{}; _ = &t; }
+    ;
+    // A field at the file's level, one in a container, one through an alias in a function; a map
+    // keyed otherwise, the program's own function so spelled and a test's are none. A callee that
+    // may be std's is undecided.
+    try std.testing.expectEqual(.{ 3, 1 }, try tablesAllowing(source, &.{}));
+    // Allowed where it is made: a field by its containers' path, a function by its name.
+    try std.testing.expectEqual(.{ 1, 1 }, try tablesAllowing(source, &.{
+        .{ .file = "root", .function = "Scope.by_name", .reason = "text is the identity" },
+        .{ .file = "root", .function = "index", .reason = "text is the identity" },
+    }));
+    // An entry no table is at is a finding.
+    try std.testing.expectEqual(.{ 4, 1 }, try tablesAllowing(source, &.{.{ .file = "root", .function = "gone", .reason = "text is the identity" }}));
 }

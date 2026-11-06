@@ -2297,8 +2297,6 @@ fn comptimeTruthRead(self: *Facts, env: ?*const Env, file: Project.FileId, node:
     if (args.len != 2) return null;
     const container = switch (try self.resolveIn(env, file, args[0])) {
         .container => |c| c,
-        // An anonymous struct declares nothing: its literal names fields only.
-        .literal => |literal| return if (self.anonymousLiteral(literal)) false else null,
         else => return null,
     };
     if (container.symbolic) return null;
@@ -5386,19 +5384,7 @@ fn kindOfType(self: *Facts, of: Value) ResolveError!?[]const u8 {
         .error_union => "error_union",
         .fn_type, .function => "fn",
         .primitive => |name| primitiveKind(name),
-        // A literal with no type of its own (`.{}`, `.{ .a = x }`, `.{ a, b }`) bound as it is (an
-        // `anytype` argument) is of an anonymous struct, a tuple's included.
-        .literal => |literal| if (self.anonymousLiteral(literal)) "struct" else null,
         else => null,
-    };
-}
-
-/// Whether `literal` is an anonymous struct's or tuple's literal, one with no type of its own
-/// (not a table of types, `[_]type{ A, B }`): a struct whose only members are its fields.
-fn anonymousLiteral(self: *Facts, literal: Key) bool {
-    return switch (self.project.at(literal.file).file.tree.nodeTag(literal.node)) {
-        .struct_init_dot, .struct_init_dot_comma, .struct_init_dot_two, .struct_init_dot_two_comma, .array_init_dot, .array_init_dot_comma, .array_init_dot_two, .array_init_dot_two_comma => true,
-        else => false,
     };
 }
 
@@ -14692,7 +14678,7 @@ test "a container a generic declares in its body is its reading's: its fields re
     }
 }
 
-test "reachedUnder: a binding decides a type's kind, whether a struct is a tuple, a primitive's kind, and an anonymous literal's kind and declarations" {
+test "reachedUnder: a binding decides a type's kind, whether a struct is a tuple, and a primitive's kind" {
     const source =
         \\const Plain = struct { v: u32 };
         \\const Pair = struct { u8, u16 };
@@ -14707,13 +14693,6 @@ test "reachedUnder: a binding decides a type's kind, whether a struct is a tuple
         \\}
         \\fn ints(comptime T: type) T {
         \\    if (@typeInfo(T) != .int) return undefined;
-        \\    return @enumFromInt(0);
-        \\}
-        \\const empty = .{};
-        \\const named = .{ .ignore = 0 };
-        \\const table = [_]type{u8};
-        \\fn decls(comptime T: type) u32 {
-        \\    if (!@hasDecl(T, "ignore")) return undefined;
         \\    return @enumFromInt(0);
         \\}
         \\fn prongs(comptime T: type) T {
@@ -14742,17 +14721,6 @@ test "reachedUnder: a binding decides a type's kind, whether a struct is a tuple
     const pair = try facts.declaration(named.decl(model, file, "Pair"));
     const id = try facts.declaration(named.decl(model, file, "Id"));
     const int: Value = .{ .primitive = "u32" };
-    // An anonymous literal bound as it is (an `anytype` argument's value, `@TypeOf` of which is
-    // itself): `.{}` and `.{ .ignore = 0 }`, and a table of types, also a literal.
-    const initOf = struct {
-        fn key(m: *const Model, t: *const Ast, f: Project.FileId, name: []const u8) Value {
-            const d = named.decl(m, f, name);
-            return .{ .literal = .{ .file = f, .node = t.fullVarDecl(m.declarations[@backingInt(d.index)].node).?.ast.init_node.unwrap().? } }; // unreachable: each is a const with a value
-        }
-    };
-    const empty = initOf.key(model, tree, file, "empty");
-    const fields = initOf.key(model, tree, file, "named");
-    const table = initOf.key(model, tree, file, "table");
     const float: Value = .{ .primitive = "f32" };
     // Each `@enumFromInt`, in the order the functions declare them.
     var casts: std.ArrayList(Ast.Node.Index) = .empty;
@@ -14765,7 +14733,7 @@ test "reachedUnder: a binding decides a type's kind, whether a struct is a tuple
             return t.nodeMainToken(a) < t.nodeMainToken(b);
         }
     }.less);
-    try std.testing.expectEqual(5, casts.items.len);
+    try std.testing.expectEqual(4, casts.items.len);
     const Row = struct { function: []const u8, cast: usize, bound: Value, reached: bool };
     const rows = [_]Row{
         // `@typeInfo(T) == .tag` (kindCompared): a struct returns before it, an enum gets past.
@@ -14778,16 +14746,8 @@ test "reachedUnder: a binding decides a type's kind, whether a struct is a tuple
         .{ .function = "ints", .cast = 2, .bound = int, .reached = true },
         .{ .function = "ints", .cast = 2, .bound = float, .reached = false },
         .{ .function = "ints", .cast = 2, .bound = plain, .reached = false },
-        // An anonymous literal is a struct; a table of types is no kind known, never cleared.
-        .{ .function = "kinds", .cast = 0, .bound = empty, .reached = false },
-        .{ .function = "kinds", .cast = 0, .bound = table, .reached = true },
-        // An anonymous struct declares nothing, a field of the name no declaration: each returns
-        // before the cast. A table of types is not known to declare it or not.
-        .{ .function = "decls", .cast = 3, .bound = empty, .reached = false },
-        .{ .function = "decls", .cast = 3, .bound = fields, .reached = false },
-        .{ .function = "decls", .cast = 3, .bound = table, .reached = true },
-        .{ .function = "prongs", .cast = 4, .bound = int, .reached = false },
-        .{ .function = "prongs", .cast = 4, .bound = float, .reached = true },
+        .{ .function = "prongs", .cast = 3, .bound = int, .reached = false },
+        .{ .function = "prongs", .cast = 3, .bound = float, .reached = true },
     };
     for (rows) |row| {
         const env = try arena.allocator().create(Env);

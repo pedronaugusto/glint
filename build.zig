@@ -160,7 +160,16 @@ pub fn dev(b: *std.Build, tools: type) void {
     rule_lint.addDirectoryArg2(.zig_lib, .{});
     rule_lint.addArg("--module");
     rule_lint.addPrefixedFileArg("aegis=", aegis_dependency.path("src/root.zig"));
-    b.step("check-rule-readers", "Report where a rule reads a value, a write, a call or a type around the shared queries").dependOn(&rule_lint.step);
+    // NAME_TABLES over every source of glint's own, the shared queries' files included: a table
+    // of declarations by their text is the class wherever it is made.
+    const table_lint = addLint(b, rule_readers, .{ .sources = ownSources(b, p) catch |err| std.debug.panic("glint's src/ could not be listed for NAME_TABLES: {t}", .{err}), .directories = &.{p.path("src")}, .args = &.{ "--only", "NAME_TABLES" } });
+    table_lint.addArg("--zig-lib-path");
+    table_lint.addDirectoryArg2(.zig_lib, .{});
+    table_lint.addArg("--module");
+    table_lint.addPrefixedFileArg("aegis=", aegis_dependency.path("src/root.zig"));
+    const rule_readers_step = b.step("check-rule-readers", "Report where a rule reads a value, a write, a call or a type around the shared queries, and where glint keys a table by text");
+    rule_readers_step.dependOn(&rule_lint.step);
+    rule_readers_step.dependOn(&table_lint.step);
     const rule_readers_tests = b.addTest(.{ .root_module = rule_readers.root_module, .filters = if (filter) |f| &.{f} else &.{} });
     test_step.dependOn(&b.addRunArtifact(rule_readers_tests).step);
     check.dependOn(&rule_readers.step);
@@ -258,6 +267,29 @@ fn aegisSources(b: *std.Build, p: *std.Build, glint: *std.Build.Module, aegis_de
 }
 
 /// Builds a project's linter with statically compiled Zig rules and the standalone CLI.
+/// Every Zig source of glint's own under `src/`, test files aside, in order: read from the tree,
+/// so a file added later is read too.
+fn ownSources(b: *std.Build, p: *std.Build) ![]const std.Build.LazyPath {
+    const io = b.graph.io;
+    var dir = try p.root.openDir(io, "src", .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walk(b.allocator);
+    defer walker.deinit();
+    var paths: std.ArrayList([]const u8) = .empty;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".zig") or std.mem.endsWith(u8, entry.path, "_test.zig")) continue;
+        try paths.append(b.allocator, try b.allocator.dupe(u8, entry.path));
+    }
+    std.mem.sort([]const u8, paths.items, {}, struct {
+        fn less(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.order(u8, x, y) == .lt;
+        }
+    }.less);
+    var found: std.ArrayList(std.Build.LazyPath) = .empty;
+    for (paths.items) |path| try found.append(b.allocator, p.path(b.fmt("src/{s}", .{path})));
+    return found.items;
+}
+
 pub fn addLinter(b: *std.Build, dependency: *std.Build.Dependency, options: LinterOptions) *std.Build.Step.Compile {
     return b.addExecutable(.{ .name = options.name, .root_module = b.createModule(.{
         .root_source_file = options.source,

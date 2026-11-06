@@ -3186,29 +3186,16 @@ pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
         const hold = (try stateHold(c, try c.facts.resolve(c.file, written))) orelse continue;
         const holder: Facts.Container = .{ .file = c.file, .scope = decl.scope };
         var uses: std.ArrayList(Facts.Key) = .empty;
-        var field_reads: std.ArrayList(FieldUse) = .empty;
         var writes: std.ArrayList(StateWrite) = .empty;
         for (try fieldUses(c, decl.name)) |use| {
             const owner = byPointer(try c.facts.resolve(use.file, use.receiver)) orelse continue;
             if (owner.file != holder.file or owner.scope != holder.scope) continue;
             try uses.append(c.allocator, .{ .file = use.file, .node = use.node });
-            try field_reads.append(c.allocator, use);
         }
         try carried(c, &uses, decl.name);
         var switched = false;
         for (uses.items) |use| switched = switched or switchedOn(&c.project.at(use.file).file.tree, &c.project.at(use.file).model, use.node, hold);
         if (!switched) continue;
-        // The state of a record made where it is read is its own, never another record's: a
-        // condition or a value on it chooses by other data (`madeHere`).
-        var own: std.ArrayList(Facts.Key) = .empty;
-        for (uses.items) |use| {
-            const read = for (field_reads.items) |r| {
-                if (r.file == use.file and r.node == use.node) break r;
-            } else null;
-            if (read) |r| if (madeHere(c, r.file, r.receiver, uses.items)) continue;
-            try own.append(c.allocator, use);
-        }
-        uses = own;
         try stateWrites(c, .{ .file = c.file, .index = @fromBackingInt(@intCast(index)) }, hold, &writes);
         const fixed = try fixedFunctions(c, writes.items);
         var writers: std.ArrayList(Facts.Key) = .empty;
@@ -3458,11 +3445,9 @@ fn stateWrites(c: *Context, field: Facts.Decl, hold: StateHold, writes: *std.Arr
                 .unknown => null,
             } else null,
             .set => if (site.value) |value| written: {
-                // `undefined` gives it no state: reading it after is illegal. An optional holder
-                // set to `null` holds no record, and so no state.
-                if (undefinedValue(tree, value) or (site.reach == .holder and nullValue(tree, value))) continue;
+                // `undefined` gives it no state: reading it after is illegal.
+                if (undefinedValue(tree, value)) continue;
                 if (site.reach == .holder and !try madeValue(c, site.file, value, state, 0)) continue;
-                if (try stateCopy(c, site.file, value, field, site.reach == .holder)) continue;
                 break :written value;
             } else null,
             .update => site.node,
@@ -3545,66 +3530,9 @@ fn choosesState(c: *Context, file: Project.FileId, node: Ast.Node.Index, state: 
     return false;
 }
 
-/// Whether a write's value gives the state as another record holds it: the state field read of a
-/// value of its holder's type (`dest.kind = edge.kind`, through parentheses), or, for a whole
-/// holder's literal (`whole`), the field's initializer such a read (`dest.* = .{ .kind =
-/// edge.kind }`). It carries the state chosen where that record's was, as a whole holder's copy
-/// does (`a = b`): no write, under whatever condition it is made; of the record it reads, no
-/// change. A literal that leaves the field to its default chooses that state here.
-fn stateCopy(c: *Context, file: Project.FileId, value: Ast.Node.Index, field: Facts.Decl, whole: bool) Context.Error!bool {
-    const tree = &c.project.at(file).file.tree;
-    const record = c.project.at(field.file).model.declarations[@backingInt(field.index)];
-    var given = value;
-    if (whole) {
-        var buffer: [2]Ast.Node.Index = undefined;
-        const literal = tree.fullStructInit(&buffer, value) orelse return false;
-        given = for (literal.ast.fields) |init| {
-            // `.name = init`: the name two tokens before the value.
-            if (std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(tree.firstToken(init) - 2)), record.name)) break init;
-        } else return false;
-    }
-    while (tree.nodeTag(given) == .grouped_expression) given = tree.nodeData(given).node_and_token[0];
-    if (tree.nodeTag(given) != .field_access) return false;
-    const holder, const name = tree.nodeData(given).node_and_token;
-    if (!std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(name)), record.name)) return false;
-    const owner = byPointer(try c.facts.resolve(file, holder)) orelse return false;
-    return owner.file == field.file and owner.scope == record.scope;
-}
-
 /// Whether `node` is `undefined`.
 fn undefinedValue(tree: *const Ast, node: Ast.Node.Index) bool {
     return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "undefined");
-}
-
-/// Whether `node` is `null`.
-fn nullValue(tree: *const Ast, node: Ast.Node.Index) bool {
-    return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "null");
-}
-
-/// Whether `receiver`, the holder a state is read from, is a constant its function makes from a
-/// literal in which no read of the state (`uses`, what carries one on among them: a getter's
-/// call, a local) is made (`const unit: Lexeme = .{ .kind = switch (t.kind()) { ... }, ... }`):
-/// a record of its own, whose state never changes and is no other record's. A condition on it
-/// chooses what another record is set to by data, not by that record's own value.
-fn madeHere(c: *Context, file: Project.FileId, receiver: Ast.Node.Index, uses: []const Facts.Key) bool {
-    const tree = &c.project.at(file).file.tree;
-    const model = &c.project.at(file).model;
-    if (tree.nodeTag(receiver) != .identifier) return false;
-    const d = (model.reference(receiver) orelse return false).declaration orelse return false;
-    const record = model.declarations[@backingInt(d)];
-    if (record.kind != .variable) return false;
-    const variable = tree.fullVarDecl(record.node) orelse return false;
-    if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return false;
-    const init = variable.ast.init_node.unwrap() orelse return false;
-    var buffer: [2]Ast.Node.Index = undefined;
-    _ = tree.fullStructInit(&buffer, init) orelse return false;
-    // No read of the state inside it: its state is not taken from a record's.
-    for (uses) |use| {
-        if (use.file != file) continue;
-        const token = tree.nodeMainToken(use.node);
-        if (token >= tree.firstToken(init) and token <= tree.lastToken(init)) return false;
-    }
-    return true;
 }
 
 /// Whether a whole holder's value `node` is one made here, which sets a state, rather than a
