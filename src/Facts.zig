@@ -3835,6 +3835,10 @@ pub const Analysis = struct {
         /// The steps one question may take (`lazy_steps`; a test asks with fewer).
         limit: usize = lazy_steps,
         sites: ?Sites = null,
+        /// The readings code the walk did not read makes of a generic function, each found once
+        /// (`lazyCallReadings`), and the ones being found.
+        readings: std.AutoHashMapUnmanaged(Decl, ?[]const *const Env) = .empty,
+        readings_open: std.AutoHashMapUnmanaged(Decl, void) = .empty,
         pub const Answer = enum { open, yes, no };
     };
     /// Each site that may name a declaration or a file, found once over every file: by the name
@@ -4234,6 +4238,7 @@ fn lazyStep(self: *Facts, found: *Analysis) ResolveError!bool {
 /// loose part or `comptime` block where the walk did not enter the file but code it did not read
 /// imports it. A test is the program's, read by the walk.
 fn lazilyRead(self: *Facts, found: *Analysis, site: Key) ResolveError!bool {
+    if (try self.testOnly(site.file, site.node)) return false;
     const part = try self.partOf(site.file, site.node) orelse return !found.files.contains(site.file) and try self.lazilyEntered(found, site.file);
     const d = (try self.partsOf(site.file)).declared.get(part) orelse return switch (self.project.at(site.file).file.tree.nodeTag(part)) {
         .test_decl => false,
@@ -4250,10 +4255,127 @@ fn lazilyRead(self: *Facts, found: *Analysis, site: Key) ResolveError!bool {
 /// makes no other instance); otherwise null, each one's (binding nothing).
 fn lazyReadings(self: *Facts, found: *Analysis, decl: Decl) ResolveError!?[]const *const Env {
     if (!self.instantiated(decl)) return null;
-    const outer = self.enclosingFunction(decl) orelse return null;
-    const readings = found.reached.get(outer) orelse return null;
-    if (readings.every or try self.lazilyAnalyzed(found, outer)) return null;
-    return readings.envs.items;
+    if (self.enclosingFunction(decl)) |outer| {
+        const readings = found.reached.get(outer);
+        if (readings) |r| if (r.every) return null;
+        if (!try self.lazilyAnalyzed(found, outer)) return if (readings) |r| r.envs.items else null;
+        return self.lazyCallReadings(found, outer);
+    }
+    if (!self.genericFunction(decl)) return null;
+    return self.lazyCallReadings(found, decl);
+}
+
+/// The readings of a generic function code the walk did not read may analyze (`lazyReadings`):
+/// the walk's own, and the one each call in code it did not read makes (`readingFrom`), in each
+/// of that code's own readings: the walk's call-binding rule read backwards. Null, each one's,
+/// where it is reached otherwise (a value, a member of an unknown holder, an `@field`), where a
+/// call makes no reading, past `reading_limit`, inside its own finding, or short of budget: a
+/// unit of its own, as each reading of the walk is.
+fn lazyCallReadings(self: *Facts, found: *Analysis, decl: Decl) ResolveError!?[]const *const Env {
+    const lazy = &found.lazy;
+    if (lazy.readings.get(decl)) |known| return known;
+    if ((try lazy.readings_open.getOrPut(self.gpa, decl)).found_existing) return null;
+    defer _ = lazy.readings_open.remove(decl);
+    const asker = self.enter(reading_budget);
+    const read = self.lazyCallReadingsRead(found, decl);
+    const short = self.leave(asker);
+    const answer = if (short) null else try read;
+    try lazy.readings.put(self.gpa, decl, answer);
+    return answer;
+}
+
+/// `lazyCallReadings`, read.
+fn lazyCallReadingsRead(self: *Facts, found: *Analysis, decl: Decl) ResolveError!?[]const *const Env {
+    var envs: std.ArrayList(*const Env) = .empty;
+    if (found.reached.get(decl)) |readings| {
+        if (readings.every) return null;
+        try envs.appendSlice(self.gpa, readings.envs.items);
+    }
+    const record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+    if (found.named.contains(record.name)) return null;
+    const sites = try self.lazySites(found);
+    // A site in the function itself is read in the readings found so far, until none is new
+    // (its recursion, its own reflection); every other one in its own code's readings.
+    var own: std.ArrayList(Key) = .empty;
+    for (sites.reflected.items) |site| {
+        if (!try self.lazilyRead(found, site)) continue;
+        const enclosing = try self.siteDecl(site);
+        if (enclosing != null and std.meta.eql(enclosing.?, decl)) {
+            try own.append(self.gpa, site);
+            continue;
+        }
+        if (try self.reachedFromSite(found, site, decl)) return null;
+    }
+    const named = if (sites.by_name.get(record.name)) |list| list.items else &.{};
+    for (named) |site| {
+        if (!try self.lazilyRead(found, site)) continue;
+        const enclosing = try self.siteDecl(site);
+        if (enclosing != null and std.meta.eql(enclosing.?, decl)) {
+            try own.append(self.gpa, site);
+            continue;
+        }
+        if (!try self.reachedFromSite(found, site, decl)) continue;
+        const call = calleeCall(self.project.at(site.file), site.node) orelse return null;
+        const outer_envs: ?[]const *const Env = if (enclosing) |d| try self.lazyReadings(found, d) else null;
+        if (outer_envs) |known| {
+            for (known) |env| if (!try self.lazyCallReading(&envs, site, call, decl, env)) return null;
+        } else if (!try self.lazyCallReading(&envs, site, call, decl, null)) return null;
+        if (envs.items.len > reading_limit) return null;
+    }
+    var done: usize = 0;
+    while (done < envs.items.len) {
+        const from = done;
+        done = envs.items.len;
+        for (own.items) |site| for (from..done) |at| {
+            const env = envs.items[at];
+            if (!try self.reachedFromSiteIn(site, decl, &.{env})) continue;
+            const call = calleeCall(self.project.at(site.file), site.node) orelse return null;
+            if (!try self.lazyCallReading(&envs, site, call, decl, env)) return null;
+            if (envs.items.len > reading_limit) return null;
+        };
+    }
+    return envs.items;
+}
+
+/// Adds to `envs` the reading the call at `call`, whose callee is `site`, makes of `decl` in
+/// `env` (`lazyCallReadingsRead`): false where it calls something else there or makes none.
+fn lazyCallReading(self: *Facts, envs: *std.ArrayList(*const Env), site: Key, call: Ast.Node.Index, decl: Decl, env: ?*const Env) ResolveError!bool {
+    const read = (try calls.under(self, env, site.file, call)) orelse return false;
+    const calls_it = switch (read.callee) {
+        .function => |f| std.meta.eql(f, decl),
+        .choice => |fs| for (fs) |f| {
+            if (std.meta.eql(f, decl)) break true;
+        } else false,
+        .any => false,
+    };
+    if (!calls_it) return false;
+    const reading = (try self.readingFrom(site.file, call, decl, env)) orelse return false;
+    for (envs.items) |known| if (known == reading) return true;
+    try envs.append(self.gpa, reading);
+    return true;
+}
+
+/// The call whose callee `node` is (`node(…)`, `node.*(…)`), if any.
+fn calleeCall(source: *const Project.Source, node: Ast.Node.Index) ?Ast.Node.Index {
+    const tree = &source.file.tree;
+    var callee = node;
+    var parent = source.model.parentOf(node) orelse return null;
+    if (tree.nodeTag(parent) == .deref) {
+        callee = parent;
+        parent = source.model.parentOf(parent) orelse return null;
+    }
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, parent) orelse return null;
+    return if (call.ast.fn_expr == callee) parent else null;
+}
+
+/// Whether `node` lies in a `test` block of a file outside the run's program: Zig analyzes a
+/// test only in the module under test, so code there is in no compilation of the program, and
+/// nothing it names or imports is analyzed for it. The one reading `compiledWith` shares.
+pub fn testOnly(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
+    const part = try self.partOf(file, node) orelse return false;
+    if (self.project.at(file).file.tree.nodeTag(part) != .test_decl) return false;
+    return !try self.program(file);
 }
 
 /// Whether what `site` names, read in the readings code the walk did not read analyzes its part
@@ -4261,7 +4383,19 @@ fn lazyReadings(self: *Facts, found: *Analysis, decl: Decl) ResolveError!?[]cons
 /// holder spelled as its name, as the walk reads the site (`reachFrom`) and the call the site
 /// is the callee of, recording what it reaches only.
 fn reachedFromSite(self: *Facts, found: *Analysis, site: Key, decl: Decl) ResolveError!bool {
-    const envs: ?[]const *const Env = if (try self.partOf(site.file, site.node)) |part| if ((try self.partsOf(site.file)).declared.get(part)) |d| try self.lazyReadings(found, .{ .file = site.file, .index = d }) else null else null;
+    const envs: ?[]const *const Env = if (try self.siteDecl(site)) |d| try self.lazyReadings(found, d) else null;
+    return self.reachedFromSiteIn(site, decl, envs);
+}
+
+/// The function or constant whose part holds `site`, if any.
+fn siteDecl(self: *Facts, site: Key) ResolveError!?Decl {
+    const part = try self.partOf(site.file, site.node) orelse return null;
+    const d = (try self.partsOf(site.file)).declared.get(part) orelse return null;
+    return .{ .file = site.file, .index = d };
+}
+
+/// `reachedFromSite` with the site read in `envs`, or binding nothing where null.
+fn reachedFromSiteIn(self: *Facts, site: Key, decl: Decl, envs: ?[]const *const Env) ResolveError!bool {
     var check: Analysis = .{ .checking = true };
     var next: std.ArrayList(PartRead) = .empty;
     // A unit of its own (`enter`): the reader asking is charged nothing for it.
@@ -16785,4 +16919,70 @@ test "a reader's question past its steps, or code read lazily that imports what 
     defer short.deinit();
     (try short.builtAnalysis()).lazy.limit = 0;
     try std.testing.expect(try short.analyzed(testDecl(&project, 1, "deadTarget")));
+}
+
+test "a generic code the walk did not read calls is read in the readings those calls make: a reflected @field of its argument names only what the call gives, two types give two readings, a value use any; a std function only std's own test calls is analyzed nowhere" {
+    const root =
+        \\const std = @import("std");
+        \\const missing = @import("missing");
+        \\pub fn main() void {
+        \\    missing.T.viaName();
+        \\}
+    ;
+    const library =
+        \\const Holder = struct {
+        \\    pub fn first() void {}
+        \\    pub fn second() void {}
+        \\};
+        \\pub fn alt(context: anytype, comptime name: @EnumLiteral()) void {
+        \\    _ = @field(@TypeOf(context), @tagName(name));
+        \\}
+        \\fn twice(comptime T: type) void {
+        \\    _ = T;
+        \\}
+        \\fn valued(comptime T: type) void {
+        \\    _ = T;
+        \\}
+        \\fn cyc1(comptime T: type) void {
+        \\    cyc2(T);
+        \\}
+        \\fn cyc2(comptime T: type) void {
+        \\    cyc1(T);
+        \\}
+        \\fn unrelated() void {}
+        \\fn testHelper() void {}
+        \\pub fn viaName() void {
+        \\    alt(@as(Holder, .{}), .first);
+        \\    twice(u8);
+        \\    twice(u16);
+        \\    const g = valued;
+        \\    _ = g;
+        \\    cyc1(u8);
+        \\}
+        \\test "std's own" {
+        \\    testHelper();
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{
+        .{ .name = "root", .bytes = root, .absent = &.{"missing"} },
+        .{ .name = "std/std.zig", .bytes = library, .selected = false },
+    }, &.{.{ .from = 0, .spelling = "std", .target = 1 }}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    try std.testing.expect(!(try facts.analysis()).everything);
+    // `alt(@as(Holder, .{}), .first)`: the call's reading names `first`, not every declaration.
+    try std.testing.expect(try facts.analyzed(testDecl(&project, 1, "first")));
+    try std.testing.expect(!try facts.analyzed(testDecl(&project, 1, "second")));
+    try std.testing.expect(!try facts.analyzed(testDecl(&project, 1, "unrelated")));
+    // Two types, two readings; a value use, each one's.
+    try std.testing.expectEqual(2, (try facts.analyzedReadings(testDecl(&project, 1, "twice"))).?.len);
+    try std.testing.expectEqual(@as(?[]const *const Env, null), try facts.analyzedReadings(testDecl(&project, 1, "valued")));
+    // A cycle of generics is analyzed, read soundly whatever readings it is given.
+    try std.testing.expect(try facts.analyzed(testDecl(&project, 1, "cyc1")));
+    try std.testing.expect(try facts.analyzed(testDecl(&project, 1, "cyc2")));
+    // std's own test is in no compilation of the program: what only it calls is not analyzed.
+    try std.testing.expect(!try facts.analyzed(testDecl(&project, 1, "testHelper")));
 }
