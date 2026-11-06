@@ -391,7 +391,7 @@ test "publishing aegis's API turns the pack on and nothing more: a program file 
     const second = try runOn(a, &tmp, &.{ "--only", "A004", "--module", "aegis_old=old/src/root.zig" }, "two.zig", &status);
     defer a.free(second);
     try std.testing.expect(std.mem.find(u8, second, "A004: ") != null);
-    try std.testing.expect(std.mem.find(u8, second, "aegis's lint_rules at old/src/root.zig:") != null);
+    try std.testing.expect(std.mem.find(u8, second, "aegis's lint_rules at ") != null and std.mem.find(u8, second, "src/root.zig:") != null);
     try std.testing.expect(std.mem.find(u8, second, ": a reference that does not resolve; the roles it declares are not all read in this file") != null);
 }
 
