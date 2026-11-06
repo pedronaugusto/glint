@@ -200,7 +200,7 @@ pub fn publication(facts: *Facts, library: anytype) Facts.ResolveError!*const Pu
         if (rules.declared == null) try gaps.append(facts.gpa, .{ .root = root, .problem = null });
         for (rules.problems) |problem| try gaps.append(facts.gpa, .{ .root = root, .problem = problem });
         for (rules.roles) |declared| {
-            const role_value: u32 = @intCast(@backingInt(std.meta.stringToEnum(Roles, declared.role) orelse continue));
+            const role_value = roleValue(Roles, declared.role) orelse continue;
             const decl = declared.type.declaration() orelse continue;
             switch (try facts.declaration(decl)) {
                 .function => |function| {
@@ -225,6 +225,13 @@ pub fn publication(facts: *Facts, library: anytype) Facts.ResolveError!*const Pu
     result.* = .{ .entries = entries.items, .gaps = gaps.items, .files = files.items };
     try memo.found.put(facts.gpa, keyed, result);
     return result;
+}
+
+/// The value of the tag of `Roles` named `name`, or null where it names none: a role another pack reads.
+fn roleValue(comptime Roles: type, name: []const u8) ?u32 {
+    const info = @typeInfo(Roles).@"enum";
+    inline for (info.field_names, info.field_values) |field, value| if (std.mem.eql(u8, field, name)) return value;
+    return null;
 }
 
 /// The role `library`'s package declares for a function declaration, or a type or instance of a
