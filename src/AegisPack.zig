@@ -770,7 +770,7 @@ fn backingFields(k: Contract.Kind) []const []const u8 {
         // base lock too.
         .guarded => &.{ "data", "lock", "mutex", "state", "admitted", "base" },
         // A guard's owner; an ordered guard's base guard.
-        .guard => &.{ "owner", "base" },
+        .guard, .ranked_guard => &.{ "owner", "base" },
         // A value initialized once: its publication state, its election lock and waiters, and
         // the value itself before the state says it is there.
         .once => &.{ "state", "mutex", "changed", "data" },
@@ -821,7 +821,7 @@ fn copiedOwner(k: Contract.Kind) bool {
 fn releases(k: Contract.Kind) ?[]const []const u8 {
     return switch (k) {
         .secret, .bytes => &.{ "deinit", "moveInto" },
-        .guard, .buffer, .slots, .table => &.{"deinit"},
+        .guard, .ranked_guard, .buffer, .slots, .table => &.{"deinit"},
         .handoff => &.{"release"},
         .reservation => &.{ "release", "consume", "moveInto" },
         .owned => &.{ "deinit", "take", "moveInto" },
@@ -1107,27 +1107,6 @@ fn recordCopied(c: *Context, container: Facts.Container, depth: usize) Context.E
     }
     return found;
 }
-/// The role of the published aegis type `container` is declared inside, as a guarded value's
-/// guard is: its own operations belong to that type's contract.
-fn enclosingPublished(facts: *Facts, container: Facts.Container) Facts.ResolveError!?Contract.Kind {
-    const found = try PackageRules.publication(facts, Contract.library);
-    const scopes = facts.project.at(container.file).model.scopes;
-    var scope = scopes[@backingInt(container.scope)].parent;
-    while (scope) |s| : (scope = scopes[@backingInt(s)].parent) {
-        for (found.entries) |entry| if (entry.target == .container and entry.target.container.file == container.file and entry.target.container.scope == s) return @fromBackingInt(@intCast(entry.role));
-    }
-    return null;
-}
-/// The name a container is declared under (`pub const Guard = struct { ... }`), if any.
-fn containerName(facts: *Facts, container: Facts.Container) ?[]const u8 {
-    const model = &facts.project.at(container.file).model;
-    const tree = &facts.project.at(container.file).file.tree;
-    const node = model.scopes[@backingInt(container.scope)].node;
-    if (node == .root) return null;
-    const parent = model.parentOf(node) orelse return null;
-    const declared = tree.fullVarDecl(parent) orelse return null;
-    return tree.tokenSlice(declared.ast.mut_token + 1);
-}
 /// What a resolved value's type says: a published aegis type, a type that is not aegis, or
 /// unknown. A guarded owner's guard is the guard. Another type declared inside a published one
 /// and not in the contract is plain data, as an unlisted type at a module's top is: the
@@ -1160,15 +1139,8 @@ fn typed(facts: *Facts, value: Facts.Value, depth: usize) Facts.ResolveError!Typ
             for (try facts.literalParts(literal)) |part| found = joined(found, try typed(facts, part, depth + 1));
             break :blk found;
         },
-        .container, .instance => |container| blk: {
-            if (try PackageRules.role(facts, Contract.library, value)) |k| break :blk .{ .owner = k };
-            const outer = (try enclosingPublished(facts, container)) orelse break :blk .other;
-            // A guarded owner's guard, reached by its resolved type rather than its acquisition.
-            if (outer == .guarded and Contract.guardType(containerName(facts, container) orelse "")) break :blk .{ .owner = .guard };
-            // A guard's release handed past its frame, released once as the guard is.
-            if (outer == .guarded and Contract.handoffType(containerName(facts, container) orelse "")) break :blk .{ .owner = .handoff };
-            break :blk .other;
-        },
+        // A guard and its hand-off among them, by the roles aegis declares (`Guarded(T).Guard`).
+        .container, .instance => if (try PackageRules.role(facts, Contract.library, value)) |k| .{ .owner = k } else .other,
         else => .other,
     };
 }
@@ -1984,7 +1956,7 @@ fn scalarShaped(c: *Context, value: Facts.Value) bool {
 /// reservations point at, an owner bound to its address in Debug).
 fn movable(k: Contract.Kind) bool {
     return switch (k) {
-        .guard, .handoff, .shared, .reservation, .buffer, .slots, .table, .machine, .must_use, .stage, .issuer, .atomic, .context => true,
+        .guard, .ranked_guard, .handoff, .shared, .reservation, .buffer, .slots, .table, .machine, .must_use, .stage, .issuer, .atomic, .context => true,
         else => false,
     };
 }
@@ -2426,9 +2398,10 @@ fn publishedCall(c: *Context, file: Project.FileId, node: Ast.Node.Index) Contex
     return .{ .name = (try memberNamed(c, file, call.callee_expr)) orelse record.name, .known = true };
 }
 
-/// Whether a published operation's name gives an owner: a constructor or an acquisition.
-fn acquires(name: []const u8) bool {
-    return among(&.{ "init", "adopt" }, name) or Contract.acquisition(name);
+/// Whether a published operation's name gives an owner as its constructor. An acquisition gives
+/// one by its declared result (a guard, by the role aegis declares), which `givesOwner` reads.
+fn constructs(name: []const u8) bool {
+    return among(&.{ "init", "adopt" }, name);
 }
 
 /// Whether `name` is one of a catalogue's `names`.
@@ -2448,7 +2421,7 @@ fn exposure(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     const k = (try requiredOwner(c, path.steps[1].node, copies, tree.lastToken(call.callee_expr))) orelse return false;
     const views: []const []const u8 = switch (k) {
         .secret, .bytes => &.{ "expose", "exposeMut" },
-        .guard => &.{"value"},
+        .guard, .ranked_guard => &.{"value"},
         else => return false,
     };
     return among(views, published.name);
@@ -2939,7 +2912,7 @@ fn acquisitionOwner(c: *Context, tree: *const Ast, acquisition: Ast.Node.Index, 
     if (c.facts.madeByParameter(c.file, acquisition) != null) return null;
     // A std handle acquired raw (`dir.openFile`): released by its `close`.
     if (try Shapes.acquiresHandle(c, cleanup, acquisition)) return .std_handle;
-    const named = if (try publishedCall(c, c.file, acquisition)) |published| acquires(published.name) else false;
+    const named = if (try publishedCall(c, c.file, acquisition)) |published| constructs(published.name) else false;
     // One that may give an owner is read by its type below, undecided where that does not resolve.
     if (!named and try givesOwner(c, acquisition) == .no) return null;
     if (try unlisted(c, acquisition)) return null;
@@ -4229,7 +4202,7 @@ const Flow = struct {
         return among(&.{ "await", "cancel", "join" }, name);
     }
 
-    /// `owner = x.init(...)`, `x.adopt(...)` or any acquisition of a guard: live again;
+    /// `owner = x.init(...)`, `x.adopt(...)` or anything giving an owner (a guard's acquisition): live again;
     /// unknown where what the call gives does not resolve.
     fn reacquired(f: Flow, stmt: Ast.Node.Index) Context.Error!Is {
         if (Facts.accesses.formOf(f.tree.nodeTag(stmt)) != .assign) return .no;
@@ -4238,7 +4211,7 @@ const Flow = struct {
         while (Facts.accesses.carriedFrom(f.tree, value)) |inner| value = inner;
         const call = (try Facts.calls.at(f.c.facts, f.c.file, value)) orelse return .no;
         const operation = (try memberNamed(f.c, f.c.file, call.callee_expr)) orelse return .no;
-        if (acquires(operation)) return .yes;
+        if (constructs(operation)) return .yes;
         return givesOwner(f.c, value);
     }
 
@@ -4696,7 +4669,15 @@ const Loan = struct {
         if (path.steps.len != 2 or path.steps[0].kind != .deref or declaredAt(l.c, l.file, path.root) != l.token) return false;
         while (Facts.accesses.carriedFrom(l.tree, value)) |inner| value = inner;
         const call = (try Facts.calls.at(l.c.facts, l.file, value)) orelse return false;
-        return Contract.acquisition((try memberNamed(l.c, l.file, call.callee_expr)) orelse return false);
+        // An acquisition by its declared result (`Contract.acquired`): one not known is no reacquisition shown.
+        const function = switch (call.callee) {
+            .function => |function| function,
+            .choice, .any => return false,
+        };
+        return switch (try Contract.acquired(l.c, function)) {
+            .plain, .ranked => true,
+            .no, .unknown => false,
+        };
     }
 
     const Use = enum { none, members, other };
@@ -4938,7 +4919,7 @@ fn adopts(k: Contract.Kind) ?[]const u8 {
 fn handsOn(k: Contract.Kind) ?[]const u8 {
     return switch (k) {
         .owned => "move",
-        .guard => "handOff",
+        .guard, .ranked_guard => "handOff",
         else => null,
     };
 }
