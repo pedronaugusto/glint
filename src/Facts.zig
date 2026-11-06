@@ -1900,8 +1900,10 @@ fn crowdedIn(self: *Facts, env: *const Env, function: Decl, position: usize, cop
     const memory = try self.memo(Crowded);
     const key: CrowdedKey = .{ .step = here, .kind = copy.kind, .site = copy.site, .source = copy.source.? };
     if (memory.found.get(key)) |kept| return kept;
-    for (walk.open.items, 0..) |step, at| if (std.meta.eql(step, here)) {
-        walk.low = @min(walk.low, at);
+    // A step the walk holds, being read or read in a cycle not yet closed, adds nothing new
+    // here: what it reaches, the cycle's first step reads.
+    for (walk.stack.items) |held| if (std.meta.eql(held.step, here)) {
+        walk.low = @min(walk.low, held.at);
         return null;
     };
     if (walk.steps == crowd_steps) {
@@ -1909,21 +1911,35 @@ fn crowdedIn(self: *Facts, env: *const Env, function: Decl, position: usize, cop
         return .{ .unknown = .budget };
     }
     walk.steps += 1;
-    const mine = walk.open.items.len;
-    try walk.open.append(self.gpa, here);
-    defer _ = walk.open.pop();
+    const mine = walk.count;
+    walk.count += 1;
+    const base = walk.stack.items.len;
+    try walk.stack.append(self.gpa, .{ .step = here, .at = mine });
     const outer_low = walk.low;
     const outer_spent = walk.spent;
-    walk.low = std.math.maxInt(usize);
     walk.spent = false;
+    const was_short = self.short;
+    const met = self.open_met;
+    const wide = self.wide;
+    walk.low = std.math.maxInt(usize);
     const found = try self.crowdedRead(env, function, position, copy, walk);
-    // Kept where every route cut was cut at this step or one it began: the cycles it is in
-    // close here, so its answer holds all they add, whichever binding asked first. A route cut
-    // at a step read before this one leaves it partial; one that ran out of steps, unknown for
-    // this walk only.
+    // Closed where every route cut was cut at this step or one read after it: the cycles it
+    // is in close here (Tarjan's components, in the order the walk reads its steps). What a
+    // step holds is what it reaches, chosen, and each step of a cycle reaches all the cycle
+    // does: each held since this one began holds its answer, whichever binding asked first.
+    // A step cut at one read before this one waits for that one to close. A component read
+    // where the run's budget ran out, in it or in a unit it asked (`short`), holds what the
+    // budget left it; one that met a query in progress (`open_met`: a resolution past its
+    // depth, a cycle), what the asker's stack left it; one read wider than the analysis gives
+    // (`wideSince`), more than it holds; one where the walk ran out of `crowd_steps`, unknown
+    // for this walk only: each is this asker's answer, and none of it is kept.
     const closed = walk.low >= mine;
-    if (closed and !walk.spent and self.remaining != 0) try memory.found.put(self.gpa, key, found);
-    walk.low = if (closed) outer_low else @min(outer_low, walk.low);
+    if (closed) {
+        const whole = !walk.spent and self.remaining != 0 and self.short == was_short and self.open_met == met and !self.wideSince(wide);
+        if (whole) for (walk.stack.items[base..]) |held| try memory.found.put(self.gpa, .{ .step = held.step, .kind = copy.kind, .site = copy.site, .source = copy.source.? }, found);
+        walk.stack.items.len = base;
+        walk.low = outer_low;
+    } else walk.low = @min(outer_low, walk.low);
     walk.spent = outer_spent or walk.spent;
     return found;
 }
@@ -1969,11 +1985,14 @@ const Crowded = struct {
     found: std.AutoHashMapUnmanaged(CrowdedKey, ?Value) = .empty,
 };
 
-/// One crowded copy's walk from a binding: the steps being read, outermost first; the earliest
-/// of them a route was cut at since the step being read began; how many steps it has read; and
-/// whether one ran out of `crowd_steps` since the step being read began.
+/// One crowded copy's walk from a binding: the steps it holds, being read or read in a cycle
+/// not yet closed, in the order they were begun, each with that order (at most `crowd_steps`,
+/// so found by looking); how many it has begun; the earliest a route was cut at since the step
+/// being read began; how many steps it has read; and whether one ran out of `crowd_steps`
+/// since the step being read began.
 const CrowdedWalk = struct {
-    open: std.ArrayList(CrowdedStep) = .empty,
+    stack: std.ArrayList(struct { step: CrowdedStep, at: usize }) = .empty,
+    count: usize = 0,
     low: usize = std.math.maxInt(usize),
     steps: usize = 0,
     spent: bool = false,
@@ -15820,6 +15839,120 @@ test "a crowded copy is read along a route of generics deeper than any count of 
     // The enum's route reaches `dup` through 20 generics passing `v` on: `E.clone` gives an `E`.
     const value = (try facts.boundCopy(enum_call, keep, crowded)) orelse return error.TestUnexpectedResult;
     try std.testing.expect(value == .instance);
+}
+
+test "a crowded copy's walk reads each step once, however many routes reach it: 24 generics passing the value round in cycles, two routes from each, read within 5000 resolutions; one answer for the cycle whichever step is asked first, and none of it kept where the budget ran out inside it" {
+    const w = std.testing.allocator;
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(w);
+    try source.appendSlice(w, "fn dup(comptime T: type, v: T) T {\n    return T.clone(v);\n}\n");
+    const k = 24;
+    for (0..k) |i| {
+        if (i == k - 1) {
+            try source.print(w, "fn p{d}(comptime T: type, v: T, n: u8) T {{\n    if (n == 0) return dup(T, v);\n    return p0(T, v, n);\n}}\n", .{i});
+        } else try source.print(w, "fn p{d}(comptime T: type, v: T, n: u8) T {{\n    if (n == 0) return p{d}(T, v, n);\n    return p{d}(T, v, n);\n}}\n", .{ i, i + 1, (i + 2) % k });
+    }
+    // `keep` enters the cycle at its first step, `keep2` at a step inside it.
+    for ([_][]const u8{ "keep", "keep2" }, [_][]const u8{ "p0", "p12" }) |name, entry| try source.print(w,
+        \\fn {s}(comptime T: type, v: T, n: u8) T {{
+        \\    switch (@typeInfo(T)) {{
+        \\        .@"union" => switch (n) {{
+        \\            0 => return dup(T, v),
+        \\            1 => return dup(T, v),
+        \\            2 => return dup(T, v),
+        \\            else => return dup(T, v),
+        \\        }},
+        \\        .@"enum" => return {s}(T, v, n),
+        \\        else => return v,
+        \\    }}
+        \\}}
+        \\
+    , .{ name, entry });
+    try source.appendSlice(w,
+        \\const E = enum {
+        \\    a,
+        \\    fn clone(e: E) E {
+        \\        return e;
+        \\    }
+        \\};
+        \\pub fn main() void {
+        \\    _ = keep(E, .a, 0);
+        \\    _ = keep2(E, .a, 0);
+        \\}
+        \\
+    );
+    const Run = struct {
+        project: Project,
+        arena: std.heap.ArenaAllocator,
+        facts: Facts,
+
+        fn init(run: *@This(), bytes: []const u8) !void {
+            run.project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = bytes }}, &.{}, .{});
+            run.arena = .init(std.testing.allocator);
+            run.facts = .{ .project = &run.project, .gpa = run.arena.allocator() };
+        }
+
+        fn deinit(run: *@This()) void {
+            run.facts.deinit();
+            run.arena.deinit();
+            run.project.deinit();
+        }
+
+        /// What the crowded copy `name`'s binding in `main` makes holds.
+        fn ask(run: *@This(), name: []const u8) !Value {
+            const tree = &run.project.sources[0].file.tree;
+            const file = run.project.sources[0].id;
+            var text_buffer: [32]u8 = undefined;
+            const text = try std.mem.print(&text_buffer, "{s}(E, .a, 0)", .{name});
+            const call_node = for (0..tree.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (std.mem.eql(u8, tree.getNodeSource(at), text)) break at;
+            } else unreachable; // unreachable: main calls each
+            const clone = for (0..tree.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (std.mem.eql(u8, tree.getNodeSource(at), "T.clone(v)")) break at;
+            } else unreachable; // unreachable: dup clones
+            const call = (try calls.at(&run.facts, file, call_node)).?;
+            const generic = call.callee.function;
+            const crowded = for (try run.facts.parameterCopies(generic)) |copy| {
+                if (copy.source != null and copy.source.?.node == clone and copy.crowded) break copy;
+            } else return error.TestUnexpectedResult;
+            return (try run.facts.boundCopy(call, generic, crowded)) orelse error.TestUnexpectedResult;
+        }
+    };
+    // Each step read once: within 5000 resolutions, where reading it again along each route
+    // ran out of them.
+    var first: Run = undefined;
+    try first.init(source.items);
+    defer first.deinit();
+    first.facts.remaining = 5000;
+    const from_root = try first.ask("keep");
+    try std.testing.expect(from_root == .instance);
+    try std.testing.expect(!first.facts.short);
+    try std.testing.expect((try first.facts.memo(Crowded)).found.count() >= k);
+    try std.testing.expect(sameValue(from_root, try first.ask("keep2")));
+    // Asked first from a step inside the cycle: the same answer.
+    var member_first: Run = undefined;
+    try member_first.init(source.items);
+    defer member_first.deinit();
+    member_first.facts.remaining = 5000;
+    try std.testing.expect(sameValue(from_root, try member_first.ask("keep2")));
+    try std.testing.expect(sameValue(from_root, try member_first.ask("keep")));
+    // The budget runs out at a step in the middle of the cycle: the whole of it is
+    // unknown(budget), and none of it is kept, so asked again from another step with budget,
+    // the cycle is read whole.
+    var cut: Run = undefined;
+    try cut.init(source.items);
+    defer cut.deinit();
+    // A read of the whole spends 375 resolutions here: 200 run out partway through it.
+    cut.facts.remaining = 200;
+    try std.testing.expectEqual(Unknown.budget, (try cut.ask("keep")).unknown);
+    try std.testing.expect(cut.facts.short);
+    try std.testing.expectEqual(0, (try cut.facts.memo(Crowded)).found.count());
+    cut.facts.short = false;
+    cut.facts.remaining = 5000;
+    try std.testing.expect(sameValue(from_root, try cut.ask("keep2")));
+    try std.testing.expect(!cut.facts.short);
 }
 
 test "a copy crowded past its routes is read along the routes its binding compiles, kept or not" {
