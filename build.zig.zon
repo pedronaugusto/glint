@@ -6,8 +6,8 @@
     .paths = .{ "build.zig", "build.zig.zon", "src", "examples", "docs", "README.md", "CHANGELOG.md", "LICENSE" },
     .dependencies = .{
         .aegis = .{
-            .url = "git+https://github.com/pedronaugusto/aegis#d65f04c771335ed1ab97f9fb6b8be66ae845c85b",
-            .hash = "aegis-0.2.4-rsxoukfGCwCJ7Se96ag4wFG0dQkOqNacexiFx_TbeUqd",
+            .url = "git+https://github.com/pedronaugusto/aegis#14d2d44fb67910cbc5bdc2bd02a32b017353b93e",
+            .hash = "aegis-0.2.4-rsxouoTGCwA8YlzCzd-Wk7WISC_SiWibPz47uYRmNgML",
         },
 
         .ensign = .{
