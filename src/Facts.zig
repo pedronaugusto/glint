@@ -3838,11 +3838,21 @@ pub const Analysis = struct {
         /// The readings code the walk did not read makes of a generic function, each found once
         /// (`lazyCallReadings`), and the ones being found.
         readings: std.AutoHashMapUnmanaged(Decl, ?[]const *const Env) = .empty,
-        readings_open: std.AutoHashMapUnmanaged(Decl, void) = .empty,
+        /// The generics whose readings the outermost question in progress is finding, each with
+        /// the ones found so far, the round it was last read in, and whether it is being read
+        /// (`lazyCallRound`); the round, whether one grew in it, and how deep the questions are.
+        partial: std.AutoHashMapUnmanaged(Decl, Partial) = .empty,
+        readings_round: usize = 0,
+        readings_grew: bool = false,
+        readings_depth: usize = 0,
+        /// The budget of the outermost question finding readings (`reading_budget`; a test
+        /// asks with less).
+        readings_budget: usize = reading_budget,
         /// The checking reaches free to read a site with (`reachedFromSiteIn`), kept and
         /// cleared: one is taken per site, so a check asked inside another has its own.
         checkers: std.ArrayList(*Analysis) = .empty,
         pub const Answer = enum { open, yes, no };
+        pub const Partial = struct { envs: ?[]const *const Env, round: usize, open: bool };
     };
     /// Each site that may name a declaration or a file, found once over every file: by the name
     /// it spells (an identifier, a member access, a decl literal), each `@field` (whose name may
@@ -4158,6 +4168,15 @@ fn lazyAsk(self: *Facts, found: *Analysis, key: LazyKey, outermost: bool) Resolv
     const met = lazy.met_open;
     lazy.met_open = met_before or met;
     const kept: Analysis.Lazy.Answer = if (yes) .yes else .no;
+    // A no read while readings are still being found (`lazyCallReadings`) may be one they
+    // later reach: it is asked again. A yes stays, as more readings only add reaches.
+    if (!yes and lazy.readings_depth != 0) {
+        switch (key) {
+            .decl => |d| _ = lazy.decls.remove(d),
+            .file => |f| _ = lazy.files.remove(f),
+        }
+        return false;
+    }
     switch (key) {
         .decl => |d| try lazy.decls.put(self.gpa, d, kept),
         .file => |f| try lazy.files.put(self.gpa, f, kept),
@@ -4277,14 +4296,69 @@ fn lazyReadings(self: *Facts, found: *Analysis, decl: Decl) ResolveError!?[]cons
 fn lazyCallReadings(self: *Facts, found: *Analysis, decl: Decl) ResolveError!?[]const *const Env {
     const lazy = &found.lazy;
     if (lazy.readings.get(decl)) |known| return known;
-    if ((try lazy.readings_open.getOrPut(self.gpa, decl)).found_existing) return null;
-    defer _ = lazy.readings_open.remove(decl);
-    const asker = self.enter(reading_budget);
-    const read = self.lazyCallReadingsRead(found, decl);
+    if (lazy.readings_depth != 0) return self.lazyCallRound(found, decl);
+    // The outermost question: a unit of its own, read in rounds until none grows, each round one
+    // of its resolutions; what every round found is kept at the end, nothing where it ran short.
+    const asker = self.enter(lazy.readings_budget);
+    lazy.readings_depth += 1;
+    const read: ResolveError!void = while (true) {
+        if (self.remaining == 0) {
+            _ = self.spent();
+            break;
+        }
+        self.remaining -= 1;
+        lazy.readings_round += 1;
+        lazy.readings_grew = false;
+        _ = self.lazyCallRound(found, decl) catch |err| break err;
+        if (!lazy.readings_grew) break;
+    };
+    lazy.readings_depth -= 1;
     const short = self.leave(asker);
-    const answer = if (short) null else try read;
-    try lazy.readings.put(self.gpa, decl, answer);
-    return answer;
+    defer lazy.partial.clearRetainingCapacity();
+    try read;
+    if (short) return null;
+    var each = lazy.partial.iterator();
+    while (each.next()) |entry| try lazy.readings.put(self.gpa, entry.key_ptr.*, entry.value_ptr.envs);
+    return lazy.partial.get(decl).?.envs; // unreachable: the round put it
+}
+
+/// One round's readings of a generic (`lazyCallReadings`): read once a round, its readings so
+/// far where it is being read or was read this round. Readings only grow, and null (each
+/// one's) stays: a round where one grew is followed by another.
+fn lazyCallRound(self: *Facts, found: *Analysis, decl: Decl) ResolveError!?[]const *const Env {
+    const lazy = &found.lazy;
+    const entry = try lazy.partial.getOrPut(self.gpa, decl);
+    if (entry.found_existing) {
+        if (entry.value_ptr.open or entry.value_ptr.round == lazy.readings_round) return entry.value_ptr.envs;
+        if (entry.value_ptr.envs == null) return null;
+    } else entry.value_ptr.* = .{ .envs = &.{}, .round = 0, .open = false };
+    entry.value_ptr.open = true;
+    entry.value_ptr.round = lazy.readings_round;
+    const got = self.lazyCallReadingsRead(found, decl);
+    // The map may have grown meanwhile: the entry is found again.
+    const held = lazy.partial.getPtr(decl).?; // unreachable: put above, cleared only by the outermost
+    held.open = false;
+    const envs = try got orelse {
+        held.envs = null;
+        lazy.readings_grew = true;
+        return null;
+    };
+    if (!sameReadings(envs, held.envs.?)) {
+        held.envs = envs;
+        lazy.readings_grew = true;
+    }
+    return held.envs;
+}
+
+/// Whether two sets of readings hold the same ones (`keptReading` interns each).
+fn sameReadings(one: []const *const Env, other: []const *const Env) bool {
+    if (one.len != other.len) return false;
+    for (one) |env| {
+        for (other) |known| {
+            if (known == env) break;
+        } else return false;
+    }
+    return true;
 }
 
 /// `lazyCallReadings`, read.
@@ -17041,4 +17115,68 @@ test "a generic code the walk did not read calls is read in the readings those c
     try std.testing.expect(try facts.analyzed(testDecl(&project, 1, "cyc2")));
     // std's own test is in no compilation of the program: what only it calls is not analyzed.
     try std.testing.expect(!try facts.analyzed(testDecl(&project, 1, "testHelper")));
+}
+
+test "the readings code the walk did not read makes of a generic are a least fixpoint: two generics whose reflected sites each ask of the other read each in its own calls' readings, a recursive one converges, and one out of budget midway is null and kept nowhere" {
+    const root =
+        \\const std = @import("std");
+        \\const missing = @import("missing");
+        \\pub fn main() void {
+        \\    missing.T.viaName();
+        \\}
+    ;
+    const library =
+        \\const Holder = struct {
+        \\    pub fn first() void {}
+        \\    pub fn second() void {}
+        \\};
+        \\const E = enum { a, b };
+        \\pub fn alt(context: anytype, comptime name: @EnumLiteral()) void {
+        \\    _ = @field(@TypeOf(context), @tagName(name));
+        \\}
+        \\pub fn tagsOf(comptime T: type) void {
+        \\    inline for (@typeInfo(T).@"enum".fields) |f| _ = @field(T, f.name);
+        \\}
+        \\fn rec(comptime T: type) void {
+        \\    rec(T);
+        \\}
+        \\fn unrelated() void {}
+        \\pub fn viaName() void {
+        \\    alt(@as(Holder, .{}), .first);
+        \\    tagsOf(E);
+        \\    rec(u8);
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{
+        .{ .name = "root", .bytes = root, .absent = &.{"missing"} },
+        .{ .name = "std/std.zig", .bytes = library, .selected = false },
+    }, &.{.{ .from = 0, .spelling = "std", .target = 1 }}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    {
+        var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+        defer facts.deinit();
+        // Each reflected site read in its generic's own readings: neither answers everything.
+        try std.testing.expect(try facts.analyzed(testDecl(&project, 1, "first")));
+        try std.testing.expect(!try facts.analyzed(testDecl(&project, 1, "second")));
+        try std.testing.expect(!try facts.analyzed(testDecl(&project, 1, "unrelated")));
+        try std.testing.expectEqual(1, (try facts.analyzedReadings(testDecl(&project, 1, "alt"))).?.len);
+        try std.testing.expectEqual(1, (try facts.analyzedReadings(testDecl(&project, 1, "tagsOf"))).?.len);
+        // A generic calling itself in the reading it is in converges on that one reading.
+        try std.testing.expectEqual(1, (try facts.analyzedReadings(testDecl(&project, 1, "rec"))).?.len);
+    }
+    {
+        var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+        defer facts.deinit();
+        const found = try facts.builtAnalysis();
+        _ = try facts.analyzed(testDecl(&project, 1, "viaName"));
+        // A fixpoint whose budget runs out midway (its first round spends the one resolution it
+        // has): null, each one's, and none of what its rounds found is kept.
+        found.lazy.readings_budget = 1;
+        try std.testing.expectEqual(@as(?[]const *const Env, null), try facts.lazyCallReadings(found, testDecl(&project, 1, "alt")));
+        try std.testing.expect(!found.lazy.readings.contains(testDecl(&project, 1, "alt")));
+        try std.testing.expect(!found.lazy.readings.contains(testDecl(&project, 1, "tagsOf")));
+        try std.testing.expectEqual(0, found.lazy.partial.count());
+    }
 }
