@@ -42,6 +42,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 - aegis pinned at its 0.3 line (d65f04c: one module, `aegis`, whose types and assertions declare their roles in `lint_rules`), and preflight (development) at its 0.19 line, which builds on it.
 - Metrics counts aegis's assertions by the roles aegis declares (`invariant`, `never`, `debug`, `debug_check`), and std's `debug.assert` by std's contract at its path.
+- The pack reads guards, hand-offs and acquisitions by the roles aegis declares, never by name: a guard is a type whose role is `guard`, or `ranked_guard` for an `Order`'s capability (one check, `AegisContract.isGuard`, reads both), a hand-off one whose role is `handoff`, and an acquisition a function whose declared result, through `!`, `?` and `MustUse`, has a guard's role; a result, or a wrapped payload, that does not resolve is undecided. The 18 acquisition names, the guard and hand-off type names and the ranked form (`...Ordered`) are gone.
 
 ### Fixed
 - A type function that chooses its container by a comptime option gives its role to every container it may return (aegis 0.3's `handle.SlotPool(T, Tag, options)`, `Keyed` or `Indexed`): its instances read as no aegis type, so A001 cleared a read of a pool's private field with the run complete. `Facts.template` reads such a choice as one of its containers (`Facts.returnedContainers`).
