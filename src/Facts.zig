@@ -4303,7 +4303,7 @@ fn lazyCallReadingsRead(self: *Facts, found: *Analysis, decl: Decl) ResolveError
     for (sites.reflected.items) |site| {
         if (!try self.lazilyRead(found, site)) continue;
         const enclosing = try self.siteDecl(site);
-        if (enclosing != null and std.meta.eql(enclosing.?, decl)) {
+        if (self.ownSite(enclosing, decl)) {
             try own.append(self.gpa, site);
             continue;
         }
@@ -4318,7 +4318,7 @@ fn lazyCallReadingsRead(self: *Facts, found: *Analysis, decl: Decl) ResolveError
     while (name_at < names.items.len) : (name_at += 1) for (if (sites.by_name.get(names.items[name_at])) |list| list.items else &.{}) |site| {
         if (!try self.lazilyRead(found, site)) continue;
         const enclosing = try self.siteDecl(site);
-        if (enclosing != null and std.meta.eql(enclosing.?, decl)) {
+        if (self.ownSite(enclosing, decl)) {
             try own.append(self.gpa, site);
             continue;
         }
@@ -4369,6 +4369,16 @@ fn lazyCallReading(self: *Facts, envs: *std.ArrayList(*const Env), site: Key, ca
     for (envs.items) |known| if (known == reading) return true;
     try envs.append(self.gpa, reading);
     return true;
+}
+
+/// Whether a site in `enclosing` is read in `decl`'s own readings: it is `decl`, or a member of a
+/// container `decl` declares, read in each of `decl`'s readings (`reachDeclaration`).
+fn ownSite(self: *Facts, enclosing: ?Decl, decl: Decl) bool {
+    var at = enclosing orelse return false;
+    while (true) {
+        if (std.meta.eql(at, decl)) return true;
+        at = self.enclosingFunction(at) orelse return false;
+    }
 }
 
 /// The container-level constant `site` is the whole value of (`const X = path.to.F;`), if any.
