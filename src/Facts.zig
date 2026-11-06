@@ -3839,6 +3839,9 @@ pub const Analysis = struct {
         /// (`lazyCallReadings`), and the ones being found.
         readings: std.AutoHashMapUnmanaged(Decl, ?[]const *const Env) = .empty,
         readings_open: std.AutoHashMapUnmanaged(Decl, void) = .empty,
+        /// The checking reaches free to read a site with (`reachedFromSiteIn`), kept and
+        /// cleared: one is taken per site, so a check asked inside another has its own.
+        checkers: std.ArrayList(*Analysis) = .empty,
         pub const Answer = enum { open, yes, no };
     };
     /// Each site that may name a declaration or a file, found once over every file: by the name
@@ -4306,8 +4309,13 @@ fn lazyCallReadingsRead(self: *Facts, found: *Analysis, decl: Decl) ResolveError
         }
         if (try self.reachedFromSite(found, site, decl)) return null;
     }
-    const named = if (sites.by_name.get(record.name)) |list| list.items else &.{};
-    for (named) |site| {
+    // The sites spelled as its name, and as each container-level constant that names it
+    // (`pub const MultiArrayList = @import("multi_array_list.zig").MultiArrayList`): a call
+    // through one resolves to it.
+    var names: std.ArrayList([]const u8) = .empty;
+    try names.append(self.gpa, record.name);
+    var name_at: usize = 0;
+    while (name_at < names.items.len) : (name_at += 1) for (if (sites.by_name.get(names.items[name_at])) |list| list.items else &.{}) |site| {
         if (!try self.lazilyRead(found, site)) continue;
         const enclosing = try self.siteDecl(site);
         if (enclosing != null and std.meta.eql(enclosing.?, decl)) {
@@ -4315,20 +4323,28 @@ fn lazyCallReadingsRead(self: *Facts, found: *Analysis, decl: Decl) ResolveError
             continue;
         }
         if (!try self.reachedFromSite(found, site, decl)) continue;
-        const call = calleeCall(self.project.at(site.file), site.node) orelse return null;
+        const call = calleeCall(self.project.at(site.file), site.node) orelse {
+            const alias = try self.aliasAt(site) orelse return null;
+            const alias_name = self.project.at(alias.file).model.declarations[@backingInt(alias.index)].name;
+            if (found.named.contains(alias_name)) return null;
+            for (names.items) |known| {
+                if (std.mem.eql(u8, known, alias_name)) break;
+            } else try names.append(self.gpa, alias_name);
+            continue;
+        };
         const outer_envs: ?[]const *const Env = if (enclosing) |d| try self.lazyReadings(found, d) else null;
         if (outer_envs) |known| {
             for (known) |env| if (!try self.lazyCallReading(&envs, site, call, decl, env)) return null;
         } else if (!try self.lazyCallReading(&envs, site, call, decl, null)) return null;
         if (envs.items.len > reading_limit) return null;
-    }
+    };
     var done: usize = 0;
     while (done < envs.items.len) {
         const from = done;
         done = envs.items.len;
         for (own.items) |site| for (from..done) |at| {
             const env = envs.items[at];
-            if (!try self.reachedFromSiteIn(site, decl, &.{env})) continue;
+            if (!try self.reachedFromSiteIn(found, site, decl, &.{env})) continue;
             const call = calleeCall(self.project.at(site.file), site.node) orelse return null;
             if (!try self.lazyCallReading(&envs, site, call, decl, env)) return null;
             if (envs.items.len > reading_limit) return null;
@@ -4353,6 +4369,18 @@ fn lazyCallReading(self: *Facts, envs: *std.ArrayList(*const Env), site: Key, ca
     for (envs.items) |known| if (known == reading) return true;
     try envs.append(self.gpa, reading);
     return true;
+}
+
+/// The container-level constant `site` is the whole value of (`const X = path.to.F;`), if any.
+fn aliasAt(self: *Facts, site: Key) ResolveError!?Decl {
+    const part = try self.partOf(site.file, site.node) orelse return null;
+    const index = (try self.partsOf(site.file)).declared.get(part) orelse return null;
+    const tree = &self.project.at(site.file).file.tree;
+    const variable = tree.fullVarDecl(part) orelse return null;
+    if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
+    const init = variable.ast.init_node.unwrap() orelse return null;
+    if (ungrouped(tree, init) != site.node) return null;
+    return .{ .file = site.file, .index = index };
 }
 
 /// The call whose callee `node` is (`node(…)`, `node.*(…)`), if any.
@@ -4384,7 +4412,7 @@ pub fn testOnly(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
 /// is the callee of, recording what it reaches only.
 fn reachedFromSite(self: *Facts, found: *Analysis, site: Key, decl: Decl) ResolveError!bool {
     const envs: ?[]const *const Env = if (try self.siteDecl(site)) |d| try self.lazyReadings(found, d) else null;
-    return self.reachedFromSiteIn(site, decl, envs);
+    return self.reachedFromSiteIn(found, site, decl, envs);
 }
 
 /// The function or constant whose part holds `site`, if any.
@@ -4395,12 +4423,27 @@ fn siteDecl(self: *Facts, site: Key) ResolveError!?Decl {
 }
 
 /// `reachedFromSite` with the site read in `envs`, or binding nothing where null.
-fn reachedFromSiteIn(self: *Facts, site: Key, decl: Decl, envs: ?[]const *const Env) ResolveError!bool {
-    var check: Analysis = .{ .checking = true };
+fn reachedFromSiteIn(self: *Facts, found: *Analysis, site: Key, decl: Decl, envs: ?[]const *const Env) ResolveError!bool {
+    const check = found.lazy.checkers.pop() orelse blk: {
+        const made = try self.gpa.create(Analysis);
+        made.* = .{ .checking = true };
+        break :blk made;
+    };
+    defer {
+        check.reached.clearRetainingCapacity();
+        check.named.clearRetainingCapacity();
+        check.files.clearRetainingCapacity();
+        check.members.clearRetainingCapacity();
+        check.limits.clearRetainingCapacity();
+        check.everything = false;
+        // Out of memory to keep it, the checker is only not reused: the next is made anew.
+        found.lazy.checkers.append(self.gpa, check) catch {};
+    }
     var next: std.ArrayList(PartRead) = .empty;
+    defer next.deinit(self.gpa);
     // A unit of its own (`enter`): the reader asking is charged nothing for it.
     const asker = self.enter(reading_budget);
-    const read = if (envs) |each| self.readSiteIn(&check, &next, site, each) else self.readSite(&check, &next, site, null);
+    const read = if (envs) |each| self.readSiteIn(check, &next, site, each) else self.readSite(check, &next, site, null);
     if (self.leave(asker)) return true;
     if (!try read) return false;
     if (check.everything or check.reached.contains(decl)) return true;
@@ -16951,8 +16994,10 @@ test "a generic code the walk did not read calls is read in the readings those c
         \\}
         \\fn unrelated() void {}
         \\fn testHelper() void {}
+        \\pub const Alias = alt;
         \\pub fn viaName() void {
         \\    alt(@as(Holder, .{}), .first);
+        \\    Alias(@as(Holder, .{}), .first);
         \\    twice(u8);
         \\    twice(u16);
         \\    const g = valued;
@@ -16973,7 +17018,8 @@ test "a generic code the walk did not read calls is read in the readings those c
     var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
     defer facts.deinit();
     try std.testing.expect(!(try facts.analysis()).everything);
-    // `alt(@as(Holder, .{}), .first)`: the call's reading names `first`, not every declaration.
+    // `alt(@as(Holder, .{}), .first)`, and the same through a constant naming it: the call's
+    // reading names `first`, not every declaration.
     try std.testing.expect(try facts.analyzed(testDecl(&project, 1, "first")));
     try std.testing.expect(!try facts.analyzed(testDecl(&project, 1, "second")));
     try std.testing.expect(!try facts.analyzed(testDecl(&project, 1, "unrelated")));
