@@ -143,33 +143,27 @@ fn checkRecursion(c: *Context) Context.Error!void {
     if (!try begin(c, recursion)) return;
     try @import("AegisRecursion.zig").check(c, recursion);
 }
-/// Starts a check of this file. The library's own files are its safe-type internals, where what
-/// a `lint_rules` they declare says that glint cannot read is reported instead (`ownRules`); a
-/// root whose roles are not all read is reported where the library is imported, so a renamed
-/// declaration cannot make a gate quietly stop seeing it.
+/// Starts a check of this file. What a `lint_rules` it declares says that glint cannot read is
+/// reported where it is written, in whatever package (`ownRules`). The library's own files are
+/// its safe-type internals; a root whose roles are not all read is reported where the library is
+/// imported, so a renamed declaration cannot make a gate quietly stop seeing it.
 fn begin(c: *Context, rule: Rule) Context.Error!bool {
-    if (try c.inLibrary(Contract.library, c.file)) {
-        if (rule == access) try ownRules(c);
-        return false;
-    }
+    if (rule == access) try ownRules(c);
+    if (try c.inLibrary(Contract.library, c.file)) return false;
     if (try c.drift(Contract.library)) |gap| try c.undecided(rule, gap.start, .unresolved, gap.detail);
     return true;
 }
-/// In aegis's own files, once (under A001): each part of a `lint_rules` this file declares that
-/// glint cannot read (PackageRules.Problem), where it is written, and each role it names that no
-/// pack of glint's reads (a misspelt role would leave its type plain, which clears its sites).
+/// Once per file (under A001), in any package: each part of a `lint_rules` this file declares
+/// that glint cannot read (PackageRules.Problem: a reference that does not resolve, a role no
+/// pack of the run reads, ...), where it is written, so the package's own lint catches what would
+/// leave its types plain in the programs that import it.
 fn ownRules(c: *Context) Context.Error!void {
     const declared = try PackageRules.of(c.facts, c.file);
-    const decl = declared.declared orelse return;
+    if (declared.declared == null) return;
     const tree = &c.project.at(c.file).file.tree;
     for (declared.problems) |problem| if (problem.file == c.file) {
-        try c.at(access, tree.firstToken(problem.node), try c.allocator.print("lint_rules: {t}: glint does not read this part, so the roles and pairs it declares are not known to the programs that import aegis", .{problem.why}));
+        try c.at(access, tree.firstToken(problem.node), try c.allocator.print("lint_rules: {t}: glint does not read this part, so the programs that import this package do not know what it declares", .{problem.why}));
     };
-    for (declared.roles) |role| {
-        if (std.meta.stringToEnum(Contract.Kind, role.role) != null or std.meta.stringToEnum(Report.Metrics.Kind, role.role) != null) continue;
-        const at = c.project.at(decl.file).model.declarations[@backingInt(decl.index)].token;
-        if (decl.file == c.file) try c.at(access, at, try c.allocator.print("lint_rules: role .{s} is none glint reads, so its type reads as plain", .{role.role}));
-    }
 }
 fn checkAccess(c: *Context) Context.Error!void {
     if (!try begin(c, access)) return;
