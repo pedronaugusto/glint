@@ -7,7 +7,7 @@ const Role = enum(u8) { widget, gauge, legacy };
 const gadgets: @FieldType(glint.Library(Role), "package") = .{ .name = "gadgets", .fingerprint = 0x9ad9e75 };
 const library: glint.Library(Role) = .{ .package = gadgets };
 const own: glint.Rule = @fromBackingInt(1000); // safe: this project owns its validated extension identity.
-const rule: glint.ProjectRule = .{ .definition = .{ .id = own, .name = "ROLE_PROBE", .group = .family_policy, .purpose = "reports the role a library gives each public constant", .version = 1 }, .check = probe };
+const rule: glint.ProjectRule = .{ .definition = .{ .id = own, .name = "ROLE_PROBE", .group = .family_policy, .purpose = "reports the role a library gives each public constant", .version = 1 }, .check = probe, .roles = &.{ "widget", "gauge", "legacy" } };
 
 /// Reports, for each public constant, the role of what it names, or that it names none.
 fn probe(context: *glint.RuleContext) glint.RuleContext.Error!void {
@@ -67,7 +67,7 @@ const consumer =
     \\pub const E = struct {};
     \\pub const F = gadgets.kit;
 ;
-const rules = "pub const lint_rules = .{ .version = 1, .roles = .{ .{ .type = Widget, .role = .widget }, .{ .type = kit.Gauge, .role = .gauge }, .{ .type = kit.Gauge, .role = .another_packs } } };\n";
+const rules = "pub const lint_rules = .{ .version = 1, .roles = .{ .{ .type = Widget, .role = .widget }, .{ .type = kit.Gauge, .role = .gauge }, .{ .type = kit.Gauge, .role = .secret } } };\n";
 const flat = [_]Layout{
     .{ .name = "gadgets.zig", .bytes = "pub const Widget = @import(\"widget.zig\").Widget;\npub const kit = @import(\"kit.zig\");\n" ++ rules },
     .{ .name = "widget.zig", .bytes = "pub fn Widget(comptime T: type) type { return struct { value: T }; }" },
@@ -198,4 +198,29 @@ test "a type function with several returns has no single template, yet is still 
     defer run.project.deinit();
     defer run.report.deinit();
     try expectMessages(run.report, &.{ "widget", "none", "gauge", "gauge", "none", "none" });
+}
+test "a role no pack of the run reads is drift where the package is imported, and a finding in the package's own lint" {
+    const misspelt = [_]Layout{
+        .{ .name = "gadgets.zig", .bytes = "pub const Widget = @import(\"widget.zig\").Widget;\npub const lint_rules = .{ .version = 1, .roles = .{.{ .type = Widget, .role = .widgte }} };\n" },
+        flat[1],
+    };
+    var run = try probeAll("const gadgets = @import(\"gadgets\");\npub const A = gadgets.Widget;", &misspelt);
+    defer run.project.deinit();
+    defer run.report.deinit();
+    try std.testing.expect(!run.report.complete);
+    try std.testing.expectEqualStrings("gadgets's lint_rules at gadgets.zig:2: a role no pack of this run reads; the roles it declares are not all read in this file", coverage(run.report).?);
+    // The package's own lint: its root is the program's file, and A001 reports the role there.
+    var own_lint = try P.init(std.testing.allocator, &.{.{ .name = "gadgets.zig", .bytes = misspelt[0].bytes, .package = gadgets.name, .fingerprint = gadgets.fingerprint }}, &.{}, .{});
+    defer own_lint.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &own_lint, .{ .enabled = @splat(false), .selections = &.{.{ .rule = glint.AegisPack.access, .level = .gate }} }, .{ .project_rules = &(glint.AegisPack.rules ++ [_]glint.ProjectRule{rule}) });
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len);
+    try std.testing.expectEqualStrings("lint_rules: unknown_role: glint does not read this part, so the programs that import this package do not know what it declares", report.diagnostics[0].message);
+}
+test "two packs that give one role name in different lists are refused, so a package's role names one pack" {
+    var built = try project(std.testing.allocator, consumer, &flat);
+    defer built.deinit();
+    var clashing = rule;
+    clashing.roles = &.{ "widget", "secret" };
+    try std.testing.expectError(error.InvalidSelection, glint.runConfigured(std.testing.allocator, &built, config, .{ .project_rules = &.{clashing} }));
 }

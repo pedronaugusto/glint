@@ -43,8 +43,13 @@ pub const Sink = struct {
     config: *const fn (*Sink, Project.FileId) rules.Config,
 };
 /// Compiled rule. Metadata and callback are validated once before execution. `facts` are the
-/// flow facts its check asks (`Taint.get`), solved once for every rule that asks one.
-pub const Rule = struct { definition: rules.Definition, check: *const fn (*RuleContext) Error!void, facts: []const @import("FactSpec.zig").Spec = &.{} };
+/// flow facts its check asks (`Taint.get`), solved once for every rule that asks one. `roles` are
+/// the role names its pack reads from what packages declare (the fields of its `Library(R)`'s
+/// `R`, `std.meta.fieldNames(R)`): glint's own packs' are known without it. A role a package's
+/// `lint_rules` names that no pack of the run knows is a problem where it is written, and a name
+/// two packs give different lists for is refused (`error.InvalidSelection`), so an entry's name
+/// names one pack.
+pub const Rule = struct { definition: rules.Definition, check: *const fn (*RuleContext) Error!void, facts: []const @import("FactSpec.zig").Spec = &.{}, roles: []const []const u8 = &.{} };
 /// Checked immutable handle for all model queries.
 pub fn source(self: *const RuleContext) Project.QueryError!Project.Handle {
     return self.project.handle(self.file);
@@ -179,6 +184,7 @@ fn problemText(why: PackageRules.Problem.Why) []const u8 {
         .unresolved => "a reference that does not resolve",
         .foreign => "a declaration outside the package",
         .refused => "a pair refused as written",
+        .unknown_role => "a role no pack of this run reads",
     };
 }
 
