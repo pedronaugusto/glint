@@ -4440,8 +4440,14 @@ fn lazyCallReading(self: *Facts, envs: *std.ArrayList(*const Env), site: Key, ca
     };
     if (!calls_it) return false;
     const reading = (try self.readingFrom(site.file, call, decl, env)) orelse return false;
-    for (envs.items) |known| if (known == reading) return true;
-    try envs.append(self.gpa, reading);
+    // One per type an argument may be, as the walk instantiates it (`splitReading`).
+    var split: std.ArrayList(*const Env) = .empty;
+    try self.splitReading(decl, reading, 0, &split);
+    for (split.items) |one| {
+        for (envs.items) |known| {
+            if (known == one) break;
+        } else try envs.append(self.gpa, one);
+    }
     return true;
 }
 
@@ -4770,9 +4776,17 @@ fn reachCalled(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), f
 /// takes, never with a choice. From the argument at `from` on.
 fn reachEach(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), decl: Decl, reading: ?*const Env, from: usize) ResolveError!void {
     const bound = reading orelse return self.reachDeclaration(found, next, decl, null);
+    var split: std.ArrayList(*const Env) = .empty;
+    try self.splitReading(decl, bound, from, &split);
+    for (split.items) |one| try self.reachDeclaration(found, next, decl, one);
+}
+
+/// The readings Zig instantiates the generic `decl` in for `bound` (`reachEach`): one per type
+/// an argument may be where it is one of several, from the argument at `from` on.
+fn splitReading(self: *Facts, decl: Decl, bound: *const Env, from: usize, out: *std.ArrayList(*const Env)) ResolveError!void {
     const tree = &self.project.at(decl.file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
-    const proto = tree.fullFnProto(&buffer, self.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return self.reachDeclaration(found, next, decl, bound);
+    const proto = tree.fullFnProto(&buffer, self.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return out.append(self.gpa, bound);
     var it = proto.iterate(tree);
     var position: usize = 0;
     while (it.next()) |param| : (position += 1) {
@@ -4788,11 +4802,11 @@ fn reachEach(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), dec
             // Each split is a reading made once by its content (`keptReading`), as every one is.
             var draft = bound.*;
             draft.args = args;
-            try self.reachEach(found, next, decl, try self.keptReading(draft), position + 1);
+            try self.splitReading(decl, try self.keptReading(draft), position + 1, out);
         }
         return;
     }
-    try self.reachDeclaration(found, next, decl, bound);
+    try out.append(self.gpa, bound);
 }
 
 /// The container a value is or is an instance of, through a pointer.
