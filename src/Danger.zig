@@ -721,13 +721,14 @@ const SecretTypes = struct { built: bool = false, types: std.ArrayList(SecretTyp
 
 /// A011: time crossing to and from std as a raw integer.
 pub fn units(c: *Context, rule: Rule) Context.Error!void {
+    // The doors that make std's time from a count come first (`rawTime`'s `made`).
     const doors = [_][]const u8{
-        "Io.Duration.fromNanoseconds", "Io.Duration.fromMicroseconds", "Io.Duration.fromMilliseconds", "Io.Duration.fromSeconds",
-        "Io.Duration.toNanoseconds",   "Io.Duration.toMicroseconds",   "Io.Duration.toMilliseconds",   "Io.Duration.toSeconds",
-        "Io.Duration.nanoseconds",     "Io.Timestamp.fromNanoseconds", "Io.Timestamp.toNanoseconds",   "Io.Timestamp.toMicroseconds",
-        "Io.Timestamp.toMilliseconds", "Io.Timestamp.toSeconds",       "Io.Timestamp.nanoseconds",
+        "Io.Duration.fromNanoseconds",  "Io.Duration.fromMicroseconds", "Io.Duration.fromMilliseconds", "Io.Duration.fromSeconds",
+        "Io.Timestamp.fromNanoseconds", "Io.Duration.toNanoseconds",    "Io.Duration.toMicroseconds",   "Io.Duration.toMilliseconds",
+        "Io.Duration.toSeconds",        "Io.Duration.nanoseconds",      "Io.Timestamp.toNanoseconds",   "Io.Timestamp.toMicroseconds",
+        "Io.Timestamp.toMilliseconds",  "Io.Timestamp.toSeconds",       "Io.Timestamp.nanoseconds",
     };
-    try rawTime(c, rule, &doors);
+    try rawTime(c, rule, &doors, 5);
     const constants = [_][]const u8{
         "time.ns_per_us",  "time.ns_per_ms",   "time.ns_per_s",   "time.ns_per_min",  "time.ns_per_hour", "time.ns_per_day",  "time.ns_per_week",
         "time.us_per_ms",  "time.us_per_s",    "time.us_per_min", "time.us_per_hour", "time.us_per_day",  "time.us_per_week", "time.ms_per_s",
@@ -754,8 +755,9 @@ pub fn units(c: *Context, rule: Rule) Context.Error!void {
 
 /// A011's doors: each raw-integer crossing of std's time, as the program runs or compiles. Two
 /// raw nanosecond counts compared or subtracted, or one compared with zero, keep their unit: no
-/// conversion happens there.
-fn rawTime(c: *Context, rule: Rule, paths: []const []const u8) Context.Error!void {
+/// conversion happens there. The first `made` doors make std's time from a count: one given a
+/// count written out in the call states its unit by its own name (`unitWritten`).
+fn rawTime(c: *Context, rule: Rule, paths: []const []const u8, made: usize) Context.Error!void {
     const targets = try c.allocator.alloc(Governed.Target, paths.len);
     const indexes = try c.allocator.alloc(usize, paths.len);
     for (paths, targets, indexes, 0..) |path, *target, *index, i| {
@@ -772,6 +774,7 @@ fn rawTime(c: *Context, rule: Rule, paths: []const []const u8) Context.Error!voi
     for (sites.items) |site| {
         if (site.through_alias or c.inTest(site.token)) continue;
         if (try sameUnit(c, counts.items, site.node)) continue;
+        if (site.index < made and try unitWritten(c, site.node)) continue;
         try c.at(rule, site.token, try c.allocator.print("{s}: time as a raw integer; aegis units.Duration and Instant carry the unit and convert with toIoDuration and fromIoDuration", .{paths[site.index]}));
     }
     // A copy of memory between std's time and anything else, by what it does
@@ -856,6 +859,25 @@ fn fieldsTime(c: *Context, times: []const Facts.Container, fields: []const Facts
 
 /// Whether a raw `.nanoseconds` read meets only another one, or zero (`Range.constantValue`),
 /// in a comparison or a difference, through parentheses (`accesses.useOf`).
+/// Whether the door at `node` is called with an integer written out in the call: a value the
+/// program fixes (`Range.constantValue`) that names no declaration (`5`, `2 * 60`). The door's
+/// own name is then its unit (`fromSeconds(5)`); a named count (`fromSeconds(timeout_ms)`)
+/// carries its unit only in its name, and stays a site.
+fn unitWritten(c: *Context, node: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    const parent = model.parentOf(node) orelse return false;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, parent) orelse return false;
+    if (call.ast.fn_expr != node or call.ast.params.len != 1) return false;
+    const count = call.ast.params[0];
+    if (try Range.constantValue(c, c.file, count) == null) return false;
+    const first = tree.firstToken(count);
+    const last = tree.lastToken(count);
+    for (model.references) |reference| if (reference.token >= first and reference.token <= last) return false;
+    return true;
+}
+
 fn sameUnit(c: *Context, counts: []const Ast.Node.Index, node: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(c.file).file.tree;
     if (!nanoseconds(tree, counts, node)) return false;
