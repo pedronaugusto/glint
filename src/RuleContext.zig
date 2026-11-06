@@ -63,11 +63,11 @@ pub fn resolve(self: *RuleContext, node: Project.NodeId) Error!Facts.Value {
 /// Null when the value is none of its declarations with a role; recognition follows the roles
 /// the library's package declares in `lint_rules`, never file bytes or names.
 pub fn role(self: *RuleContext, library: anytype, value: Facts.Value) Error!?@TypeOf(library).Role {
-    return self.facts.role(library, value);
+    return PackageRules.role(self.facts, library, value);
 }
 /// Whether `file` is one of the library's own files: of its package, by the identity the caller states.
 pub fn inLibrary(self: *RuleContext, library: anytype, file: Project.FileId) Error!bool {
-    const found = try self.facts.publication(library);
+    const found = try PackageRules.publication(self.facts, library);
     for (found.files) |own| if (own == file) return true;
     return false;
 }
@@ -151,7 +151,7 @@ fn isType(self: *RuleContext, node: Ast.Node.Index) Error!bool {
         else => return false,
     }
 }
-/// Where a library's roles are not all read (`Facts.Gap`), at the first import in this file of
+/// Where a library's roles are not all read (`PackageRules.Gap`), at the first import in this file of
 /// that root, under whatever name and however spelled: the import is the root where Facts
 /// resolves it to that root. Recognition of that library is incomplete here, so a rule reports
 /// it as coverage. A library's modules are the program's: a file only a build script's
@@ -159,7 +159,7 @@ fn isType(self: *RuleContext, node: Ast.Node.Index) Error!bool {
 pub const Drift = struct { detail: []const u8, start: u32 };
 pub fn drift(self: *RuleContext, library: anytype) Error!?Drift {
     if (!self.project.at(self.file).input.compilations.inProgram()) return null;
-    const found = try self.facts.publication(library);
+    const found = try PackageRules.publication(self.facts, library);
     const tree = try self.project.syntax(try self.source());
     const model = &self.project.at(self.file).model;
     for (found.gaps) |gap| for (model.import_nodes) |node| {

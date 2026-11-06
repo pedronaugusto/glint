@@ -510,7 +510,7 @@ test "identical source under another module is not aegis" {
 test "a role aegis declares that does not resolve is reported where aegis is imported, never a quiet gate" {
     // `Guarded`'s container declares no `Gaurd`: a misspelt member compiles (an enum literal), so
     // only the reader sees it.
-    var project = try flatFixture("const S = @import(\"aegis\").Secret; pub fn f(s: *S(u32)) void { _ = s.material; }", .{ .root = flat_declared ++ "\n" ++ flatRules("Gaurd") });
+    var project = try flatFixture("const S = @import(\"aegis\").Secret; pub fn f(s: *S(u32)) void { _ = s.material; }", .{ .root = comptime flat_declared ++ "\n" ++ flatRules("Gaurd") });
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();

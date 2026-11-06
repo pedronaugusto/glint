@@ -296,7 +296,7 @@ fn anyBacking(k: Contract.Kind) bool {
 /// The published types only their own constructor may make: `err.PublicSource`, whose
 /// `classify` takes the reviewed reason that a literal of it skips.
 fn constructed(c: *Context) Context.Error![]const Facts.Container {
-    const found = try c.facts.publication(Contract.library);
+    const found = try PackageRules.publication(c.facts, Contract.library);
     var out: std.ArrayList(Facts.Container) = .empty;
     for (found.entries) |entry| if (entry.target == .container and @as(Contract.Kind, @fromBackingInt(@intCast(entry.role))) == .public_source) try out.append(c.allocator, entry.target.container);
     return out.items;
@@ -473,7 +473,7 @@ fn namesFields(c: *Context, tree: *const Ast, literal: Ast.full.StructInit, cont
 /// `others`: `p.key` read beside `p.value`, and no aegis type whose `value` is backing state
 /// has a `key`.
 fn noLibraryHolder(c: *Context, name: []const u8, others: []const []const u8) Context.Error!bool {
-    const found = try c.facts.publication(Contract.library);
+    const found = try PackageRules.publication(c.facts, Contract.library);
     for (found.files) |file| {
         const model = &c.project.at(file).model;
         for (model.declarations) |decl| {
@@ -600,7 +600,7 @@ fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!b
     const siblings = try receiverMembers(c, tree, model, receiver, name);
     if (siblings.len != 0 and try noLibraryHolder(c, name, siblings)) return true;
     if (member == null and literal == null and !operand and !called) return false;
-    const found = try c.facts.publication(Contract.library);
+    const found = try PackageRules.publication(c.facts, Contract.library);
     var any = false;
     for (found.entries) |entry| {
         const k: Contract.Kind = @fromBackingInt(@intCast(entry.role));
@@ -721,7 +721,7 @@ fn plainStruct(c: *Context, container: Facts.Container) bool {
 
 /// The container a published target is: the type itself, or the one a type function returns,
 /// the first container declared in its body.
-fn publishedContainer(c: *Context, target: Facts.Target) Context.Error!?Facts.Container {
+fn publishedContainer(c: *Context, target: PackageRules.Target) Context.Error!?Facts.Container {
     switch (target) {
         .container => |container| return container,
         .function => |function| {
@@ -1112,7 +1112,7 @@ fn recordCopied(c: *Context, container: Facts.Container, depth: usize) Context.E
 /// The role of the published aegis type `container` is declared inside, as a guarded value's
 /// guard is: its own operations belong to that type's contract.
 fn enclosingPublished(facts: *Facts, container: Facts.Container) Facts.ResolveError!?Contract.Kind {
-    const found = try facts.publication(Contract.library);
+    const found = try PackageRules.publication(facts, Contract.library);
     const scopes = facts.project.at(container.file).model.scopes;
     var scope = scopes[@backingInt(container.scope)].parent;
     while (scope) |s| : (scope = scopes[@backingInt(s)].parent) {
@@ -1163,7 +1163,7 @@ fn typed(facts: *Facts, value: Facts.Value, depth: usize) Facts.ResolveError!Typ
             break :blk found;
         },
         .container, .instance => |container| blk: {
-            if (try facts.role(Contract.library, value)) |k| break :blk .{ .owner = k };
+            if (try PackageRules.role(facts, Contract.library, value)) |k| break :blk .{ .owner = k };
             const outer = (try enclosingPublished(facts, container)) orelse break :blk .other;
             // A guarded owner's guard, reached by its resolved type rather than its acquisition.
             if (outer == .guarded and Contract.guardType(containerName(facts, container) orelse "")) break :blk .{ .owner = .guard };
