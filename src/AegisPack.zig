@@ -18,6 +18,7 @@ const Flows = @import("DangerFlow.zig");
 const Program = @import("Program.zig");
 const Rule = @import("Rule.zig").Rule;
 const Report = @import("Report.zig");
+const PackageRules = @import("PackageRules.zig");
 const Ast = std.zig.Ast;
 pub const access = Ids.access;
 pub const copies = Ids.copies;
@@ -44,23 +45,23 @@ pub const cancellation = Ids.cancellation;
 pub const lock_order = Ids.lock_order;
 /// Aegis's package, as its `build.zig.zon` names it: a caller states it for aegis's files.
 pub const package = Contract.package;
+/// The roles the pack reads from what aegis declares, and aegis as a library of them: a project's
+/// own rule reads a role through `RuleContext.role(library, value)`.
+pub const Role = Contract.Kind;
+pub const library = Contract.library;
 /// The danger rules: each finds where a danger exists and aegis's type is the answer.
 pub const danger = [_]Rule{ shared_state, secrets, untrusted_input, integers, units, bounded_work, contracts, lifetimes, ownership, identity, state_machines, diagnostics, unsafe_set, cancellation, lock_order };
-/// The first file outside aegis whose import resolves to an aegis module (`Facts.moduleRoots`):
-/// one, whatever the program names it after and whatever its package, that publishes what the
-/// module does; or one of aegis's name that publishes some of it, does not resolve far enough
-/// to tell, or does not parse, whose missing members the run then reports. A module of aegis's
-/// name that publishes none of it is not aegis.
+/// The first file outside aegis whose import reaches aegis (`Facts.packageRoots`): a file of
+/// aegis's package, by the identity the caller states, whatever the program names it after. A
+/// module of aegis's name that is not of aegis's package is not aegis.
 pub fn importer(gpa: std.mem.Allocator, project: *const Project) Facts.ResolveError!?Project.FileId {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     var facts: Facts = .{ .project = project, .gpa = arena.allocator(), .known = Contract.package };
+    const roots = try facts.packageRoots(Contract.package);
     for (project.imports) |mapping| {
-        if (facts.knownFile(mapping.from)) continue;
-        for (Contract.library.modules) |module| {
-            if (std.mem.findScalar(Project.FileId, try facts.moduleRoots(module), mapping.target) == null) continue;
-            if (project.at(mapping.target).file.status != .parsed or try facts.publishesAny(module, mapping.target) != .no) return mapping.from;
-        }
+        if (!mapping.in.inProgram() or facts.knownFile(mapping.from)) continue;
+        if (std.mem.findScalar(Project.FileId, roots, mapping.target) != null) return mapping.from;
     }
     return null;
 }
@@ -142,16 +143,33 @@ fn checkRecursion(c: *Context) Context.Error!void {
     if (!try begin(c, recursion)) return;
     try @import("AegisRecursion.zig").check(c, recursion);
 }
-/// Starts a check of this file. The library's own files are its safe-type internals, and a
-/// published member that no longer resolves is reported where the library is imported, so a
-/// renamed declaration cannot make a gate quietly stop seeing it.
+/// Starts a check of this file. The library's own files are its safe-type internals, where what
+/// a `lint_rules` they declare says that glint cannot read is reported instead (`ownRules`); a
+/// root whose roles are not all read is reported where the library is imported, so a renamed
+/// declaration cannot make a gate quietly stop seeing it.
 fn begin(c: *Context, rule: Rule) Context.Error!bool {
-    if (try c.inLibrary(Contract.library, c.file)) return false;
-    if (try c.drift(Contract.library)) |gap| {
-        const detail = try c.allocator.print("published member {s} of {s} does not resolve ({t}); its operations are not recognized in this file", .{ gap.path, gap.module, gap.why });
-        try c.undecided(rule, gap.start, .unresolved, detail);
+    if (try c.inLibrary(Contract.library, c.file)) {
+        if (rule == access) try ownRules(c);
+        return false;
     }
+    if (try c.drift(Contract.library)) |gap| try c.undecided(rule, gap.start, .unresolved, gap.detail);
     return true;
+}
+/// In aegis's own files, once (under A001): each part of a `lint_rules` this file declares that
+/// glint cannot read (PackageRules.Problem), where it is written, and each role it names that no
+/// pack of glint's reads (a misspelt role would leave its type plain, which clears its sites).
+fn ownRules(c: *Context) Context.Error!void {
+    const declared = try PackageRules.of(c.facts, c.file);
+    const decl = declared.declared orelse return;
+    const tree = &c.project.at(c.file).file.tree;
+    for (declared.problems) |problem| if (problem.file == c.file) {
+        try c.at(access, tree.firstToken(problem.node), try c.allocator.print("lint_rules: {t}: glint does not read this part, so the roles and pairs it declares are not known to the programs that import aegis", .{problem.why}));
+    };
+    for (declared.roles) |role| {
+        if (std.meta.stringToEnum(Contract.Kind, role.role) != null or std.meta.stringToEnum(Report.Metrics.Kind, role.role) != null) continue;
+        const at = c.project.at(decl.file).model.declarations[@backingInt(decl.index)].token;
+        if (decl.file == c.file) try c.at(access, at, try c.allocator.print("lint_rules: role .{s} is none glint reads, so its type reads as plain", .{role.role}));
+    }
 }
 fn checkAccess(c: *Context) Context.Error!void {
     if (!try begin(c, access)) return;

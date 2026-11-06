@@ -733,8 +733,8 @@ test "metrics count assertion calls by the declaration their callee resolves to"
         .{ .name = "program.zig", .bytes = program },
         .{ .name = "std.zig", .bytes = "pub const debug = @import(\"debug.zig\");", .selected = false },
         .{ .name = "debug.zig", .bytes = "pub fn assert(ok: bool) void { if (!ok) unreachable; }", .selected = false },
-        .{ .name = "aegis.zig", .bytes = "pub const assert = @import(\"assert.zig\");", .selected = false },
-        .{ .name = "assert.zig", .bytes = "pub fn invariant(ok: bool, comptime m: []const u8) void { if (!ok) @panic(m); }\npub inline fn never(comptime m: []const u8) noreturn { @panic(m); }", .selected = false },
+        .{ .name = "aegis.zig", .bytes = "pub const assert = @import(\"assert.zig\");\npub const lint_rules = .{ .version = 1, .roles = .{ .{ .type = assert.invariant, .role = .invariant }, .{ .type = assert.never, .role = .never } } };", .selected = false, .package = glint.AegisPack.package.name, .fingerprint = glint.AegisPack.package.fingerprint },
+        .{ .name = "assert.zig", .bytes = "pub fn invariant(ok: bool, comptime m: []const u8) void { if (!ok) @panic(m); }\npub inline fn never(comptime m: []const u8) noreturn { @panic(m); }", .selected = false, .package = glint.AegisPack.package.name, .fingerprint = glint.AegisPack.package.fingerprint },
     };
     const imports = [_]P.Import{
         .{ .from = 0, .spelling = "std", .target = 1 },

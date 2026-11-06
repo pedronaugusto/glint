@@ -3,6 +3,7 @@ const std = @import("std");
 const Project = @import("Project.zig");
 const Ast = std.zig.Ast;
 const Facts = @import("Facts.zig");
+const PackageRules = @import("PackageRules.zig");
 const Model = @import("Model.zig");
 const rules = @import("Rule.zig");
 const Report = @import("Report.zig");
@@ -54,12 +55,12 @@ pub fn resolve(self: *RuleContext, node: Project.NodeId) Error!Facts.Value {
 }
 /// The role `library` publishes for a resolved value: a function it declares, or a type or
 /// instance of a container it declares, seen through pointers, optionals and error unions.
-/// Null when the value is none of its published declarations; recognition follows the module
-/// the program imports the library by, never file bytes or names.
+/// Null when the value is none of its declarations with a role; recognition follows the roles
+/// the library's package declares in `lint_rules`, never file bytes or names.
 pub fn role(self: *RuleContext, library: anytype, value: Facts.Value) Error!?@TypeOf(library).Role {
     return self.facts.role(library, value);
 }
-/// Whether `file` is one of the library's own files, reached from its module roots.
+/// Whether `file` is one of the library's own files: of its package, by the identity the caller states.
 pub fn inLibrary(self: *RuleContext, library: anytype, file: Project.FileId) Error!bool {
     const found = try self.facts.publication(library);
     for (found.files) |own| if (own == file) return true;
@@ -145,12 +146,12 @@ fn isType(self: *RuleContext, node: Ast.Node.Index) Error!bool {
         else => return false,
     }
 }
-/// A required library member that did not resolve, at the first import in this file of the
-/// root that lacks it, under whatever name and however spelled: the import is the root where
-/// Facts resolves it to that root. Recognition of that library is incomplete here, so a rule
-/// reports it as coverage. A library's modules are the program's: a file only a build script's
-/// compilation compiles imports none of them, whatever it names.
-pub const Drift = struct { module: []const u8, path: []const u8, why: Facts.Unknown, start: u32 };
+/// Where a library's roles are not all read (`Facts.Gap`), at the first import in this file of
+/// that root, under whatever name and however spelled: the import is the root where Facts
+/// resolves it to that root. Recognition of that library is incomplete here, so a rule reports
+/// it as coverage. A library's modules are the program's: a file only a build script's
+/// compilation compiles imports none of them, whatever it names. `detail` says what, and where.
+pub const Drift = struct { detail: []const u8, start: u32 };
 pub fn drift(self: *RuleContext, library: anytype) Error!?Drift {
     if (!self.project.at(self.file).input.compilations.inProgram()) return null;
     const found = try self.facts.publication(library);
@@ -159,9 +160,26 @@ pub fn drift(self: *RuleContext, library: anytype) Error!?Drift {
     for (found.gaps) |gap| for (model.import_nodes) |node| {
         const value = try self.facts.resolve(self.file, node);
         if (value != .container or value.container.file != gap.root) continue;
-        return .{ .module = gap.module, .path = gap.path, .why = gap.why, .start = tree.tokenStart(tree.nodeMainToken(node)) };
+        const name = library.package.name;
+        const detail = if (gap.problem) |problem| blk: {
+            const written = &self.project.at(problem.file).file.tree;
+            const line = written.tokenLocation(0, written.firstToken(problem.node)).line + 1;
+            break :blk try self.allocator.print("{s}'s lint_rules at {s}:{d}: {s}; the roles it declares are not all read in this file", .{ name, self.project.at(problem.file).input.name, line, problemText(problem.why) });
+        } else try self.allocator.print("{s}'s root {s} declares no lint_rules; the roles of its types are not read in this file", .{ name, self.project.at(gap.root).input.name });
+        return .{ .detail = detail, .start = tree.tokenStart(tree.nodeMainToken(node)) };
     };
     return null;
+}
+/// What part of a package's `lint_rules` could not be read, in words.
+fn problemText(why: PackageRules.Problem.Why) []const u8 {
+    return switch (why) {
+        .unknown_version => "a version of the vocabulary this glint does not read",
+        .unknown_field => "a field the vocabulary does not have",
+        .malformed => "a value not of the form the vocabulary gives it",
+        .unresolved => "a reference that does not resolve",
+        .foreign => "a declaration outside the package",
+        .refused => "a pair refused as written",
+    };
 }
 
 /// Reports one site; common runner supplies ordering, metadata and reason suppression.
