@@ -341,7 +341,7 @@ pub fn diagnostics(c: *Context, rule: Rule) Context.Error!void {
             // whatever the call gives; whether its writer is the peer's the call decides, which
             // this reading does not keep: undecided at every call (`least` clean).
             const own = given.clean() and try Taint.errorShown(c, c.file, written.value) != .clean;
-            try Taint.recordSink(c, fact, c.file, written.at, given, undecided or own, if (own) .clean else .data, written_message);
+            try Taint.recordSink(c, fact, c.file, written.at, given, .{ .undecided = undecided, .own_input = try Taint.ownAt(c, fact, c.file, written.value), .own_error = own }, if (own) .clean else .data, written_message);
             continue;
         }
         const level = (try Taint.levelAt(c, fact, c.file, written.value)).join(try Taint.errorShown(c, c.file, written.value));
@@ -1595,7 +1595,7 @@ fn judged(c: *Context, flow: ?Taint.Fact, rule: Rule, node: Ast.Node.Index, leve
         // program compiles, which no input reaches.
         const given = (try Taint.givenAt(c, fact, c.file, node)) orelse return;
         // Through a call that does not resolve, what it takes from the parameters is not known.
-        return Taint.recordSink(c, fact, c.file, node, given, try Taint.unknownAt(c, fact, c.file, node), least, message);
+        return Taint.recordSink(c, fact, c.file, node, given, .{ .undecided = try Taint.unknownAt(c, fact, c.file, node), .own_input = try Taint.ownAt(c, fact, c.file, node) }, least, message);
     };
     if (level == .unknown) return c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a value that passed through a call that does not resolve may be input here");
     if (!level.reaches(least)) return;
@@ -1740,8 +1740,16 @@ fn passedSinks(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (*C
                         entry.undecided = true;
                         changed = true;
                     }
+                    if (one.own_input and !entry.own_input) {
+                        entry.own_input = true;
+                        changed = true;
+                    }
+                    if (one.own_error and !entry.own_error) {
+                        entry.own_error = true;
+                        changed = true;
+                    }
                 } else {
-                    try list.append(c.allocator, .{ .at = one.at, .holder = caller, .given = given, .least = one.least, .message = one.message, .undecided = undecided });
+                    try list.append(c.allocator, .{ .at = one.at, .holder = caller, .given = given, .least = one.least, .message = one.message, .undecided = undecided, .own_input = one.own_input, .own_error = one.own_error });
                     changed = true;
                 }
             }
@@ -1818,15 +1826,21 @@ fn passedAt(c: *Context, flow: Taint.Fact, rule: Rule, call: Ast.Node.Index, dec
         const caller = Taint.functionKey(flow, c.file, call) orelse return;
         const through = try Taint.throughCall(c, flow, c.file, call, one.given);
         const given = (try Taint.givenThrough(c, flow, c.file, call, one.given)) orelse (try Taint.givenAt(c, flow, c.file, call)) orelse Taint.Dep{};
-        try list.append(c.allocator, .{ .at = one.at, .holder = caller, .given = given, .least = one.least, .message = one.message, .undecided = one.undecided or through == null or Taint.throughUnknown(flow, through.?) });
+        try list.append(c.allocator, .{ .at = one.at, .holder = caller, .given = given, .least = one.least, .message = one.message, .undecided = one.undecided or through == null or Taint.throughUnknown(flow, through.?), .own_input = one.own_input, .own_error = one.own_error });
         return;
     }
     if (try reaches(c, flow, call, one)) try passedReport(c, flow, rule, call, decl, one, 0);
 }
 
 /// Whether what the call `call` gives `sink` may be input it takes: its level at the call at
-/// the sink's least, or not known.
+/// the sink's least, or not known. A sink whose reading is not known reaches every call but one
+/// that gives its callee nothing input may reach it by (`Taint.plainClean`): what it meets then
+/// is its own package's input, which that package's lint judges. An error a function writes of
+/// its own reaches every call: its writer may be one the program stored where the function
+/// reads it, which the error's fact does not follow.
 fn reaches(c: *Context, flow: Taint.Fact, call: Ast.Node.Index, one: Taint.PassedSink) Context.Error!bool {
+    if (one.undecided and !one.own_error and try Taint.plainClean(c, flow, c.file, call)) return false;
+    if (one.own_input and try Taint.inputBeside(c, flow)) return true;
     const given = (try Taint.throughCall(c, flow, c.file, call, one.given)) orelse return true;
     const level = Taint.levelOf(flow, c.file, call, given);
     return level == .unknown or level.reaches(one.least) or (one.undecided and level != .clean);
@@ -1845,6 +1859,10 @@ fn passedReport(c: *Context, flow: Taint.Fact, rule: Rule, call: Ast.Node.Index,
         return c.undecided(rule, tree.tokenStart(tree.nodeMainToken(call)), .unresolved, try c.allocator.print("input passed to {s}, whose parameters this call's arguments are not known for, may reach a sink it reads ({s}:{d}{s})", .{ name, held_name, line, others }));
     };
     const level = Taint.levelOf(flow, c.file, call, given);
+    // Input of the function's own, where the program holds input it may read beside its
+    // parameters (`Taint.inputBeside`), may be the program's.
+    if (!one.undecided and level != .unknown and !level.reaches(one.least)) return c.undecided(rule, tree.tokenStart(tree.nodeMainToken(call)), .unresolved, try c.allocator.print("{s} meets input of its own at a sink ({s}:{d}: {s}{s}), which may be the program's: the program holds input where {s} may read it beside its parameters", .{ name, held_name, line, one.message, others, name }));
+    if (one.own_error) return c.undecided(rule, tree.tokenStart(tree.nodeMainToken(call)), .unresolved, try c.allocator.print("{s} writes an error of its own to a writer its caller decides, which this call may give a peer ({s}:{d}: {s}{s})", .{ name, held_name, line, one.message, others }));
     if (one.undecided or level == .unknown) return c.undecided(rule, tree.tokenStart(tree.nodeMainToken(call)), .unresolved, try c.allocator.print("input passed to {s} may reach a site its binding, a call back into its file or the rule's reading there leaves undecided ({s}:{d}: {s}{s})", .{ name, held_name, line, one.message, others }));
     try c.at(rule, tree.nodeMainToken(call), try c.allocator.print("input passed to {s} reaches {s}:{d}: {s}{s}", .{ name, held_name, line, one.message, others }));
 }

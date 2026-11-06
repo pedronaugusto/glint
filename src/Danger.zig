@@ -30,7 +30,10 @@ pub const peer_input: Taint.Spec = .{ .source = .{ .input = .{ .peer = true, .op
 /// A012's: peer input, and the sizes the program hands std (`Taint.sinkSites`), judged where
 /// they are a number.
 pub const bounded_input: Taint.Spec = .{ .source = peer_input.source, .control = peer_input.control, .answers = peer_input.answers, .sinks = .{ .size = true }, .reaches = .number };
-pub const peer_writer: Taint.Spec = .{ .source = .peer_writer, .control = true };
+/// A018's writers: a value that is or holds a writer reaching a peer. A writer reaches a value
+/// only as data does (a copy, a pointer, a store), never by what a branch or a loop's passes
+/// decide: a value chosen under a condition that reads a writer holds no writer of its own.
+pub const peer_writer: Taint.Spec = .{ .source = .peer_writer, .control = false };
 /// A018's: an error's text, which aegis's public text and an error's integer answer, judged
 /// where a peer writer writes it (`Taint.sinkSites`). What an error decides is no text of it.
 pub const error_text: Taint.Spec = .{ .source = .error_text, .control = false, .answers = .{ .aegis = true, .int_from_error = true }, .sinks = .{ .peer_write = true } };
@@ -1006,7 +1009,9 @@ fn contractLevel(c: *Context, flow: Taint.Fact, node: Ast.Node.Index, reads: Rea
     if (flow.flow.recording != null) {
         var given: Taint.Dep = .{};
         var undecided = reads.deep;
+        var own = false;
         for (reads.values.items) |value| {
+            if (try Taint.ownAt(c, flow, c.file, value)) own = true;
             // A value whose parameters are not read is not known to take none of them.
             const taken = (try Taint.givenAt(c, flow, c.file, value)) orelse {
                 undecided = true;
@@ -1015,7 +1020,7 @@ fn contractLevel(c: *Context, flow: Taint.Fact, node: Ast.Node.Index, reads: Rea
             given = try given.join(c.allocator, taken);
             if (try Taint.unknownAt(c, flow, c.file, value)) undecided = true;
         }
-        try Taint.recordSink(c, flow, c.file, node, given, undecided, .data, message);
+        try Taint.recordSink(c, flow, c.file, node, given, .{ .undecided = undecided, .own_input = own }, .data, message);
         return null;
     }
     var out: Taint.Level = if (reads.deep) .unknown else .clean;

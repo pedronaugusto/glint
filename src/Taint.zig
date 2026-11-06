@@ -86,25 +86,29 @@ pub const Dep = struct {
     /// whose value it was written from, as the callers give them.
     unchecked: Levels = .clean,
     bare: Slots = .{},
+    /// The parameters whose number it was written from (`s.len = n`, `n` made a number of a
+    /// parameter's data), as the callers give them, a number in each fact's lane where they give
+    /// data (`concrete`'s `numbers`).
+    bare_numbers: Slots = .{},
 
     /// The same value, its slots' tails on `gpa`: what a solve round keeps past the round.
     fn kept(a: Dep, gpa: Allocator) Allocator.Error!Dep {
-        return .{ .level = a.level, .params = try a.params.kept(gpa), .numbers = try a.numbers.kept(gpa), .ranged = try a.ranged.kept(gpa), .maybe = try a.maybe.kept(gpa), .ruled = try a.ruled.kept(gpa), .length = a.length, .lengths = try a.lengths.kept(gpa), .ruled_lengths = try a.ruled_lengths.kept(gpa), .counted = try a.counted.kept(gpa), .counted_numbers = try a.counted_numbers.kept(gpa), .unchecked = a.unchecked, .bare = try a.bare.kept(gpa) };
+        return .{ .level = a.level, .params = try a.params.kept(gpa), .numbers = try a.numbers.kept(gpa), .ranged = try a.ranged.kept(gpa), .maybe = try a.maybe.kept(gpa), .ruled = try a.ruled.kept(gpa), .length = a.length, .lengths = try a.lengths.kept(gpa), .ruled_lengths = try a.ruled_lengths.kept(gpa), .counted = try a.counted.kept(gpa), .counted_numbers = try a.counted_numbers.kept(gpa), .unchecked = a.unchecked, .bare = try a.bare.kept(gpa), .bare_numbers = try a.bare_numbers.kept(gpa) };
     }
 
     pub fn join(a: Dep, gpa: Allocator, b: Dep) Allocator.Error!Dep {
-        return .{ .level = a.level.join(b.level), .params = try a.params.unite(gpa, b.params), .numbers = try a.numbers.unite(gpa, b.numbers), .ranged = try a.ranged.unite(gpa, b.ranged), .maybe = try a.maybe.unite(gpa, b.maybe), .ruled = try a.ruled.unite(gpa, b.ruled), .length = a.length.join(b.length), .lengths = try a.lengths.unite(gpa, b.lengths), .ruled_lengths = try a.ruled_lengths.unite(gpa, b.ruled_lengths), .counted = try a.counted.unite(gpa, b.counted), .counted_numbers = try a.counted_numbers.unite(gpa, b.counted_numbers), .unchecked = a.unchecked.join(b.unchecked), .bare = try a.bare.unite(gpa, b.bare) };
+        return .{ .level = a.level.join(b.level), .params = try a.params.unite(gpa, b.params), .numbers = try a.numbers.unite(gpa, b.numbers), .ranged = try a.ranged.unite(gpa, b.ranged), .maybe = try a.maybe.unite(gpa, b.maybe), .ruled = try a.ruled.unite(gpa, b.ruled), .length = a.length.join(b.length), .lengths = try a.lengths.unite(gpa, b.lengths), .ruled_lengths = try a.ruled_lengths.unite(gpa, b.ruled_lengths), .counted = try a.counted.unite(gpa, b.counted), .counted_numbers = try a.counted_numbers.unite(gpa, b.counted_numbers), .unchecked = a.unchecked.join(b.unchecked), .bare = try a.bare.unite(gpa, b.bare), .bare_numbers = try a.bare_numbers.unite(gpa, b.bare_numbers) };
     }
     fn lowered(a: Dep, gpa: Allocator) Allocator.Error!Dep {
-        return .{ .level = a.level.lowered(), .maybe = try Slots.all(gpa, &.{ a.params, a.numbers, a.ranged, a.maybe }), .ruled = a.ruled, .counted = a.counted, .counted_numbers = a.counted_numbers, .length = a.length, .lengths = a.lengths, .ruled_lengths = a.ruled_lengths, .unchecked = a.unchecked, .bare = a.bare };
+        return .{ .level = a.level.lowered(), .maybe = try Slots.all(gpa, &.{ a.params, a.numbers, a.ranged, a.maybe }), .ruled = a.ruled, .counted = a.counted, .counted_numbers = a.counted_numbers, .length = a.length, .lengths = a.lengths, .ruled_lengths = a.ruled_lengths, .unchecked = a.unchecked, .bare = a.bare, .bare_numbers = a.bare_numbers };
     }
     /// Data made a number: a shift or a product of it, or what std decodes from it.
     fn widened(a: Dep, gpa: Allocator) Allocator.Error!Dep {
-        return .{ .level = a.level.widened(), .params = a.params, .numbers = try Slots.all(gpa, &.{ a.numbers, a.params, a.ranged }), .maybe = a.maybe, .ruled = a.ruled, .counted_numbers = try a.counted.unite(gpa, a.counted_numbers), .length = a.length, .lengths = a.lengths, .ruled_lengths = a.ruled_lengths, .unchecked = a.unchecked, .bare = a.bare };
+        return .{ .level = a.level.widened(), .params = a.params, .numbers = try Slots.all(gpa, &.{ a.numbers, a.params, a.ranged }), .maybe = a.maybe, .ruled = a.ruled, .counted_numbers = try a.counted.unite(gpa, a.counted_numbers), .length = a.length, .lengths = a.lengths, .ruled_lengths = a.ruled_lengths, .unchecked = a.unchecked, .bare = a.bare, .bare_numbers = a.bare_numbers };
     }
     /// A value kept to a range the program chose: a number is data there.
     fn narrowed(a: Dep, gpa: Allocator) Allocator.Error!Dep {
-        return .{ .level = a.level.narrowed(), .ranged = try Slots.all(gpa, &.{ a.params, a.numbers, a.ranged }), .maybe = a.maybe, .ruled = try Slots.all(gpa, &.{ a.ruled, a.counted, a.counted_numbers }), .length = a.length, .lengths = a.lengths, .ruled_lengths = a.ruled_lengths, .unchecked = a.unchecked, .bare = a.bare };
+        return .{ .level = a.level.narrowed(), .ranged = try Slots.all(gpa, &.{ a.params, a.numbers, a.ranged }), .maybe = a.maybe, .ruled = try Slots.all(gpa, &.{ a.ruled, a.counted, a.counted_numbers }), .length = a.length, .lengths = a.lengths, .ruled_lengths = a.ruled_lengths, .unchecked = a.unchecked, .bare = a.bare, .bare_numbers = a.bare_numbers };
     }
     /// What a condition reading this value decides: data held to the choice, for the facts
     /// that take what they decide (`Masks.control`); for the others nothing.
@@ -126,13 +130,13 @@ pub const Dep = struct {
     /// build holds it there (`unchecked`). A parameter's own length (its `lengthSlot`) is
     /// what its callers measured; a parameter's value bounding a slice is data.
     fn measured(a: Dep) Dep {
-        return .{ .level = a.length.narrowed().join(a.unchecked), .params = a.bare, .ranged = a.lengths, .ruled = a.ruled_lengths };
+        return .{ .level = a.length.narrowed().join(a.unchecked), .params = a.bare, .numbers = a.bare_numbers, .ranged = a.lengths, .ruled = a.ruled_lengths };
     }
     /// Memory whose length is this value written in place (`s.len = n`), which no build
-    /// checks against the memory: the value's level, and a parameter's as its callers give it
-    /// (a number where it was made one).
+    /// checks against the memory: the value's level, and a parameter's as its callers give it,
+    /// a number in each fact's lane where it was made one (`bare_numbers`).
     fn written(a: Dep, gpa: Allocator) Allocator.Error!Dep {
-        return .{ .unchecked = a.level.join(if (!a.numbers.empty() or !a.counted_numbers.empty()) Levels.all(.number) else .clean), .bare = try a.params.unite(gpa, a.counted), .lengths = try a.ranged.unite(gpa, a.maybe), .ruled_lengths = a.ruled };
+        return .{ .unchecked = a.level, .bare = try a.params.unite(gpa, a.counted), .bare_numbers = try a.numbers.unite(gpa, a.counted_numbers), .lengths = try a.ranged.unite(gpa, a.maybe), .ruled_lengths = a.ruled };
     }
     /// Memory whose length a measure gave (`concreteLength`), read back.
     fn measuredLength(level: Levels) Dep {
@@ -148,14 +152,14 @@ pub const Dep = struct {
     }
     /// Its length alone: what a slice to the end of this memory keeps of it.
     fn lengthOnly(a: Dep) Dep {
-        return .{ .length = a.length, .lengths = a.lengths, .ruled_lengths = a.ruled_lengths, .unchecked = a.unchecked, .bare = a.bare };
+        return .{ .length = a.length, .lengths = a.lengths, .ruled_lengths = a.ruled_lengths, .unchecked = a.unchecked, .bare = a.bare, .bare_numbers = a.bare_numbers };
     }
     /// Whether it takes nothing: no level of its own and no parameter.
     pub fn clean(a: Dep) bool {
-        return a.level.isClean() and a.params.empty() and a.numbers.empty() and a.ranged.empty() and a.maybe.empty() and a.ruled.empty() and a.length.isClean() and a.lengths.empty() and a.ruled_lengths.empty() and a.counted.empty() and a.counted_numbers.empty() and a.unchecked.isClean() and a.bare.empty();
+        return a.level.isClean() and a.params.empty() and a.numbers.empty() and a.ranged.empty() and a.maybe.empty() and a.ruled.empty() and a.length.isClean() and a.lengths.empty() and a.ruled_lengths.empty() and a.counted.empty() and a.counted_numbers.empty() and a.unchecked.isClean() and a.bare.empty() and a.bare_numbers.empty();
     }
     fn eql(a: Dep, b: Dep) bool {
-        return a.level.eql(b.level) and a.params.eql(b.params) and a.numbers.eql(b.numbers) and a.ranged.eql(b.ranged) and a.maybe.eql(b.maybe) and a.ruled.eql(b.ruled) and a.length.eql(b.length) and a.lengths.eql(b.lengths) and a.ruled_lengths.eql(b.ruled_lengths) and a.counted.eql(b.counted) and a.counted_numbers.eql(b.counted_numbers) and a.unchecked.eql(b.unchecked) and a.bare.eql(b.bare);
+        return a.level.eql(b.level) and a.params.eql(b.params) and a.numbers.eql(b.numbers) and a.ranged.eql(b.ranged) and a.maybe.eql(b.maybe) and a.ruled.eql(b.ruled) and a.length.eql(b.length) and a.lengths.eql(b.lengths) and a.ruled_lengths.eql(b.ruled_lengths) and a.counted.eql(b.counted) and a.counted_numbers.eql(b.counted_numbers) and a.unchecked.eql(b.unchecked) and a.bare.eql(b.bare) and a.bare_numbers.eql(b.bare_numbers);
     }
 };
 
@@ -411,6 +415,9 @@ pub const Flow = struct {
     /// Per field and container-level variable, whether a store through memory no place names may
     /// reach it (`reachedUnnamed`).
     unnamed_reach: std.AutoHashMapUnmanaged(Facts.Decl, bool) = .empty,
+    /// What a function of a file the run does not select may read of input other than through
+    /// its parameters (`besideParameters`), found once the solve is done.
+    beside: ?Levels = null,
     /// The files that are the program (`Program`).
     program: *const Program = undefined,
     /// std's namespaces whose functions make data from data: what they give holds what they take.
@@ -1243,10 +1250,16 @@ fn places(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.Inde
         .field_access => {
             // The program's own field holds the fact by its declaration; a field of a type
             // outside it (std's writer, a dependency's list) is every instance's everywhere, so
-            // the store reaches only the value it belongs to.
+            // the store reaches only the value it belongs to. A container-level variable named
+            // through its namespace (`w.limit`) is that variable, as its reads take it, wherever
+            // it is declared; the namespace holds no memory the store writes.
             const holder = tree.nodeData(target).node_and_token[0];
             switch (try c.facts.definition(f.file, target)) {
-                .decl => |decl| if (c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind == .field and flow.own(decl.file)) return addPlace(c, out, .{ .global = decl }),
+                .decl => |decl| switch (c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind) {
+                    .field => if (flow.own(decl.file)) return addPlace(c, out, .{ .global = decl }),
+                    .variable => if (Facts.accesses.global(c.facts, decl)) return addPlace(c, out, .{ .global = decl }),
+                    else => {},
+                },
                 // A member that does not resolve, or one of a holder whose type does not, is
                 // memory no place names: a field it may be reads it there (`throughUnnamed`).
                 .unknown => try addPlace(c, out, .unknown),
@@ -2542,6 +2555,7 @@ fn summarized(c: *Context, flow: *Flow, function: Function.Id, callee: Callee, s
             if (summary.maybe.has(slot)) out = try out.join(c.allocator, try held_there.lowered(c.allocator));
             if (summary.lengths.has(slot)) out = try out.join(c.allocator, try held_there.sizing(c.allocator));
             if (summary.bare.has(slot)) out = try out.join(c.allocator, try held_there.written(c.allocator));
+            if (summary.bare_numbers.has(slot)) out = try out.join(c.allocator, try (try held_there.widened(c.allocator)).written(c.allocator));
             if (summary.ruled.has(slot)) out = try out.join(c.allocator, try held_there.ruling(c.allocator, flow.masks));
             if (summary.ruled_lengths.has(slot)) out = try out.join(c.allocator, try (try held_there.ruling(c.allocator, flow.masks)).sizing(c.allocator));
             if (summary.counted.has(slot)) out = try out.join(c.allocator, try held_there.counting(c.allocator, flow.masks));
@@ -2729,6 +2743,18 @@ pub const PassedSink = struct {
     least: Level,
     message: []const u8,
     undecided: bool = false,
+    /// Input of its function's own reaches it, beside what `given` takes from the parameters
+    /// (`ownAt`): the dependency's own lint's, but where the program holds input a function of
+    /// a file the run does not select may read beside its parameters (`inputBeside`), it may be
+    /// the program's.
+    own_input: bool = false,
+    /// A018: its function writes an error of its own (`errorShown`), whatever the call gives, to
+    /// a writer its caller decides; whether that writer is a peer's the reading does not keep,
+    /// so the sink is undecided at every call for that, not for what its value takes.
+    own_error: bool = false,
+
+    /// What a rule says of a sink it records, beside what its value takes (`recordSink`).
+    pub const Recorded = struct { undecided: bool = false, own_input: bool = false, own_error: bool = false };
 
     /// The same sink, what it holds (its Dep's slots' tails, its message) on `gpa`: kept past the
     /// memory the reading that found it is given back with.
@@ -2739,6 +2765,89 @@ pub const PassedSink = struct {
         return out;
     }
 };
+
+/// Whether the call `node` gives its callee nothing input may reach the callee by: each
+/// argument, a bound receiver first, clean and plain (`plainValue`: a number, a truth value, an
+/// error, an enum's tag, the program's own constant text, or arrays, optionals and records of
+/// them), and no input held where a function of a file the run does not select may read it
+/// beside its parameters (`besideParameters`). What such a callee then meets of input is its own
+/// package's, which that package's own lint judges (designs/glint-provenance.md part 1). A
+/// function, a pointer, a type or a record holding one may hand the callee input its level here
+/// does not show: a function reading a peer, memory input fills, a type's declarations.
+pub fn plainClean(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    if (try inputBeside(c, fact)) return false;
+    const callee = (try resolveCall(c, fact.flow, file, node)) orelse return false;
+    if (callee.kind != .program) return false;
+    for (callee.args) |arg| {
+        if (!try plainValue(c, try c.facts.resolve(file, arg), 0)) return false;
+        if (try levelAt(c, fact, file, arg) != .clean) return false;
+    }
+    return true;
+}
+
+/// Whether a value of `value`'s type holds nothing but plain data: a number (a literal's
+/// `scalar`, the program's own constant text among them), a truth value, an error, an enum's
+/// tag, a primitive type other than `type` and `anyopaque`, and arrays, optionals, error unions
+/// and records of them, by each field the record holds. A pointer, a function, a type (whose
+/// declarations a callee may read), an opaque, a literal or a value that does not resolve may
+/// hold more.
+fn plainValue(c: *Context, value: Facts.Value, depth: usize) Context.Error!bool {
+    // A type nested this deep is read as one that may hold more.
+    if (depth > 8) return false;
+    switch (value) {
+        .scalar, .error_set => return true,
+        .primitive => |name| return !std.mem.eql(u8, name, "type") and !std.mem.eql(u8, name, "anyopaque"),
+        .optional, .error_union, .array => |inner| return plainValue(c, inner.*, depth + 1),
+        .alternatives => |each| {
+            for (each) |one| if (!try plainValue(c, one, depth + 1)) return false;
+            return true;
+        },
+        .instance => |k| {
+            if (k.symbolic and k.made_by == null) return false;
+            switch (c.facts.kindOf(k) orelse return false) {
+                .keyword_enum => return true,
+                .keyword_struct, .keyword_union => {},
+                else => return false,
+            }
+            for (try c.facts.heldFields(k)) |field| if (!try plainValue(c, field.value, depth + 1)) return false;
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// What a function of a file the run does not select may read of input other than through its
+/// parameters, per lane: a field or a container-level variable that file's package declares,
+/// what any file stores into one included; one a selected file declares where a file the run
+/// does not select imports that file (`@import("root")`, say); and memory no place names. The
+/// whole program's solve gives each its level, so a store of the program's input into one shows
+/// here. Read once the solve is done.
+pub fn inputBeside(c: *Context, fact: Fact) Context.Error!bool {
+    return (try besideParameters(c, fact)).at(fact.lane) != .clean;
+}
+
+/// `inputBeside`'s levels, every lane.
+fn besideParameters(c: *Context, fact: Fact) Context.Error!Levels {
+    const flow = fact.flow;
+    if (flow.beside) |found| return found;
+    var imported: std.AutoHashMapUnmanaged(Project.FileId, void) = .empty;
+    defer imported.deinit(c.facts.gpa);
+    for (c.project.imports) |mapping| {
+        if (judged(c, mapping.from) or !try c.facts.program(mapping.from)) continue;
+        if (judged(c, mapping.target)) try imported.put(c.facts.gpa, mapping.target, {});
+    }
+    var out = flow.unnamed.join(flow.unnamed_length);
+    for ([_]*const std.AutoHashMapUnmanaged(Facts.Decl, Levels){ &flow.globals, &flow.lengths }) |map| {
+        var it = map.iterator();
+        while (it.next()) |entry| {
+            const decl = entry.key_ptr.*;
+            if (judged(c, decl.file) and !imported.contains(decl.file)) continue;
+            out = out.join(entry.value_ptr.*);
+        }
+    }
+    flow.beside = out;
+    return out;
+}
 
 /// A call a function of the file being read makes into a function of that file.
 pub const PassedCall = struct { node: Ast.Node.Index, decl: Facts.Decl };
@@ -2755,10 +2864,19 @@ pub fn readHere(fact: Fact, file: Project.FileId, node: Ast.Node.Index) bool {
 /// kept with what it takes from its function's parameters (`given`, as `givenAt` keeps it), to
 /// be judged at the calls into that function. A sink outside a function is kept by none: a
 /// container's declarations are evaluated as the program compiles, so no input reaches them.
-pub fn recordSink(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Index, given: Dep, undecided: bool, least: Level, message: []const u8) Allocator.Error!void {
+pub fn recordSink(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Index, given: Dep, recorded: PassedSink.Recorded, least: Level, message: []const u8) Allocator.Error!void {
     const list = fact.flow.recording orelse return;
     const function = functionKey(fact, file, node) orelse return;
-    try list.append(c.allocator, .{ .at = .{ .file = file, .node = node }, .holder = function, .given = given, .least = least, .message = message, .undecided = undecided });
+    try list.append(c.allocator, .{ .at = .{ .file = file, .node = node }, .holder = function, .given = given, .least = least, .message = message, .undecided = recorded.undecided or recorded.own_error, .own_input = recorded.own_input, .own_error = recorded.own_error });
+}
+
+/// Whether the value `node` holds takes input of its function's own, beside what it takes from
+/// the parameters (what `givenAt` leaves out): a read in the function, or a field, a
+/// container-level variable or memory no place names that holds input.
+pub fn ownAt(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    const function = owner(fact.flow, file, node) orelse return false;
+    const given = try dep(c, fact.flow, function, node);
+    return given.level.at(fact.lane) != .clean or given.length.at(fact.lane) != .clean or given.unchecked.at(fact.lane) != .clean;
 }
 
 /// The function holding `node`, as an id the fact keeps for the run; null outside them.

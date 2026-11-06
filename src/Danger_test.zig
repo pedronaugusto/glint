@@ -4279,10 +4279,12 @@ test "A009 and A010 judge a dependency's sinks at the call that gives them input
     }
 }
 
-test "A009 keeps what it leaves undecided in a dependency's function: every call into it is undecided, none clean" {
+test "A009 keeps what it leaves undecided in a dependency's function: a call into it that may give it input is undecided, none clean" {
     // `dep.zig`'s loop is bounded through `pred.zig`'s predicate, a call A009 does not follow
-    // there: undecided while the file is read, so undecided at each selected call into `spin`,
-    // the program's own value too (what the site depends on is not read). `idle` loops on nothing.
+    // there: undecided while the file is read, so undecided at each selected call into `spin`
+    // that may give it input. `spin(3)` gives it a constant and the program holds no input
+    // where `dep.zig` may read it beside its parameters: what `spin` meets is its package's own
+    // (`Taint.plainClean`). `idle` loops on nothing.
     const dep: sources.Extra = .{ .name = "dep.zig", .package = "dep", .bytes =
         \\const pred = @import("pred.zig");
         \\pub fn spin(n: u64) u64 {
@@ -4319,7 +4321,63 @@ test "A009 keeps what it leaves undecided in a dependency's function: every call
         try std.testing.expect(std.mem.find(u8, entry.detail, "input passed to spin") != null);
         undecided += 1;
     };
-    try std.testing.expectEqual(@as(usize, 2), undecided);
+    try std.testing.expectEqual(@as(usize, 1), undecided);
+}
+
+test "A009 reads a dependency's function at a call by what may reach it: a pointer, a function or a global the program fills keeps it undecided" {
+    // `spin` loops on a predicate A009 does not follow there (undecided while `dep.zig` is
+    // read); `pick` indexes a table by a container-level variable, input of its own beside its
+    // parameters. Each row: the program's body, and the calls left undecided.
+    const dep: sources.Extra = .{ .name = "dep.zig", .package = "dep", .bytes =
+        \\const pred = @import("pred.zig");
+        \\pub var limit: u64 = 0;
+        \\pub var at: u8 = 0;
+        \\const table = [_]u8{ 1, 2, 3, 4 };
+        \\pub fn spin(n: u64, get: ?*const fn () u64) u64 {
+        \\    var i: u64 = 0;
+        \\    var sum: u64 = 0;
+        \\    const bound = if (get) |g| g() else n;
+        \\    while (pred.below(i, bound + limit)) : (i += 1) sum +%= i;
+        \\    return sum;
+        \\}
+        \\pub fn pick(n: u8) u8 {
+        \\    _ = n;
+        \\    return table[at];
+        \\}
+    };
+    const pred: sources.Extra = .{ .name = "pred.zig", .package = "dep", .bytes =
+        \\pub fn below(a: u64, b: u64) bool {
+        \\    return a < b;
+        \\}
+    };
+    for ([_]struct { []const u8, usize }{
+        // Constants, the globals the program's own: clean.
+        .{ "    dep.limit = 3;\n    dep.at = 1;\n    _ = dep.spin(3, null);\n    _ = dep.pick(0);\n    _ = try r.takeByte();\n", 0 },
+        // A function handed: it may read input, which the call's level does not show.
+        .{ "    _ = dep.spin(3, &seven);\n    _ = try r.takeByte();\n", 1 },
+        // Input stored into a variable of the dependency's: `spin`, left undecided there, may
+        // meet it; `pick` reads `at`, which holds none.
+        .{ "    dep.limit = try r.takeByte();\n    _ = dep.spin(3, null);\n    _ = dep.pick(0);\n", 1 },
+        .{ "    dep.at = try r.takeByte();\n    _ = dep.pick(0);\n", 1 },
+    }) |row| {
+        const body, const expected = row;
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ "const std = @import(\"std\");\nconst dep = @import(\"dep.zig\");\nfn seven() u64 {\n    return 7;\n}\npub fn f(r: *std.Io.Reader) !void {\n", body, "}\n" });
+        defer std.testing.allocator.free(source);
+        var project = try sources.projectAs(std.testing.allocator, source, .{ .package = "pkg" }, &(std_files ++ [_]sources.Extra{ dep, pred }), &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "dep.zig", .target = std_files.len }, .{ .from = std_files.len, .spelling = "pred.zig", .target = std_files.len + 1 } }));
+        defer project.deinit();
+        var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.untrusted_input, .level = .report }} }, .{ .project_rules = &pack.rules });
+        defer report.deinit();
+        try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
+        var undecided: usize = 0;
+        for (report.coverage) |entry| if (entry.rule != null) {
+            undecided += 1;
+        };
+        std.testing.expectEqual(expected, undecided) catch |err| {
+            std.debug.print("row:\n{s}\n", .{body});
+            for (report.coverage) |entry| std.debug.print("  {s}\n", .{entry.detail});
+            return err;
+        };
+    }
 }
 
 test "A013 judges a dependency's contracts at the call that gives them input: an assert, an unreachable a branch chooses, a `.?`, and one through the dependency's own call" {
@@ -4410,7 +4468,7 @@ test "A018 judges a dependency's peer writes at the call that gives them an erro
     var undecided: usize = 0;
     for (report.coverage) |entry| if (entry.rule != null) {
         undecided += 1;
-        try std.testing.expect(std.mem.find(u8, entry.detail, "input passed to fail") != null);
+        try std.testing.expect(std.mem.find(u8, entry.detail, "fail writes an error of its own") != null);
     };
     try std.testing.expectEqual(@as(usize, 1), undecided);
     const lines = [_]u32{ 4, 5 };
