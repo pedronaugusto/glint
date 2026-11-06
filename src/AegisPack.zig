@@ -849,34 +849,104 @@ fn copiedOwner(k: Contract.Kind) bool {
     };
 }
 
-/// What ends a local owner's obligation, by kind: its release, or a declared transfer that
-/// moves it into storage the caller names. Null for kinds with no cleanup to owe.
+/// The kinds whose obligation a pair aegis declares names (`PackageRules.Pair`): a guard, its
+/// hand-off, a reservation, a scope and a result that must be used. What ends, moves or checks one
+/// is read from the callee's declaration, never its name.
+fn logical(k: Contract.Kind) bool {
+    return switch (k) {
+        .guard, .ranked_guard, .handoff, .reservation, .scope, .must_use => true,
+        else => false,
+    };
+}
+/// Whether a local owner of kind `k` owes cleanup: a pair's obligation, or an owner's release.
+fn owes(k: Contract.Kind) bool {
+    return logical(k) or releases(k) != null;
+}
+/// What the call at `node` in `file` does to an obligation a pair aegis declares, by its callee's
+/// declaration (`PackageRules.operation`); null where it does none. A choice of callees that do
+/// different things is unknown; a callee that does not resolve is found as Zig finds it, by its
+/// name in the holder's type where that type has a pair's role, and is unknown otherwise.
+fn pairCall(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?PackageRules.Operation {
+    const call = (try Facts.calls.at(c.facts, file, node)) orelse return null;
+    switch (call.callee) {
+        .function => |decl| return PackageRules.operation(c.facts, Contract.library, decl),
+        .choice => |all| {
+            var found: ?PackageRules.Operation = null;
+            for (all, 0..) |decl, i| {
+                const each = try PackageRules.operation(c.facts, Contract.library, decl);
+                if (i == 0) {
+                    found = each;
+                } else if (!std.meta.eql(found, each)) return .unknown;
+            }
+            return found;
+        },
+        .any => {
+            const path = try Facts.accesses.pathOf(c.facts, file, call.callee_expr);
+            if (path.steps.len < 2 or path.steps[0].kind != .field) return .unknown;
+            const name = path.steps[0].name orelse return .unknown;
+            const holder = recordOf(try c.facts.resolve(file, path.steps[1].node)) orelse return .unknown;
+            const k = (try PackageRules.role(c.facts, Contract.library, .{ .container = holder })) orelse return .unknown;
+            if (!logical(k)) return .unknown;
+            const decl = c.facts.member(holder, name) orelse return null;
+            return PackageRules.operation(c.facts, Contract.library, decl);
+        },
+    }
+}
+/// Whether the function the call at `node` calls declares an optional or error-union result: one
+/// that may give nothing.
+fn fallibleResult(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    const call = (try Facts.calls.at(c.facts, file, node)) orelse return false;
+    const decl = switch (call.callee) {
+        .function => |decl| decl,
+        .choice, .any => return false,
+    };
+    const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+    const tree = &c.project.at(decl.file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, record.node) orelse return false;
+    const result = proto.ast.return_type.unwrap() orelse return false;
+    if (Model.inferredErrors(tree, result)) return true;
+    return switch (tree.nodeTag(result)) {
+        .optional_type, .error_union => true,
+        else => false,
+    };
+}
+
+/// Whether the call at `node` ends a local logical obligation: a release, or a move into storage
+/// the caller names; null where its callee is not known.
+fn endsObligation(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?bool {
+    const found = (try pairCall(c, file, node)) orelse return false;
+    return switch (found) {
+        .release => true,
+        .transfer => |to| to == .argument,
+        .teardown => false,
+        .unknown => null,
+    };
+}
+/// `endsObligation` in the checked file: one not known is undecided at the call, never no release.
+fn endsHere(c: *Context, node: Ast.Node.Index) Context.Error!bool {
+    return (try endsObligation(c, c.file, node)) orelse {
+        const tree = &c.project.at(c.file).file.tree;
+        try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a call on an aegis obligation whose callee does not resolve to what its pair declares");
+        return true;
+    };
+}
+
+/// What ends a local owner's obligation, by kind, for the owners whose releases their bodies will
+/// show (glint-b's release summary takes these): its release, or a declared transfer that moves it
+/// into storage the caller names. A pair's obligation is read from the callee's declaration
+/// (`logical`, `endsObligation`). Null for kinds with no cleanup to owe.
 fn releases(k: Contract.Kind) ?[]const []const u8 {
     return switch (k) {
         .secret, .bytes => &.{ "deinit", "moveInto" },
-        .guard, .ranked_guard, .buffer, .slots, .table => &.{"deinit"},
-        .handoff => &.{"release"},
-        .reservation => &.{ "release", "consume", "moveInto" },
+        .buffer, .slots, .table => &.{"deinit"},
         .owned => &.{ "deinit", "take", "moveInto" },
         // A std resource held raw: `close`, a server's `deinit` (it closes the listening
         // socket), a child's `kill` or `wait`. No other std resource declares a `deinit`.
         .std_handle => &.{ "close", "deinit", "kill", "wait" },
-        // A result obligation is discharged by taking it or acknowledging it with a reason;
-        // its `deinit` checks that it was.
-        .must_use => &.{ "take", "acknowledge" },
         // Its release is whichever call of its releases each owner it holds (`recordReleases`).
         .record => &.{},
         .shared => &.{"release"},
-        .scope => &.{"end"},
-        else => null,
-    };
-}
-
-/// What checks a local owner's obligation once it is discharged, by kind: a result
-/// obligation's `deinit`, which stops the program unless `take` or `acknowledge` came first.
-fn teardown(k: Contract.Kind) ?[]const u8 {
-    return switch (k) {
-        .must_use => "deinit",
         else => null,
     };
 }
@@ -889,6 +959,7 @@ fn releaseName(k: Contract.Kind, name: []const u8) bool {
 /// its kind's release by name, or, of a record of owners, a call that releases each of them.
 fn releasesBy(c: *Context, k: Contract.Kind, call: Ast.Node.Index, name: []const u8) Context.Error!bool {
     if (k == .record) return recordReleases(c, call, null);
+    if (logical(k)) return endsHere(c, call);
     return releaseName(k, name);
 }
 
@@ -913,7 +984,12 @@ fn aegisRelease(facts: *Facts, callee: Facts.Decl, owner: Facts.Value) Facts.Res
         .other, .unknown => return false,
     };
     const record = facts.project.at(callee.file).model.declarations[@backingInt(callee.index)];
-    if (record.kind != .function or !releaseName(k, record.name)) return false;
+    if (record.kind != .function) return false;
+    if (logical(k)) {
+        // By its declaration: a release, or a move into storage the caller names.
+        const found = (try PackageRules.operation(facts, Contract.library, callee)) orelse return false;
+        if (!(found == .release or (found == .transfer and found.transfer == .argument))) return false;
+    } else if (!releaseName(k, record.name)) return false;
     const container = recordOf(owner) orelse return false;
     return callee.file == container.file and record.scope == container.scope;
 }
@@ -959,7 +1035,7 @@ fn ownerPaths(c: *Context, container: Facts.Container, prefix: []const Facts.Dec
         while (inner == .optional) inner = inner.optional.*;
         switch (try typed(c.facts, inner, depth + 1)) {
             .owner => |k| {
-                if (releases(k) == null) {
+                if (!owes(k)) {
                     if (try carried(c, inner, depth + 1) != .other) return false;
                     continue;
                 }
@@ -1211,7 +1287,7 @@ fn heldIn(c: *Context, container: Facts.Container, bindings: Bindings, depth: us
         };
         switch (try typed(c.facts, field.value, depth + 1)) {
             .other => if (try heldInRecord(c, field.value, depth + 1) != .other) return .unknown,
-            .owner => |k| if (releases(k) != null or try carried(c, field.value, depth + 1) != .other) return .unknown,
+            .owner => |k| if (owes(k) or try carried(c, field.value, depth + 1) != .other) return .unknown,
             .unknown => return .unknown,
         }
     }
@@ -1521,7 +1597,7 @@ fn boundBy(c: *Context, tree: *const Ast, call: Facts.calls.Call, rule: Rule, fu
             const line = site.line(site.tree.tokenStart(site.tree.firstToken(copy.site.node))) + 1;
             const owner = try madeOwner(c, call, function, copy, bound);
             switch (owner) {
-                .owner => |k| if (releases(k) != null) try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unsupported, try c.allocator.print("this binding makes an owner of what {s}:{d} acquires by the generic's type parameter; its cleanup is not walked per binding", .{ c.project.at(copy.site.file).input.name, line })),
+                .owner => |k| if (owes(k)) try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unsupported, try c.allocator.print("this binding makes an owner of what {s}:{d} acquires by the generic's type parameter; its cleanup is not walked per binding", .{ c.project.at(copy.site.file).input.name, line })),
                 .other => {},
                 .unknown => if (!bindingTyped(bound)) try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a generic that acquires by its type parameter is bound to a type that does not resolve"),
             }
@@ -2608,7 +2684,7 @@ fn heldPart(c: *Context, value: Facts.Value) Context.Error!HeldPart {
     if (value == .pointer) return .none;
     if (bindingTyped(value)) return .unknown;
     return switch (try typed(c.facts, value, 1)) {
-        .owner => |k| if (releases(k) != null) .{ .owner = k } else .unknown,
+        .owner => |k| if (owes(k)) .{ .owner = k } else .unknown,
         .unknown => .unknown,
         .other => if (try heldInRecord(c, value, 1) == .other) .none else .unknown,
     };
@@ -2949,7 +3025,7 @@ fn acquisitionOwner(c: *Context, tree: *const Ast, acquisition: Ast.Node.Index, 
         .owner => |k| k,
         .other, .unknown => return null,
     };
-    if (releases(k) == null) return null;
+    if (!owes(k)) return null;
     return k;
 }
 
@@ -3292,6 +3368,14 @@ const Flow = struct {
             }
             // After the discharge, the check that it came is no use of the owner.
             if (state == .released and try f.tornDown(stmt)) continue;
+            // Before it, the check stops the program: the finding is at the teardown, which ends the
+            // value, so the block's end reports nothing more and a release after it is a use after
+            // its end (cleaned twice).
+            if (state == .live and !f.aggregate and try f.tornDown(stmt)) {
+                try fault(f.c, f.kind, f.firstUse(stmt), "result obligation torn down before its take or acknowledge: its deinit checks a discharge that never came");
+                state = .released;
+                continue;
+            }
             if (state == .released) switch (try f.reacquired(stmt)) {
                 .yes => {
                     state = .live;
@@ -4257,12 +4341,25 @@ const Flow = struct {
         return f.handOffCall(value);
     }
 
-    /// `owner.handOff()`, called on the owner with nothing passed.
+    /// `owner.handOff()`, called on the owner with nothing passed: by its declaration a move of the
+    /// pair's obligation to the call's result. Where that result is `?R` or `!R`, the obligation moves
+    /// only when the call gives one; this walk does not follow that per path, so it is undecided.
     fn handOffCall(f: Flow, value: Ast.Node.Index) Context.Error!bool {
         var buffer: [1]Ast.Node.Index = undefined;
         const call = f.tree.fullCall(&buffer, value) orelse return false;
-        if (call.ast.params.len != 0) return false;
-        return std.mem.eql(u8, (try f.calledOwner(value)) orelse return false, handsOn(.guard).?);
+        if (call.ast.params.len != 0 or !logical(f.kind)) return false;
+        _ = (try f.calledOwner(value)) orelse return false;
+        const found = (try pairCall(f.c, f.c.file, value)) orelse return false;
+        switch (found) {
+            .transfer => |to| if (to != .result) return false,
+            .unknown => {
+                try f.c.undecided(cleanup, f.tree.tokenStart(f.tree.nodeMainToken(value)), .unresolved, "a call on an aegis obligation whose callee does not resolve to what its pair declares");
+                return true;
+            },
+            .release, .teardown => return false,
+        }
+        if (try fallibleResult(f.c, f.c.file, value)) try f.c.undecided(cleanup, f.tree.tokenStart(f.tree.nodeMainToken(value)), .unsupported, "an obligation moved to an optional or error result moves only when the call gives one; that path is not followed");
+        return true;
     }
 
     /// `var h, const m = .{ owner.handOff(), n };`: a destructure of a literal of as many
@@ -4464,8 +4561,11 @@ const Flow = struct {
 
     /// `owner.deinit()` of a result obligation: the check that its discharge came.
     fn tornDown(f: Flow, stmt: Ast.Node.Index) Context.Error!bool {
-        const name = teardown(f.kind) orelse return false;
-        return std.mem.eql(u8, (try f.calledOwner(stmt)) orelse return false, name);
+        // On the owner, and by its declaration a teardown of the pair's (`MustUse.deinit`).
+        if (!logical(f.kind)) return false;
+        _ = (try f.calledOwner(stmt)) orelse return false;
+        const found = (try pairCall(f.c, f.c.file, stmt)) orelse return false;
+        return found == .teardown;
     }
 
     /// `_ = &owner;`
@@ -4685,7 +4785,9 @@ const Loan = struct {
     /// `p.deinit(...)`.
     fn releases(l: Loan, stmt: Ast.Node.Index) Context.Error!bool {
         const called = (try calledOn(l.c, l.file, stmt)) orelse return false;
-        return called.on == l.token and releaseName(l.kind, called.name);
+        if (called.on != l.token) return false;
+        if (logical(l.kind)) return (try endsObligation(l.c, l.file, stmt)) orelse false;
+        return releaseName(l.kind, called.name);
     }
 
     /// `p.* = x.acquire...(...)`.
@@ -4716,7 +4818,9 @@ const Loan = struct {
         while (each.next()) |candidate| {
             switch (try Facts.accesses.useOf(l.c.facts, l.file, candidate)) {
                 .member => |read| {
-                    if (releaseName(l.kind, (try memberNamed(l.c, l.file, read)) orelse return .other)) return .other;
+                    if (logical(l.kind)) {
+                        if ((try endsObligation(l.c, l.file, l.model.parentOf(read) orelse return .other)) orelse true) return .other;
+                    } else if (releaseName(l.kind, (try memberNamed(l.c, l.file, read)) orelse return .other)) return .other;
                     found = .members;
                     continue;
                 },
@@ -4946,7 +5050,7 @@ fn adopts(k: Contract.Kind) ?[]const u8 {
 fn handsOn(k: Contract.Kind) ?[]const u8 {
     return switch (k) {
         .owned => "move",
-        .guard, .ranked_guard => "handOff",
+
         else => null,
     };
 }
