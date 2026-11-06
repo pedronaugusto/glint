@@ -239,10 +239,10 @@ fn roleNames(a: std.mem.Allocator, project_rules: []const Context.Rule) error{ O
     return names.items;
 }
 fn namesOf(comptime E: type) []const []const u8 {
-    const fields = @typeInfo(E).@"enum".fields;
+    const fields = comptime std.meta.fieldNames(E);
     const names = comptime blk: {
         var out: [fields.len][]const u8 = undefined;
-        for (fields, &out) |field, *name| name.* = field.name;
+        for (fields, &out) |field, *name| name.* = field;
         break :blk out;
     };
     return &names;
