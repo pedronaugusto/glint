@@ -40,7 +40,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ### Changed
 
-- aegis pinned at its 0.3 line (d65f04c: one module, `aegis`, whose types and assertions declare their roles in `lint_rules`), and preflight (development) at its 0.19 line, which builds on it.
+- aegis pinned at its 0.3 line (248245d: one module, `aegis`, whose types and assertions declare their roles and private fields in `lint_rules`), and preflight (development) at its 0.19 line, which builds on it.
 - Metrics counts aegis's assertions by the roles aegis declares (`invariant`, `never`, `debug`, `debug_check`), and std's `debug.assert` by std's contract at its path.
 - The pack reads guards, hand-offs and acquisitions by the roles aegis declares, never by name: a guard is a type whose role is `guard`, or `ranked_guard` for an `Order`'s capability (one check, `AegisContract.isGuard`, reads both), a hand-off one whose role is `handoff`, and an acquisition a function whose declared result, through `!`, `?` and `MustUse`, has a guard's role; a result, or a wrapped payload, that does not resolve is undecided. The 18 acquisition names, the guard and hand-off type names and the ranked form (`...Ordered`) are gone.
 - A001 reads the fields only aegis touches from what aegis declares (`.internal`), never a list of names per role: a type's own where the value's type resolves to one aegis gives a role; where only its role is known, a field every type of that role keeps is a finding, one only some keep is undecided, one none keeps is not.

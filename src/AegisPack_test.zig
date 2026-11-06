@@ -2601,3 +2601,10 @@ test "a guard's release moved to its hand-off by declaration; to an optional han
     try std.testing.expect(!maybe.complete);
     try std.testing.expectEqual(@as(usize, 0), maybe.findings);
 }
+
+test "the private fields aegis's first list missed are A001's: a reader-writer owner's admission limit, a dense map's regions and rooms, a secondary map's index and entries" {
+    const head = "const aegis = @import(\"aegis\");\nconst Tag = struct {};\nconst P = aegis.handle.SlotPool(u32, Tag, .{ .generation = u64 });\n";
+    try expectJudged(head ++ "pub fn f(g: *aegis.RwGuarded(u32)) usize { return g.limit; }", pack.access, true, 1);
+    try expectJudged(head ++ "pub fn f(m: *aegis.handle.DenseSlotMap(u32, Tag)) void { _ = m.value_region; _ = m.key_room; }", pack.access, true, 2);
+    try expectJudged(head ++ "pub fn f(m: *aegis.handle.SecondaryMap(P, u8)) void { _ = m.index; _ = m.first; _ = m.room; _ = m.gpa; }", pack.access, true, 3);
+}
