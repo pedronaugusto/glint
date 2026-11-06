@@ -2479,3 +2479,51 @@ test "A019 leaves a use after cleanup of a local A003 follows to A003 where it r
     try std.testing.expectEqual(@as(usize, 1), own_alias.undefined_read);
     try std.testing.expectEqual(@as(usize, 0), own_alias.undefined_undecided);
 }
+
+/// An aegis whose acquisitions return their guard wrapped in `MustUse`, and one whose wrapped
+/// payload names nothing: each acquisition read by its declared result, through the wrapper.
+const wrapped_root =
+    \\pub fn MustUse(comptime T: type, comptime why: []const u8) type {
+    \\    _ = why;
+    \\    return struct {
+    \\        data: T,
+    \\        pub fn take(m: *@This()) T { return m.data; }
+    \\    };
+    \\}
+    \\pub fn Guarded(comptime T: type) type {
+    \\    return struct {
+    \\        const Self = @This();
+    \\        data: T,
+    \\        lock: bool = false,
+    \\        pub fn acquire(o: *Self) MustUse(Guard, "release it") { return .{ .data = .{ .owner = o } }; }
+    \\        pub fn obtain(o: *Self) MustUse(@import("absent.zig").Missing, "release it") { _ = o; unreachable; }
+    \\        pub const Guard = struct {
+    \\            owner: *Self,
+    \\            pub fn deinit(g: *Guard) void { g.owner.lock = false; }
+    \\        };
+    \\    };
+    \\}
+    \\pub const lint_rules = .{ .version = 1, .roles = .{
+    \\    .{ .type = MustUse, .role = .must_use },
+    \\    .{ .type = Guarded, .role = .guarded },
+    \\    .{ .type = .{ .generic = Guarded, .member = .Guard }, .role = .guard },
+    \\} };
+;
+fn wrappedLocks(program: []const u8) !struct { findings: usize, complete: bool } {
+    const own = glint.AegisPack.package;
+    var project = try P.init(std.testing.allocator, &.{
+        .{ .name = "consumer", .bytes = program },
+        .{ .name = "root.zig", .bytes = wrapped_root, .selected = false, .package = own.name, .fingerprint = own.fingerprint },
+    }, &.{.{ .from = 0, .spelling = "aegis", .target = 1 }}, .{});
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.lock_order, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    return .{ .findings = count(report, pack.lock_order), .complete = report.complete };
+}
+test "an acquisition is read by its declared result through MustUse; one whose wrapped payload does not resolve is undecided, never no acquisition" {
+    const both = try wrappedLocks("const aegis = @import(\"aegis\");\npub fn f(a: *aegis.Guarded(u32), b: *aegis.Guarded(u32)) void {\n    var ga = a.acquire();\n    var gb = b.acquire();\n    _ = &ga;\n    _ = &gb;\n}\n");
+    try std.testing.expectEqual(@as(usize, 1), both.findings);
+    const unknown = try wrappedLocks("const aegis = @import(\"aegis\");\npub fn f(a: *aegis.Guarded(u32), b: *aegis.Guarded(u32)) void {\n    var ga = a.acquire();\n    var gb = b.obtain();\n    _ = &ga;\n    _ = &gb;\n}\n");
+    try std.testing.expectEqual(@as(usize, 0), unknown.findings);
+    try std.testing.expect(!unknown.complete);
+}
