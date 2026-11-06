@@ -4175,6 +4175,24 @@ test "A018 takes as the writer only a value whose type may hold one: a peer writ
     , 1);
 }
 
+test "A018 reads a writer kept where its type only may hold one as no writer shown: undecided, never a finding" {
+    // relic's remote_helper.warn: a writer over memory made from an allocator whose opaque
+    // state a writer's level reached, read as a peer's writer. A place whose type holds a
+    // writer only through what does not resolve (`*anyopaque`) keeps it unknown.
+    const kept = try run(pack.diagnostics,
+        \\const std = @import("std");
+        \\pub fn reply(stream: std.Io.net.Stream, err: anyerror) !void {
+        \\    var buf: [64]u8 = undefined;
+        \\    var w = stream.writer(&buf);
+        \\    const ctx: *anyopaque = @ptrCast(&w);
+        \\    const again: *std.Io.Writer = @ptrCast(@alignCast(ctx));
+        \\    try again.print("{s}", .{@errorName(err)});
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), kept.findings);
+    try std.testing.expectEqual(@as(usize, 1), kept.undecided);
+}
+
 test "A018 reads the peer writers a package declares" {
     var project = try sources.projectWithSources(std.testing.allocator,
         \\const std = @import("std");
