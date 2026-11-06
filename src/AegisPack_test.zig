@@ -521,7 +521,7 @@ test "a role aegis declares that does not resolve is reported where aegis is imp
     for (report.coverage) |entry| if (entry.rule != null) {
         detail = entry.detail;
     };
-    try std.testing.expectEqualStrings("aegis's lint_rules at root.zig:10: a reference that does not resolve; the roles it declares are not all read in this file", detail.?);
+    try std.testing.expectEqualStrings("aegis's lint_rules at root.zig:9: a reference that does not resolve; the roles it declares are not all read in this file", detail.?);
 }
 test "an aegis that declares no lint_rules is undecided where it is imported, never plain" {
     var project = try flatFixture("const S = @import(\"aegis\").Secret; pub fn f(s: *S(u32)) void { _ = s.material; }", .{ .root = flat_declared });
