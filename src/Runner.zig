@@ -239,13 +239,18 @@ fn roleNames(a: std.mem.Allocator, project_rules: []const Context.Rule) error{ O
     return names.items;
 }
 fn namesOf(comptime E: type) []const []const u8 {
-    const fields = comptime std.meta.fieldNames(E);
-    const names = comptime blk: {
-        var out: [fields.len][]const u8 = undefined;
-        for (fields, &out) |field, *name| name.* = field;
-        break :blk out;
+    return &Names(E).list;
+}
+/// An enum's tag names, once per enum.
+fn Names(comptime E: type) type {
+    return struct {
+        const list = blk: {
+            const given = @typeInfo(E).@"enum".field_names;
+            var out: [given.len][]const u8 = undefined;
+            for (given, &out) |name, *each| each.* = name;
+            break :blk out;
+        };
     };
-    return &names;
 }
 fn sameNames(a: []const []const u8, b: []const []const u8) bool {
     if (a.len != b.len) return false;
