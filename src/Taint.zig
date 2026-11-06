@@ -427,6 +427,9 @@ pub const Flow = struct {
     writer_unknown: bool = false,
     /// Whether a container outside the program may hold a writer, once each (`mayHoldWriter`).
     writer_holders: std.AutoHashMapUnmanaged(Facts.Container, bool) = .empty,
+    /// Whether a ceiling's limit is being read (`ceilingHeld`): a limit read through a call given
+    /// the value it bounds (`if (x > f(x)) return`) reads no ceiling again, so none holds there.
+    in_ceiling: bool = false,
     /// Functions whose result is what they read: std's `process.run`, which holds a child's output,
     /// and aegis's whole-file reads, `own.readFile` and `own.readFileSentinel`.
     reads: std.ArrayList(Facts.Decl) = .empty,
@@ -1526,7 +1529,7 @@ fn effects(c: *Context, flow: *Flow, function: Function.Id, callee: Callee) Cont
             for (callee.args, 0..) |arg, index| {
                 if (index >= g.params.len) break;
                 if (g.fixed.has(index)) continue;
-                const given = try dep(c, flow, function, arg);
+                const given = try passed(c, flow, function, arg, try dep(c, flow, function, arg));
                 for ([_]struct { usize, Levels }{ .{ valueSlot(index), concrete(flow, function, given) }, .{ lengthSlot(index), concreteLength(flow, function, given) } }) |each| {
                     const slot, const level = each;
                     if (slot >= g.levels.len) continue;
@@ -1591,7 +1594,7 @@ fn accounting(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.E
 fn outsideWrites(c: *Context, flow: *Flow, function: Function.Id, callee: Callee) Context.Error!void {
     const decl = callee.decl orelse return;
     var given: Dep = .{};
-    for (callee.args) |arg| given = try given.join(c.allocator, try whole(c, flow, function, arg));
+    for (callee.args) |arg| given = try given.join(c.allocator, try passed(c, flow, function, arg, try whole(c, flow, function, arg)));
     const writes = try mutableParams(c, decl);
     const file = flow.functions.items[@backingInt(function)].file;
     for (callee.args, 0..) |arg, position| if (writes.has(position)) {
@@ -2532,7 +2535,7 @@ fn breaksTo(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.In
 fn summarized(c: *Context, flow: *Flow, function: Function.Id, callee: Callee, summary: Dep) Context.Error!Dep {
     var out: Dep = .{ .level = summary.level, .length = summary.length, .unchecked = summary.unchecked };
     for (callee.args, 0..) |arg, index| {
-        const given = try dep(c, flow, function, arg);
+        const given = try passed(c, flow, function, arg, try dep(c, flow, function, arg));
         for ([_]struct { usize, Dep }{ .{ valueSlot(index), given }, .{ lengthSlot(index), given.measured() } }) |each| {
             const slot, const held_there = each;
             if (summary.params.has(slot)) out = try out.join(c.allocator, held_there);
@@ -2550,10 +2553,42 @@ fn summarized(c: *Context, flow: *Flow, function: Function.Id, callee: Callee, s
     return out;
 }
 
+/// Whether a ceiling the program fixes holds `node` where it is read (`Range.ceilings`, on every
+/// path to it: `if (n > max) return` before it): a limit clean where it is read, its parameters as
+/// their callers give them (`concrete`), in the fact's `lane`, or in every lane where the value
+/// is given whole (null: a call narrows every lane at once). A value so held is within a range the program chose: data, no peer's
+/// number. The one reading of a ceiling, at a sink (`capped`) and at a call given the value
+/// (`passed`). What it does not claim: memory grown by such amounts in a loop input drives (a
+/// list appended to n at a time, each n held) holds data, as `@min`'s narrowing gives today.
+fn ceilingHeld(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.Index, lane: ?u8) Context.Error!bool {
+    if (flow.in_ceiling) return false;
+    flow.in_ceiling = true;
+    defer flow.in_ceiling = false;
+    for (try Range.ceilings(c, file, node)) |limit| {
+        const function = owner(flow, file, limit) orelse continue;
+        const level = concrete(flow, function, try dep(c, flow, function, limit));
+        if (if (lane) |one| level.at(one) == .clean else level.isClean()) return true;
+    }
+    return false;
+}
+
+/// Whether a ceiling the program fixes holds `node` where a rule's sink reads it (`ceilingHeld`).
+pub fn capped(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    return ceilingHeld(c, fact.flow, file, node, fact.lane);
+}
+
+/// What a call is given at `arg` (`value`, as `dep` or `whole` reads it): narrowed where a ceiling
+/// the program fixes holds it at the call (`ceilingHeld`), as a sink reads it there.
+fn passed(c: *Context, flow: *Flow, function: Function.Id, arg: Ast.Node.Index, value: Dep) Context.Error!Dep {
+    if (value.clean()) return value;
+    if (!try ceilingHeld(c, flow, flow.functions.items[@backingInt(function)].file, arg, null)) return value;
+    return value.narrowed(c.allocator);
+}
+
 /// What a function outside the program may make of an argument: what it holds, and its length,
 /// which a search's position or a count is within (`std.mem.indexOfScalar(u8, buf[0..n], 0)`).
 fn outsideArg(c: *Context, flow: *Flow, function: Function.Id, arg: Ast.Node.Index) Context.Error!Dep {
-    const value = try whole(c, flow, function, arg);
+    const value = try passed(c, flow, function, arg, try whole(c, flow, function, arg));
     return try value.join(c.allocator, value.measured());
 }
 

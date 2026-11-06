@@ -1507,7 +1507,7 @@ fn sink(c: *Context, flow: Taint.Fact, rule: Rule, node: Ast.Node.Index, comptim
 /// argument whose value a call's result keeps, `Range.keptArgument`): `.{ .reserve_amount = n
 /// }` and `.limited(n)` after `try limit.check(n)`.
 fn capped(c: *Context, flow: Taint.Fact, node: Ast.Node.Index) Context.Error!bool {
-    for (try Range.ceilings(c, c.file, node)) |limit| if (try Taint.levelAt(c, flow, c.file, limit) == .clean) return true;
+    if (try Taint.capped(c, flow, c.file, node)) return true;
     const tree = &c.project.at(c.file).file.tree;
     var two: [2]Ast.Node.Index = undefined;
     const parts: []const Ast.Node.Index = if (tree.fullStructInit(&two, node)) |init| init.ast.fields else if (tree.fullArrayInit(&two, node)) |init| init.ast.elements else {
