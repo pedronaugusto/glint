@@ -112,6 +112,7 @@ pub fn dev(b: *std.Build, tools: type) void {
             p.path("src/Library_test.zig"),
             p.path("src/Model.zig"),
             p.path("src/Project.zig"),
+            p.path("src/releases.zig"),
             p.path("src/Disallowed.zig"),
             p.path("src/Token.zig"),
             p.path("src/Token/liveness.zig"),

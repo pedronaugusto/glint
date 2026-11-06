@@ -5,6 +5,7 @@ const Project = @import("Project.zig");
 const Facts = @import("Facts.zig");
 const Governed = @import("Governed.zig");
 const Context = @import("RuleContext.zig");
+const release_summary = @import("releases.zig");
 const Contract = @import("AegisContract.zig");
 const Ids = @import("AegisRules.zig");
 const Danger = @import("Danger.zig");
@@ -297,7 +298,7 @@ fn checkLiteral(c: *Context, tree: *const Ast, node: Ast.Node.Index, targets: []
     var fits = false;
     for (targets) |target| fits = fits or try namesFields(c, tree, literal, target);
     if (!fits) return;
-    switch (try typed(c, try c.facts.literalType(c.file, node), 0)) {
+    switch (try typed(c.facts, try c.facts.literalType(c.file, node), 0)) {
         .owner => |k| if (k == .public_source) try c.at(access, tree.firstToken(node), "public text built by a literal skips its reviewed classification; use err.PublicSource.classify(reason, bytes)"),
         .other => {},
         .unknown => try c.undecided(access, tree.tokenStart(tree.firstToken(node)), .unresolved, "a literal that may be a public source has no resolved result type"),
@@ -466,7 +467,7 @@ fn noLibraryHolder(c: *Context, name: []const u8, others: []const []const u8) Co
         for (model.declarations) |decl| {
             if (decl.kind != .field or !std.mem.eql(u8, decl.name, name)) continue;
             const holder: Facts.Container = .{ .file = file, .scope = decl.scope };
-            switch (try typed(c, .{ .instance = holder }, 0)) {
+            switch (try typed(c.facts, .{ .instance = holder }, 0)) {
                 .owner => |k| if (!backing(k, name)) continue,
                 .other => continue,
                 .unknown => {},
@@ -816,6 +817,8 @@ fn releases(k: Contract.Kind) ?[]const []const u8 {
         // A result obligation is discharged by taking it or acknowledging it with a reason;
         // its `deinit` checks that it was.
         .must_use => &.{ "take", "acknowledge" },
+        // Its release is whichever call of its releases each owner it holds (`recordReleases`).
+        .record => &.{},
         .shared => &.{"release"},
         .scope => &.{"end"},
         else => null,
@@ -834,6 +837,151 @@ fn teardown(k: Contract.Kind) ?[]const u8 {
 fn releaseName(k: Contract.Kind, name: []const u8) bool {
     for (releases(k) orelse return false) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
     return false;
+}
+/// Whether the call `call`, of the member `name` on an owner of kind `k`, ends its obligation:
+/// its kind's release by name, or, of a record of owners, a call that releases each of them.
+fn releasesBy(c: *Context, k: Contract.Kind, call: Ast.Node.Index, name: []const u8) Context.Error!bool {
+    if (k == .record) return recordReleases(c, call, null);
+    return releaseName(k, name);
+}
+
+/// The call a statement makes through `try` and the left of `catch`: a release read by its
+/// summary (releases.zig) holds on every exit of what it calls, its errors' too, so it
+/// releases whether the call fails or not.
+fn unfailing(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
+    var at = node;
+    while (true) at = switch (tree.nodeTag(at)) {
+        .@"try" => tree.nodeData(at).node,
+        .@"catch" => tree.nodeData(at).node_and_node[0],
+        .grouped_expression => tree.nodeData(at).node_and_token[0],
+        else => return at,
+    };
+}
+
+/// What releases an aegis owner by its type alone, for releases.zig: a release its kind names
+/// (`releases`), declared by the owner's own type.
+fn aegisRelease(facts: *Facts, callee: Facts.Decl, owner: Facts.Value) Facts.ResolveError!bool {
+    const k = switch (try typed(facts, owner, 0)) {
+        .owner => |k| k,
+        .other, .unknown => return false,
+    };
+    const record = facts.project.at(callee.file).model.declarations[@backingInt(callee.index)];
+    if (record.kind != .function or !releaseName(k, record.name)) return false;
+    const container = recordOf(owner) orelse return false;
+    return callee.file == container.file and record.scope == container.scope;
+}
+const aegis_release: release_summary.Base = .{ .notion = .aegis_owner, .isRelease = aegisRelease };
+
+/// The container a value is an instance of, through pointers, optionals and error unions.
+fn recordOf(value: Facts.Value) ?Facts.Container {
+    var current = value;
+    while (true) current = switch (current) {
+        .pointer => |inner| inner.child.*,
+        .optional, .error_union => |inner| inner.*,
+        .instance, .container => |container| return container,
+        else => return null,
+    };
+}
+
+/// Whether `value` is a record of the program whose every owner held is known on a path of its
+/// fields (`ownerPaths`): A003 follows it as an owner of kind `record`.
+fn recordOwned(c: *Context, value: Facts.Value) Context.Error!bool {
+    var current = value;
+    while (current == .error_union) current = current.error_union.*;
+    const container = switch (current) {
+        .instance => |container| container,
+        else => return false,
+    };
+    var paths: std.ArrayList([]const Facts.Decl) = .empty;
+    if (!try ownerPaths(c, container, &.{}, &paths, 0)) return false;
+    return paths.items.len != 0;
+}
+
+/// The paths of fields, from a record of the program, to each owner it holds by value, through
+/// optionals and records of the program it holds (`heldIn`'s reading): false where one is not
+/// known (a field typed by a generic's binding, one that does not resolve, a tuple's, an owner in
+/// an array, an owner that carries another, one past 8 records deep).
+fn ownerPaths(c: *Context, container: Facts.Container, prefix: []const Facts.Decl, out: *std.ArrayList([]const Facts.Decl), depth: usize) Context.Error!bool {
+    if (depth == 8) return false;
+    if (try c.inLibrary(Contract.library, container.file)) return false;
+    if (!try c.facts.program(container.file)) return false;
+    for (try c.facts.heldFields(container)) |field| {
+        if (field.value == .pointer) continue;
+        if (bindingTyped(field.value)) return false;
+        var inner = field.value;
+        while (inner == .optional) inner = inner.optional.*;
+        switch (try typed(c.facts, inner, depth + 1)) {
+            .owner => |k| {
+                if (releases(k) == null) {
+                    if (try carried(c, inner, depth + 1) != .other) return false;
+                    continue;
+                }
+                if (inner != .instance) return false;
+                const path = try std.mem.concat(c.allocator, Facts.Decl, &.{ prefix, &.{field.decl orelse return false} });
+                try out.append(c.allocator, path);
+            },
+            .unknown => return false,
+            .other => switch (try heldInRecord(c, inner, depth + 1)) {
+                .other => {},
+                .owner, .unknown => {
+                    const record = switch (inner) {
+                        .instance => |record| record,
+                        else => return false,
+                    };
+                    const path = try std.mem.concat(c.allocator, Facts.Decl, &.{ prefix, &.{field.decl orelse return false} });
+                    if (!try ownerPaths(c, record, path, out, depth + 1)) return false;
+                },
+            },
+        }
+    }
+    return true;
+}
+
+/// Whether the call `call` releases each owner the record it is given as its receiver holds
+/// (`ownerPaths`), on every exit of each function it may call (releases.zig); the receiver
+/// the local `token` declares, where given.
+fn recordReleases(c: *Context, call_node: Ast.Node.Index, token: ?Ast.TokenIndex) Context.Error!bool {
+    return try recordReading(c, call_node, token) == .released;
+}
+
+/// What the call `call` does with the owners the record it is given as its receiver holds, each
+/// function it may call read by releases.zig: releases each on every exit, leaves each as it
+/// was (`untouched`), or anything else. No call, or one on another receiver, is unknown.
+fn recordReading(c: *Context, call_node: Ast.Node.Index, token: ?Ast.TokenIndex) Context.Error!enum { released, untouched, unknown } {
+    const call = (try Facts.calls.at(c.facts, c.file, call_node)) orelse return .unknown;
+    const receiver = switch (call.receiver) {
+        .bound => |node| node,
+        .none, .unknown => return .unknown,
+    };
+    if (token) |local| {
+        const tree = try c.project.syntax(try c.source());
+        const named = Facts.ungrouped(tree, receiver);
+        if (tree.nodeTag(named) != .identifier or declaringToken(&c.project.at(c.file).model, named) != local) return .unknown;
+    }
+    const container = recordOf(try c.facts.resolve(c.file, receiver)) orelse return .unknown;
+    var paths: std.ArrayList([]const Facts.Decl) = .empty;
+    if (!try ownerPaths(c, container, &.{}, &paths, 0) or paths.items.len == 0) return .unknown;
+    const each: []const Facts.Decl = switch (call.callee) {
+        .function => |*one| one[0..1],
+        .choice => |all| all,
+        .any => return .unknown,
+    };
+    var released = true;
+    var untouched = true;
+    for (each) |callee| {
+        const function = switch (try c.facts.origin(callee)) {
+            .decl => |d| d,
+            .none, .unknown => return .unknown,
+        };
+        for (paths.items) |path| switch (try release_summary.released(c.facts, function, .{ .parameter = 0, .path = path }, aegis_release)) {
+            .every_exit => untouched = false,
+            .untouched => released = false,
+            .unknown => return .unknown,
+        };
+    }
+    if (released) return .released;
+    if (untouched) return .untouched;
+    return .unknown;
 }
 fn requiredOwner(c: *Context, node: Ast.Node.Index, rule: Rule, token: Ast.TokenIndex) Context.Error!?Contract.Kind {
     switch (try ownerKind(c, node, rule)) {
@@ -856,9 +1004,15 @@ fn ownerKind(c: *Context, node: Ast.Node.Index, rule: Rule) Context.Error!Typed 
     // owner's in the builds that choose the owner. Cleanup is owed along the paths of those
     // builds, which are every path unless the function branches on a comptime condition
     // (`if (wrapped) owner.deinit();`); then A003 leaves a choice that disagrees undecided.
-    const found = if (rule != cleanup or !try c.facts.branchesOnCondition(c.file, node)) try perBuild(c, value) else try typed(c, value, 0);
-    // An owner held in a record's field is A003's too, though the record is no owner.
-    if (rule == cleanup and found == .other) return heldInRecord(c, value, 0);
+    const found = if (rule != cleanup or !try c.facts.branchesOnCondition(c.file, node)) try perBuild(c, value) else try typed(c.facts, value, 0);
+    // An owner held in a record's field is A003's too, though the record is no owner: a record
+    // whose every owner is known on a path of its fields is released as each of them is
+    // (`recordReleases`).
+    if (rule == cleanup and found == .other) {
+        const held = try heldInRecord(c, value, 0);
+        if (held == .unknown and try recordOwned(c, value)) return .{ .owner = .record };
+        return held;
+    }
     return found;
 }
 const Typed = union(enum) { owner: Contract.Kind, other, unknown };
@@ -886,9 +1040,9 @@ fn perBuild(c: *Context, value: Facts.Value) Context.Error!Typed {
         .reified => |built| built.fields.*,
         else => break,
     };
-    if (current != .alternatives) return typed(c, value, 0);
+    if (current != .alternatives) return typed(c.facts, value, 0);
     var found: Typed = .other;
-    for (current.alternatives) |one| found = joined(found, try typed(c, one, 0));
+    for (current.alternatives) |one| found = joined(found, try typed(c.facts, one, 0));
     return found;
 }
 /// What a copy of a value of a binding's type duplicates, per build as `perBuild` reads it: a
@@ -913,11 +1067,11 @@ fn copied(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
         // A record of the program copied copies what it holds by value in its fields
         // (`struct { s: Secret(u32) }`), as `heldInRecord` reads them for A003.
         .instance => |container| blk: {
-            const found = try typed(c, value, depth + 1);
+            const found = try typed(c.facts, value, depth + 1);
             if (found != .other) break :blk found;
             break :blk recordCopied(c, container, depth + 1);
         },
-        else => typed(c, value, depth + 1),
+        else => typed(c.facts, value, depth + 1),
     };
 }
 /// What a copy of a value of the program's record `container` duplicates of its fields, by
@@ -935,9 +1089,9 @@ fn recordCopied(c: *Context, container: Facts.Container, depth: usize) Context.E
 }
 /// The role of the published aegis type `container` is declared inside, as a guarded value's
 /// guard is: its own operations belong to that type's contract.
-fn enclosingPublished(c: *Context, container: Facts.Container) Context.Error!?Contract.Kind {
-    const found = try c.facts.publication(Contract.library);
-    const scopes = c.project.at(container.file).model.scopes;
+fn enclosingPublished(facts: *Facts, container: Facts.Container) Facts.ResolveError!?Contract.Kind {
+    const found = try facts.publication(Contract.library);
+    const scopes = facts.project.at(container.file).model.scopes;
     var scope = scopes[@backingInt(container.scope)].parent;
     while (scope) |s| : (scope = scopes[@backingInt(s)].parent) {
         for (found.entries) |entry| if (entry.target == .container and entry.target.container.file == container.file and entry.target.container.scope == s) return @fromBackingInt(@intCast(entry.role));
@@ -945,9 +1099,9 @@ fn enclosingPublished(c: *Context, container: Facts.Container) Context.Error!?Co
     return null;
 }
 /// The name a container is declared under (`pub const Guard = struct { ... }`), if any.
-fn containerName(c: *Context, container: Facts.Container) ?[]const u8 {
-    const model = &c.project.at(container.file).model;
-    const tree = &c.project.at(container.file).file.tree;
+fn containerName(facts: *Facts, container: Facts.Container) ?[]const u8 {
+    const model = &facts.project.at(container.file).model;
+    const tree = &facts.project.at(container.file).file.tree;
     const node = model.scopes[@backingInt(container.scope)].node;
     if (node == .root) return null;
     const parent = model.parentOf(node) orelse return null;
@@ -961,7 +1115,7 @@ fn containerName(c: *Context, container: Facts.Container) ?[]const u8 {
 /// `Table.Scope`), and the state such a type holds for its owner (a map's entries, a shared
 /// owner's block) is reached through the owner's backing field, which is read there. A choice
 /// between types that disagree stays unknown.
-fn typed(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
+fn typed(facts: *Facts, value: Facts.Value, depth: usize) Facts.ResolveError!Typed {
     if (depth == 64) return .unknown;
     return switch (value) {
         // What std computes from the program and target it is in is std's own: std declares
@@ -970,29 +1124,29 @@ fn typed(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
             .zig_own, .absent => .other,
             else => .unknown,
         },
-        .pointer => |payload| typed(c, payload.child.*, depth + 1),
-        .array, .optional, .error_union => |payload| typed(c, payload.*, depth + 1),
+        .pointer => |payload| typed(facts, payload.child.*, depth + 1),
+        .array, .optional, .error_union => |payload| typed(facts, payload.*, depth + 1),
         // A built type holds what its fields' types do.
-        .reified => |built| typed(c, built.fields.*, depth + 1),
+        .reified => |built| typed(facts, built.fields.*, depth + 1),
         .alternatives => |each| blk: {
-            const first = try typed(c, each[0], depth + 1);
-            for (each[1..]) |one| if (!std.meta.eql(first, try typed(c, one, depth + 1))) break :blk .unknown;
+            const first = try typed(facts, each[0], depth + 1);
+            for (each[1..]) |one| if (!std.meta.eql(first, try typed(facts, one, depth + 1))) break :blk .unknown;
             break :blk first;
         },
         // An anonymous literal holds what its fields or elements do: one owner among plain
         // parts is that owner's, as a copy of the literal copies it.
         .literal => |literal| blk: {
             var found: Typed = .other;
-            for (try c.facts.literalParts(literal)) |part| found = joined(found, try typed(c, part, depth + 1));
+            for (try facts.literalParts(literal)) |part| found = joined(found, try typed(facts, part, depth + 1));
             break :blk found;
         },
         .container, .instance => |container| blk: {
-            if (try c.role(Contract.library, value)) |k| break :blk .{ .owner = k };
-            const outer = (try enclosingPublished(c, container)) orelse break :blk .other;
+            if (try facts.role(Contract.library, value)) |k| break :blk .{ .owner = k };
+            const outer = (try enclosingPublished(facts, container)) orelse break :blk .other;
             // A guarded owner's guard, reached by its resolved type rather than its acquisition.
-            if (outer == .guarded and Contract.guardType(containerName(c, container) orelse "")) break :blk .{ .owner = .guard };
+            if (outer == .guarded and Contract.guardType(containerName(facts, container) orelse "")) break :blk .{ .owner = .guard };
             // A guard's release handed past its frame, released once as the guard is.
-            if (outer == .guarded and Contract.handoffType(containerName(c, container) orelse "")) break :blk .{ .owner = .handoff };
+            if (outer == .guarded and Contract.handoffType(containerName(facts, container) orelse "")) break :blk .{ .owner = .handoff };
             break :blk .other;
         },
         else => .other,
@@ -1036,7 +1190,7 @@ fn heldIn(c: *Context, container: Facts.Container, bindings: Bindings, depth: us
             .judged_at_binding => continue,
             .read_here => return .unknown,
         };
-        switch (try typed(c, field.value, depth + 1)) {
+        switch (try typed(c.facts, field.value, depth + 1)) {
             .other => if (try heldInRecord(c, field.value, depth + 1) != .other) return .unknown,
             .owner => |k| if (releases(k) != null or try carried(c, field.value, depth + 1) != .other) return .unknown,
             .unknown => return .unknown,
@@ -1531,7 +1685,7 @@ fn fieldOwner(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed
         .instance, .container => |container| container,
         else => return .other,
     };
-    switch (try typed(c, value, 0)) {
+    switch (try typed(c.facts, value, 0)) {
         .other => {},
         else => |found| return found,
     }
@@ -2295,6 +2449,18 @@ fn checkCleanup(c: *Context) Context.Error!void {
     for (0..tree.nodes.len) |i| try strayAcquisition(c, tree, model, @fromBackingInt(@intCast(i)));
 }
 
+/// A003's finding at `token`, of an owner of kind `k`. A record is no owner: what it holds is
+/// an owner at each of its fields' paths, some of them optional (`keep: ?Token = null`, set
+/// only when the caller asks), and a record a call returns may be a copy of one already
+/// released (`list.swapRemove(i)` after `list.items[i].deinit()`). A003 clears a record when
+/// releases.zig reads its release on every exit; that it holds an owner where it is left
+/// held, or released twice, nothing proves, so those are undecided.
+fn fault(c: *Context, k: Contract.Kind, token: Ast.TokenIndex, comptime message: []const u8) Context.Error!void {
+    if (k != .record) return c.at(cleanup, token, message);
+    const tree = try c.project.syntax(try c.source());
+    try c.undecided(cleanup, tree.tokenStart(token), .unsupported, "a record whose fields hold owners: " ++ message ++ " if it holds one here, which a field that may be null or a copy of a released value leaves open; no leak claimed");
+}
+
 /// Walks the owner the local `decl` holds, of kind `k`, from its acquisition to its block's
 /// end: the local itself, or the field of it `path` names (`heldOwners`).
 fn follow(c: *Context, tree: *const Ast, model: *const Model, decl: Model.Declaration, k: Contract.Kind, path: []const []const u8) Context.Error!void {
@@ -2318,7 +2484,7 @@ fn follow(c: *Context, tree: *const Ast, model: *const Model, decl: Model.Declar
 fn walkOwner(c: *Context, tree: *const Ast, model: *const Model, token: Ast.TokenIndex, k: Contract.Kind, scope: Ast.Node.Index, statements: []const Ast.Node.Index, path: []const []const u8, report: Ast.TokenIndex) Context.Error!void {
     const flow: Flow = .{ .c = c, .tree = tree, .model = model, .token = token, .kind = k, .scope = scope, .path = path };
     switch (try flow.walk(statements, .live)) {
-        .paths => |paths| if (paths.falls == .live) try c.at(cleanup, report, if (path.len == 0) "recognized local acquisition reaches block end without cleanup; review ownership obligation" else "recognized acquisition held in a local's field reaches block end without cleanup; review ownership obligation"),
+        .paths => |paths| if (paths.falls == .live) if (path.len == 0) try fault(c, k, report, "recognized local acquisition reaches block end without cleanup; review ownership obligation") else try fault(c, k, report, "recognized acquisition held in a local's field reaches block end without cleanup; review ownership obligation"),
         .split, .uncertain => try c.undecided(cleanup, tree.tokenStart(report), .unsupported, "cleanup/error exits/transfers/aliases require unsupported flow facts; no leak claimed"),
     }
 }
@@ -2380,7 +2546,7 @@ fn heldOwners(c: *Context, tree: *const Ast, model: *const Model, decl: Model.De
     };
     if (try c.inLibrary(Contract.library, container.file)) return null;
     if (!try c.facts.program(container.file)) return null;
-    if (try typed(c, whole, 0) != .other) return null;
+    if (try typed(c.facts, whole, 0) != .other) return null;
     const fields = try c.facts.heldFields(container);
     var out: std.ArrayList(HeldOwner) = .empty;
     if (position) |at| {
@@ -2421,7 +2587,7 @@ const HeldPart = union(enum) { none, owner: Contract.Kind, unknown };
 fn heldPart(c: *Context, value: Facts.Value) Context.Error!HeldPart {
     if (value == .pointer) return .none;
     if (bindingTyped(value)) return .unknown;
-    return switch (try typed(c, value, 1)) {
+    return switch (try typed(c.facts, value, 1)) {
         .owner => |k| if (releases(k) != null) .{ .owner = k } else .unknown,
         .unknown => .unknown,
         .other => if (try heldInRecord(c, value, 1) == .other) .none else .unknown,
@@ -2499,8 +2665,8 @@ fn strayAcquisition(c: *Context, tree: *const Ast, model: *const Model, node: As
         },
         else => false,
     };
-    _ = (try acquisitionKind(c, tree, value, true)) orelse return;
-    if (discarded) return c.at(cleanup, tree.nodeMainToken(node), "an acquisition discarded with `_ =` is never released");
+    const k = (try acquisitionKind(c, tree, value, true)) orelse return;
+    if (discarded) return fault(c, k, tree.nodeMainToken(node), "an acquisition discarded with `_ =` is never released");
     try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unsupported, "an acquisition whose owner is not a block's local, returned, or stored into memory is not followed; no leak claimed");
 }
 
@@ -2801,7 +2967,7 @@ fn unlisted(c: *Context, call: Ast.Node.Index) Context.Error!bool {
         else => return false,
     };
     if (try c.role(Contract.library, value) != null) return false;
-    if (try typed(c, value, 0) == .owner) return false;
+    if (try typed(c.facts, value, 0) == .owner) return false;
     return c.inLibrary(Contract.library, container.file);
 }
 
@@ -3061,7 +3227,7 @@ const Flow = struct {
                 continue;
             }
             if (try f.handedOff(stmt)) {
-                if (state != .live) try f.c.at(cleanup, f.tree.nodeMainToken(stmt), "same local capability is handed off after its cleanup or transfer on this straight-line path");
+                if (state != .live) try fault(f.c, f.kind, f.tree.nodeMainToken(stmt), "same local capability is handed off after its cleanup or transfer on this straight-line path");
                 // Returned, the path ends there.
                 if (f.tree.nodeTag(stmt) == .@"return") return .{ .paths = out };
                 state = .released;
@@ -3085,7 +3251,7 @@ const Flow = struct {
                 continue;
             };
             if (!f.aggregate and !f.pointer and try f.stored(stmt)) {
-                if (state != .live) try f.c.at(cleanup, f.tree.nodeMainToken(stmt), "same local owner is stored after its cleanup or transfer on this straight-line path");
+                if (state != .live) try fault(f.c, f.kind, f.tree.nodeMainToken(stmt), "same local owner is stored after its cleanup or transfer on this straight-line path");
                 // A std handle is a value: the store copies it, and either copy may close the
                 // one handle after (`job.file = fresh; ... fresh.close(io)`), so the local is
                 // held beside the store, as a call given it holds it.
@@ -3095,13 +3261,13 @@ const Flow = struct {
             const tag = f.tree.nodeTag(stmt);
             const deferred = !f.aggregate and tag == .@"defer" and try f.releasesIn(f.tree.nodeData(stmt).node);
             if (deferred or (!f.aggregate and try f.releaseAt(stmt))) {
-                if (state != .live) try f.c.at(cleanup, f.tree.nodeMainToken(stmt), if (deferred) "same local capability has repeated cleanup scheduled on this straight-line path" else "same local capability is cleaned twice on this straight-line path");
+                if (state != .live) if (deferred) try fault(f.c, f.kind, f.tree.nodeMainToken(stmt), "same local capability has repeated cleanup scheduled on this straight-line path") else try fault(f.c, f.kind, f.tree.nodeMainToken(stmt), "same local capability is cleaned twice on this straight-line path");
                 state = if (deferred) .deferred else .released;
                 continue;
             }
             // A discard of the owner's address has no retaining call or mutation.
             if (try f.discardedAddress(stmt)) {
-                if (state == .released) try f.c.at(cleanup, f.tree.nodeMainToken(f.tree.nodeData(f.tree.nodeData(stmt).node_and_node[1]).node), "same local owner used after cleanup on this straight-line path");
+                if (state == .released) try fault(f.c, f.kind, f.tree.nodeMainToken(f.tree.nodeData(f.tree.nodeData(stmt).node_and_node[1]).node), "same local owner used after cleanup on this straight-line path");
                 continue;
             }
             // After the discharge, the check that it came is no use of the owner.
@@ -3420,7 +3586,7 @@ const Flow = struct {
     fn leave(f: Flow, node: Ast.Node.Index, state: State) Context.Error!Outcome {
         switch (try f.uses(node)) {
             .none => {},
-            .members => if (state == .released) try f.c.at(cleanup, f.firstUse(node), "same local owner used after its cleanup or transfer on every path here"),
+            .members => if (state == .released) try fault(f.c, f.kind, f.firstUse(node), "same local owner used after its cleanup or transfer on every path here"),
             .other => return .uncertain,
         }
         return f.jumps(node, state);
@@ -3471,7 +3637,7 @@ const Flow = struct {
     /// it held gives it back to the caller.
     fn exit(f: Flow, token: Ast.TokenIndex, fails: bool, state: State) Context.Error!bool {
         if (f.errdeferred and fails) switch (state) {
-            .released => try f.c.at(cleanup, token, "an errdefer releases the same local owner again on this error exit, after its cleanup or transfer"),
+            .released => try fault(f.c, f.kind, token, "an errdefer releases the same local owner again on this error exit, after its cleanup or transfer"),
             .passed => return false,
             .live, .deferred => {},
         } else if (state == .live) {
@@ -3606,7 +3772,7 @@ const Flow = struct {
             if (main > f.tree.firstToken(move)) return null;
             switch (try Facts.accesses.useOf(f.c.facts, f.c.file, candidate)) {
                 .builtin_argument => |at| if (at.position == 0 and Facts.isBuiltin(f.tree, at.call, "@field")) continue else return null,
-                .member => |read| if (releaseName(f.kind, (try memberNamed(f.c, f.c.file, read)) orelse return null)) return null,
+                .member => |read| if (try releasesBy(f.c, f.kind, f.model.parentOf(read) orelse return null, (try memberNamed(f.c, f.c.file, read)) orelse return null)) return null,
                 else => return null,
             }
         }
@@ -3885,7 +4051,41 @@ const Flow = struct {
         if (f.path.len == 0) return release(f.c, node, f.token, f.kind);
         // `for (&owners) |*owner| owner.deinit();` releases each element of the local array.
         if (f.path.len == 1 and pathIndex(f.path[0]) != null and try releasedEach(f.c, node, f.token, f.kind)) return true;
-        return releaseName(f.kind, (try f.calledOwner(node)) orelse return false);
+        if (try f.holderReleases(node)) return true;
+        return releasesBy(f.c, f.kind, node, (try f.calledOwner(node)) orelse return false);
+    }
+
+    /// `holder.deinit()` on the local holding the owner at `path`: a call of a function that
+    /// releases the owner there, this instance, on every exit (releases.zig).
+    fn holderReleases(f: Flow, node: Ast.Node.Index) Context.Error!bool {
+        const call = (try Facts.calls.at(f.c.facts, f.c.file, unfailing(f.tree, node))) orelse return false;
+        const receiver = switch (call.receiver) {
+            .bound => |bound| Facts.ungrouped(f.tree, bound),
+            .none, .unknown => return false,
+        };
+        if (f.tree.nodeTag(receiver) != .identifier or declaringToken(f.model, receiver) != f.token) return false;
+        var value = try f.c.facts.resolve(f.c.file, receiver);
+        var fields: std.ArrayList(Facts.Decl) = .empty;
+        for (f.path) |name| {
+            if (pathIndex(name) != null) return false;
+            const container = recordOf(value) orelse return false;
+            const field = f.c.facts.member(container, name) orelse return false;
+            try fields.append(f.c.allocator, field);
+            value = try f.c.facts.declaration(field);
+        }
+        const each: []const Facts.Decl = switch (call.callee) {
+            .function => |*one| one[0..1],
+            .choice => |all| all,
+            .any => return false,
+        };
+        for (each) |callee| {
+            const function = switch (try f.c.facts.origin(callee)) {
+                .decl => |d| d,
+                .none, .unknown => return false,
+            };
+            if (try release_summary.released(f.c.facts, function, .{ .parameter = 0, .path = fields.items }, aegis_release) != .every_exit) return false;
+        }
+        return true;
     }
 
     const Use = enum { none, members, other };
@@ -3929,7 +4129,11 @@ const Flow = struct {
             };
             const member = (try memberNamed(f.c, f.c.file, read)) orelse return .other;
             // A move hands the owner on, as a release ends it (`kept`).
-            if (releaseName(f.kind, member) or (f.kind == .owned and std.mem.eql(u8, member, handsOn(.owned).?))) return .other;
+            if (try releasesBy(f.c, f.kind, f.model.parentOf(read) orelse return .other, member) or (f.kind == .owned and std.mem.eql(u8, member, handsOn(.owned).?))) return .other;
+            // A record's method that may release or move what it holds, read by no summary: undecided.
+            if (f.kind == .record) if (f.model.parentOf(read)) |parent| {
+                if (try Facts.calls.at(f.c.facts, f.c.file, parent)) |call| if (call.callee_expr == read and try recordReading(f.c, parent, null) != .untouched) return .other;
+            };
             found = .members;
         }
         return found;
@@ -4320,7 +4524,7 @@ fn lentTo(c: *Context, file: Project.FileId, call: Facts.calls.Call, position: u
         const holder = path.steps[1].node;
         const name = (try memberNamed(c, file, call.callee_expr)) orelse "";
         if (among(lends(.condition), name)) {
-            const k = (try Contract.kind(c, file, holder, 0)) orelse switch (try typed(c, try c.facts.resolve(file, holder), 0)) {
+            const k = (try Contract.kind(c, file, holder, 0)) orelse switch (try typed(c.facts, try c.facts.resolve(file, holder), 0)) {
                 .owner => |owned| owned,
                 .other, .unknown => null,
             };
@@ -4576,8 +4780,9 @@ fn endsInExit(tree: *const Ast, stmt: Ast.Node.Index) bool {
 }
 /// `owner.<release>(...)`: the call that ends the obligation of an owner of kind `k`.
 fn release(c: *Context, node: Ast.Node.Index, token: Ast.TokenIndex, k: Contract.Kind) Context.Error!bool {
+    if (k == .record) return recordReleases(c, unfailing(try c.project.syntax(try c.source()), node), token);
     if (try releasedEach(c, node, token, k)) return true;
-    return releaseName(k, (try ownerCall(c, node, token)) orelse return false);
+    return releasesBy(c, k, node, (try ownerCall(c, node, token)) orelse return false);
 }
 /// `for (&owners) |*owner| owner.deinit();`: a loop over the local array `token` declares,
 /// whose one statement releases each element through its pointer capture; or, of std handles,
@@ -4600,7 +4805,7 @@ fn releasedEach(c: *Context, node: Ast.Node.Index, token: Ast.TokenIndex, k: Con
         if (statements.len != 1) return false;
         body = statements[0];
     }
-    return releaseName(k, (try ownerCall(c, body, capture)) orelse return false);
+    return releasesBy(c, k, body, (try ownerCall(c, body, capture)) orelse return false);
 }
 /// The member `node` calls on the local `token` declares, if it is such a call.
 fn ownerCall(c: *Context, node: Ast.Node.Index, token: Ast.TokenIndex) Context.Error!?[]const u8 {

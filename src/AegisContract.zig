@@ -60,6 +60,10 @@ pub const Kind = enum {
     /// Runtime text classified public, `err.PublicSource`: made by `classify`, whose reason is
     /// the review a literal skips.
     public_source,
+    /// A record of the program holding owners by value in its fields (`heldInRecord`), no type of
+    /// aegis's: released by a call of its own that releases each of them on every exit, read by
+    /// releases.zig (A003).
+    record,
 };
 
 /// Aegis as programs import it. A declaration is aegis's when the path a program writes from the
