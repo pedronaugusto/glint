@@ -19,12 +19,13 @@ known: ?Package = null,
 cache: std.AutoHashMapUnmanaged(Settled, Value) = .empty,
 /// What a node gives in a reading (`resolveIn`), by the reading's address and the node.
 bound: std.AutoHashMapUnmanaged(Bound, Value) = .empty,
-/// Each condition's truth on a reading (`comptimeTruth`), by the interned reading (`keptReading`)
+/// Each condition's truth and each value fixed at compile time on a reading (`comptimeMemo`), by
+/// the interned reading (`keptReading`)
 /// and the comptime conditions settled around it.
-truths: std.AutoHashMapUnmanaged(TruthKey, ?bool) = .empty,
-/// The conditions `comptimeTruth` is reading: one asked again inside its own reading is unknown.
+truths: std.AutoHashMapUnmanaged(TruthKey, ?Comptime) = .empty,
+/// The conditions and values being read (`comptimeMemo`): one asked again inside its own reading is unknown.
 truths_open: std.AutoHashMapUnmanaged(TruthKey, void) = .empty,
-/// How many `callTruth`s are being read, one inside another.
+/// How many `callComptime`s are being read, one inside another.
 truth_calls: u8 = 0,
 /// Each reading made (`keptReading`), by its function, outer reading and depth.
 readings: std.AutoHashMapUnmanaged(ReadingKey, std.ArrayList(*const Env)) = .empty,
@@ -130,7 +131,7 @@ pub const Key = struct { file: Project.FileId, node: Ast.Node.Index };
 /// A node read under a set of settled comptime conditions (`assumed`).
 const Settled = struct { key: Key, assumed: ?Assumptions.Id };
 const Bound = struct { env: *const Env, settled: Settled };
-const TruthKey = struct { key: Key, env: ?*const Env, assumed: ?Assumptions.Id };
+const TruthKey = struct { key: Key, env: ?*const Env, assumed: ?Assumptions.Id, value: bool = false };
 /// A set of settled assumptions, held once in `settled`.
 const Assumptions = struct {
     held: []const Assumption,
@@ -2366,10 +2367,17 @@ pub fn literalOf(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resol
 /// `info.is_tuple` (`isTuple`); and a call to a function returning `bool` whose body decides
 /// it (`callTruth`).
 fn comptimeTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?bool {
-    const key: TruthKey = .{ .key = .{ .file = file, .node = node }, .env = env, .assumed = self.assumed };
+    const known = try self.comptimeMemo(env, file, node, false) orelse return null;
+    return known.boolean;
+}
+
+/// `comptimeTruth`'s answer (a `.boolean`) or `comptimeValue`'s (`value`), each kept once per
+/// node, reading and settled assumptions. A condition that decides itself (a `bool` function
+/// asking itself on the same reading) is not known by its own reading: unknown, and kept by no
+/// reading in progress.
+fn comptimeMemo(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index, value: bool) ResolveError!?Comptime {
+    const key: TruthKey = .{ .key = .{ .file = file, .node = node }, .env = env, .assumed = self.assumed, .value = value };
     if (self.truths.get(key)) |kept| return kept;
-    // A condition that decides itself (a `bool` function asking itself on the same reading)
-    // is not known by its own reading: unknown, and kept by no reading in progress.
     if ((try self.truths_open.getOrPut(self.gpa, key)).found_existing) {
         self.open_met += 1;
         return null;
@@ -2377,9 +2385,9 @@ fn comptimeTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
     defer _ = self.truths_open.remove(key);
     const wide = self.wide;
     const met = self.open_met;
-    const answer = try self.comptimeTruthRead(env, file, node);
+    const answer: ?Comptime = if (value) try self.comptimeValueRead(env, file, node) else if (try self.comptimeTruthRead(env, file, node)) |known| .{ .boolean = known } else null;
     // Kept as `resolve` keeps a value: read with budget left and on no answer wider than the built
-    // analysis gives (`wideSince`). A known truth holds whatever a query in progress gave inside
+    // analysis gives (`wideSince`). A known answer holds whatever a query in progress gave inside
     // it: `and`, `or` and `!` know an answer only where the unknown side cannot change it. An
     // unknown is kept only where it met none (`open_met`): one that did is asked again.
     if (self.remaining != 0 and !self.wideSince(wide) and (answer != null or self.open_met == met)) try self.truths.put(self.gpa, key, answer);
@@ -2407,10 +2415,15 @@ fn comptimeTruthRead(self: *Facts, env: ?*const Env, file: Project.FileId, node:
             if (try self.sizeIs(env, file, compared.left, compared.right) orelse try self.sizeIs(env, file, compared.right, compared.left)) |same_size|
                 return if (compared.order == .equal) same_size else !same_size;
             if (try self.kindCompared(env, file, compared.left, compared.right)) |kinds_agree| return if (compared.order == .equal) kinds_agree else !kinds_agree;
-            const one = try self.namedType(env, file, compared.left) orelse return null;
-            const other = try self.namedType(env, file, compared.right) orelse return null;
-            const one_type = sameType(one, other) orelse return null;
-            return if (compared.order == .equal) one_type else !one_type;
+            if (try self.namedType(env, file, compared.left)) |one| if (try self.namedType(env, file, compared.right)) |other| {
+                const one_type = sameType(one, other) orelse return null;
+                return if (compared.order == .equal) one_type else !one_type;
+            };
+            // Values the program fixes (`kind(T) == .counter`, `declared.contract != 1`).
+            const one = try self.comptimeValue(env, file, compared.left) orelse return null;
+            const other = try self.comptimeValue(env, file, compared.right) orelse return null;
+            const equal = comptimeEqual(one, other) orelse return null;
+            return if (compared.order == .equal) equal else !equal;
         },
         .other => |value| value,
     };
@@ -2428,7 +2441,13 @@ fn comptimeTruthRead(self: *Facts, env: ?*const Env, file: Project.FileId, node:
     }
     if (try self.isTuple(env, file, at)) |known| return known;
     if (try self.callTruth(env, file, at)) |known| return known;
-    if (!isBuiltin(tree, at, "@hasDecl")) return null;
+    if (isBuiltin(tree, at, "@hasField")) return self.hasFieldTruth(env, file, at);
+    if (!isBuiltin(tree, at, "@hasDecl")) {
+        // A `bool` the program fixes otherwise: a constant's, a field of a literal's.
+        if (!fixedContext(env, tree, node)) return null;
+        const value = try self.comptimeValue(env, file, at) orelse return null;
+        return if (value == .boolean) value.boolean else null;
+    }
     var buffer: [2]Ast.Node.Index = undefined;
     const args = builtinArgs(tree, at, &buffer);
     if (args.len != 2) return null;
@@ -2439,7 +2458,255 @@ fn comptimeTruthRead(self: *Facts, env: ?*const Env, file: Project.FileId, node:
     if (container.symbolic) return null;
     const name = try self.nameIn(env, file, args[1], 0) orelse return null;
     const decl = self.project.at(container.file).model.scopes[@backingInt(container.scope)].names.get(name) orelse return false;
-    return self.project.at(container.file).model.declarations[@backingInt(decl)].kind != .field;
+    const record = self.project.at(container.file).model.declarations[@backingInt(decl)];
+    if (record.kind == .field) return false;
+    // A declaration not `pub` is visible to `@hasDecl` only in its container's file, as Zig has it.
+    return record.public or container.file == file;
+}
+
+/// `@hasField(T, name)` on the reading `env` binds: of a container resolved, whether its scope
+/// declares a field so named; of a struct literal's type (`@TypeOf(declared)`), whether the
+/// literal sets one. Null where neither is known.
+fn hasFieldTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?bool {
+    const tree = &self.project.at(file).file.tree;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = builtinArgs(tree, node, &buffer);
+    if (args.len != 2) return null;
+    const name = try self.nameIn(env, file, args[1], 0) orelse return null;
+    if (try self.literalOfType(env, file, args[0])) |literal| return (try self.comptimeLiteralField(literal, name)) != null;
+    const container = switch (try self.resolveIn(env, file, args[0])) {
+        .container => |c| c,
+        else => return null,
+    };
+    if (container.symbolic) return null;
+    const decl = self.project.at(container.file).model.scopes[@backingInt(container.scope)].names.get(name) orelse return false;
+    return self.project.at(container.file).model.declarations[@backingInt(decl)].kind == .field;
+}
+
+/// The struct literal `@TypeOf(x)` at `node` is the type of, where `x` is one the program fixes.
+fn literalOfType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?ComptimeLiteral {
+    const tree = &self.project.at(file).file.tree;
+    const at = ungrouped(tree, node);
+    if (!isBuiltin(tree, at, "@TypeOf")) return null;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = builtinArgs(tree, at, &buffer);
+    if (args.len != 1) return null;
+    const value = try self.comptimeValue(env, file, args[0]) orelse return null;
+    return if (value == .literal) value.literal else null;
+}
+
+/// A value Zig fixes at compile time, as `comptimeValue` reads it: a `bool`, an integer, an
+/// enum's tag (with its enum where known; a bare enum literal's is the type it meets), `null`,
+/// a type, or an anonymous struct literal, read for the fields it sets.
+pub const Comptime = union(enum) {
+    boolean: bool,
+    integer: i128,
+    tag: struct { name: []const u8, of: ?Container },
+    none,
+    type: Value,
+    literal: ComptimeLiteral,
+};
+/// An anonymous struct literal and the reading its fields are read in.
+pub const ComptimeLiteral = struct { file: Project.FileId, node: Ast.Node.Index, env: ?*const Env };
+
+/// Whether two values fixed at compile time are equal (`==`): null where Zig would not compare
+/// them or the answer is not known (tags of two different enums, a type against a value).
+fn comptimeEqual(one: Comptime, other: Comptime) ?bool {
+    return switch (one) {
+        .boolean => |b| switch (other) {
+            .boolean => |c| b == c,
+            .none => false,
+            else => null,
+        },
+        .integer => |n| switch (other) {
+            .integer => |m| n == m,
+            .none => false,
+            else => null,
+        },
+        .tag => |t| switch (other) {
+            .tag => |u| {
+                if (t.of != null and u.of != null and (t.of.?.file != u.of.?.file or t.of.?.scope != u.of.?.scope)) return null;
+                return std.mem.eql(u8, t.name, u.name);
+            },
+            .none => false,
+            else => null,
+        },
+        .none => switch (other) {
+            .none => true,
+            .boolean, .integer, .tag => false,
+            else => null,
+        },
+        .type => |a| switch (other) {
+            .type => |b| sameType(a, b),
+            else => null,
+        },
+        .literal => null,
+    };
+}
+
+/// The value `node` gives at compile time on the reading `env` binds, where the program fixes it:
+/// a literal; `true`, `false` and `null`; a `bool` condition (`comptimeTruth`); a constant's
+/// value, its holder resolved on the reading (`T.aegis_scalar`), through the struct literal it
+/// holds for a field (`declared.contract`); an enum's tag (`Kind.ranged`); `.?` and `orelse`; a
+/// type; a call whose body returns one, read as `callComptime` reads it. Null where it is not
+/// fixed or not known: a variable, a runtime value, a constant whose value is built otherwise,
+/// past the budget, or asked inside its own reading. Kept as `comptimeTruth` keeps a truth.
+pub fn comptimeValue(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Comptime {
+    return self.comptimeMemo(env, file, node, true);
+}
+
+/// `comptimeValue`, read.
+fn comptimeValueRead(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Comptime {
+    const tree = &self.project.at(file).file.tree;
+    const at = switch (conditionOf(tree, node)) {
+        .not, .both, .either, .compare => return if (try self.comptimeTruth(env, file, node)) |known| .{ .boolean = known } else null,
+        .other => |value| value,
+    };
+    // A name is first what it resolves to: a type is `resolve`'s, read with its cycles and its
+    // budget (one being read meanwhile is not known); a constant is chased only for a value. A
+    // name rooted in a runtime parameter, a `var` or a capture fixes nothing, and is not
+    // resolved at all: a runtime comparison costs no budget.
+    switch (tree.nodeTag(at)) {
+        .identifier, .field_access => {
+            if (self.runtimeRooted(file, at)) return null;
+            const resolved = try self.resolveIn(env, file, at);
+            if (resolved == .unknown and (resolved.unknown == .cycle or resolved.unknown == .budget)) return null;
+            if (try self.namedType(env, file, at)) |t| return .{ .type = t };
+        },
+        else => {},
+    }
+    switch (tree.nodeTag(at)) {
+        .number_literal => return switch (std.zig.parseNumberLiteral(tree.tokenSlice(tree.nodeMainToken(at)))) {
+            .int => |n| .{ .integer = n },
+            .big_int => null, // past i128 when it does not fit u64: not read
+            else => null,
+        },
+        .enum_literal => return .{ .tag = .{ .name = try self.memberName(tree.tokenSlice(tree.nodeMainToken(at))), .of = null } },
+        .identifier => {
+            const spelled = tree.tokenSlice(tree.nodeMainToken(at));
+            if (std.mem.eql(u8, spelled, "true")) return .{ .boolean = true };
+            if (std.mem.eql(u8, spelled, "false")) return .{ .boolean = false };
+            if (std.mem.eql(u8, spelled, "null")) return .none;
+            if (self.truth(env, file, at)) |known| return .{ .boolean = known };
+            const model = &self.project.at(file).model;
+            if ((model.reference(at) orelse return null).declaration) |index| {
+                const decl: Decl = .{ .file = file, .index = index };
+                // A local is read on the reading its function is; a container-level constant
+                // on its instance's (`instanceOf`), none for one no function makes.
+                const local = switch (model.scopes[@backingInt(model.declarations[@backingInt(index)].scope)].kind) {
+                    .file, .container => false,
+                    else => true,
+                };
+                return self.constantComptime(decl, if (local) env else try self.instanceOf(decl, null, env));
+            }
+            return if (try self.namedType(env, file, at)) |t| .{ .type = t } else null;
+        },
+        .field_access => {
+            const holder, const member_token = tree.nodeData(at).node_and_token;
+            const name = try self.memberName(tree.tokenSlice(member_token));
+            const held = try self.resolveIn(env, file, holder);
+            if (held == .container) {
+                const k = held.container;
+                if (k.symbolic) return null;
+                const decl = self.member(k, name) orelse {
+                    // An enum's tag (`Kind.ranged`).
+                    const index = self.project.at(k.file).model.scopes[@backingInt(k.scope)].names.get(name) orelse return null;
+                    if (self.kindOf(k) != .keyword_enum or self.project.at(k.file).model.declarations[@backingInt(index)].kind != .field) return null;
+                    return .{ .tag = .{ .name = name, .of = k } };
+                };
+                return self.constantComptime(decl, try self.instanceOf(decl, k, env));
+            }
+            // A field of a struct literal the program fixes (`declared.contract`).
+            const value = try self.comptimeValue(env, file, holder) orelse return null;
+            if (value != .literal) return null;
+            const field = (try self.comptimeLiteralField(value.literal, name)) orelse return null;
+            return self.comptimeValue(value.literal.env, value.literal.file, field);
+        },
+        .unwrap_optional => {
+            const value = try self.comptimeValue(env, file, tree.nodeData(at).node_and_token[0]) orelse return null;
+            // `null.?` does not compile: no value.
+            return if (value == .none) null else value;
+        },
+        .@"orelse" => {
+            const sides = tree.nodeData(at).node_and_node;
+            const value = try self.comptimeValue(env, file, sides[0]) orelse return null;
+            return if (value == .none) self.comptimeValue(env, file, sides[1]) else value;
+        },
+        .struct_init_dot_two, .struct_init_dot_two_comma, .struct_init_dot, .struct_init_dot_comma => return .{ .literal = .{ .file = file, .node = at, .env = env } },
+        else => {},
+    }
+    // A `switch` or an `if` giving a value: the branch the bindings take, where they take one.
+    if (tree.fullSwitch(at)) |choice| {
+        const taken = (try self.takenProng(env, file, choice)) orelse return null;
+        if (taken.other != null) return null;
+        return self.comptimeValue(env, file, tree.fullSwitchCase(choice.ast.cases[taken.one]).?.ast.target_expr); // unreachable: a switch's cases are cases
+    }
+    if (tree.fullIf(at)) |branch| {
+        if (branch.payload_token != null or branch.error_token != null) return null;
+        const otherwise = branch.ast.else_expr.unwrap() orelse return null;
+        const taken = (try self.comptimeTruth(env, file, branch.ast.cond_expr)) orelse return null;
+        return self.comptimeValue(env, file, if (taken) branch.ast.then_expr else otherwise);
+    }
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    if (tree.fullCall(&call_buffer, at) != null) return self.callComptime(env, file, at);
+    if (isBuiltin(tree, at, "@hasDecl") or isBuiltin(tree, at, "@hasField")) return if (try self.comptimeTruth(env, file, at)) |known| .{ .boolean = known } else null;
+    return if (try self.namedType(env, file, at)) |t| .{ .type = t } else null;
+}
+
+/// Whether a switch subject or a bare condition is read for a value the program fixes
+/// (`comptimeValue`): inside a reading, whose bindings fix values, or written `comptime`. Code
+/// read once asks it of none other, as a run's budget pays for each.
+fn fixedContext(env: ?*const Env, tree: *const Ast, node: Ast.Node.Index) bool {
+    if (env != null) return true;
+    var at = node;
+    while (tree.nodeTag(at) == .grouped_expression) at = tree.nodeData(at).node_and_token[0];
+    return tree.nodeTag(at) == .@"comptime";
+}
+
+/// Whether `node`, a name or a member access, is rooted in a value fixed only at run time: its
+/// leftmost name is a parameter not `comptime`, a `var`, or a capture.
+fn runtimeRooted(self: *Facts, file: Project.FileId, node: Ast.Node.Index) bool {
+    const tree = &self.project.at(file).file.tree;
+    var at = node;
+    while (tree.nodeTag(at) == .field_access) at = tree.nodeData(at).node_and_token[0];
+    if (tree.nodeTag(at) != .identifier) return false;
+    const model = &self.project.at(file).model;
+    const index = (model.reference(at) orelse return false).declaration orelse return false;
+    const record = model.declarations[@backingInt(index)];
+    return switch (record.kind) {
+        // A parameter of type `type` is comptime without the keyword.
+        .parameter => !self.comptimeParameter(file, at) and !(if (self.parameterTypeNode(.{ .file = file, .index = index })) |kind| tree.nodeTag(kind) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(kind)), "type") else false),
+        .capture => true,
+        .variable => if (tree.fullVarDecl(record.node)) |variable| tree.tokenTag(variable.ast.mut_token) == .keyword_var else false,
+        else => false,
+    };
+}
+
+/// The value a constant holds at compile time, read in `env` (its instance's reading): its
+/// initializer's, where it is a `const` with one. Null for a variable, a parameter, a field or a
+/// capture.
+fn constantComptime(self: *Facts, decl: Decl, env: ?*const Env) ResolveError!?Comptime {
+    const model = &self.project.at(decl.file).model;
+    const record = model.declarations[@backingInt(decl.index)];
+    if (record.kind != .variable) return null;
+    const tree = &self.project.at(decl.file).file.tree;
+    const variable = tree.fullVarDecl(record.node) orelse return null;
+    if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
+    const init = variable.ast.init_node.unwrap() orelse return null;
+    return self.comptimeValue(env, decl.file, init);
+}
+
+/// The initializer of the field `name` an anonymous struct literal sets, null where it sets none.
+fn comptimeLiteralField(self: *Facts, literal: ComptimeLiteral, name: []const u8) ResolveError!?Ast.Node.Index {
+    const tree = &self.project.at(literal.file).file.tree;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const init = tree.fullStructInit(&buffer, literal.node) orelse return null;
+    for (init.ast.fields) |field| {
+        // `.name = value`: the name two tokens before the value.
+        const name_token = tree.firstToken(field) - 2;
+        if (std.mem.eql(u8, try self.memberName(tree.tokenSlice(name_token)), name)) return field;
+    }
+    return null;
 }
 
 /// Whether the pointer size `size` reads (`info.size`) is the one the enum literal `tag` names
@@ -5463,10 +5730,15 @@ fn branches(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node
 /// else, a kind has no prong, or a prong names its kind other than by a literal.
 fn takenProng(self: *Facts, env: ?*const Env, file: Project.FileId, whole: Ast.full.Switch) ResolveError!?Taken {
     const tree = &self.project.at(file).file.tree;
-    // Only type information or a pointer's size read off it decides: a subject written as
-    // neither (`switch (tag)`) is not resolved, every prong taken, as one that does not
-    // resolve to either is.
-    if (!mayReflect(tree, whole.ast.condition)) return null;
+    // Only type information, a pointer's size read off it, or a tag the program fixes
+    // (`switch (comptime kind(T).?)`, `comptimeValue`) decides: any other subject is not
+    // resolved, every prong taken, as one that does not resolve to any is.
+    if (!mayReflect(tree, whole.ast.condition)) {
+        if (!fixedContext(env, tree, whole.ast.condition)) return null;
+        const value = try self.comptimeValue(env, file, whole.ast.condition) orelse return null;
+        if (value != .tag) return null;
+        return .{ .one = (try self.prongOf(tree, whole, value.tag.name)) orelse return null };
+    }
     const subject = try self.resolveIn(env, file, whole.ast.condition);
     if (subject != .reflected) return null;
     // A pointer's size (`switch (info.size)`): the prong naming it, else the `else`.
@@ -8010,20 +8282,32 @@ fn kindCompared(self: *Facts, env: ?*const Env, file: Project.FileId, left: Ast.
         .{ right, left }
     else
         return null;
+    const wanted = try self.memberName(tree.tokenSlice(tree.nodeMainToken(tag)));
+    // The type of a struct literal the program fixes (`@typeInfo(@TypeOf(declared))`) is a struct.
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = builtinArgs(tree, ungrouped(tree, info), &buffer);
+    if (args.len == 1) if (try self.literalOfType(env, file, args[0]) != null) return std.mem.eql(u8, wanted, "struct");
     const subject = try self.resolveIn(env, file, info);
     if (subject != .reflected or subject.reflected.at != .info) return null;
     const kind = (try self.kindOfType(subject.reflected.of.*)) orelse return null;
-    return std.mem.eql(u8, kind, try self.memberName(tree.tokenSlice(tree.nodeMainToken(tag))));
+    return std.mem.eql(u8, kind, wanted);
 }
 
-/// How many `callTruth`s are read one inside another, at most.
+/// How many `callComptime`s are read one inside another, at most.
 const truth_call_limit = 8;
 
-/// What a call to a function returning `bool` gives on the reading `env` binds, where its body
-/// decides it as the program compiles (`std.meta.hasFn(T, "jsonParse")`): its statements read
-/// in the reading the call makes, each `if` and `switch` there settled by its bindings, up to
-/// the `return` taken. Null where a statement it may return past is not settled.
+/// What a call to a function returning `bool` gives on the reading `env` binds (`callComptime`).
 fn callTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?bool {
+    const value = try self.callComptime(env, file, node) orelse return null;
+    return if (value == .boolean) value.boolean else null;
+}
+
+/// What a call gives at compile time on the reading `env` binds, where its body decides it as
+/// the program compiles (`std.meta.hasFn(T, "jsonParse")`, strand's `scalars.kind(T)`): its
+/// statements read in the reading the call makes, each `if` and `switch` there settled by its
+/// bindings, up to the `return` taken, its value as `comptimeValue` reads it. A function giving
+/// a type is `resolve`'s to read. Null where a statement it may return past is not settled.
+fn callComptime(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Comptime {
     const tree = &self.project.at(file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
     _ = tree.fullCall(&buffer, node) orelse return null;
@@ -8048,7 +8332,16 @@ fn callTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
     var proto_buffer: [1]Ast.Node.Index = undefined;
     const proto = held.fullFnProto(&proto_buffer, record.node) orelse return null;
     const result = proto.ast.return_type.unwrap() orelse return null;
-    if (held.nodeTag(result) != .identifier or !std.mem.eql(u8, held.tokenSlice(held.nodeMainToken(result)), "bool")) return null;
+    const returns_bool = held.nodeTag(result) == .identifier and std.mem.eql(u8, held.tokenSlice(held.nodeMainToken(result)), "bool");
+    if (held.nodeTag(result) == .identifier and std.mem.eql(u8, held.tokenSlice(held.nodeMainToken(result)), "type")) return null;
+    // A value other than a `bool` is read only of a call given nothing fixed at run time: its
+    // receiver and arguments rooted in no runtime parameter, `var` or capture.
+    if (!returns_bool) {
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&call_buffer, node).?; // unreachable: checked a call above
+        if (tree.nodeTag(call.ast.fn_expr) == .field_access and self.runtimeRooted(file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) return null;
+        for (call.ast.params) |argument| if (self.runtimeRooted(file, argument)) return null;
+    }
     const bound = (try self.readingFrom(file, node, decl, env)) orelse return null;
     return switch (try self.decidedReturn(bound, decl.file, held.nodeData(whole).node_and_node[1], decided_forks)) {
         .returns => |value| value,
@@ -8056,9 +8349,22 @@ fn callTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
     };
 }
 
-/// What a statement read on `env` does as the program compiles: returns a known `bool`, falls
+/// What a statement read on `env` does as the program compiles: returns a known value, falls
 /// through to the next, or is not known to do either.
-const Decided = union(enum) { returns: bool, falls, unknown };
+const Decided = union(enum) {
+    returns: Comptime,
+    falls,
+    unknown,
+
+    /// Whether two ways of a statement do alike: return equal values, or both fall through.
+    fn alike(one: Decided, other: Decided) bool {
+        return switch (one) {
+            .returns => |a| other == .returns and comptimeEqual(a, other.returns) == true,
+            .falls => other == .falls,
+            .unknown => false,
+        };
+    }
+};
 
 /// How many `if`s whose condition the bindings do not settle `decidedReturn` reads both ways of,
 /// one inside another: past it, unknown.
@@ -8070,7 +8376,7 @@ fn decidedReturn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
     if (tree.blockStatements(&buffer, node)) |statements| return self.decidedSequence(env, file, statements, forks);
     if (tree.nodeTag(node) == .@"return") {
         const value = tree.nodeData(node).opt_node.unwrap() orelse return .unknown;
-        return if (try self.comptimeTruth(env, file, value)) |known| .{ .returns = known } else .unknown;
+        return if (try self.comptimeValue(env, file, value)) |known| .{ .returns = known } else .unknown;
     }
     const unsettled: Decided = if (returnsWithin(tree, node)) .unknown else .falls;
     if (tree.fullIf(node)) |branch| {
@@ -8105,7 +8411,7 @@ fn decidedSequence(self: *Facts, env: ?*const Env, file: Project.FileId, stateme
             const rest = statements[n + 1 ..];
             const then = try self.decidedThen(env, file, branch.ast.then_expr, rest, forks - 1);
             const otherwise = if (branch.ast.else_expr.unwrap()) |other| try self.decidedThen(env, file, other, rest, forks - 1) else try self.decidedSequence(env, file, rest, forks - 1);
-            if (std.meta.eql(then, otherwise)) return then;
+            if (then.alike(otherwise)) return then;
             return .unknown;
         },
     };
@@ -16151,4 +16457,225 @@ test "a copy crowded past its routes is read along the routes its binding compil
     const enum_call = (try calls.at(&facts, file, node.of(tree, "keep(E, .a, 0)"))).?;
     const value = (try facts.boundCopy(enum_call, keep, crowded)) orelse return error.TestUnexpectedResult;
     try std.testing.expect(value == .instance);
+}
+
+/// What `knownBool` gives for the initializer of the constant `name` in the project's `source`th
+/// file, for the tests of values the program fixes (`comptimeValue`).
+fn testKnownBool(facts: *Facts, source: usize, name: []const u8) !?bool {
+    const project = facts.project;
+    const model = &project.sources[source].model;
+    const tree = &project.sources[source].file.tree;
+    for (model.declarations) |d| if (std.mem.eql(u8, d.name, name) and d.kind == .variable) {
+        const init = tree.fullVarDecl(d.node).?.ast.init_node.unwrap().?; // unreachable: each asked is a constant with a value
+        return facts.knownBool(project.sources[source].id, init);
+    };
+    unreachable; // unreachable: the source declares each name asked
+}
+
+test "a value the program fixes decides a condition: strand's scalars.kind(T) read per type, through @hasDecl, a constant's struct literal, @typeInfo(@TypeOf(...)), @hasField, a contract number and enum tags; a switch on the tag it gives takes its prong" {
+    const source =
+        \\pub const Kind = enum { integer, ranged, nonzero, counter, text };
+        \\pub fn kind(comptime T: type) ?Kind {
+        \\    switch (@typeInfo(T)) {
+        \\        .@"struct", .@"enum" => {},
+        \\        else => return null,
+        \\    }
+        \\    if (!@hasDecl(T, "aegis_scalar")) return null;
+        \\    const declared = T.aegis_scalar;
+        \\    if (@typeInfo(@TypeOf(declared)) != .@"struct" or !@hasField(@TypeOf(declared), "contract")) return null;
+        \\    if (declared.contract != 1) @compileError("contract");
+        \\    const scalar = declared.kind;
+        \\    if (scalar == .ranged) return .ranged;
+        \\    if (scalar == .nonzero) return .nonzero;
+        \\    if (scalar == .counter) return .counter;
+        \\    if (scalar == .duration or scalar == .bytes) return .text;
+        \\    if (scalar == .checked or scalar == .saturating or scalar == .count) return .integer;
+        \\    return null;
+        \\}
+        \\fn isRanged(comptime T: type) bool {
+        \\    return switch (comptime kind(T).?) {
+        \\        .ranged => true,
+        \\        else => false,
+        \\    };
+        \\}
+        \\fn unbound(comptime T: type) bool {
+        \\    return kind(T) == .ranged;
+        \\}
+        \\const Checked = struct {
+        \\    pub const aegis_scalar = .{ .contract = 1, .kind = .checked, .representation = u32 };
+        \\};
+        \\const Ranged = struct {
+        \\    pub const aegis_scalar = .{ .contract = 1, .kind = .ranged, .representation = u8, .minimum = 1, .maximum = 9 };
+        \\};
+        \\const NonZero = enum(u32) {
+        \\    _,
+        \\    pub const aegis_scalar = .{ .contract = 1, .kind = .nonzero, .representation = u32 };
+        \\};
+        \\const Counter = struct {
+        \\    pub const aegis_scalar = .{ .contract = 1, .kind = .counter, .representation = u64 };
+        \\};
+        \\const Duration = struct {
+        \\    pub const aegis_scalar = .{ .contract = 1, .kind = .duration, .representation = u64 };
+        \\};
+        \\const Plain = struct { x: u8 };
+        \\const Later = struct {
+        \\    pub const aegis_scalar = .{ .contract = 2, .kind = .checked, .representation = u32 };
+        \\};
+        \\fn declare(comptime k: anytype) @TypeOf(.{ .contract = 1, .kind = k }) {
+        \\    return .{ .contract = 1, .kind = k };
+        \\}
+        \\const Built = struct {
+        \\    pub const aegis_scalar = declare(.checked);
+        \\};
+        \\const E1 = enum { a };
+        \\const E2 = enum { a };
+        \\const checked = kind(Checked) == .integer;
+        \\const ranged = kind(Ranged) == .ranged;
+        \\const nonzero = kind(NonZero) == .nonzero;
+        \\const counter = kind(Counter) == .counter;
+        \\const text = kind(Duration) == .text;
+        \\const plain = kind(Plain) == null;
+        \\const scalar_int = kind(u8) == null;
+        \\const contract = Later.aegis_scalar.contract != 1;
+        \\const pruned = isRanged(Ranged);
+        \\const pruned_other = isRanged(Checked);
+        \\const built = kind(Built) == .integer;
+        \\const two_enums = E1.a == E2.a;
+        \\const past_range = 0x1_0000_0000_0000_0000_0000_0000_0000_0000 == 1;
+        \\const in_range = 18446744073709551615 == 18446744073709551615;
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    for ([_][]const u8{ "checked", "ranged", "nonzero", "counter", "text", "plain", "scalar_int", "contract", "pruned", "in_range" }) |name| {
+        errdefer std.debug.print("not true: {s}\n", .{name});
+        try std.testing.expectEqual(@as(?bool, true), try testKnownBool(&facts, 0, name));
+    }
+    try std.testing.expectEqual(@as(?bool, false), try testKnownBool(&facts, 0, "pruned_other"));
+    // A constant built by a call is what the call gives, read as that call reads it: its `kind`
+    // is the call's parameter, not known here, never a default.
+    try std.testing.expectEqual(@as(?bool, null), try testKnownBool(&facts, 0, "built"));
+    // Tags of two enums, and a number past what is read: not known, never a guess.
+    try std.testing.expectEqual(@as(?bool, null), try testKnownBool(&facts, 0, "two_enums"));
+    try std.testing.expectEqual(@as(?bool, null), try testKnownBool(&facts, 0, "past_range"));
+    // `kind(T)` with `T` bound by nothing: not known.
+    const tree = &project.sources[0].file.tree;
+    const unbound_return = for (0..tree.nodes.len) |i| {
+        const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        if (std.mem.eql(u8, tree.getNodeSource(at), "kind(T) == .ranged")) break at;
+    } else unreachable; // unreachable: the source holds it
+    try std.testing.expectEqual(@as(?bool, null), try facts.knownBool(project.sources[0].id, unbound_return));
+}
+
+test "@hasDecl sees a declaration not pub only from its container's file, as Zig has it" {
+    const lib =
+        \\pub const Foo = struct {
+        \\    nope: i32,
+        \\    const hi = 1;
+        \\    pub const blah = 2;
+        \\};
+        \\const same_file = @hasDecl(Foo, "hi");
+        \\const field = @hasDecl(Foo, "nope");
+    ;
+    const root =
+        \\const lib = @import("lib.zig");
+        \\const other_file = @hasDecl(lib.Foo, "hi");
+        \\const other_pub = @hasDecl(lib.Foo, "blah");
+    ;
+    var project = try Project.init(std.testing.allocator, &.{
+        .{ .name = "root", .bytes = root },
+        .{ .name = "lib.zig", .bytes = lib },
+    }, &.{.{ .from = 0, .spelling = "lib.zig", .target = 1 }}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    try std.testing.expectEqual(@as(?bool, true), try testKnownBool(&facts, 1, "same_file"));
+    try std.testing.expectEqual(@as(?bool, false), try testKnownBool(&facts, 1, "field"));
+    try std.testing.expectEqual(@as(?bool, false), try testKnownBool(&facts, 0, "other_file"));
+    try std.testing.expectEqual(@as(?bool, true), try testKnownBool(&facts, 0, "other_pub"));
+}
+
+test "a guard on a value the program fixes prunes per binding: `comptime kind(T) != null` is false for `bool` and true for a scalar, and the branch behind it is reached only where it holds; a runtime optional stays unknown (warp-fast's probe, census G1)" {
+    const source =
+        \\const Kind = enum { integer };
+        \\fn kind(comptime T: type) ?Kind {
+        \\    switch (@typeInfo(T)) {
+        \\        .@"struct", .@"enum" => {},
+        \\        else => return null,
+        \\    }
+        \\    if (!@hasDecl(T, "aegis_scalar")) return null;
+        \\    return .integer;
+        \\}
+        \\fn scalar(comptime T: type) bool {
+        \\    switch (@typeInfo(T)) {
+        \\        .@"struct", .@"enum" => {},
+        \\        else => return false,
+        \\    }
+        \\    return @hasDecl(T, "aegis_scalar");
+        \\}
+        \\fn maybe(x: ?Kind) ?Kind {
+        \\    return x orelse null;
+        \\}
+        \\fn guarded(k: ?Kind) void {
+        \\    if (maybe(k) != null) emitScalar(k);
+        \\}
+        \\fn emitScalar(value: anytype) void {
+        \\    _ = value;
+        \\}
+        \\fn emit(comptime T: type, value: T) void {
+        \\    if (comptime kind(T) != null) return emitScalar(value);
+        \\}
+        \\const S = struct {
+        \\    pub const aegis_scalar = .{};
+        \\};
+        \\pub fn main(k: ?Kind) void {
+        \\    emit(bool, true);
+        \\    emit(S, .{});
+        \\    guarded(k);
+        \\}
+        \\const bool_kind = kind(bool) != null;
+        \\const s_kind = kind(S) != null;
+        \\const bool_scalar = scalar(bool);
+        \\const s_scalar = scalar(S);
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    try std.testing.expectEqual(@as(?bool, false), try testKnownBool(&facts, 0, "bool_kind"));
+    try std.testing.expectEqual(@as(?bool, true), try testKnownBool(&facts, 0, "s_kind"));
+    try std.testing.expectEqual(@as(?bool, false), try testKnownBool(&facts, 0, "bool_scalar"));
+    try std.testing.expectEqual(@as(?bool, true), try testKnownBool(&facts, 0, "s_scalar"));
+    const tree = &project.sources[0].file.tree;
+    const file = project.sources[0].id;
+    const node = struct {
+        fn of(t: *const Ast, text: []const u8) Ast.Node.Index {
+            for (0..t.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (std.mem.eql(u8, t.getNodeSource(at), text)) return at;
+            }
+            unreachable; // unreachable: the source holds each text asked
+        }
+    };
+    const behind = node.of(tree, "emitScalar(value)");
+    for ([_]struct { []const u8, bool }{ .{ "emit(bool, true)", false }, .{ "emit(S, .{})", true } }) |each| {
+        const at = node.of(tree, each[0]);
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, at).?;
+        const read = (try calls.at(&facts, file, at)).?;
+        const env = try facts.bind(file, call, read.callee.function, null);
+        try std.testing.expectEqual(each[1], try facts.reachedUnder(env, file, behind));
+    }
+    // A runtime optional is no value the program fixes: unknown, never `null`, and the branch it
+    // guards is reached.
+    try std.testing.expectEqual(@as(?Comptime, null), try facts.comptimeValue(null, file, node.of(tree, "x orelse null")));
+    try std.testing.expectEqual(@as(?bool, null), try facts.knownBool(file, node.of(tree, "maybe(k) != null")));
+    try std.testing.expect(try facts.reachedUnder(null, file, node.of(tree, "emitScalar(k)")));
 }
