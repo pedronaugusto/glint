@@ -108,6 +108,9 @@ pub const Problem = struct {
         /// destination its declaration does not settle (no parameter or several), or a teardown
         /// with no release to check for.
         refused,
+        /// A role no pack of the run reads (`Facts.role_names`): a misspelt role would leave its
+        /// type plain, which clears its sites.
+        unknown_role,
     };
 };
 
@@ -274,6 +277,11 @@ const Reader = struct {
                 entry.type = try r.reference(file, field, .own);
             } else if (std.mem.eql(u8, name, "role")) {
                 entry.role = try r.enumLiteral(file, field);
+                if (r.facts.role_names) |known| {
+                    for (known) |each| {
+                        if (std.mem.eql(u8, each, entry.role)) break;
+                    } else try r.problem(file, field, .unknown_role);
+                }
             } else if (std.mem.eql(u8, name, "internal")) {
                 var names: std.ArrayList([]const u8) = .empty;
                 for (try r.list(file, field) orelse continue) |each| try names.append(r.facts.gpa, try r.enumLiteral(file, each));
@@ -449,7 +457,12 @@ const Reader = struct {
                 member = t.tokenSlice(t.nodeMainToken(field));
             } else return .not;
         }
-        const made_by = switch (try r.facts.definition(file, function orelse return .not)) {
+        const named = switch (try r.facts.definition(file, function orelse return .not)) {
+            .decl => |decl| decl,
+            .none, .unknown => return .unresolved,
+        };
+        // Through aliases to the type function (`pub const Guarded = sync.Guarded;`).
+        const made_by = switch (try r.facts.origin(named)) {
             .decl => |decl| decl,
             .none, .unknown => return .unresolved,
         };

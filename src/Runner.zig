@@ -82,7 +82,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     }
     try validateRules(config, definitions);
     const known = try knownRules(a, definitions);
-    var runner: Runner = .{ .a = a, .project = project, .config = config, .base = config, .files = options.files, .definitions = definitions, .facts = .{ .project = project, .gpa = a, .backing = gpa, .known = Contract.package, .remaining = config.fact_budget, .check_records = if (options.summary_check) &Summary.check else null, .read_records = options.summary_records } };
+    var runner: Runner = .{ .a = a, .project = project, .config = config, .base = config, .files = options.files, .definitions = definitions, .facts = .{ .project = project, .gpa = a, .backing = gpa, .known = Contract.package, .role_names = try roleNames(a, options.project_rules), .remaining = config.fact_budget, .check_records = if (options.summary_check) &Summary.check else null, .read_records = options.summary_records } };
     defer runner.facts.deinit();
     var metrics: std.ArrayList(Report.Metrics.File) = .empty;
     var total: Report.Metrics.Counts = .{};
@@ -219,6 +219,40 @@ fn exhausted(runner: *Runner) error{OutOfMemory}!void {
 
 /// Every rule glint has: the core's, this run's own and the aegis pack's, whether or not this
 /// run gives the pack. A suppression naming one this run does not enable is not judged; a name
+/// The role names the run's packs read: glint's own (the aegis pack's and the metrics'), then
+/// each project rule's (`Context.Rule.roles`), a list several rules give once. A name two packs
+/// give in different lists is refused, so a package's role names one pack.
+fn roleNames(a: std.mem.Allocator, project_rules: []const Context.Rule) error{ OutOfMemory, InvalidSelection }![]const []const u8 {
+    var lists: std.ArrayList([]const []const u8) = .empty;
+    try lists.append(a, namesOf(Contract.Kind));
+    try lists.append(a, namesOf(Report.Metrics.Kind));
+    each: for (project_rules) |rule| {
+        if (rule.roles.len == 0) continue;
+        for (lists.items) |list| if (sameNames(list, rule.roles)) continue :each;
+        try lists.append(a, rule.roles);
+    }
+    var names: std.ArrayList([]const u8) = .empty;
+    for (lists.items, 0..) |list, i| for (list) |name| {
+        for (lists.items[i + 1 ..]) |other| for (other) |given| if (std.mem.eql(u8, given, name)) return error.InvalidSelection;
+        try names.append(a, name);
+    };
+    return names.items;
+}
+fn namesOf(comptime E: type) []const []const u8 {
+    const fields = @typeInfo(E).@"enum".fields;
+    const names = comptime blk: {
+        var out: [fields.len][]const u8 = undefined;
+        for (fields, &out) |field, *name| name.* = field.name;
+        break :blk out;
+    };
+    return &names;
+}
+fn sameNames(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
+}
+
 /// none of them has is malformed.
 fn knownRules(a: std.mem.Allocator, definitions: []const rules.Definition) std.mem.Allocator.Error![]const rules.Definition {
     var known: std.ArrayList(rules.Definition) = .empty;
