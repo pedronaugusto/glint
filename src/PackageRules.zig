@@ -171,7 +171,8 @@ pub const Publication = struct {
     /// or a copy vendored without its manifest, stays the program's.
     files: []const Project.FileId,
 };
-pub const Entry = struct { role: u32, target: Target };
+/// A role on a declaration, with the fields only its package touches (`.internal`, A001's).
+pub const Entry = struct { role: u32, target: Target, internal: []const []const u8 = &.{} };
 pub const Target = union(enum) { function: Facts.Decl, container: Facts.Container };
 /// A root of the library whose roles are not all read: it declares no `lint_rules` (`problem`
 /// null), or part of what it declares could not be read (`Problem`, where it is written).
@@ -204,15 +205,15 @@ pub fn publication(facts: *Facts, library: anytype) Facts.ResolveError!*const Pu
             const decl = declared.type.declaration() orelse continue;
             switch (try facts.declaration(decl)) {
                 .function => |function| {
-                    try entries.append(facts.gpa, .{ .role = role_value, .target = .{ .function = function } });
+                    try entries.append(facts.gpa, .{ .role = role_value, .target = .{ .function = function }, .internal = declared.internal });
                     // The container a type function returns is also its type: instances declared
                     // with it are the role's, each container it may return where it chooses one
                     // by a comptime option (aegis 0.3's `SlotPool(T, Tag, options)`).
                     if (try facts.template(function)) |returned| for (try Facts.returnedContainers(facts.gpa, returned)) |made| {
-                        try entries.append(facts.gpa, .{ .role = role_value, .target = .{ .container = .{ .file = made.file, .scope = made.scope } } });
+                        try entries.append(facts.gpa, .{ .role = role_value, .target = .{ .container = .{ .file = made.file, .scope = made.scope } }, .internal = declared.internal });
                     };
                 },
-                .container => |made| try entries.append(facts.gpa, .{ .role = role_value, .target = .{ .container = .{ .file = made.file, .scope = made.scope } } }),
+                .container => |made| try entries.append(facts.gpa, .{ .role = role_value, .target = .{ .container = .{ .file = made.file, .scope = made.scope } }, .internal = declared.internal }),
                 // A role on what is no type and no function: the declarer's own lint reports
                 // the form; for its consumers the role is not read.
                 else => try gaps.append(facts.gpa, .{ .root = root, .problem = .{ .file = decl.file, .node = facts.project.at(decl.file).model.declarations[@backingInt(decl.index)].node, .why = .malformed } }),
@@ -238,17 +239,30 @@ fn roleValue(comptime Roles: type, name: []const u8) ?u32 {
 /// container with a role, seen through pointers, optionals and error unions.
 pub fn role(facts: *Facts, library: anytype, value: Facts.Value) Facts.ResolveError!?@TypeOf(library).Role {
     const Roles = @TypeOf(library).Role;
+    const found = (try entryOf(facts, library, value)) orelse return null;
+    return @as(Roles, @fromBackingInt(@intCast(found.role)));
+}
+
+/// The fields only `library`'s package touches of a value's type (`.internal`), where its type is
+/// one the package gives a role, seen as `role` sees it; null where it is none.
+pub fn internalOf(facts: *Facts, library: anytype, value: Facts.Value) Facts.ResolveError!?[]const []const u8 {
+    const found = (try entryOf(facts, library, value)) orelse return null;
+    return found.internal;
+}
+
+/// The entry of the declaration `value` is, or is a type or instance of.
+fn entryOf(facts: *Facts, library: anytype, value: Facts.Value) Facts.ResolveError!?Entry {
     const found = try publication(facts, library);
     var current = value;
     while (true) switch (current) {
         .pointer => |inner| current = inner.child.*,
         .array, .optional, .error_union => |inner| current = inner.*,
         .function => |decl| {
-            for (found.entries) |entry| if (entry.target == .function and std.meta.eql(entry.target.function, decl)) return @as(Roles, @fromBackingInt(@intCast(entry.role)));
+            for (found.entries) |entry| if (entry.target == .function and std.meta.eql(entry.target.function, decl)) return entry;
             return null;
         },
         .container, .instance => |c| {
-            for (found.entries) |entry| if (entry.target == .container and entry.target.container.file == c.file and entry.target.container.scope == c.scope) return @as(Roles, @fromBackingInt(@intCast(entry.role)));
+            for (found.entries) |entry| if (entry.target == .container and entry.target.container.file == c.file and entry.target.container.scope == c.scope) return entry;
             return null;
         },
         // A choice: the role every part agrees on, none where they differ or one has none.
