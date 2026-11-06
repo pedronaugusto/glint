@@ -889,7 +889,13 @@ fn recordOf(value: Facts.Value) ?Facts.Container {
 /// fields (`ownerPaths`): A003 follows it as an owner of kind `record`.
 fn recordOwned(c: *Context, value: Facts.Value) Context.Error!bool {
     var current = value;
-    while (current == .error_union) current = current.error_union.*;
+    // Through an error union or an optional: where the call fails or gives null, nothing is
+    // held; the record it gives is released as one held by value.
+    while (true) current = switch (current) {
+        .error_union => |inner| inner.*,
+        .optional => |inner| inner.*,
+        else => break,
+    };
     const container = switch (current) {
         .instance => |container| container,
         else => return false,
