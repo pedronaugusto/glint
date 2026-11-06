@@ -1,11 +1,12 @@
 //! Assertion metrics: how many functions a file declares and the assertion calls in them, each
 //! counted by the declaration its callee resolves to (std's `debug.assert`, aegis's `assert`
-//! contracts), never by spelling. A call named like one whose callee does not resolve is counted
+//! contracts by the roles aegis declares), never by spelling. A call named like one whose callee does not resolve is counted
 //! apart. A report, never a proof or a gate: a count says nothing about what an assertion checks.
 const std = @import("std");
 const Context = @import("RuleContext.zig");
 const Model = @import("Model.zig");
 const Library = @import("Library.zig").Library;
+const Governed = @import("Governed.zig");
 const Report = @import("Report.zig");
 const Ast = std.zig.Ast;
 
@@ -13,24 +14,9 @@ pub const Kind = Report.Metrics.Kind;
 pub const Counts = Report.Metrics.Counts;
 
 const Lib = Library(Kind);
-/// Where std and aegis publish their assertions. Nothing is required: a program that imports
-/// neither, or an aegis without one of them, just counts none.
-pub const library: Lib = .{ .modules = &.{
-    .{ .name = "std", .members = &.{.{ .path = "debug.assert", .role = .std_assert, .required = false }} },
-    .{ .name = "aegis", .members = &aegis_members },
-    .{ .name = "aegis.assert", .members = &assert_members },
-} };
-const aegis_members = blk: {
-    var members: [assert_members.len]Lib.Member = undefined;
-    for (assert_members, &members) |member, *each| each.* = .{ .path = "assert." ++ member.path, .role = member.role, .required = false };
-    break :blk members;
-};
-const assert_members = [_]Lib.Member{
-    .{ .path = "invariant", .role = .invariant, .required = false },
-    .{ .path = "never", .role = .never, .required = false },
-    .{ .path = "debug", .role = .debug, .required = false },
-    .{ .path = "debugCheck", .role = .debug_check, .required = false },
-};
+/// Aegis's assertions, by the roles its `lint_rules` gives them (`.role = .invariant`, ...).
+/// An aegis that declares none of them, or a program that imports no aegis, just counts none.
+pub const library: Lib = .{ .package = @import("AegisContract.zig").package };
 
 /// Counts the context's file.
 pub fn count(context: *Context) Context.Error!Counts {
@@ -47,7 +33,8 @@ pub fn count(context: *Context) Context.Error!Counts {
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
         const value = try context.facts.resolve(context.file, call.ast.fn_expr);
-        const kind = if (value == .function) try context.role(library, value) else null;
+        // std's by std's contract, at its path; aegis's by the role aegis declares.
+        const kind: ?Kind = if (value != .function) null else if (try Governed.stdCall(context, node, "debug.assert") == .yes) .std_assert else try context.role(library, value);
         if (kind) |k| {
             counts.assertions[@backingInt(k)] += 1; // safe: a kind indexes its own count table.
             if (function(tree, model, node)) |f| asserted[@backingInt(f)] = true; // safe: the checked AST indexes its own node table.
