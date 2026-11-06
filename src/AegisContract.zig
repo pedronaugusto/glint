@@ -66,123 +66,15 @@ pub const Kind = enum {
     record,
 };
 
-/// Aegis as programs import it. A declaration is aegis's when the path a program writes from the
-/// module root reaches it, so recognition survives any revision that keeps its public names and
-/// reports one that drops them (Context.drift). The same members are listed once per way aegis
-/// is imported: the root, and each namespace module a program may depend on alone.
-pub const library: Lib = .{ .modules = &modules, .package = package };
+/// Aegis's roles, as aegis declares them in its root's `lint_rules` (glint-design §12): each
+/// type's role by its declaration, read through `Facts.publication`. A role a revision of aegis
+/// no longer declares, or one it declares that does not resolve, is a gap that rule reports where
+/// aegis is imported (Context.drift); aegis's own lint reports its problems where they are written.
+pub const library: Library(Kind) = .{ .package = package };
 /// Aegis's package, as its `build.zig.zon` names it (`Facts.known`): its own files are not the
 /// program's, as the analyses know aegis by its declarations, under whatever name it is
 /// imported. Its fingerprint stays the same in every revision.
 pub const package: Facts.Package = .{ .name = "aegis", .fingerprint = 0x5e23831cba68ccae };
-const Lib = Library(Kind);
-const modules = [_]Lib.Module{
-    .{ .name = "aegis", .members = &root_members },
-    .{ .name = "aegis.secret", .members = &secret_members },
-    .{ .name = "aegis.sync", .members = &sync_members },
-    .{ .name = "aegis.int", .members = &int_members },
-    .{ .name = "aegis.id", .members = &id_members },
-    .{ .name = "aegis.units", .members = &units_members },
-};
-const secret_members = [_]Lib.Member{
-    .{ .path = "Secret", .role = .secret },
-    .{ .path = "SecretBytes", .role = .bytes },
-    .{ .path = "SecretBytes.Writer", .role = .bytes_writer, .required = false },
-    .{ .path = "Choice", .role = .choice, .required = false },
-};
-const sync_members = [_]Lib.Member{
-    .{ .path = "Guarded", .role = .guarded },
-    .{ .path = "BlockingGuarded", .role = .guarded },
-    .{ .path = "RwGuarded", .role = .guarded },
-    .{ .path = "SpinRwGuarded", .role = .guarded },
-    .{ .path = "Condition", .role = .condition },
-    .{ .path = "Once", .role = .once },
-    .{ .path = "Lazy", .role = .once },
-    .{ .path = "Confined", .role = .confined },
-    .{ .path = "Shared", .role = .shared, .required = false },
-    .{ .path = "Atomic", .role = .atomic, .required = false },
-    .{ .path = "InitContext", .role = .context, .required = false },
-    .{ .path = "Order.Context", .role = .context, .required = false },
-    .{ .path = "Order.Ordered", .role = .guarded, .required = false },
-};
-const int_members = [_]Lib.Member{
-    .{ .path = "Checked", .role = .scalar },
-    .{ .path = "Saturating", .role = .scalar },
-    .{ .path = "Ranged", .role = .scalar },
-};
-const id_members = [_]Lib.Member{
-    .{ .path = "Id", .role = .scalar },
-    .{ .path = "NonZero", .role = .scalar },
-    .{ .path = "Counter", .role = .issuer },
-};
-const units_members = [_]Lib.Member{
-    .{ .path = "Count", .role = .scalar },
-    .{ .path = "Bytes", .role = .scalar },
-    .{ .path = "Bits", .role = .scalar },
-    .{ .path = "Duration", .role = .scalar },
-    .{ .path = "Instant", .role = .scalar },
-};
-const root_members = [_]Lib.Member{
-    .{ .path = "Secret", .role = .secret },
-    .{ .path = "SecretBytes", .role = .bytes },
-    .{ .path = "SecretBytes.Writer", .role = .bytes_writer, .required = false },
-    .{ .path = "Guarded", .role = .guarded },
-    .{ .path = "BlockingGuarded", .role = .guarded },
-    .{ .path = "RwGuarded", .role = .guarded },
-    .{ .path = "SpinRwGuarded", .role = .guarded },
-    .{ .path = "Condition", .role = .condition },
-    .{ .path = "Once", .role = .once },
-    .{ .path = "Lazy", .role = .once },
-    .{ .path = "Confined", .role = .confined },
-    .{ .path = "int.Checked", .role = .scalar },
-    .{ .path = "int.Saturating", .role = .scalar },
-    .{ .path = "int.Ranged", .role = .scalar },
-    .{ .path = "id.Id", .role = .scalar },
-    .{ .path = "id.NonZero", .role = .scalar },
-    .{ .path = "id.Counter", .role = .issuer },
-    .{ .path = "units.Count", .role = .scalar },
-    .{ .path = "units.Bytes", .role = .scalar },
-    .{ .path = "units.Bits", .role = .scalar },
-    .{ .path = "units.Duration", .role = .scalar },
-    .{ .path = "units.Instant", .role = .scalar },
-    .{ .path = "secret.Choice", .role = .choice },
-    .{ .path = "Shared", .role = .shared },
-    .{ .path = "Atomic", .role = .atomic },
-    .{ .path = "InitContext", .role = .context },
-    .{ .path = "Order.Context", .role = .context },
-    .{ .path = "Order.Ordered", .role = .guarded },
-    .{ .path = "bounded.Array", .role = .inline_store },
-    .{ .path = "bounded.Ring", .role = .inline_store },
-    // `Queue` and `QueueBuffer` name `Ring` and `RingBuffer` through 0.2; 0.3 keeps one name each.
-    .{ .path = "bounded.Queue", .role = .inline_store, .required = false },
-    .{ .path = "bounded.Buffer", .role = .buffer },
-    .{ .path = "bounded.RingBuffer", .role = .buffer },
-    .{ .path = "bounded.QueueBuffer", .role = .buffer, .required = false },
-    .{ .path = "bounded.Limit", .role = .limit },
-    .{ .path = "bounded.Budget", .role = .budget },
-    .{ .path = "bounded.Budget.Reservation", .role = .reservation },
-    .{ .path = "own.Owned", .role = .owned },
-    .{ .path = "own.OwnedIo", .role = .owned },
-    .{ .path = "own.Lent", .role = .lent, .required = false },
-    .{ .path = "own.MustUse", .role = .must_use },
-    // 0.3 folds 0.2's `Pool` and `SlotMap` into `SlotPool`, on a region the pool owns, and adds
-    // `RunPool`; each name is in one revision only.
-    .{ .path = "handle.SlotPool", .role = .slots, .required = false },
-    .{ .path = "handle.RunPool", .role = .slots, .required = false },
-    .{ .path = "handle.Pool", .role = .slots, .required = false },
-    .{ .path = "handle.SlotMap", .role = .slots, .required = false },
-    .{ .path = "handle.DenseSlotMap", .role = .slots },
-    .{ .path = "handle.SecondaryMap", .role = .slots },
-    .{ .path = "handle.Domain", .role = .issuer },
-    .{ .path = "handle.Index", .role = .scalar },
-    .{ .path = "state.Machine.At", .role = .stage },
-    .{ .path = "state.Machine.Runtime", .role = .machine },
-    .{ .path = "scope.Table", .role = .table },
-    .{ .path = "scope.Table.Scope", .role = .scope },
-    .{ .path = "scope.Ref", .role = .ref },
-    .{ .path = "input.Untrusted", .role = .untrusted },
-    .{ .path = "err.PublicSource", .role = .public_source, .required = false },
-};
 
 /// Finds known owners through lexical aliases, declared types and exact constructors.
 /// Generic argument equality, alias effects and control flow are deliberately not inferred.
