@@ -2360,24 +2360,24 @@ fn plainType(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usi
 /// an array or a vector, a pointer or slice, an optional or an error union of plain data, an enum
 /// or a struct (a tuple included) every field of which is plain, of no role aegis declares. No
 /// aegis owner or capability is such a value. A type not known, or one of a choice that is not
-/// plain, is not; a struct already being read (`within`, a field that holds its own type through
+/// plain, is not; a struct already being read (`reading`, a field that holds its own type through
 /// a pointer) is not either.
-fn plainTyped(c: *Context, value: Facts.Value, within: []const Facts.Container) Context.Error!bool {
-    if (within.len == 16) return false;
+fn plainTyped(c: *Context, value: Facts.Value, reading: []const Facts.Container) Context.Error!bool {
+    if (reading.len == 16) return false;
     var each: Facts.Join = .{};
     for (Facts.valueParts(&value)) |part| each.add(part, switch (part) {
         .primitive => true,
-        .pointer => |pointer| try plainTyped(c, pointer.child.*, within),
-        .array, .optional, .error_union => |inner| try plainTyped(c, inner.*, within),
+        .pointer => |pointer| try plainTyped(c, pointer.child.*, reading),
+        .array, .optional, .error_union => |inner| try plainTyped(c, inner.*, reading),
         .container, .instance => |container| blk: {
             if (try c.role(Contract.library, part) != null) break :blk false;
-            for (within) |held| if (held.file == container.file and held.scope == container.scope) break :blk false;
+            for (reading) |held| if (held.file == container.file and held.scope == container.scope) break :blk false;
             switch (c.facts.kindOf(container) orelse break :blk false) {
                 .keyword_enum => break :blk true,
                 .keyword_struct => {},
                 else => break :blk false,
             }
-            const deeper = try std.mem.concat(c.allocator, Facts.Container, &.{ within, &.{container} });
+            const deeper = try std.mem.concat(c.allocator, Facts.Container, &.{ reading, &.{container} });
             for (try c.facts.heldFields(container)) |field| if (!try plainTyped(c, field.value, deeper)) break :blk false;
             break :blk true;
         },
