@@ -719,6 +719,128 @@ test "P006 leaves an entry's owning packages alone, and only them" {
     }
 }
 
+/// A run of P006 over a program (`app`), the package that declares the replacements (`airlock`)
+/// and one that does not import it (`lone`), every file selected; std a fixture of its own.
+fn replacedRun(airlock: []const u8) !glint.Report {
+    return replacedRunOn(airlock, glint.Config.none().fact_budget);
+}
+
+/// `replacedRun` on a budget of `budget` resolutions.
+fn replacedRunOn(airlock: []const u8, budget: usize) !glint.Report {
+    const P = glint.Project;
+    const inputs = [_]P.Input{
+        .{ .name = "app/main.zig", .package = "app", .fingerprint = 1, .bytes =
+        \\const std = @import("std");
+        \\const airlock = @import("airlock");
+        \\extern "c" fn fsync(fd: c_int) c_int;
+        \\pub fn main() void {
+        \\    std.posix.fdatasync(1);
+        \\    _ = fsync(1);
+        \\    airlock.syncFile(1);
+        \\    std.posix.read(1);
+        \\}
+        },
+        .{ .name = "airlock/root.zig", .package = "airlock", .fingerprint = 2, .bytes = airlock },
+        .{ .name = "lone/root.zig", .package = "lone", .fingerprint = 3, .bytes = "const std = @import(\"std\");\npub fn f() void {\n    std.posix.fdatasync(1);\n}\n" },
+        .{ .name = "std/std.zig", .selected = false, .bytes = "pub const posix = @import(\"posix.zig\");\n" },
+        .{ .name = "std/posix.zig", .selected = false, .bytes = "pub fn fdatasync(fd: i32) void {\n    _ = fd;\n}\npub fn read(fd: i32) void {\n    _ = fd;\n}\n" },
+    };
+    const imports = [_]P.Import{
+        .{ .from = 0, .spelling = "std", .target = 3 },
+        .{ .from = 0, .spelling = "airlock", .target = 1 },
+        .{ .from = 1, .spelling = "std", .target = 3 },
+        .{ .from = 2, .spelling = "std", .target = 3 },
+        .{ .from = 3, .spelling = "posix.zig", .target = 4 },
+    };
+    var project = try P.init(std.testing.allocator, &inputs, &imports, .{});
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.selections = &.{.{ .rule = .P006, .level = .gate }};
+    config.fact_budget = budget;
+    return glint.run(std.testing.allocator, &project, config);
+}
+
+test "P006 reads what a package declares it replaces: in every package that imports it, its own included, save the replacement and what only the replacement reaches" {
+    var report = try replacedRun(
+        \\const std = @import("std");
+        \\pub fn syncFile(fd: i32) void {
+        \\    std.posix.fdatasync(fd);
+        \\    flush(fd);
+        \\    helper(fd);
+        \\}
+        \\fn flush(fd: i32) void {
+        \\    deeper(fd);
+        \\}
+        \\fn deeper(fd: i32) void {
+        \\    std.posix.fdatasync(fd);
+        \\}
+        \\pub fn other(fd: i32) void {
+        \\    std.posix.fdatasync(fd);
+        \\}
+        \\fn helper(fd: i32) void {
+        \\    std.posix.fdatasync(fd);
+        \\}
+        \\pub const hook: *const fn (i32) void = &helper;
+        \\pub const lint_rules = .{
+        \\    .version = 1,
+        \\    .replaces = .{
+        \\        .{ .std = std.posix.fdatasync, .with = syncFile, .why = "durability belongs to airlock" },
+        \\        .{ .symbol = "fsync", .with = syncFile, .why = "durability belongs to airlock" },
+        \\    },
+        \\};
+    );
+    defer report.deinit();
+    try std.testing.expect(report.complete);
+    // The program's fdatasync and its own fsync; airlock's `other` and its handed-out `helper`.
+    // syncFile, and flush and deeper, which only it reaches, are the replacement's own; `lone`
+    // does not import airlock; `read` is not replaced.
+    // By file (0 the program, 1 airlock) and line.
+    var lines: [8]u32 = undefined;
+    var n: usize = 0;
+    for (report.diagnostics) |d| {
+        try std.testing.expectEqual(glint.Rule.P006, d.rule);
+        try std.testing.expect(std.mem.find(u8, d.message, "replaced by airlock: durability belongs to airlock; use syncFile") != null);
+        lines[n] = @backingInt(d.span.file) * 100 + d.span.line;
+        n += 1;
+    }
+    std.mem.sort(u32, lines[0..n], {}, std.sort.asc(u32));
+    try std.testing.expectEqualSlices(u32, &.{ 5, 6, 114, 117 }, lines[0..n]);
+}
+
+/// airlock's replacement reached through a chain of `steps` private functions, each called once by
+/// the next: every one of them only the replacement reaches.
+fn chained(steps: usize) ![]u8 {
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(std.testing.allocator);
+    try text.appendSlice(std.testing.allocator, "const std = @import(\"std\");\npub fn syncFile(fd: i32) void {\n    step0(fd);\n}\n");
+    for (0..steps) |i| try text.print(std.testing.allocator, "fn step{d}(fd: i32) void {{\n    step{d}(fd);\n}}\n", .{ i, i + 1 });
+    try text.print(std.testing.allocator, "fn step{d}(fd: i32) void {{\n    std.posix.fdatasync(fd);\n}}\npub const lint_rules = .{{ .version = 1, .replaces = .{{.{{ .std = std.posix.fdatasync, .with = syncFile, .why = \"durability belongs to airlock\" }}}} }};\n", .{steps});
+    return text.toOwnedSlice(std.testing.allocator);
+}
+
+test "P006 follows a function's callers to their end: a chain only the replacement reaches is its own, and one the budget does not read to its end is undecided" {
+    const long = try chained(10);
+    defer std.testing.allocator.free(long);
+    // Read to its end: the chain is the replacement's; only the program's fdatasync is judged (this
+    // airlock replaces no symbol).
+    var whole = try replacedRun(long);
+    defer whole.deinit();
+    try std.testing.expect(whole.complete);
+    for (whole.diagnostics) |d| try std.testing.expectEqual(@as(u32, 0), @backingInt(d.span.file));
+    try std.testing.expectEqual(@as(usize, 1), whole.diagnostics.len);
+    // Past the budget: the site in the chain is undecided, for want of budget, never exempt.
+    const longer = try chained(200);
+    defer std.testing.allocator.free(longer);
+    var short = try replacedRunOn(longer, 150);
+    defer short.deinit();
+    try std.testing.expect(!short.complete);
+    var noted = false;
+    for (short.coverage) |note| if (note.rule != null and note.rule.? == .P006 and std.mem.find(u8, note.detail, "may be reached only from the replacement") != null) {
+        noted = true;
+    };
+    try std.testing.expect(noted);
+}
+
 test "P006 configuration needs a symbol without dots, or a source and a path" {
     var config = glint.Config.none();
     config.disallowed = &.{.{ .declaration = "c.fsync", .reason = "durability", .replacement = "airlock" }};

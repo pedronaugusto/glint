@@ -45,8 +45,10 @@ pub const Reference = union(enum) {
     }
 };
 
-/// A std declaration the package's replacement stands for (P006's).
-pub const Replace = struct { std: Reference, with: Reference, why: []const u8 };
+/// A declaration the package's replacement stands for (P006's): a std declaration (`.std`), or an
+/// external symbol by its link name (`.symbol = "fsync"`), which every `extern` of it binds; one or
+/// the other.
+pub const Replace = struct { std: ?Reference = null, symbol: ?[]const u8 = null, with: Reference, why: []const u8 };
 /// A declaration of the package's to move off (Z011's).
 pub const Deprecated = struct { decl: Reference, with: ?Reference, why: []const u8 };
 /// What a type means: its role, by the enum literal's name, and the fields only the package may
@@ -381,19 +383,23 @@ const Reader = struct {
     }
 
     fn replace(r: *Reader, file: Project.FileId, node: Ast.Node.Index) Error!void {
-        var entry: Replace = .{ .std = .unresolved, .with = .unresolved, .why = "" };
+        var entry: Replace = .{ .with = .unresolved, .why = "" };
         var buffer: [2]Ast.Node.Index = undefined;
         const literal = r.tree(file).fullStructInit(&buffer, node) orelse return r.problem(file, node, .malformed);
         for (literal.ast.fields) |field| {
             const name = fieldName(r.tree(file), field);
             if (std.mem.eql(u8, name, "std")) {
                 entry.std = try r.reference(file, field, .std);
+            } else if (std.mem.eql(u8, name, "symbol")) {
+                entry.symbol = try r.string(file, field);
             } else if (std.mem.eql(u8, name, "with")) {
                 entry.with = try r.reference(file, field, .own);
             } else if (std.mem.eql(u8, name, "why")) {
                 entry.why = try r.string(file, field);
             } else try r.problem(file, field, .unknown_field);
         }
+        // One of a std declaration and an external symbol, never both or neither.
+        if ((entry.std == null) == (entry.symbol == null)) return r.problem(file, node, .malformed);
         try r.replaces.append(r.facts.gpa, entry);
     }
 
@@ -727,7 +733,7 @@ test "a root's lint_rules are read by declaration: std's replaced, the package's
     const rules = try of(&f.facts, f.project.sources[1].id);
     try std.testing.expectEqual(@as(usize, 0), rules.problems.len);
     try std.testing.expectEqual(@as(usize, 1), rules.replaces.len);
-    try std.testing.expectEqualStrings("createFileAtomic", f.name(rules.replaces[0].std));
+    try std.testing.expectEqualStrings("createFileAtomic", f.name(rules.replaces[0].std.?));
     try std.testing.expectEqualStrings("publish", f.name(rules.replaces[0].with));
     try std.testing.expectEqualStrings("airlock's publish is durable", rules.replaces[0].why);
     try std.testing.expectEqualStrings("old", f.name(rules.deprecated[0].decl));
@@ -774,6 +780,34 @@ test "what a root's lint_rules cannot name is a problem where it is written: dri
     try std.testing.expectEqual(Problem.Why.unknown_version, later.problems[0].why);
     // A root that declares none has none, and no problem.
     try std.testing.expect((try of(&f.facts, f.project.sources[1].id)).declared == null);
+}
+
+test "a replacement names a std declaration or an external symbol, one of the two: both, or neither, is malformed where it is written" {
+    var f: Fixture = undefined;
+    try f.init(&.{
+        .{ .name = "pkg/root.zig", .package = "pkg", .fingerprint = 7, .bytes =
+        \\const std = @import("std");
+        \\pub fn publish() void {}
+        \\pub const lint_rules = .{
+        \\    .version = 1,
+        \\    .replaces = .{
+        \\        .{ .symbol = "fsync", .with = publish, .why = "durable" },
+        \\        .{ .std = std.Io.Dir.createFileAtomic, .symbol = "fsync", .with = publish, .why = "both" },
+        \\        .{ .with = publish, .why = "neither" },
+        \\    },
+        \\};
+        },
+        .{ .name = "std", .bytes = fake_std, .selected = false },
+    }, &.{.{ .from = 0, .spelling = "std", .target = 1 }});
+    defer f.deinit();
+    const rules = try of(&f.facts, f.project.sources[0].id);
+    try std.testing.expectEqual(@as(usize, 1), rules.replaces.len);
+    try std.testing.expectEqualStrings("fsync", rules.replaces[0].symbol.?);
+    try std.testing.expect(rules.replaces[0].std == null);
+    try std.testing.expectEqualStrings("publish", f.name(rules.replaces[0].with));
+    var whys: [4]Problem.Why = undefined;
+    for (rules.problems, 0..) |problem, i| whys[i] = problem.why;
+    try std.testing.expectEqualSlices(Problem.Why, &.{ .malformed, .malformed }, whys[0..rules.problems.len]);
 }
 
 test "a fork's copy of a package is the package by its stated identity, wherever its tree is" {
