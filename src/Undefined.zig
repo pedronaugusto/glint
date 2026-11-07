@@ -4398,7 +4398,7 @@ fn parentNamed(c: *Context, owner: Owner, name: []const u8) Context.Error!bool {
 
 /// A function's parameter a `@fieldParentPtr` takes its field's name from: the function's name
 /// and the parameter's place, with the struct the conversion gives.
-const Given = struct { function: []const u8, index: usize, owner: ?Facts.Container = null };
+const Given = struct { function: Facts.Decl, index: usize, owner: ?Facts.Container = null };
 
 fn nameGiven(facts: *Facts, source: *const Project.Source, node: Ast.Node.Index, spelled: Ast.Node.Index) Context.Error!?Given {
     const tree = &source.file.tree;
@@ -4409,48 +4409,36 @@ fn nameGiven(facts: *Facts, source: *const Project.Source, node: Ast.Node.Index,
     const function = while (model.parentOf(at)) |up| : (at = up) {
         if (tree.nodeTag(up) == .fn_decl) break up;
     } else return null;
+    // A function is declared at its prototype.
+    const prototype = tree.nodeData(function).node_and_node[0];
+    const declared = for (model.declarations, 0..) |record, i| {
+        if (record.kind == .function and record.node == prototype) break i;
+    } else return null;
     var buffer: [1]Ast.Node.Index = undefined;
-    const proto = tree.fullFnProto(&buffer, tree.nodeData(function).node_and_node[0]) orelse return null;
+    const proto = tree.fullFnProto(&buffer, prototype) orelse return null;
     var it = proto.iterate(tree);
     var index: usize = 0;
     while (it.next()) |param| : (index += 1) {
-        if (param.name_token == decl.token) return .{ .function = tree.tokenSlice(proto.name_token orelse return null), .index = index };
+        if (param.name_token == decl.token) return .{ .function = .{ .file = source.id, .index = @fromBackingInt(@intCast(declared)) }, .index = index };
     }
     return null;
 }
 
-/// Adds the names each call of `given.function` spells at its parameter, by every name in the
-/// project spelled as that function.
+/// Adds the names each call of `given.function` gives its parameter (`Facts.programCallSites`,
+/// `Facts.fieldName`): any field where a call gives one no name spells or the function is used
+/// other than to be called.
 fn spellCalls(c: *Context, memo: *ParentNames, given: Given) Context.Error!void {
     const any: ParentNames.Conversion = .{ .owner = given.owner, .name = null };
-    for (c.project.sources) |*source| {
-        if (std.mem.find(u8, source.file.source, given.function) == null) continue;
-        const tree = &source.file.tree;
-        for (tree.nodes.items(.tag), 0..) |tag, i| {
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            const token = switch (tag) {
-                .identifier => tree.nodeMainToken(node),
-                .field_access => tree.nodeData(node).node_and_token[1],
-                else => continue,
-            };
-            if (!std.mem.eql(u8, tree.tokenSlice(token), given.function)) continue;
-            var buffer: [1]Ast.Node.Index = undefined;
-            const up = source.model.parentOf(node) orelse return memo.conversions.append(c.allocator, any);
-            const call = tree.fullCall(&buffer, up) orelse return memo.conversions.append(c.allocator, any);
-            if (call.ast.fn_expr != node or given.index >= call.ast.params.len or tree.nodeTag(call.ast.params[given.index]) != .string_literal) {
-                return memo.conversions.append(c.allocator, any);
-            }
-            try spell(c, memo, given.owner, tree, call.ast.params[given.index]);
+    const sites = (try c.facts.programCallSites(given.function)) orelse return memo.conversions.append(c.allocator, any);
+    for (sites) |site| {
+        // A method's parameters count the receiver its call passes first.
+        if (given.index < site.receiver or given.index - site.receiver >= site.params.len) return memo.conversions.append(c.allocator, any);
+        switch (try c.facts.fieldName(site.file, site.params[given.index - site.receiver])) {
+            .name => |name| try memo.conversions.append(c.allocator, .{ .owner = given.owner, .name = name }),
+            .names => |names| for (names) |name| try memo.conversions.append(c.allocator, .{ .owner = given.owner, .name = name }),
+            .each_of, .computed => return memo.conversions.append(c.allocator, any),
         }
     }
-}
-
-fn spell(c: *Context, memo: *ParentNames, owner: ?Facts.Container, tree: *const Ast, literal: Ast.Node.Index) Context.Error!void {
-    const spelled = std.zig.string_literal.parseAlloc(c.allocator, tree.tokenSlice(tree.nodeMainToken(literal))) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return memo.conversions.append(c.allocator, .{ .owner = owner, .name = null }),
-    };
-    try memo.conversions.append(c.allocator, .{ .owner = owner, .name = spelled });
 }
 
 /// Whether `node` never goes on to what follows it: a `return`, `break`, `continue` or
