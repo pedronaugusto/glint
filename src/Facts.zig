@@ -3229,7 +3229,9 @@ pub const IntegerType = union(enum) {
 /// `pointer`: `uN`, `iN`, `usize`, `isize`, and C's integers as Zig's C ABI gives them (`c_char`
 /// 8 bits of either sign, `c_short` 16, `c_int` 16 on 16-bit targets such as AVR and MSP430 and
 /// 32 elsewhere, `c_long` 32 on Windows and on 16- and 32-bit targets and the pointer's width
-/// elsewhere, `c_longlong` 64). The one reading of a primitive integer's width.
+/// elsewhere, `c_longlong` 64). The one reading of a primitive integer's width. Where `wide` is
+/// set the width is the target's: a bound against overflow takes the larger (`wide`), a proof
+/// that a value fits the smaller (`bits`).
 pub fn integerType(value: Value, pointer: u16) IntegerType {
     switch (value) {
         .optional, .error_union => |inner| return integerType(inner.*, pointer),
@@ -7638,7 +7640,8 @@ const FieldBuiltins = struct {
 /// The `@field` reads and writes in the program's files (`program`) that may name a field
 /// `name`: each whose name `fieldName` spells as `name`, or ranges over a list or a struct that
 /// names it (`mayName`), and each whose name it computes, answered as `computed`, never left
-/// out. Beside `memberUses`, which gives `x.name`. In `allocator`.
+/// out. Of the program's files only (`Facts.program`): std's and dependencies' `@field`s are
+/// not among them. Beside `memberUses`, which gives `x.name`. In `allocator`.
 pub fn fieldUses(self: *Facts, allocator: std.mem.Allocator, name: []const u8) ResolveError![]const FieldUse {
     const index = try self.memo(FieldBuiltins);
     if (!index.built) {
@@ -7796,7 +7799,9 @@ pub fn memoryField(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Res
 pub const LanguageField = union(enum) { len, ptr, none, unknown: Unknown };
 
 /// Which language field `node` reads (`LanguageField`), by its holder's type as `memoryField`
-/// reads it, so a rule never tells `len` and `ptr` apart by spelling them.
+/// reads it, so a rule never tells `len` and `ptr` apart by spelling them. A holder chosen per
+/// build is read part by part: the language field only where every part is one, `none` only
+/// where every part declares a field so named, else unknown.
 pub fn languageField(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!LanguageField {
     const tree = &self.project.at(file).file.tree;
     if (tree.nodeTag(node) != .field_access) return .none;
@@ -7804,8 +7809,15 @@ pub fn languageField(self: *Facts, file: Project.FileId, node: Ast.Node.Index) R
     const spelled = tree.tokenSlice(name);
     const which: LanguageField = if (std.mem.eql(u8, spelled, "len")) .len else if (std.mem.eql(u8, spelled, "ptr")) .ptr else return .none;
     const value = try self.resolve(file, receiver);
-    if (value == .unknown) return .{ .unknown = value.unknown };
-    return if (try self.lengthOfValue(value, spelled) == .field) .none else which;
+    const parts: []const Value = if (value == .alternatives) value.alternatives else &.{value};
+    var language = true;
+    var declared = true;
+    for (parts) |part| {
+        if (part == .unknown) return .{ .unknown = part.unknown };
+        if (try self.lengthOfValue(part, spelled) == .field) language = false else declared = false;
+    }
+    if (language) return which;
+    return if (declared) .none else .{ .unknown = .unsupported };
 }
 
 /// Whether the memory a value of `value`'s type holds (a function's result through its error

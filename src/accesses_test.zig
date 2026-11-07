@@ -1007,8 +1007,32 @@ test "consolidate: a member read's step, which language field it is, the program
     try std.testing.expectEqual(@as(usize, 1), other.len);
     try std.testing.expect(other[0].computed);
 
+    // Q2, per build: a holder that is a slice in one build and a struct with a `len` field in
+    // another is unknown, never one of them.
+    {
+        const chosen =
+            \\const S = struct { len: u32 };
+            \\const Pick = switch (@import("builtin").os.tag) {
+            \\    .windows => []const u8,
+            \\    else => S,
+            \\};
+            \\fn f(p: Pick) usize {
+            \\    return p.len;
+            \\}
+        ;
+        var per_build = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = chosen }}, &.{}, .{});
+        defer per_build.deinit();
+        var per_build_facts: Facts = .{ .project = &per_build, .gpa = arena.allocator() };
+        defer per_build_facts.deinit();
+        const read = spelledNode(&per_build.sources[0].file.tree, "p.len", 0).?;
+        try std.testing.expect(try per_build_facts.languageField(per_build.sources[0].id, read) == .unknown);
+    }
+
     // Q4: Zig's and C's integers at a pointer width; comptime_int is a literal; others none.
     const Int = Facts.IntegerType;
+    try std.testing.expectEqual(Int{ .int = .{ .bits = 16, .signed = true } }, Facts.integerType(.{ .primitive = "c_int" }, 16));
+    try std.testing.expectEqual(Int{ .int = .{ .bits = 32, .signed = false } }, Facts.integerType(.{ .primitive = "usize" }, 32));
+    try std.testing.expect(Facts.integerType(.{ .primitive = "ux" }, 64) == .unknown);
     try std.testing.expectEqual(Int{ .int = .{ .bits = 32, .signed = true } }, Facts.integerType(.{ .primitive = "c_int" }, 64));
     try std.testing.expectEqual(Int{ .int = .{ .bits = 16, .signed = false } }, Facts.integerType(.{ .primitive = "c_uint" }, 16));
     try std.testing.expectEqual(Int{ .int = .{ .bits = 32, .signed = true, .wide = 64 } }, Facts.integerType(.{ .primitive = "c_long" }, 64));
