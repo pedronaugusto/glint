@@ -199,9 +199,37 @@ fn foreign(c: *Context, rule: Rule, resources: []const ?Facts.Container) Context
                     continue;
                 },
             };
+            // A tuple a function's result type writes is what the function returns: one whose every
+            // return reads what is already held hands over no owner (`views`), as a result of the
+            // resource itself does.
+            if (resultOf(c, @fromBackingInt(@intCast(i)))) |function| if (try views(c, resources, function, 0, null)) continue;
             try c.at(rule, first, try c.allocator.print("a tuple's field holds a std.{s} by value: aegis own.Owned names its one owner and checks it is released once; a borrow of it is its borrow().*, which is never released", .{resource_paths[which]}));
         }
     }
+}
+
+/// The function of the checked file whose result type is the container `node`, or its payload
+/// (`!struct { File }`, `?struct { File }`); null for any other container.
+fn resultOf(c: *Context, node: Ast.Node.Index) ?Facts.Decl {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    var child = node;
+    var parent = model.parentOf(child) orelse return null;
+    while (true) : ({
+        child = parent;
+        parent = model.parentOf(child) orelse return null;
+    }) switch (Facts.accesses.formOf(tree.nodeTag(parent))) {
+        .grouped, .optional_type => {},
+        .error_union => if (tree.nodeData(parent).node_and_node[1] != child) return null,
+        else => break,
+    };
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, parent) orelse return null;
+    if (proto.ast.return_type.unwrap() != child) return null;
+    for (model.declarations, 0..) |decl, index| {
+        if (decl.kind == .function and decl.node == parent) return .{ .file = c.file, .index = @fromBackingInt(@intCast(index)) };
+    }
+    return null;
 }
 
 /// A015 at `call`, which hands a std owner by value to a function that keeps it (`stores`): each
@@ -1967,6 +1995,13 @@ fn leafViewed(c: *Context, resources: []const ?Facts.Container, file: Project.Fi
         else => {},
     };
     if (try Facts.calls.at(c.facts, file, node)) |call| return callViewed(c, resources, file, &call, next, bound);
+    // A tuple holds its elements: a view where each one is.
+    var elements_buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullArrayInit(&elements_buffer, node)) |tuple| {
+        if (tuple.ast.type_expr != .none or tuple.ast.elements.len == 0) return false;
+        for (tuple.ast.elements) |element| if (!try viewed(c, resources, file, element, next, bound)) return false;
+        return true;
+    }
     var init_buffer: [2]Ast.Node.Index = undefined;
     if (tree.fullStructInit(&init_buffer, node)) |literal| {
         // A std handle made from one it is given: the literal of a std resource type.
