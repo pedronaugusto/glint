@@ -426,8 +426,13 @@ const Walk = struct {
         w.aliases = try aliasesOf(w.c.allocator, w.c.facts, w.file, w.local, w.param);
         const index = try indexOf(w.c.facts, w.file);
         if (w.param) {
-            try w.returns.appendSlice(w.c.allocator, index.returns.items);
-            try w.tries.appendSlice(w.c.allocator, index.tries.items);
+            // Its function's own: a `return` or `try` in a function declared within it leaves
+            // that one.
+            const function = ownFunction(w.tree, w.model, w.model.declarations[@backingInt(w.local)].node);
+            if (index.exits.get(function)) |own| {
+                try w.returns.appendSlice(w.c.allocator, own.returns.items);
+                try w.tries.appendSlice(w.c.allocator, own.tries.items);
+            }
         }
         for (index.outputs.items) |node| {
             // `[a] "b" (c)` names its variable by the token before `)`; `(-> T)` returns one.
@@ -2970,17 +2975,25 @@ fn installed(c: *Context, slot: Slot) Context.Error!?[]const Facts.Decl {
 }
 
 /// What `Walk.collect` and `aliasesOf` read of a file, gathered once for the run: each
-/// declaration's identifiers (`nameOf`), the file's `return`s, `try`s and asm outputs, and its
-/// variables whose initializer names a declaration of the file or its address, each in order.
+/// declaration's identifiers (`nameOf`), each function's own `return`s and `try`s (`ownFunction`),
+/// the file's asm outputs, and its variables whose initializer names a declaration of the file or
+/// its address, each in order.
 const FileIndex = struct {
     named: std.AutoHashMapUnmanaged(Model.Declaration.Id, std.ArrayList(Ast.Node.Index)) = .empty,
-    returns: std.ArrayList(Ast.Node.Index) = .empty,
-    tries: std.ArrayList(Ast.Node.Index) = .empty,
+    exits: std.AutoHashMapUnmanaged(Ast.Node.Index, Exits) = .empty,
     outputs: std.ArrayList(Ast.Node.Index) = .empty,
     bindings: std.ArrayList(Binding) = .empty,
 
     const Binding = struct { id: Model.Declaration.Id, of: Model.Declaration.Id, address: bool };
+    const Exits = struct { returns: std.ArrayList(Ast.Node.Index) = .empty, tries: std.ArrayList(Ast.Node.Index) = .empty };
 };
+
+/// The function declaration `node` is in, nearest first: `.root` outside any.
+fn ownFunction(tree: *const Ast, model: *const Model, node: Ast.Node.Index) Ast.Node.Index {
+    var at = node;
+    while (model.parentOf(at)) |up| : (at = up) if (tree.nodeTag(up) == .fn_decl) return up;
+    return .root;
+}
 
 const FileIndexes = struct { files: std.AutoHashMapUnmanaged(Project.FileId, *const FileIndex) = .empty };
 
@@ -2995,8 +3008,11 @@ fn indexOf(facts: *Facts, file: Project.FileId) Context.Error!*const FileIndex {
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         switch (tag) {
-            .@"return" => try index.returns.append(gpa, node),
-            .@"try" => try index.tries.append(gpa, node),
+            .@"return", .@"try" => {
+                const entry = try index.exits.getOrPut(gpa, ownFunction(tree, model, node));
+                if (!entry.found_existing) entry.value_ptr.* = .{};
+                try (if (tag == .@"return") &entry.value_ptr.returns else &entry.value_ptr.tries).append(gpa, node);
+            },
             .asm_output => try index.outputs.append(gpa, node),
             else => {
                 const decl = (try nameOf(facts, file, node)) orelse continue;
