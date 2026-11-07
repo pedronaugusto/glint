@@ -4717,3 +4717,33 @@ test "summaries are read a bounded number of times per function, through nested 
     try std.testing.expect(write_read.remembered_reads >= write_functions);
     try std.testing.expect(write_read.remembered_reads <= 40 * write_functions);
 }
+
+test "a length read through a holder is fixed by each part of it: an array's own, a slice's holder, never through a pointer to a choice holding an instance or a choice of none" {
+    const bytes: Facts.Value = .{ .primitive = "u8" };
+    const array: Facts.Value = .{ .array = &bytes };
+    const instance: Facts.Value = .{ .instance = .{ .file = @fromBackingInt(0), .scope = @fromBackingInt(0) } };
+    const slice: Facts.Value = .{ .pointer = .{ .child = &bytes, .size = .slice } };
+    const to_array: Facts.Value = .{ .pointer = .{ .child = &array, .size = .one } };
+    const array_or_instance: Facts.Value = .{ .alternatives = &.{ array, instance } };
+    const none: Facts.Value = .{ .alternatives = &.{} };
+    const to_choice: Facts.Value = .{ .pointer = .{ .child = &array_or_instance, .size = .one } };
+    const to_none: Facts.Value = .{ .pointer = .{ .child = &none, .size = .one } };
+    const LengthBy = @typeInfo(@TypeOf(lengthBy)).@"fn".return_type.?;
+    for ([_]struct { Facts.Value, LengthBy }{
+        .{ array, .fixed },
+        .{ to_array, .fixed },
+        .{ slice, .holder },
+        .{ .{ .alternatives = &.{ array, to_array } }, .fixed },
+        .{ .{ .alternatives = &.{ array, slice } }, .holder },
+        // A pointer to a choice one of whose parts is an instance: its `len` may be written
+        // through the pointer, whatever holds it.
+        .{ to_choice, .not_fixed },
+        .{ to_none, .not_fixed },
+        .{ .{ .alternatives = &.{ array, instance } }, .not_fixed },
+        .{ instance, .other },
+        .{ none, .other },
+    }) |row| {
+        const value, const expected = row;
+        try std.testing.expectEqual(expected, lengthBy(value));
+    }
+}
