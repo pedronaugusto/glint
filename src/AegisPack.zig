@@ -4675,13 +4675,6 @@ const Heard = struct {
     }
 };
 
-/// Whether `parent` is `@field(node, name)`: a member of `node` named at compile time.
-fn fieldOf(tree: *const Ast, parent: Ast.Node.Index, node: Ast.Node.Index) bool {
-    var buffer: [2]Ast.Node.Index = undefined;
-    const args = Facts.builtinArgs(tree, parent, &buffer);
-    return args.len == 2 and args[0] == node and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@field");
-}
-
 /// Whether `argument`, the address of an owner of `kind` or a pointer to one, is lent by the
 /// call it is an argument of: to an aegis condition's `wait` or `waitUncancelable`, which
 /// release the guard while they wait and hold it again on every return, or to a function of the

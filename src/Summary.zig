@@ -16,7 +16,6 @@ const Value = Facts.Value;
 const Env = Facts.Env;
 const Made = Facts.Made;
 const Decl = Facts.Decl;
-const Summary = @This();
 
 /// The format's version: a reader refuses any other.
 pub const version: u32 = 1;

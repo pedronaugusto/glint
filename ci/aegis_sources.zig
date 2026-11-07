@@ -44,7 +44,7 @@ fn imports(gpa: std.mem.Allocator) ![]Project.Import {
             const target = for (sources, 1..) |each, i| {
                 if (std.mem.eql(u8, each.name, path)) break i;
             } else {
-                std.debug.print("aegis_sources: {s} imports {s}, which aegis's src/ does not hold\n", .{ source.name, spelling });
+                std.log.err("aegis_sources: {s} imports {s}, which aegis's src/ does not hold", .{ source.name, spelling });
                 return error.UnpinnedImport;
             };
             // A file that writes a spelling twice imports one file: one edge.
@@ -115,7 +115,7 @@ pub fn writeTree(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !void {
         try dir.writeFile(io, .{ .sub_path = source.name, .data = source.bytes });
     }
     for (sources) |source| {
-        var rest = source.bytes;
+        var rest: []const u8 = source.bytes;
         while (std.mem.find(u8, rest, "@import(\"")) |at| {
             rest = rest[at + "@import(\"".len ..];
             const end = std.mem.findScalar(u8, rest, '"') orelse break;

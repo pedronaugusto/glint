@@ -2314,14 +2314,6 @@ fn declaredBy(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Mode
     return (model.reference(node) orelse return null).declaration;
 }
 
-/// Whether a primitive type's name is an unsigned integer's (`u8`, `u64`, `usize`).
-fn unsignedName(name: []const u8) bool {
-    if (std.mem.eql(u8, name, "usize")) return true;
-    if (name.len < 2 or name[0] != 'u') return false;
-    for (name[1..]) |ch| if (!std.ascii.isDigit(ch)) return false;
-    return true;
-}
-
 fn site(c: *Context, node: Ast.Node.Index) bool {
     const tree = &c.project.at(c.file).file.tree;
     return !c.inTest(tree.nodeMainToken(node)) and Danger.atRuntime(c, node);

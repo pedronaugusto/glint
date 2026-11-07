@@ -3625,6 +3625,22 @@ test "Z026 reads a release by what the call does, never its name: a body that re
         \\pub fn f(io: std.Io) void { const held = open(); if (held) |file| file.close(io) else |_| {} }
     );
     try std.testing.expectEqual(@as(usize, 0), direct.findings);
+    // A std container's `deinit` is std's contract, by the declaration its own type gives the name.
+    const container = try run(.Z026,
+        \\const std = @import("std");
+        \\fn fill() error{Bad}!std.ArrayList(u8) { return error.Bad; }
+        \\pub fn f() void { var held = fill(); if (held) |*list| list.deinit(0) else |_| {} }
+    );
+    try std.testing.expectEqual(@as(usize, 0), container.findings);
+    // A type of the program's that calls itself `deinit` over one is read by its body all the same.
+    const own = try run(.Z026,
+        \\const std = @import("std");
+        \\const Log = struct { list: std.ArrayList(u8), fn deinit(l: *Log) void { publish(l); } };
+        \\fn publish(l: *Log) void { _ = l; }
+        \\fn fill() error{Bad}!Log { return error.Bad; }
+        \\pub fn f() void { var held = fill(); if (held) |*log| log.deinit() else |_| {} }
+    );
+    try std.testing.expectEqual(@as(usize, 1), own.findings);
     // A callee that does not resolve stays a site.
     const unknown = try run(.Z026,
         \\const ext = @import("missing");

@@ -1160,28 +1160,6 @@ fn releasedReturn(c: *Context, file: Project.FileId, ret: Ast.Node.Index, depth:
     return result;
 }
 
-/// The labeled block or loop `label` names around the `break` at `jump`.
-fn breakTarget(tree: *const Ast, model: *const Model, jump: Ast.Node.Index, label: Ast.TokenIndex) ?Ast.Node.Index {
-    const name = tree.tokenSlice(label);
-    var at = jump;
-    while (model.parentOf(at)) |parent| : (at = parent) {
-        switch (tree.nodeTag(parent)) {
-            .block, .block_semicolon, .block_two, .block_two_semicolon => {
-                const lbrace = tree.nodeMainToken(parent);
-                if (lbrace >= 2 and tree.tokenTag(lbrace - 1) == .colon and std.mem.eql(u8, tree.tokenSlice(lbrace - 2), name)) return parent;
-            },
-            .@"while", .while_simple, .while_cont, .@"for", .for_simple => {
-                var first = tree.firstToken(parent);
-                if (tree.tokenTag(first) == .keyword_inline) first += 1;
-                if (tree.tokenTag(first) == .identifier and tree.tokenTag(first + 1) == .colon and std.mem.eql(u8, tree.tokenSlice(first), name)) return parent;
-            },
-            .fn_decl => return null,
-            else => {},
-        }
-    }
-    return null;
-}
-
 /// Whether the field `name` of a struct literal is `released`: where the value it makes goes
 /// (`madeReleased`), a local it initializes by each read of the local.
 fn literalReleased(c: *Context, file: Project.FileId, literal: Ast.Node.Index, name: []const u8, depth: u8) Context.Error!Stored {
