@@ -41,6 +41,7 @@ const spellsName = Range.spellsName;
 const Program = @import("Program.zig");
 const Facts = @import("Facts.zig");
 const Governed = @import("Governed.zig");
+const aegis = @import("aegis");
 
 const Error = Context.Error;
 
@@ -605,13 +606,14 @@ fn proveRelations(c: *Context) Error!void {
     var proofs: std.ArrayList(Proof) = .empty;
     for (try Range.programFiles(c)) |file| try candidatesIn(c, file, &proofs);
     // Each function is read once per width, for every relation it writes.
-    var by_function: std.AutoArrayHashMapUnmanaged(Callee, std.ArrayList(usize)) = .empty;
-    for (proofs.items, 0..) |*proof, at| {
+    // The proofs no longer grow: each is named by where it is.
+    var by_function: std.array_hash_map.Auto(Callee, std.ArrayList(*Proof)) = .empty;
+    for (proofs.items) |*proof| {
         if (proof.failed) continue;
         for (proof.expected.items) |one| {
             const entry = try by_function.getOrPut(c.allocator, .{ .file = one.file, .function = one.function });
             if (!entry.found_existing) entry.value_ptr.* = .empty;
-            if (std.mem.findScalar(usize, entry.value_ptr.items, at) == null) try entry.value_ptr.append(c.allocator, at);
+            if (std.mem.findScalar(*Proof, entry.value_ptr.items, proof) == null) try entry.value_ptr.append(c.allocator, proof);
         }
     }
     // The proofs are one unit of solving, on the run's budget for one: every pass is charged to
@@ -623,26 +625,25 @@ fn proveRelations(c: *Context) Error!void {
         memo.of = .empty;
         (try c.facts.memo(Analyses)).* = .{};
         (try c.facts.memo(Entries)).* = .{};
-        var left: usize = 0;
+        var left = false;
         for (proofs.items) |*proof| {
             if (proof.failed) continue;
-            left += 1;
+            left = true;
             for ([_]Facts.Decl{ proof.relation.small, proof.relation.large }) |member| {
                 const entry = try memo.of.getOrPut(c.allocator, member);
                 if (!entry.found_existing) entry.value_ptr.* = .empty;
                 try entry.value_ptr.append(c.allocator, proof.relation);
             }
         }
-        if (left == 0) break;
+        if (!left) break;
         var refused = false;
         for (Range.pointerWidths(c)) |width| {
             for (proofs.items) |*proof| proof.checked.clearRetainingCapacity();
-            var each = by_function.iterator();
-            while (each.next()) |entry| {
+            for (by_function.keys(), by_function.values()) |callee, which| {
                 var some = false;
-                for (entry.value_ptr.items) |at| some = some or !proofs.items[at].failed;
+                for (which.items) |proof| some = some or !proof.failed;
                 if (!some) continue;
-                try readProving(c, entry.key_ptr.*, width, proofs.items, entry.value_ptr.items);
+                try readProving(c, callee, width, which.items);
             }
             // A write no reading met is one no reading judged.
             for (proofs.items) |*proof| {
@@ -672,18 +673,18 @@ fn proveRelations(c: *Context) Error!void {
 }
 
 /// One reading of `callee` judging the relations at `which`.
-fn readProving(c: *Context, callee: Callee, width: u16, proofs: []Proof, which: []const usize) Error!void {
+fn readProving(c: *Context, callee: Callee, width: u16, which: []const *Proof) Error!void {
     var scratch: std.heap.ArenaAllocator = .init(c.backing);
     defer scratch.deinit();
     const proving = try scratch.allocator().alloc(Proof, which.len);
-    for (which, proving) |at, *one| one.* = proofs[at];
+    for (which, proving) |proof, *one| one.* = proof.*;
     var frame: Frame = .{ .c = c, .a = scratch.allocator(), .file = callee.file, .tree = &c.project.at(callee.file).file.tree, .model = &c.project.at(callee.file).model, .width = width, .function = callee.function, .entry = null, .bound = null, .proving = proving };
     frame.run() catch |err| switch (err) {
         // A function it does not model meets no write: each stays unchecked, and fails.
         error.Unsupported => {},
         else => |e| return e,
     };
-    for (which, proving) |at, one| proofs[at] = one;
+    for (which, proving) |proof, one| proof.* = one;
 }
 
 /// The relations a file's structs may hold: an integer field at most another, or at most a
@@ -695,7 +696,7 @@ fn candidatesIn(c: *Context, file: Project.FileId, proofs: *std.ArrayList(Proof)
     var fields: std.ArrayList(Sibling) = .empty;
     for (model.declarations, 0..) |record, d| {
         if (record.kind != .field) continue;
-        const decl: Facts.Decl = .{ .file = file, .index = @fromBackingInt(@intCast(d)) };
+        const decl: Facts.Decl = .{ .file = file, .index = @fromBackingInt(aegis.int.cast(u32, d) catch continue) };
         const full = model.containerField(tree, record.node) orelse continue;
         const type_node = full.ast.type_expr.unwrap() orelse continue;
         const slice = if (tree.fullPtrType(type_node)) |pointer| pointer.size == .slice else false;
@@ -1459,9 +1460,12 @@ const Frame = struct {
     /// What a literal gives a field: its value (its length, where `length`), or its default's.
     fn givenOr(f: *Frame, s: State, value: ?Ast.Node.Index, member: Facts.Decl, length: bool, fields: []const Ast.Node.Index, values: []const Value) Error!?Lin {
         if (value) |node| {
-            const at = std.mem.findScalar(Ast.Node.Index, fields, node) orelse return null;
-            if (!length) return values[at].lin;
-            return (try f.lengthOf(s, node, values[at]))[1];
+            for (fields, values) |field_node, given| {
+                if (field_node != node) continue;
+                if (!length) return given.lin;
+                return (try f.lengthOf(s, node, given))[1];
+            }
+            return null;
         }
         return defaultOf(f.c, member, length);
     }
