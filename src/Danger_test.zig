@@ -9718,6 +9718,158 @@ test "A013 reads std's assert called through any alias the program declares, pub
     try std.testing.expect(once.undecided <= 4);
 }
 
+test "A013 decides a consumer's call of std's assert through a field a package stores it in, by the field's stores, and leaves one a store may erase undecided" {
+    // programCallSites follows the package's field to the program's calls through it; a
+    // consumer's call through it (`dep.make().run(b)`, `dep.ops.run(b)`) is its own run's,
+    // resolved there by the stores of the field (`fieldOf`): each a finding on a peer's byte.
+    const decided = try runWithDependency(pack.contracts,
+        \\const std = @import("std");
+        \\const dep = @import("dep");
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const b = try r.takeByte();
+        \\    dep.make().run(b < 4);
+        \\    dep.ops.run(b < 8);
+        \\}
+    ,
+        \\const std = @import("std");
+        \\pub const Ops = struct { run: *const fn (bool) void };
+        \\pub fn make() Ops {
+        \\    return .{ .run = std.debug.assert };
+        \\}
+        \\pub const ops: Ops = .{ .run = std.debug.assert };
+    );
+    // Each call is a finding or undecided, never clean. `dep.ops.run`'s callee is read while
+    // `storedFunctions` is open on the field (a cast's analysis walk over aegis's `@ptrCast`s
+    // reaches it), and `Facts.resolve`'s cache keeps that erased value: undecided. When the
+    // cache keeps no value read while a query was open (`open_met`), this is 2 F 0 U.
+    try std.testing.expect(decided.findings >= 1);
+    try std.testing.expectEqual(@as(usize, 2), decided.findings + decided.undecided);
+    // A store of what a caller gives (`set`) may put any function there: the call through the
+    // field resolves to none, and is left undecided, never cleared.
+    const erased = try runWithDependency(pack.contracts,
+        \\const std = @import("std");
+        \\const dep = @import("dep");
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const b = try r.takeByte();
+        \\    dep.make().run(b < 4);
+        \\    dep.ops.run(b < 8);
+        \\}
+    ,
+        \\const std = @import("std");
+        \\pub const Ops = struct { run: *const fn (bool) void };
+        \\pub fn make() Ops {
+        \\    return .{ .run = std.debug.assert };
+        \\}
+        \\pub const ops: Ops = .{ .run = std.debug.assert };
+        \\pub fn set(o: *Ops, f: *const fn (bool) void) void {
+        \\    o.run = f;
+        \\}
+    );
+    // Each call through it is undecided, never a finding read as if the field held std's
+    // assert alone, and never clean.
+    try std.testing.expectEqual(@as(usize, 0), erased.findings);
+    try std.testing.expectEqual(@as(usize, 2), erased.undecided);
+}
+
+test "A013 leaves undecided a call whose callee does not resolve where std's assert's value goes unread: a function-pointer parameter, a callback std is handed; not Zig's own builtin" {
+    // `&check` handed to a private `each`: its one caller binds `g` to the assert, so `g(ok)`
+    // is judged as one, on a peer's byte; the alias's value site stays undecided.
+    const private = try run(pack.contracts,
+        \\const std = @import("std");
+        \\const check = std.debug.assert;
+        \\fn each(g: *const fn (bool) void, ok: bool) void {
+        \\    g(ok);
+        \\}
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const b = try r.takeByte();
+        \\    each(&check, b < 4);
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 1), private.findings);
+    try std.testing.expectEqual(@as(usize, 1), private.undecided);
+    // A public `each`, which a consumer may call with any function: `g(ok)` may be the assert
+    // and is undecided, never clean.
+    const parameter = try run(pack.contracts,
+        \\const std = @import("std");
+        \\const check = std.debug.assert;
+        \\pub fn each(g: *const fn (bool) void, ok: bool) void {
+        \\    g(ok);
+        \\}
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const b = try r.takeByte();
+        \\    each(&check, b < 4);
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), parameter.findings);
+    try std.testing.expectEqual(@as(usize, 2), parameter.undecided);
+    // Handed to std, which calls it where no file of the program does: its value site is
+    // undecided, never a quiet miss.
+    const to_std = try run(pack.contracts,
+        \\const std = @import("std");
+        \\const check = std.debug.assert;
+        \\pub fn f(io: std.Io, r: *std.Io.Reader) !void {
+        \\    const b = try r.takeByte();
+        \\    try io.concurrent(check, .{b < 4});
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), to_std.findings);
+    try std.testing.expect(to_std.undecided >= 1);
+    // A callee of Zig's own per-build file holds none of the program's values: only the value
+    // site is undecided.
+    const builtin = try run(pack.contracts,
+        \\const std = @import("std");
+        \\fn keep(g: anytype) void {
+        \\    _ = g;
+        \\}
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const b = try r.takeByte();
+        \\    keep(std.debug.assert);
+        \\    @import("builtin").check(b < 4);
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), builtin.findings);
+    try std.testing.expectEqual(@as(usize, 1), builtin.undecided);
+    // A call on a holder that does not resolve (an unmapped import): its one written argument
+    // is the condition, undecided on a peer's byte, nothing on the program's own.
+    const holder = try run(pack.contracts,
+        \\const std = @import("std");
+        \\const ext = @import("ext");
+        \\fn keep(g: anytype) void {
+        \\    _ = g;
+        \\}
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const b = try r.takeByte();
+        \\    keep(std.debug.assert);
+        \\    ext.check(b < 4);
+        \\    ext.check(1 < 2);
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), holder.findings);
+    try std.testing.expectEqual(@as(usize, 2), holder.undecided);
+}
+
+test "A013 leaves std's assert undecided where the program takes a public alias of it as a value in another file: its calls are not all read" {
+    // `other.check(b < 4)` is a call through the alias, judged; `&other.check` handed to
+    // `apply` is its value, called there with what no call shows: undecided, never clear.
+    const found = try runWithFile(pack.contracts,
+        \\const std = @import("std");
+        \\const other = @import("other.zig");
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const b = try r.takeByte();
+        \\    other.check(b < 4);
+        \\    other.apply(&other.check, b < 8);
+        \\}
+    ,
+        \\const std = @import("std");
+        \\pub const check = std.debug.assert;
+        \\pub fn apply(g: *const fn (bool) void, ok: bool) void {
+        \\    g(ok);
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 1), found.findings);
+    try std.testing.expect(found.undecided >= 1);
+}
+
 test "A015 flags a field the program releases or writes an owner into, and a borrow it is only given as none" {
     // Lent's fields hold what they are given: an own.OwnedIo's borrow().*, a handle made from a
     // parameter's, a parameter. An opened file stored and never released is a leak (Leak,

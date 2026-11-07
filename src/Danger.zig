@@ -1045,29 +1045,38 @@ fn asserts(c: *Context, rule: Rule, flow: Taint.Fact) Context.Error!void {
     try Governed.sites(c, rule, found, &sites);
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
+    // Each call of it, by what its callee reaches (`Facts.calls`): by its name, through an alias
+    // or a constant pointer to it (a dependency's among them), a field or a table holding it.
     var calls: std.ArrayList(Ast.Node.Index) = .empty;
-    // A call through an alias the program declares is read by what its callee reaches.
-    try aliasCalls(c, found[0].decls, &calls);
-    // Each alias declaration is read once, however many sites name it or aliases of it reach it.
-    var read: std.AutoHashMapUnmanaged(Ast.Node.Index, void) = .empty;
-    for (sites.items) |site| {
-        if (c.inTest(site.token)) continue;
-        const parent = model.parentOf(site.node) orelse continue;
-        // A call of it (`std.debug.assert(c)`, `@call(.auto, check, .{c})`), by `Facts.calls`;
-        // one through an alias `aliasCalls` reads by what its callee reaches.
-        if (try Facts.calls.at(c.facts, c.file, parent)) |call| if (call.callee_expr == site.node) {
-            if (!site.through_alias) try calls.append(c.allocator, parent);
-            continue;
+    for (try Facts.calls.in(c.facts, c.file)) |call| {
+        const reaches = switch (call.callee) {
+            .function => |one| try reachesAssert(c, found[0].decls, one),
+            .choice => |each| for (each) |one| {
+                if (try reachesAssert(c, found[0].decls, one)) break true;
+            } else false,
+            .any => false,
         };
-        // An alias's declaration is no call, nor is a constant pointer to it (`const check:
-        // *const fn (bool) void = &std.debug.assert;`): `aliasCalls` reads the calls through
-        // either. The assert or an alias of it taken as a value anywhere else (a field's
-        // default, a table's element, a variable) is called where it goes, which this reading
-        // does not follow, at run time or not.
-        if (try aliasDeclaration(c, site.node)) |declaration| {
-            try aliasValues(c, rule, declaration, &read, 0);
-            continue;
-        }
+        if (reaches) try calls.append(c.allocator, call.node);
+    }
+    // Its value taken anywhere else: every call through it is one above where the program's
+    // calls of it are all known (`Facts.programCallSites`: the program's own, judged here); where
+    // its value goes elsewhere, a call through it may be none of these.
+    var followed = true;
+    for (found[0].decls) |decl| {
+        const known = (try c.facts.programCallSites(decl)) orelse {
+            followed = false;
+            break;
+        };
+        // A call through a field or a table whose callee `Facts.calls` does not resolve.
+        for (known) |site| if (site.file == c.file and std.mem.findScalar(Ast.Node.Index, calls.items, site.call) == null) try calls.append(c.allocator, site.call);
+    }
+    // Where they are not, any call whose callee does not resolve may be one through its value:
+    // `unseen` judges each.
+    if (!followed) try unseen(c, rule, flow);
+    for (sites.items) |site| {
+        if (c.inTest(site.token) or followed) continue;
+        const parent = model.parentOf(site.node) orelse continue;
+        if (try Facts.calls.at(c.facts, c.file, parent)) |call| if (call.callee_expr == site.node) continue;
         try c.undecided(rule, tree.tokenStart(site.token), .unresolved, "std.debug.assert taken as a value: its calls are not read");
     }
     for (calls.items) |node| {
@@ -1093,94 +1102,64 @@ fn asserts(c: *Context, rule: Rule, flow: Taint.Fact) Context.Error!void {
     }
 }
 
-/// The alias of std's assert this file declares at `declaration` (`const check =
-/// std.debug.assert;`) taken as a value in this file (`.{ .each = &check }`, a table's
-/// element), by `accesses`: called where it goes, which A013 does not follow, so undecided. A
-/// call of it is `aliasCalls`'s, an alias of it is read as this one is; another file's use of
-/// the alias is a site `Governed.sites` gives there. A declaration in `read` is read already.
-fn aliasValues(c: *Context, rule: Rule, declaration: Ast.Node.Index, read: *std.AutoHashMapUnmanaged(Ast.Node.Index, void), depth: usize) Context.Error!void {
-    if ((try read.getOrPut(c.allocator, declaration)).found_existing) return;
-    if (depth == 8) return c.undecided(rule, c.project.at(c.file).file.tree.tokenStart(c.project.at(c.file).file.tree.firstToken(declaration)), .unsupported, "an alias of std.debug.assert past the depth A013 follows");
+/// Where std's assert's value goes where its calls are not all read (`Facts.programCallSites`
+/// null), each call of this file whose callee does not resolve (`.any`) may be one of it: a
+/// call through a field whose stores are not all seen (`erased_field`), a function-pointer
+/// parameter, a method of a holder that does not resolve. Undecided where its one argument may
+/// hold input; one that takes another count of arguments is no call of it, and a clean
+/// condition makes none a finding. A callee of Zig's own per-build file (`zig_own`) or of code
+/// the build leaves out (`absent`) is none of the program's values.
+fn unseen(c: *Context, rule: Rule, flow: Taint.Fact) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
-    const model = &c.project.at(c.file).model;
-    const index = for (model.declarations, 0..) |d, i| {
-        if (d.kind == .variable and d.node == declaration) break i;
-    } else return;
-    const place: Facts.accesses.Place = .{ .declaration = .{ .file = c.file, .index = @fromBackingInt(@intCast(index)) } };
-    for ([_]Facts.accesses.Each{ Facts.accesses.reads(c.facts, place, &.{c.file}), Facts.accesses.writes(c.facts, place, &.{c.file}) }) |start| {
-        var found = start;
-        while (try found.next()) |site| {
-            if (site.kind != .read and site.kind != .address) continue;
-            const target = site.target orelse site.node;
-            if (c.inTest(tree.firstToken(target))) continue;
-            const parent = model.parentOf(site.node) orelse continue;
-            if (try Facts.calls.at(c.facts, c.file, parent)) |call| if (call.callee_expr == target) continue;
-            if (try aliasDeclaration(c, target)) |alias| {
-                try aliasValues(c, rule, alias, read, depth + 1);
-                continue;
-            }
-            try c.undecided(rule, tree.tokenStart(tree.firstToken(target)), .unresolved, "an alias of std.debug.assert taken as a value: its calls are not read");
+    for (try Facts.calls.in(c.facts, c.file)) |call| {
+        const why = switch (call.callee) {
+            .any => |why| why,
+            .function, .choice => continue,
+        };
+        if (why == .zig_own or why == .absent) continue;
+        if (c.inTest(tree.nodeMainToken(call.node)) or !atRuntime(c, call.node)) continue;
+        const token = tree.firstToken(call.node);
+        const condition = switch (call.args) {
+            .known => |each| if (each.len == 1) each[0] else continue,
+            // A method on a holder that does not resolve may bind its receiver first or not:
+            // bound, the call takes two or more, so it is no call of std's assert, a function of
+            // one bool that no type declares as a method; not bound, the one written is its
+            // condition. A call whose arguments are not written (`@call` with a tuple read
+            // elsewhere) may be any.
+            .unknown => blk: {
+                var buffer: [1]Ast.Node.Index = undefined;
+                const written = tree.fullCall(&buffer, call.node) orelse {
+                    try c.undecided(rule, tree.tokenStart(token), .unresolved, "a call whose callee and arguments do not resolve may be std.debug.assert, whose value the program takes where its calls are not all read");
+                    continue;
+                };
+                if (written.ast.params.len != 1) continue;
+                break :blk written.ast.params[0];
+            },
+        };
+        switch (try Taint.conditionAt(c, flow, c.file, condition)) {
+            .clean => {},
+            .unknown, .data, .number => try undecidedCall(c, rule, token, why),
         }
     }
 }
 
-/// The constant whose first value is `node`, or its address (`const check = std.debug.assert;`,
-/// `const check: *const fn (bool) void = &std.debug.assert;`), by `accesses.useOf`; null where
-/// the value goes anywhere else.
-fn aliasDeclaration(c: *Context, node: Ast.Node.Index) Context.Error!?Ast.Node.Index {
-    const use = try Facts.accesses.useOf(c.facts, c.file, node);
-    const held = switch (use) {
-        .address => |address| try Facts.accesses.useOf(c.facts, c.file, address),
-        else => use,
-    };
-    const declaration = switch (held) {
-        .initializes => |declaration| declaration,
-        else => return null,
-    };
-    const tree = &c.project.at(c.file).file.tree;
-    const variable = tree.fullVarDecl(declaration) orelse return null;
-    return if (tree.tokenTag(variable.ast.mut_token) == .keyword_const) declaration else null;
+/// The undecided site of `unseen`, by why its callee does not resolve.
+fn undecidedCall(c: *Context, rule: Rule, token: Ast.TokenIndex, why: Facts.Unknown) Context.Error!void {
+    const start = c.project.at(c.file).file.tree.tokenStart(token);
+    const lead = "a call whose callee does not resolve (";
+    const tail = ") may be std.debug.assert, whose value the program takes where its calls are not all read, on a condition that may hold input";
+    switch (why) {
+        inline else => |known| try c.undecided(rule, start, .unresolved, lead ++ @tagName(known) ++ tail),
+    }
 }
 
-/// The calls in this file through an alias the program declares of std's assert (`const check =
-/// std.debug.assert;`), public or private, in any of its files, and an alias of one: each call
-/// whose callee is a declaration other than std's that reaches one of `assert_decls`.
-fn aliasCalls(c: *Context, assert_decls: []const Facts.Decl, calls: *std.ArrayList(Ast.Node.Index)) Context.Error!void {
-    const tree = &c.project.at(c.file).file.tree;
-    for (tree.nodes.items(.tag), 0..) |_, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const call = (try Facts.calls.at(c.facts, c.file, node)) orelse continue;
-        // A callee that does not resolve, or an alias whose value does not, is read by
-        // `Governed.sites`: by its spelling, undecided where it may reach the assert.
-        const callee = switch (try c.facts.definition(c.file, call.callee_expr)) {
-            .decl => |decl| decl,
-            .none, .unknown => continue,
-        };
-        // std's assert called by its own name is a site `Governed.sites` gives.
-        if (isAssert(assert_decls, callee)) continue;
-        const reached: ?Facts.Decl = switch (try c.facts.origin(callee)) {
-            .decl => |found| if (std.meta.eql(callee, found)) null else found,
-            .none, .unknown => null,
-        };
-        // A constant pointer to it (`const check: *const fn (bool) void = &std.debug.assert;`,
-        // a dependency's among them): each function the call may reach through it.
-        const origins: []const Facts.Decl = if (reached) |found| &.{found} else switch (call.callee) {
-            .function => |function| &.{function},
-            .choice => |each| each,
-            .any => continue,
-        };
-        // A function pointer's stored function may be an alias (`.{ .each = &check }`): what
-        // the alias reaches.
-        for (origins) |one| {
-            const ends = switch (try c.facts.origin(one)) {
-                .decl => |found| found,
-                .none, .unknown => one,
-            };
-            if (!isAssert(assert_decls, one) and !isAssert(assert_decls, ends)) continue;
-            try calls.append(c.allocator, node);
-            break;
-        }
-    }
+/// Whether a callee is std's assert, or a constant whose value it is (`origin`).
+fn reachesAssert(c: *Context, assert_decls: []const Facts.Decl, callee: Facts.Decl) Context.Error!bool {
+    if (isAssert(assert_decls, callee)) return true;
+    return switch (try c.facts.origin(callee)) {
+        .decl => |found| isAssert(assert_decls, found),
+        .none, .unknown => false,
+    };
 }
 
 fn isAssert(assert_decls: []const Facts.Decl, decl: Facts.Decl) bool {
