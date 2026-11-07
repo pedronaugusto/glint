@@ -56,6 +56,7 @@ const allowed = [_]Allowed{
     .{ .file = "src/AegisPack.zig", .function = "Flow.decided", .reason = "Zig's `!` can't be overloaded: the node tag is the negation of the flag the walk knows" },
     .{ .file = "src/AegisPack.zig", .function = "Flow.repeat", .reason = "`while (true)` is the language's literal, which no declaration stands behind" },
     .{ .file = "src/Escapes.zig", .function = "compiledIn", .reason = "a literal as written is compiled into the program, never the frame's memory" },
+    .{ .file = "src/DangerFlow.zig", .function = "input", .reason = "std's parameter name is part of std's declared contract (A012's size parameters are read the same way, docs/design.md), read only from the resolved std declaration, never from program code" },
 };
 
 /// VALUE_SWITCHES: a switch on a value Facts resolved (`Facts.Value`) that names no `.alternatives`

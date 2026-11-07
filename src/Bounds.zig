@@ -34,6 +34,10 @@ const Context = @import("RuleContext.zig");
 const Project = @import("Project.zig");
 const Model = @import("Model.zig");
 const Range = @import("Range.zig");
+const accesses = Facts.accesses;
+const formAt = Range.formAt;
+const nameRef = Range.nameRef;
+const spellsName = Range.spellsName;
 const Program = @import("Program.zig");
 const Facts = @import("Facts.zig");
 const Governed = @import("Governed.zig");
@@ -850,12 +854,6 @@ fn callersIndex(c: *Context) Error!*Callers {
     const memo = try c.facts.memo(Callers);
     if (memo.built) return memo;
     memo.built = true;
-    // Every name a program function is declared under, to resolve only what may reach one.
-    var names: std.StringHashMapUnmanaged(void) = .empty;
-    for (c.project.sources) |*source| {
-        if (source.file.status != .parsed or !try Program.owns(c, source.id)) continue;
-        for (source.model.declarations) |decl| if (decl.kind == .function) try names.put(c.allocator, decl.name, {});
-    }
     for (c.project.sources) |*source| {
         if (source.file.status != .parsed or !try Program.owns(c, source.id)) continue;
         const file = source.id;
@@ -863,26 +861,36 @@ fn callersIndex(c: *Context) Error!*Callers {
         const model = &source.model;
         for (tree.nodes.items(.tag), 0..) |tag, i| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            const name_token = switch (tag) {
-                .identifier, .enum_literal => tree.nodeMainToken(node),
-                .field_access => tree.nodeData(node).node_and_token[1],
-                .builtin_call_two, .builtin_call_two_comma => {
-                    // `@field(T, "f")` names `f` by text: each function of that name may be
-                    // reached so; a name computed may be any.
-                    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) continue;
+            switch (accesses.formOf(tag)) {
+                // A name, or a decl literal (`.init`): a local's or a parameter's holds no
+                // function the program declares by name; any other may be one, or an alias of one.
+                .leaf => {
+                    if (tree.tokenTag(tree.nodeMainToken(node)) != .identifier) continue;
+                    if (nameRef(model, node)) |ref| if (ref.declaration) |d| switch (model.declarations[@backingInt(d)].kind) {
+                        .function, .variable => {},
+                        else => continue,
+                    };
+                },
+                .member => {},
+                .builtin => {
+                    // `@field(T, "f")` names `f` (`Facts.fieldName`): each function of that name may
+                    // be reached so; a name computed may be any.
+                    if (!Facts.isBuiltin(tree, node, "@field")) continue;
                     var buffer: [2]Ast.Node.Index = undefined;
                     const args = Facts.builtinArgs(tree, node, &buffer);
-                    if (args.len != 2 or tree.nodeTag(args[1]) != .string_literal) {
+                    if (args.len != 2) {
                         memo.reflective = true;
                         continue;
                     }
-                    const quoted = tree.tokenSlice(tree.nodeMainToken(args[1]));
-                    try fieldNamed(c, memo, quoted[1 .. quoted.len - 1]);
+                    switch (try c.facts.fieldName(file, args[1])) {
+                        .name => |name| try fieldNamed(c, memo, name),
+                        .names => |names| for (names) |name| try fieldNamed(c, memo, name),
+                        .each_of, .computed => memo.reflective = true,
+                    }
                     continue;
                 },
                 else => continue,
-            };
-            if (!names.contains(tree.tokenSlice(name_token))) continue;
+            }
             // A declaration's own name is no use of it.
             const decl = switch (try c.facts.resolve(file, node)) {
                 .function => |d| d,
@@ -1003,13 +1011,13 @@ pub fn within(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: 
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
     const access = model.parentOf(index) orelse return false;
-    switch (tree.nodeTag(access)) {
+    switch (formAt(tree, access)) {
         .array_access => {
             const array, const at = tree.nodeData(access).node_and_node;
             if (array != memory or at != index or end) return false;
             return cleared(c, file, index, .index);
         },
-        .slice_open, .slice, .slice_sentinel => {
+        .slice => {
             const slice = tree.fullSlice(access) orelse return false;
             if (slice.ast.sliced != memory or !end) return false;
             if (slice.ast.start == index) return cleared(c, file, index, .start);
@@ -1218,8 +1226,8 @@ const Frame = struct {
         if (proto.ast.return_type.unwrap()) |result| {
             f.result_sized = try f.c.facts.sizedMemory(try f.c.facts.resolve(f.file, result));
             var t = result;
-            if (f.tree.nodeTag(t) == .error_union) t = f.tree.nodeData(t).node_and_node[1];
-            if (f.tree.nodeTag(t) == .optional_type) t = f.tree.nodeData(t).node;
+            if (formAt(f.tree, t) == .error_union) t = f.tree.nodeData(t).node_and_node[1];
+            if (formAt(f.tree, t) == .optional_type) t = f.tree.nodeData(t).node;
             f.returns_int = try Range.intNamedIn(f.c, f.bound, f.file, t, f.width) != null;
         }
         const body = f.tree.nodeData(f.function).node_and_node[1];
@@ -1733,12 +1741,12 @@ const Frame = struct {
     /// The state after `node` runs from `s`.
     fn exec(f: *Frame, s: State, node: Ast.Node.Index) RunError!State {
         if (s.dead) return s;
-        switch (f.tree.nodeTag(node)) {
-            .simple_var_decl, .local_var_decl, .aligned_var_decl, .global_var_decl => return f.declare(s, node),
-            .assign, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor => return f.assignment(s, node),
-            .assign_destructure => return f.destructure(s, node),
-            .@"defer", .@"errdefer" => {
-                try f.defers.append(f.a, .{ .body = f.tree.nodeData(node).node, .on_error = f.tree.nodeTag(node) == .@"errdefer" });
+        switch (formAt(f.tree, node)) {
+            .variable => return f.declare(s, node),
+            .assign, .compound_assign => return f.assignment(s, node),
+            .destructure => return f.destructure(s, node),
+            .deferred => {
+                try f.defers.append(f.a, .{ .body = f.tree.nodeData(node).node, .on_error = f.tree.tokenTag(f.tree.nodeMainToken(node)) == .keyword_errdefer });
                 return s;
             },
             else => return (try f.eval(s, node)).s,
@@ -1796,12 +1804,13 @@ const Frame = struct {
 
     fn assignment(f: *Frame, s: State, node: Ast.Node.Index) RunError!State {
         const tag = f.tree.nodeTag(node);
+        const whole = formAt(f.tree, node) == .assign;
         const target, const rhs = f.tree.nodeData(node).node_and_node;
         const d = f.trackedName(target) orelse {
             if (try f.lengthStored(target)) |memory| return f.storeLength(s, node, target, rhs, memory);
             // An optional field: the store writes it as any store does, and it then holds a
             // value where what it is given does.
-            if (tag == .assign) if (try f.presencePlaceOf(target)) |p| {
+            if (whole) if (try f.presencePlaceOf(target)) |p| {
                 const e = try f.eval(s, rhs);
                 const out = try f.storedThrough(e.s, target);
                 return f.assign(out, try f.presencePlaceVar(p), try f.presentOf(rhs, e.v), null);
@@ -1811,9 +1820,9 @@ const Frame = struct {
             const place = try f.eval(s, target);
             return f.storedThrough((try f.eval(place.s, rhs)).s, target);
         };
-        var e = if (tag == .assign and f.condition(rhs)) try f.truthOf(s, rhs) else try f.eval(s, rhs);
+        var e = if (whole and f.condition(rhs)) try f.truthOf(s, rhs) else try f.eval(s, rhs);
         const int = try f.intOf(target);
-        if (tag == .assign) {
+        if (whole) {
             try f.counted(e.s, rhs, e.v.lin);
             e.v.present = try f.presentOf(rhs, e.v);
             return f.bind(e.s, d, e.v, int);
@@ -1858,7 +1867,7 @@ const Frame = struct {
     /// where only stores through its name change it: its value (`Range.placeable`) or, for an
     /// optional, whether it holds one (`Range.presenceable`).
     fn fieldPlace(f: *Frame, node: Ast.Node.Index, comptime held: enum { number, presence }) Error!?Place {
-        if (f.tree.nodeTag(node) != .field_access) return null;
+        if (formAt(f.tree, node) != .member) return null;
         const holder = f.tree.nodeData(node).node_and_token[0];
         const root = f.trackedName(holder) orelse return null;
         if (held == .presence and try f.c.facts.resolve(f.file, node) != .optional) return null;
@@ -1908,7 +1917,7 @@ const Frame = struct {
         const tag = f.tree.nodeTag(node);
         const e = try f.eval(s, rhs);
         const int = try f.intOf(target);
-        if (tag == .assign) return f.setPlace(e.s, target, p, e.v);
+        if (formAt(f.tree, node) == .assign) return f.setPlace(e.s, target, p, e.v);
         // `op=` reads the place first: what it held at entry, where nothing has stored one yet.
         const current = try f.placeValue(e.s, target, p);
         const out = try f.storedIn(current.s, p);
@@ -1946,16 +1955,16 @@ const Frame = struct {
     /// every place. A number or a pointer stored into memory writes no place, as no pointer
     /// reaches a place's field (`placeOf`); `_ = x` stores nothing.
     fn storedThrough(f: *Frame, s: State, target: Ast.Node.Index) Error!State {
-        switch (f.tree.nodeTag(target)) {
-            .identifier => if (std.mem.eql(u8, f.tree.tokenSlice(f.tree.nodeMainToken(target)), "_")) return s,
-            .field_access => {
+        switch (formAt(f.tree, target)) {
+            .leaf => if (Range.discards(f.tree, target)) return s,
+            .member => {
                 // A field that does not resolve (`p.at` of an `anytype` `p`) may be any place's.
                 const decl = ((try f.c.facts.definition(f.file, target)).orNull()) orelse return f.wrote(s, null, null);
                 const value = try f.c.facts.resolve(f.file, target);
                 if (value == .scalar or value == .pointer or try f.flatOptional(value)) return f.wrote(s, ((try f.c.facts.origin(decl)).orNull()) orelse decl, null);
             },
             // `@field(x, "at") = v`: a field by a name read as the program compiles.
-            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return f.wrote(s, null, null),
+            .builtin => return f.wrote(s, null, null),
             else => {},
         }
         const value = try f.c.facts.resolve(f.file, target);
@@ -1968,7 +1977,7 @@ const Frame = struct {
             // A number's store, its type read where the value does not resolve or resolves as
             // its type's name (`k.*` of a capture's pointer), writes no place.
             // A field's store is recorded as its field's above, or as any.
-            .unknown, .primitive => if (f.tree.nodeTag(target) != .field_access and try f.intOf(target) != null) s else f.wrote(s, null, null),
+            .unknown, .primitive => if (formAt(f.tree, target) != .member and try f.intOf(target) != null) s else f.wrote(s, null, null),
             .alternatives => f.wrote(s, null, null),
             else => f.wrote(s, null, null),
         };
@@ -2084,18 +2093,22 @@ const Frame = struct {
     /// The tracked slice whose length a store to `target` sets: `s.len = n`, or
     /// `@field(s, name)`, whose name may be `len`.
     fn lengthStored(f: *Frame, target: Ast.Node.Index) Error!?Model.Declaration.Id {
-        switch (f.tree.nodeTag(target)) {
-            .field_access => {
-                const holder, const member = f.tree.nodeData(target).node_and_token;
-                if (!std.mem.eql(u8, f.tree.tokenSlice(member), "len")) return null;
+        switch (formAt(f.tree, target)) {
+            .member => {
+                const holder = f.tree.nodeData(target).node_and_token[0];
+                // A slice's own `len` (`Facts.languageField`), or a holder's that does not resolve.
+                switch (try f.c.facts.languageField(f.file, target)) {
+                    .len, .unknown => {},
+                    .ptr, .none => return null,
+                }
                 const d = f.trackedName(holder) orelse return null;
                 return if (try f.holdsLength(holder)) d else null;
             },
-            .builtin_call_two, .builtin_call_two_comma => {
-                if (!std.mem.eql(u8, f.tree.tokenSlice(f.tree.nodeMainToken(target)), "@field")) return null;
+            .builtin => {
+                if (!Facts.isBuiltin(f.tree, target, "@field")) return null;
                 const holder, const field_name = f.tree.nodeData(target).opt_node_and_opt_node;
-                // A name spelled out other than `len` stores another field: a store to memory.
-                if (field_name.unwrap()) |spelled| if (f.tree.nodeTag(spelled) == .string_literal and !std.mem.eql(u8, f.tree.tokenSlice(f.tree.nodeMainToken(spelled)), "\"len\"")) return null;
+                // A name that cannot be `len` stores another field: a store to memory.
+                if (field_name.unwrap()) |spelled| if (!f.c.facts.mayName(try f.c.facts.fieldName(f.file, spelled), "len")) return null;
                 return f.trackedName(holder.unwrap() orelse return null);
             },
             else => return null,
@@ -2107,7 +2120,7 @@ const Frame = struct {
     fn storeLength(f: *Frame, s: State, node: Ast.Node.Index, target: Ast.Node.Index, rhs: Ast.Node.Index, d: Model.Declaration.Id) RunError!State {
         const tag = f.tree.nodeTag(node);
         const e = try f.eval(s, rhs);
-        if (tag == .assign or f.tree.nodeTag(target) != .field_access) return f.setLength(e.s, target, d, e.v);
+        if (formAt(f.tree, node) == .assign or formAt(f.tree, target) != .member) return f.setLength(e.s, target, d, e.v);
         const v = try f.variable(.{ .length = d });
         try f.claimed.put(f.a, v, {});
         const int = try f.intOf(target);
@@ -2120,14 +2133,13 @@ const Frame = struct {
         const v = try f.variable(.{ .length = d });
         try f.claimed.put(f.a, v, {});
         // `@field(s, name)` with a name read as the program compiles: any field, `len` among them.
-        if (f.tree.nodeTag(target) != .field_access) return f.assign(try f.wrote(s, null, null), v, null, null);
+        if (formAt(f.tree, target) != .member) return f.assign(try f.wrote(s, null, null), v, null, null);
         return f.assign(s, v, value.lin, null);
     }
 
     /// The tracked declaration an identifier names, where it names one.
     fn trackedName(f: *Frame, node: Ast.Node.Index) ?Model.Declaration.Id {
-        if (f.tree.nodeTag(node) != .identifier) return null;
-        const d = (f.model.reference(node) orelse return null).declaration orelse return null;
+        const d = (nameRef(f.model, node) orelse return null).declaration orelse return null;
         return if (f.tracked(d)) d else null;
     }
 
@@ -2139,66 +2151,74 @@ const Frame = struct {
     fn eval(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
         if (s.dead) return .{ .s = s };
         const tree = f.tree;
-        switch (tree.nodeTag(node)) {
-            .number_literal => return .{ .s = s, .v = .{ .lin = switch (std.zig.parseNumberLiteral(tree.tokenSlice(tree.nodeMainToken(node)))) {
-                .int => |n| constant(n),
-                else => null,
-            } } },
-            .identifier => return f.name(s, node),
+        switch (formAt(tree, node)) {
+            .leaf => {
+                const token = tree.nodeMainToken(node);
+                if (spellsName(tree, node)) return f.name(s, node);
+                return switch (tree.tokenTag(token)) {
+                    .number_literal => .{ .s = s, .v = .{ .lin = switch (std.zig.parseNumberLiteral(tree.tokenSlice(token))) {
+                        .int => |n| constant(n),
+                        else => null,
+                    } } },
+                    .keyword_unreachable => .{ .s = State.unreachable_state },
+                    // A string, a character, an enum literal or an error: nothing at run time.
+                    else => .{ .s = s },
+                };
+            },
             // A statement as a branch's or a loop's whole body (`if (a) i = 0;`).
-            .assign, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_destructure => return .{ .s = try f.exec(s, node) },
-            .grouped_expression => return f.eval(s, tree.nodeData(node).node_and_token[0]),
+            .assign, .compound_assign => return .{ .s = try f.assignment(s, node) },
+            .grouped => return f.eval(s, tree.nodeData(node).node_and_token[0]),
             .@"nosuspend" => return f.eval(s, tree.nodeData(node).node),
-            .field_access => return f.field(s, node),
+            .member => return f.field(s, node),
             .array_access => return f.element(s, node),
-            .slice_open, .slice, .slice_sentinel => return f.slice(s, node),
-            .add, .sub, .mul, .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .div, .mod, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor => {
+            .slice => return f.slice(s, node),
+            .operator => {
+                if (accesses.unaryOf(tree.nodeTag(node))) |unary| {
+                    if (unary == .negation) {
+                        const operand = try f.eval(s, tree.nodeData(node).node);
+                        return f.arith(operand.s, node, .sub, constant(0), operand.v.lin, tree.nodeData(node).node, try f.intOf(node));
+                    }
+                    return f.fresh((try f.eval(s, tree.nodeData(node).node)).s, node, 0);
+                }
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
                 const left = try f.heldPast(try f.eval(s, lhs), node, rhs);
                 const right = try f.eval(left.s, rhs);
                 return f.arith(right.s, node, tree.nodeTag(node), left.v.lin, right.v.lin, rhs, try f.intOf(node));
             },
-            .negation => {
-                const operand = try f.eval(s, tree.nodeData(node).node);
-                return f.arith(operand.s, node, .sub, constant(0), operand.v.lin, tree.nodeData(node).node, try f.intOf(node));
+            .deref, .address_of => return f.fresh((try f.eval(s, tree.nodeData(node).node)).s, node, 0),
+            .unwrap_optional => {
+                const e = try f.eval(s, tree.nodeData(node).node_and_token[0]);
+                // Proven where the operand holds a value on the path; past it, it does (a safe
+                // build traps otherwise).
+                const p = e.v.present;
+                const goal: ?Lin = if (p) |x| try atLeast(f.a, x, constant(1)) else null;
+                try f.record(node, .present, if (goal) |g| try f.shows(e.s, g) else false);
+                const after = if (p) |x| try f.same(e.s, x, constant(1)) else e.s;
+                return f.fresh(after, node, 0);
             },
-            .negation_wrap, .bit_not, .deref, .address_of, .unwrap_optional => {
-                const operand: Ast.Node.Index = switch (tree.nodeTag(node)) {
-                    .unwrap_optional => tree.nodeData(node).node_and_token[0],
-                    else => tree.nodeData(node).node,
-                };
-                const e = try f.eval(s, operand);
-                if (tree.nodeTag(node) == .unwrap_optional) {
-                    // Proven where the operand holds a value on the path; past it, it does (a
-                    // safe build traps otherwise).
-                    const p = e.v.present;
-                    const goal: ?Lin = if (p) |x| try atLeast(f.a, x, constant(1)) else null;
-                    try f.record(node, .present, if (goal) |g| try f.shows(e.s, g) else false);
-                    const after = if (p) |x| try f.same(e.s, x, constant(1)) else e.s;
-                    return f.fresh(after, node, 0);
-                }
-                return f.fresh(e.s, node, 0);
-            },
-            .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal, .bool_and, .bool_or, .bool_not => {
+            .comparison, .logic => {
                 const split = try f.cond(s, node);
                 return .{ .s = try f.join(split.yes, split.no) };
             },
-            .@"try" => return f.tried(s, node),
+            .tried => return f.tried(s, node),
             .@"catch", .@"orelse" => return f.otherwise(s, node),
-            .@"if", .if_simple => return f.branch(s, node),
-            .@"while", .while_simple, .while_cont => return f.whileLoop(s, node),
-            .@"for", .for_simple => return f.forLoop(s, node),
-            .@"switch", .switch_comma => return f.switchOn(s, node),
+            .@"if" => return f.branch(s, node),
+            .@"while" => return f.whileLoop(s, node),
+            .@"for" => return f.forLoop(s, node),
+            .@"switch" => return f.switchOn(s, node),
             .@"return" => return f.returned(s, node),
             .@"break" => return f.jump(s, node, true),
             .@"continue" => return f.jump(s, node, false),
-            .unreachable_literal => return .{ .s = State.unreachable_state },
-            .block, .block_semicolon, .block_two, .block_two_semicolon => return f.block(s, node),
-            .call_one, .call_one_comma, .call, .call_comma => return f.call(s, node),
-            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return f.builtin(s, node),
-            .struct_init_one, .struct_init_one_comma, .struct_init_dot_two, .struct_init_dot_two_comma, .struct_init_dot, .struct_init_dot_comma, .struct_init, .struct_init_comma => {
+            .body => {
                 var buffer: [2]Ast.Node.Index = undefined;
-                const full = tree.fullStructInit(&buffer, node).?; // unreachable: the tag is a struct literal's
+                if (tree.blockStatements(&buffer, node) == null) return .{ .s = s };
+                return f.block(s, node);
+            },
+            .call => return f.call(s, node),
+            .builtin => return f.builtin(s, node),
+            .struct_literal => {
+                var buffer: [2]Ast.Node.Index = undefined;
+                const full = tree.fullStructInit(&buffer, node).?; // unreachable: a struct literal's form holds them
                 var out = s;
                 var values: std.ArrayList(Value) = .empty;
                 for (full.ast.fields) |each| {
@@ -2209,16 +2229,16 @@ const Frame = struct {
                 if (f.proving.len != 0) try f.judgeLiteral(out, node, full.ast.fields, values.items);
                 return .{ .s = out };
             },
-            .array_init_one, .array_init_one_comma, .array_init_dot_two, .array_init_dot_two_comma, .array_init_dot, .array_init_dot_comma, .array_init, .array_init_comma => {
+            .array_literal => {
                 var buffer: [2]Ast.Node.Index = undefined;
-                const full = tree.fullArrayInit(&buffer, node).?; // unreachable: the tag is an array literal's
+                const full = tree.fullArrayInit(&buffer, node).?; // unreachable: an array literal's form holds them
                 var out = s;
                 for (full.ast.elements) |each| out = (try f.eval(out, each)).s;
                 return .{ .s = out, .v = .{ .length = constant(@intCast(full.ast.elements.len)) } };
             },
-            .@"asm", .asm_simple, .@"suspend", .@"resume" => return error.Unsupported,
+            .@"asm", .frame => return error.Unsupported,
             // Evaluated as the program compiles, or a type: nothing at run time.
-            .@"comptime", .string_literal, .multiline_string_literal, .char_literal, .enum_literal, .error_value, .error_set_decl, .anyframe_literal, .anyframe_type, .optional_type, .array_type, .array_type_sentinel, .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range, .error_union, .merge_error_sets, .container_decl, .container_decl_trailing, .container_decl_two, .container_decl_two_trailing, .container_decl_arg, .container_decl_arg_trailing, .tagged_union, .tagged_union_trailing, .tagged_union_two, .tagged_union_two_trailing, .tagged_union_enum_tag, .tagged_union_enum_tag_trailing, .fn_proto_simple, .fn_proto_multi, .fn_proto_one, .fn_proto => return .{ .s = s },
+            .@"comptime", .optional_type, .array_type, .pointer_type, .anyframe_type, .error_union, .merged_errors, .prototype => return .{ .s = s },
             else => return f.opaqueExpr(s, node),
         }
     }
@@ -2234,11 +2254,11 @@ const Frame = struct {
             const inner: Ast.Node.Index = @fromBackingInt(@intCast(i));
             const token = tree.nodeMainToken(inner);
             if (token < first or token > last) continue;
-            switch (tag) {
+            switch (accesses.formOf(tag)) {
                 .@"return", .@"break", .@"continue" => if (functionOf(f.c, f.file, inner) == f.function) return error.Unsupported,
-                .assign, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor => if (f.trackedName(tree.nodeData(inner).node_and_node[0]) != null) return error.Unsupported,
-                .assign_destructure, .simple_var_decl, .local_var_decl, .aligned_var_decl => if (functionOf(f.c, f.file, inner) == f.function) return error.Unsupported,
-                .@"asm", .asm_simple => return error.Unsupported,
+                .assign, .compound_assign => if (f.trackedName(tree.nodeData(inner).node_and_node[0]) != null) return error.Unsupported,
+                .destructure, .variable => if (functionOf(f.c, f.file, inner) == f.function) return error.Unsupported,
+                .@"asm" => return error.Unsupported,
                 else => {},
             }
         }
@@ -2283,7 +2303,8 @@ const Frame = struct {
         const holder, const field_token = f.tree.nodeData(node).node_and_token;
         const e = try f.eval(s, holder);
         // `len` is a slice's or an array's length; a struct's own field of that name is a field.
-        if (!std.mem.eql(u8, f.tree.tokenSlice(field_token), "len") or !try f.holdsLength(holder) or try f.c.facts.memoryField(f.file, node) == .field) {
+        _ = field_token;
+        if (try f.c.facts.languageField(f.file, node) != .len or !try f.holdsLength(holder)) {
             if (try f.presencePlaceOf(node)) |p| {
                 const v = try f.presencePlaceVar(p);
                 return .{ .s = try f.within(e.s, v), .v = .{ .present = try single(f.a, v) } };
@@ -2646,10 +2667,8 @@ const Frame = struct {
                     .not_equal => .{ .yes = base, .no = try f.same(base, x, y) },
                 };
             },
-            .other => |at| if (tree.nodeTag(at) == .identifier) {
-                const spelled = tree.tokenSlice(tree.nodeMainToken(at));
-                if (std.mem.eql(u8, spelled, "true")) return .{ .yes = s, .no = State.unreachable_state };
-                if (std.mem.eql(u8, spelled, "false")) return .{ .yes = State.unreachable_state, .no = s };
+            .other => |at| if (spellsName(tree, at)) {
+                if (try f.c.facts.literalOf(f.file, at)) |written| if (written == .boolean) return if (written.boolean) .{ .yes = s, .no = State.unreachable_state } else .{ .yes = State.unreachable_state, .no = s };
                 // A tracked `bool`: 1 where it holds, 0 where it does not.
                 if (f.trackedName(at)) |d| {
                     const u = try f.unit(s, .{ .boolean = d });
@@ -2869,7 +2888,7 @@ const Frame = struct {
             .struct_literal, .array_literal => return true,
             else => {},
         }
-        if (f.tree.nodeTag(at) == .number_literal or f.tree.nodeTag(at) == .char_literal) return true;
+        if (try f.c.facts.literalOf(f.file, at)) |written| if (written == .number or written == .char) return true;
         switch (try f.c.facts.resolve(f.file, at)) {
             .instance, .pointer, .array, .function => return true,
             .alternatives => {},
@@ -2884,7 +2903,7 @@ const Frame = struct {
     fn payloadPresent(f: *Frame, node: Ast.Node.Index) Error!?Lin {
         const t = (try exprType(f.c, f.file, node, 0)) orelse return null;
         const tree = &f.c.project.at(t.file).file.tree;
-        const payload: TypeRef = switch (tree.nodeTag(t.node)) {
+        const payload: TypeRef = switch (formAt(tree, t.node)) {
             .optional_type => .{ .file = t.file, .node = tree.nodeData(t.node).node },
             .error_union => .{ .file = t.file, .node = tree.nodeData(t.node).node_and_node[1] },
             else => return null,
@@ -2963,10 +2982,8 @@ const Frame = struct {
                 };
             },
             .other => |at| {
-                if (tree.nodeTag(at) != .identifier) return null;
-                const spelled = tree.tokenSlice(tree.nodeMainToken(at));
-                if (std.mem.eql(u8, spelled, "true")) return .{ s, constant(1) };
-                if (std.mem.eql(u8, spelled, "false")) return .{ s, constant(0) };
+                if (!spellsName(tree, at)) return null;
+                if (try f.c.facts.literalOf(f.file, at)) |written| if (written == .boolean) return .{ s, constant(@intFromBool(written.boolean)) };
                 const d = f.trackedName(at) orelse return null;
                 const u = try f.unit(s, .{ .boolean = d });
                 return .{ u[0], try single(f.a, u[1]) };
@@ -3085,11 +3102,14 @@ const Frame = struct {
     /// payload, a literal, what an operator or an arithmetic builtin gives, a value of a kind
     /// that holds no error, `failingValue`) is not; anything else may be.
     fn failingOf(f: *Frame, operand: Ast.Node.Index) Error!Failing {
-        switch (f.tree.nodeTag(operand)) {
-            .error_value => return .yes,
-            .@"try", .number_literal, .char_literal, .string_literal, .multiline_string_literal, .enum_literal => return .no,
-            .add, .sub, .mul, .div, .mod, .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor, .bit_not, .negation, .negation_wrap, .bool_not, .bool_and, .bool_or, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => return .no,
-            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+        switch (formAt(f.tree, operand)) {
+            .leaf => if (try f.c.facts.literalOf(f.file, operand)) |written| switch (written) {
+                .error_value => return .yes,
+                .number, .char, .string, .enum_literal => return .no,
+                else => {},
+            },
+            .tried, .operator, .logic, .comparison => return .no,
+            .builtin => {
                 const called = f.tree.tokenSlice(f.tree.nodeMainToken(operand));
                 for (numeric_builtins) |each| if (std.mem.eql(u8, called, each)) return .no;
             },
@@ -3104,8 +3124,7 @@ const Frame = struct {
     /// Whether `node` names a parameter or a local declared of an integer type, as written
     /// (`d: usize`, `const n: u32 = …`) or bound in the reading (`n: T`).
     fn declaredInt(f: *Frame, node: Ast.Node.Index) Error!bool {
-        if (f.tree.nodeTag(node) != .identifier) return false;
-        const d = (f.model.reference(node) orelse return false).declaration orelse return false;
+        const d = (nameRef(f.model, node) orelse return false).declaration orelse return false;
         if (f.param_ints.contains(d)) return true;
         const decl = f.model.declarations[@backingInt(d)];
         if (decl.kind != .variable) return false;
@@ -3270,9 +3289,9 @@ const Frame = struct {
         const last = f.tree.lastToken(node);
         var assigned: std.AutoHashMapUnmanaged(Model.Declaration.Id, void) = .empty;
         for (f.tree.nodes.items(.tag), 0..) |tag, i| {
-            switch (tag) {
-                .assign, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor => {},
-                .assign_destructure => return null,
+            switch (accesses.formOf(tag)) {
+                .assign, .compound_assign => {},
+                .destructure => return null,
                 else => continue,
             }
             const inner: Ast.Node.Index = @fromBackingInt(@intCast(i));
@@ -3338,8 +3357,8 @@ const Frame = struct {
             const inner: Ast.Node.Index = @fromBackingInt(@intCast(i));
             const token = f.tree.nodeMainToken(inner);
             if (token < first or token > last) continue;
-            const target, const value = switch (tag) {
-                .assign, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor => f.tree.nodeData(inner).node_and_node,
+            const target, const value = switch (accesses.formOf(tag)) {
+                .assign, .compound_assign => f.tree.nodeData(inner).node_and_node,
                 else => continue,
             };
             const stepped = (try f.steppedBy(target)) orelse continue;
@@ -3422,7 +3441,7 @@ const Frame = struct {
             else => return null,
         };
         if (try f.sameStepped(amount, target)) return null;
-        if (f.tree.nodeTag(amount) == .number_literal) switch (std.zig.parseNumberLiteral(f.tree.tokenSlice(f.tree.nodeMainToken(amount)))) {
+        if (try f.c.facts.literalOf(f.file, amount)) |written| if (written == .number) switch (std.zig.parseNumberLiteral(f.tree.tokenSlice(f.tree.nodeMainToken(Facts.ungrouped(f.tree, amount))))) {
             .int => |k| return .{ .up = up, .most = k, .least = k },
             else => return null,
         };
@@ -3632,7 +3651,7 @@ const Frame = struct {
         var out = s;
         var receiver: ?Value = null;
         var holder_node: ?Ast.Node.Index = null;
-        if (f.tree.nodeTag(full.ast.fn_expr) == .field_access) {
+        if (formAt(f.tree, full.ast.fn_expr) == .member) {
             const holder = f.tree.nodeData(full.ast.fn_expr).node_and_token[0];
             const e = try f.eval(out, holder);
             out = e.s;
@@ -3682,7 +3701,7 @@ const Frame = struct {
                 if (listed.param >= full.ast.params.len) continue;
                 break :operand full.ast.params[listed.param];
             };
-            const root = f.trackedName(if (f.tree.nodeTag(operand) == .address_of) f.tree.nodeData(operand).node else operand) orelse continue;
+            const root = f.trackedName(if (formAt(f.tree, operand) == .address_of) f.tree.nodeData(operand).node else operand) orelse continue;
             const p: Place = .{ .root = root, .field = listed.field };
             entries[k].place = p;
             // Each place's entries in the temporaries after the operands'.
@@ -3846,7 +3865,7 @@ const Frame = struct {
         if (!read.supported) return null;
         const summary = read.summary orelse return null;
         const result = full.ast.return_type.unwrap() orelse return null;
-        const fails = callee_tree.nodeTag(result) == .error_union or
+        const fails = formAt(callee_tree, result) == .error_union or
             (callee_tree.firstToken(result) > 0 and callee_tree.tokenTag(callee_tree.firstToken(result) - 1) == .bang) or
             try mayFail(f.c, decl.file, result);
         if (!own) return .{ .rows = &.{}, .failing = summary.failing, .params = summary.params, .places = &.{}, .written = null, .fails = fails, .own = false };
@@ -3891,34 +3910,35 @@ const type_depth = 16;
 fn memoryKind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Error!Memory {
     if (depth > type_depth) return .unknown;
     const tree = &c.project.at(file).file.tree;
-    switch (tree.nodeTag(node)) {
-        .string_literal, .multiline_string_literal => return .sentinel,
+    switch (formAt(tree, node)) {
+        .leaf => if (try c.facts.literalOf(file, node)) |written| if (written == .string) return .sentinel,
         // A literal is memory of the type it names (`[_:0]u8{…}` has a sentinel); one that names
         // none (`.{…}`) is a tuple's, which has none.
-        .array_init_dot_two, .array_init_dot_two_comma, .array_init_dot, .array_init_dot_comma => return .checked,
-        .array_init_one, .array_init_one_comma, .array_init, .array_init_comma => {
+        .array_literal => {
             var buffer: [2]Ast.Node.Index = undefined;
-            const literal = tree.fullArrayInit(&buffer, node).?; // unreachable: the tag is an array literal's
-            return typeKind(c, .{ .file = file, .node = literal.ast.type_expr.unwrap() orelse return .unknown }, depth + 1);
+            const literal = tree.fullArrayInit(&buffer, node).?; // unreachable: an array literal's form holds them
+            return typeKind(c, .{ .file = file, .node = literal.ast.type_expr.unwrap() orelse return .checked }, depth + 1);
         },
-        .grouped_expression => return memoryKind(c, file, tree.nodeData(node).node_and_token[0], depth + 1),
-        .@"try", .@"comptime", .@"nosuspend", .address_of => return memoryKind(c, file, tree.nodeData(node).node, depth + 1),
-        .slice_open, .slice, .slice_sentinel => {
-            const full = tree.fullSlice(node).?; // unreachable: the tag is a slice's
+        .grouped => return memoryKind(c, file, tree.nodeData(node).node_and_token[0], depth + 1),
+        .tried, .@"comptime", .@"nosuspend", .address_of => return memoryKind(c, file, tree.nodeData(node).node, depth + 1),
+        .slice => {
+            const full = tree.fullSlice(node).?; // unreachable: a slice's form holds them
             if (full.ast.sentinel != .none) return .sentinel;
             // A many-item pointer sliced with no end is one still.
             if (full.ast.end == .none) return memoryKind(c, file, full.ast.sliced, depth + 1);
             return .checked;
         },
-        .field_access => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeData(node).node_and_token[1]), "ptr")) return .unchecked,
+        .member => if (try c.facts.languageField(file, node) == .ptr) return .unchecked,
         // A local with no type written is what it is made from (`const s = buf[0..n];`).
-        .identifier => if (c.project.at(file).model.reference(node)) |ref| if (ref.declaration) |d| {
+        else => {},
+    }
+    if (spellsName(tree, node)) {
+        if (nameRef(&c.project.at(file).model, node)) |ref| if (ref.declaration) |d| {
             const decl = c.project.at(file).model.declarations[@backingInt(d)];
             if (decl.kind == .variable) if (tree.fullVarDecl(decl.node)) |full| if (full.ast.type_node == .none) {
                 return memoryKind(c, file, full.ast.init_node.unwrap() orelse return .unknown, depth + 1);
             };
-        },
-        else => {},
+        };
     }
     const t = (try exprType(c, file, node, depth + 1)) orelse return .unknown;
     return typeKind(c, t, depth + 1);
@@ -3931,9 +3951,9 @@ fn exprType(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
     if (depth > type_depth) return null;
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    switch (tree.nodeTag(node)) {
-        .grouped_expression => return exprType(c, file, tree.nodeData(node).node_and_token[0], depth + 1),
-        .@"try", .@"comptime", .@"nosuspend" => return exprType(c, file, tree.nodeData(node).node, depth + 1),
+    switch (formAt(tree, node)) {
+        .grouped => return exprType(c, file, tree.nodeData(node).node_and_token[0], depth + 1),
+        .tried, .@"comptime", .@"nosuspend" => return exprType(c, file, tree.nodeData(node).node, depth + 1),
         .unwrap_optional => return payloadOf(c, (try exprType(c, file, tree.nodeData(node).node_and_token[0], depth + 1)) orelse return null, depth + 1),
         .@"orelse", .@"catch" => return payloadOf(c, (try exprType(c, file, tree.nodeData(node).node_and_node[0], depth + 1)) orelse return null, depth + 1),
         .deref => {
@@ -3943,8 +3963,8 @@ fn exprType(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
             return if (full.size == .one) .{ .file = pointer.file, .node = full.ast.child_type } else null;
         },
         .array_access => return elementType(c, (try exprType(c, file, tree.nodeData(node).node_and_node[0], depth + 1)) orelse return null, depth + 1),
-        .identifier => {
-            const d = (model.reference(node) orelse return null).declaration orelse return null;
+        .leaf => {
+            const d = (nameRef(model, node) orelse return null).declaration orelse return null;
             const decl = model.declarations[@backingInt(d)];
             switch (decl.kind) {
                 .variable => {
@@ -3965,15 +3985,15 @@ fn exprType(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
                 else => return null,
             }
         },
-        .field_access => {
+        .member => {
             const decl = ((try c.facts.definition(file, node)).orNull()) orelse return null;
             const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
             const field = c.project.at(decl.file).model.containerField(&c.project.at(decl.file).file.tree, record.node) orelse return null;
             return .{ .file = decl.file, .node = field.ast.type_expr.unwrap() orelse return null };
         },
-        .call_one, .call_one_comma, .call, .call_comma => {
+        .call => {
             var buffer: [1]Ast.Node.Index = undefined;
-            const call = tree.fullCall(&buffer, node).?; // unreachable: the tag is a call's
+            const call = tree.fullCall(&buffer, node).?; // unreachable: a call's form holds calls
             const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
                 .function => |d| d,
                 .alternatives => return null,
@@ -3984,9 +4004,11 @@ fn exprType(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
             const proto = callee_tree.fullFnProto(&proto_buffer, c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return null;
             return .{ .file = decl.file, .node = proto.ast.return_type.unwrap() orelse return null };
         },
-        .builtin_call_two, .builtin_call_two_comma => {
-            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@as")) return null;
-            return .{ .file = file, .node = tree.nodeData(node).opt_node_and_opt_node[0].unwrap() orelse return null };
+        .builtin => {
+            if (!Facts.isBuiltin(tree, node, "@as")) return null;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, node, &buffer);
+            return if (args.len == 2) .{ .file = file, .node = args[0] } else null;
         },
         else => return null,
     }
@@ -4000,8 +4022,8 @@ fn exprType(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
 fn typeNeverNull(c: *Context, t: TypeRef, width: u16, depth: u8) Error!bool {
     if (depth > type_depth) return false;
     const tree = &c.project.at(t.file).file.tree;
-    switch (tree.nodeTag(t.node)) {
-        .grouped_expression => return typeNeverNull(c, .{ .file = t.file, .node = tree.nodeData(t.node).node_and_token[0] }, width, depth + 1),
+    switch (formAt(tree, t.node)) {
+        .grouped => return typeNeverNull(c, .{ .file = t.file, .node = tree.nodeData(t.node).node_and_token[0] }, width, depth + 1),
         .error_union => return typeNeverNull(c, .{ .file = t.file, .node = tree.nodeData(t.node).node_and_node[1] }, width, depth + 1),
         .optional_type => return false,
         else => {},
@@ -4009,7 +4031,8 @@ fn typeNeverNull(c: *Context, t: TypeRef, width: u16, depth: u8) Error!bool {
     if (tree.fullPtrType(t.node) != null) return true;
     if (Facts.accesses.formOf(tree.nodeTag(t.node)) == .body) return true;
     if (try Range.intNamed(c, t.file, t.node, width) != null) return true;
-    return tree.nodeTag(t.node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(t.node)), "bool");
+    const value = try c.facts.resolve(t.file, t.node);
+    return value == .primitive and std.mem.eql(u8, value.primitive, "bool");
 }
 
 /// What indexing memory of type `t` checks.
@@ -4023,11 +4046,11 @@ fn typeKind(c: *Context, t: TypeRef, depth: u8) Error!Memory {
         .one => if (tree.fullArrayType(pointer.ast.child_type)) |array| (if (array.ast.sentinel != .none) .sentinel else .checked) else .unknown,
     };
     if (tree.fullArrayType(t.node)) |array| return if (array.ast.sentinel != .none) .sentinel else .checked;
-    switch (tree.nodeTag(t.node)) {
+    switch (formAt(tree, t.node)) {
         .optional_type => return typeKind(c, .{ .file = t.file, .node = tree.nodeData(t.node).node }, depth + 1),
         .error_union => return typeKind(c, .{ .file = t.file, .node = tree.nodeData(t.node).node_and_node[1] }, depth + 1),
-        .grouped_expression => return typeKind(c, .{ .file = t.file, .node = tree.nodeData(t.node).node_and_token[0] }, depth + 1),
-        .identifier, .field_access => return typeKind(c, (try aliased(c, t)) orelse return .unknown, depth + 1),
+        .grouped => return typeKind(c, .{ .file = t.file, .node = tree.nodeData(t.node).node_and_token[0] }, depth + 1),
+        .leaf, .member => return typeKind(c, (try aliased(c, t)) orelse return .unknown, depth + 1),
         else => return .unknown,
     }
 }
@@ -4042,8 +4065,8 @@ fn elementType(c: *Context, t: TypeRef, depth: u8) Error!?TypeRef {
         return .{ .file = t.file, .node = array.ast.elem_type };
     }
     if (tree.fullArrayType(t.node)) |array| return .{ .file = t.file, .node = array.ast.elem_type };
-    return switch (tree.nodeTag(t.node)) {
-        .identifier, .field_access => elementType(c, (try aliased(c, t)) orelse return null, depth + 1),
+    return switch (formAt(tree, t.node)) {
+        .leaf, .member => elementType(c, (try aliased(c, t)) orelse return null, depth + 1),
         else => null,
     };
 }
@@ -4052,10 +4075,10 @@ fn elementType(c: *Context, t: TypeRef, depth: u8) Error!?TypeRef {
 fn payloadOf(c: *Context, t: TypeRef, depth: u8) Error!?TypeRef {
     if (depth > type_depth) return null;
     const tree = &c.project.at(t.file).file.tree;
-    return switch (tree.nodeTag(t.node)) {
+    return switch (formAt(tree, t.node)) {
         .optional_type => .{ .file = t.file, .node = tree.nodeData(t.node).node },
         .error_union => .{ .file = t.file, .node = tree.nodeData(t.node).node_and_node[1] },
-        .identifier, .field_access => payloadOf(c, (try aliased(c, t)) orelse return null, depth + 1),
+        .leaf, .member => payloadOf(c, (try aliased(c, t)) orelse return null, depth + 1),
         else => t,
     };
 }
@@ -4082,12 +4105,26 @@ fn table(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Error!?Coef 
     var node = memory;
     var buffer: [1]Ast.Node.Index = undefined;
     if (tree.fullCall(&buffer, node)) |call| {
-        if (tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
-        const holder, const name = tree.nodeData(call.ast.fn_expr).node_and_token;
-        if (!std.mem.eql(u8, tree.tokenSlice(name), "items")) return null;
+        if (formAt(tree, call.ast.fn_expr) != .member) return null;
+        const holder = tree.nodeData(call.ast.fn_expr).node_and_token[0];
+        // The holder's own `items` (a MultiArrayList's), by the declaration its type gives the name.
+        const callee = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
+            .function => |function| function,
+            .alternatives => return null,
+            else => return null,
+        };
+        var held = try c.facts.resolve(file, holder);
+        while (held == .pointer) held = held.pointer.child.*;
+        const container = switch (held) {
+            .instance, .container => |k| k,
+            .alternatives => return null,
+            else => return null,
+        };
+        const items = c.facts.member(container, "items") orelse return null;
+        if (!std.meta.eql(items, callee)) return null;
         node = holder;
     }
-    if (tree.nodeTag(node) != .field_access) return null;
+    if (formAt(tree, node) != .member) return null;
     const decl = ((try c.facts.definition(file, node)).orNull()) orelse return null;
     const tables = try c.facts.memo(Tables);
     if (!tables.found) {
