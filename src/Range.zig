@@ -1958,9 +1958,7 @@ const Fact = struct { small: Ast.Node.Index, large: Ast.Node.Index, strict: bool
 /// buf.len) return error.Short;`). A comparison holds while nothing between it and `node`
 /// assigns what it compares.
 fn facts(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error![]const Fact {
-    var out: std.ArrayList(Fact) = .empty;
-    for (try gather(c, file, node)) |fact| if (!fact.differs and !fact.read) try out.append(c.allocator, fact);
-    return out.items;
+    return (try gathered(c, file, node)).held;
 }
 
 /// Every fact holding where `node` is evaluated, the forms only a position's judgement reads
@@ -1968,6 +1966,37 @@ fn facts(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!
 /// `m[i]`, a compared `m[i]`), what an aegis `assert.invariant` before it checked, and where
 /// a std search a branch or loop takes the result of put that result.
 fn gather(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error![]const Fact {
+    return (try gathered(c, file, node)).all;
+}
+
+/// What `gather` and `facts` give at a position under the settled conditions in force.
+const Gathered = struct { all: []const Fact, held: []const Fact };
+const GatherKey = struct { file: Project.FileId, node: Ast.Node.Index, assumed: @FieldType(Facts, "assumed") };
+const Gatherings = struct { found: std.AutoHashMapUnmanaged(GatherKey, Gathered) = .empty };
+
+/// Read once per position for the run, every sink and bound asking at it again and again, and
+/// kept by the core's one memo rule: only where no budget ran out and no wider answer or open
+/// query was read meanwhile.
+fn gathered(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!Gathered {
+    const key: GatherKey = .{ .file = file, .node = node, .assumed = c.facts.assumed };
+    if ((try c.facts.memo(Gatherings)).found.get(key)) |known| return known;
+    const wide = c.facts.wide;
+    const met = c.facts.open_met;
+    const was_short = c.facts.short;
+    const all = try gatherAt(c, file, node);
+    var held: std.ArrayList(Fact) = .empty;
+    for (all) |fact| if (!fact.differs and !fact.read) try held.append(c.allocator, fact);
+    if (c.facts.remaining == 0 or c.facts.wideSince(wide) or c.facts.open_met != met or c.facts.short != was_short) return .{ .all = all, .held = held.items };
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
+    const kept: Gathered = .{ .all = try c.allocator.dupe(Fact, all), .held = try c.allocator.dupe(Fact, held.items) };
+    // Asked again: a walk read meanwhile may have replaced the memo (`Facts.dropMemos`).
+    try (try c.facts.memo(Gatherings)).found.put(c.allocator, key, kept);
+    return kept;
+}
+
+fn gatherAt(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error![]const Fact {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
     var out: std.ArrayList(Fact) = .empty;
