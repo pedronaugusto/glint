@@ -132,13 +132,9 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
         },
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return typeRole(c, try c.facts.resolve(file, node)),
         .call_one, .call_one_comma, .call, .call_comma => {
-            var buffer: [1]Ast.Node.Index = undefined;
-            const call = tree.fullCall(&buffer, node).?;
-            if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
-                const data = tree.nodeData(call.ast.fn_expr).node_and_token;
-                const name = try Model.identifier(c.allocator, tree.tokenSlice(data[1]));
-                if (std.mem.eql(u8, name, "init") or std.mem.eql(u8, name, "fromRaw") or std.mem.eql(u8, name, "adopt")) return kind(c, file, data[0], depth + 1);
-            }
+            // What the call makes, by the type its value resolves to (`T.init(...)`, `T.fromRaw`,
+            // `T.adopt`, an alias of either): never the callee's spelling.
+            if (try typeRole(c, try c.facts.resolve(file, node))) |k| return k;
             const origin = switch ((try Facts.calls.at(c.facts, file, node) orelse return null).callee) {
                 .function => |function| function,
                 .choice, .any => return null,
