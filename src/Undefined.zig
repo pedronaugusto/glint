@@ -364,7 +364,7 @@ const Walk = struct {
     param: bool,
     depth: u8,
     /// The identifiers that name the local, or one of its aliases (`aliases`), in source order.
-    mentions: std.ArrayList(Ast.Node.Index) = .empty,
+    mentions: []const Ast.Node.Index = &.{},
     /// The locals that hold the local's memory's address as it is (`aliasesOf`): a mention of
     /// one names that memory as a parameter's pointer does.
     aliases: []const Model.Declaration.Id = &.{},
@@ -374,7 +374,7 @@ const Walk = struct {
     /// The `asm` outputs bound to the local, by the token naming it, with the `asm` they are in.
     outputs: std.ArrayList(struct { token: Ast.TokenIndex, asm_node: Ast.Node.Index }) = .empty,
     /// The function's `return`s, for a parameter's walk.
-    returns: std.ArrayList(Ast.Node.Index) = .empty,
+    returns: []const Ast.Node.Index = &.{},
     read: ?Ast.TokenIndex = null,
     /// Whether the read is the local handed on rather than read in place.
     handed: bool = false,
@@ -385,7 +385,7 @@ const Walk = struct {
     exit_failure: bool = false,
     exit_success: bool = false,
     /// The `try`s of a parameter's function: each leaves it with an error.
-    tries: std.ArrayList(Ast.Node.Index) = .empty,
+    tries: []const Ast.Node.Index = &.{},
     /// What of the memory a call handed it leaves `undefined` where the call's failure leaves
     /// the function: by an error (`try`, `failing`), or by a `return` that may be either
     /// (`catch return`, `leaving`) (`undoneBy`).
@@ -430,8 +430,8 @@ const Walk = struct {
             // that one.
             const function = ownFunction(w.tree, w.model, w.model.declarations[@backingInt(w.local)].node);
             if (index.exits.get(function)) |own| {
-                try w.returns.appendSlice(w.c.allocator, own.returns.items);
-                try w.tries.appendSlice(w.c.allocator, own.tries.items);
+                w.returns = own.returns.items;
+                w.tries = own.tries.items;
             }
         }
         for (index.outputs.items) |node| {
@@ -441,14 +441,22 @@ const Walk = struct {
             const asm_node = w.enclosingAsm(rparen) orelse continue;
             try w.outputs.append(w.c.allocator, .{ .token = rparen - 1, .asm_node = asm_node });
         }
-        // The local's identifiers and its aliases', in node order.
-        if (index.named.get(w.local)) |list| try w.mentions.appendSlice(w.c.allocator, list.items);
-        for (w.aliases) |alias| if (index.named.get(alias)) |list| try w.mentions.appendSlice(w.c.allocator, list.items);
-        if (w.aliases.len != 0) std.mem.sort(Ast.Node.Index, w.mentions.items, {}, struct {
-            fn less(_: void, a: Ast.Node.Index, b: Ast.Node.Index) bool {
-                return @backingInt(a) < @backingInt(b);
-            }
-        }.less);
+        // The local's identifiers and its aliases', in node order: the index's own list, where
+        // it has no alias to merge.
+        const own_names: []const Ast.Node.Index = if (index.named.get(w.local)) |list| list.items else &.{};
+        if (w.aliases.len == 0) {
+            w.mentions = own_names;
+        } else {
+            var merged: std.ArrayList(Ast.Node.Index) = .empty;
+            try merged.appendSlice(w.c.allocator, own_names);
+            for (w.aliases) |alias| if (index.named.get(alias)) |list| try merged.appendSlice(w.c.allocator, list.items);
+            std.mem.sort(Ast.Node.Index, merged.items, {}, struct {
+                fn less(_: void, a: Ast.Node.Index, b: Ast.Node.Index) bool {
+                    return @backingInt(a) < @backingInt(b);
+                }
+            }.less);
+            w.mentions = merged.items;
+        }
         w.shape = try w.partsOf();
     }
 
@@ -521,7 +529,7 @@ const Walk = struct {
     /// `@memset(&x, undefined)`), with what of it that leaves undefined.
     fn undefinings(w: *Walk) Context.Error![]const Undefining {
         var list: std.ArrayList(Undefining) = .empty;
-        for (w.mentions.items) |mention| {
+        for (w.mentions) |mention| {
             // Only a statement that spells `undefined` gives it.
             var at = mention;
             while (w.model.parentOf(at)) |up| : (at = up) if (isBlock(w.tree, up)) break;
@@ -781,7 +789,7 @@ const Walk = struct {
             else => {},
         }
         const read = (try Facts.accesses.memberRead(w.c.facts, w.file, node)) orelse return false;
-        if (std.mem.findScalar(Ast.Node.Index, w.mentions.items, read.receiver.?) == null) return false; // unreachable: a member's step has its holder
+        if (std.mem.findScalar(Ast.Node.Index, w.mentions, read.receiver.?) == null) return false; // unreachable: a member's step has its holder
         const name = read.name orelse return false;
         const owner = w.owner orelse return false;
         if (owner != .container) return false;
@@ -830,7 +838,7 @@ const Walk = struct {
         const tree = w.tree;
         const at = tree.nodeMainToken(origin);
         var buffer: [1]Ast.Node.Index = undefined;
-        for (w.mentions.items) |mention| {
+        for (w.mentions) |mention| {
             if (tree.nodeMainToken(mention) >= at) continue;
             const place = try placeOf(w.c.facts, w.file, mention);
             if (!try w.inMemory(mention, place)) continue;
@@ -1220,7 +1228,7 @@ const Walk = struct {
         const variable = tree.fullVarDecl(node) orelse return null;
         const value = Facts.ungrouped(tree, variable.ast.init_node.unwrap() orelse return null);
         if (tree.fullSwitch(value) == null and tree.fullIf(value) == null and !(isBlock(tree, value) and blockLabel(tree, value) != null)) return null;
-        for (w.mentions.items) |mention| {
+        for (w.mentions) |mention| {
             const token = tree.nodeMainToken(mention);
             if (token < tree.firstToken(node) or token > tree.lastToken(node)) continue;
             if (token < tree.firstToken(value) or token > tree.lastToken(value)) return null;
@@ -1290,7 +1298,7 @@ const Walk = struct {
         const only = statements[0];
         if (leavesPass(tree, only) or spellsUndefined(tree, only)) return false;
         var mentions: usize = 0;
-        for (w.mentions.items) |mention| {
+        for (w.mentions) |mention| {
             if (tree.firstToken(mention) >= tree.firstToken(only) and tree.lastToken(mention) <= tree.lastToken(only)) mentions += 1;
         }
         if (mentions != 1) return false;
@@ -1465,7 +1473,7 @@ const Walk = struct {
         const first = w.tree.firstToken(call);
         const last = w.tree.lastToken(call);
         var now = state;
-        for (w.mentions.items) |mention| {
+        for (w.mentions) |mention| {
             const token = w.tree.nodeMainToken(mention);
             if (token < first or token > last) continue;
             const use = (try w.classify(mention)) orelse continue;
@@ -1745,13 +1753,13 @@ const Walk = struct {
     fn simple(w: *Walk, node: Ast.Node.Index, state: State) Context.Error!State {
         const first = w.tree.firstToken(node);
         const last = w.tree.lastToken(node);
-        for (w.returns.items) |each| {
+        for (w.returns) |each| {
             if (each == node or !try w.exitsBy(each)) continue;
             const token = w.tree.firstToken(each);
             if (token >= first and token <= last) try w.exited(each);
         }
         // A `try` in it returns its error with the memory as it is here.
-        if (w.every_exit) for (w.tries.items) |each| {
+        if (w.every_exit) for (w.tries) |each| {
             const token = w.tree.firstToken(each);
             if (token >= first and token <= last) try w.exited(each);
         };
@@ -1766,7 +1774,7 @@ const Walk = struct {
         };
         var uses: std.ArrayList(Found) = .empty;
         defer uses.deinit(w.c.allocator);
-        for (w.mentions.items) |mention| {
+        for (w.mentions) |mention| {
             const token = w.tree.nodeMainToken(mention);
             if (token < first or token > last) continue;
             var use = (try w.classify(mention)) orelse continue;
@@ -2471,7 +2479,7 @@ const Walk = struct {
 
     /// The mention of the local at `token`.
     fn mentionAt(w: *const Walk, token: Ast.TokenIndex) ?Ast.Node.Index {
-        for (w.mentions.items) |mention| if (w.tree.nodeMainToken(mention) == token) return mention;
+        for (w.mentions) |mention| if (w.tree.nodeMainToken(mention) == token) return mention;
         return null;
     }
 
@@ -2734,7 +2742,7 @@ const Walk = struct {
         const first = w.tree.firstToken(node);
         const last = w.tree.lastToken(node);
         for (w.outputs.items) |output| if (output.token >= first and output.token <= last) return true;
-        for (w.mentions.items) |mention| {
+        for (w.mentions) |mention| {
             const token = w.tree.nodeMainToken(mention);
             if (token >= first and token <= last) return true;
         }
@@ -2746,7 +2754,7 @@ const Walk = struct {
     fn returnsIn(w: *const Walk, node: Ast.Node.Index) Context.Error!bool {
         const first = w.tree.firstToken(node);
         const last = w.tree.lastToken(node);
-        for (w.returns.items) |each| {
+        for (w.returns) |each| {
             const token = w.tree.firstToken(each);
             if (token >= first and token <= last and try w.exitsBy(each)) return true;
         }
@@ -3334,7 +3342,7 @@ fn keepsOnlyRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context
     var walk: Walk = .init(c, decl.file, found.id, true, depth);
     try walk.collect();
     const tree = walk.tree;
-    for (walk.mentions.items) |mention| {
+    for (walk.mentions) |mention| {
         const parent = walk.model.parentOf(mention) orelse return false;
         if ((try c.facts.lengthOf(walk.file, parent)) != null) continue;
         var buffer: [1]Ast.Node.Index = undefined;
@@ -3365,7 +3373,7 @@ fn writesPartsRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Conte
     const model = walk.model;
     // What a statement wrote: the part (null: all of it), and the statement.
     var written: std.ArrayList(struct { part: ?Ast.Node.Index, statement: Ast.Node.Index }) = .empty;
-    for (walk.mentions.items) |mention| {
+    for (walk.mentions) |mention| {
         const key = tree.nodeMainToken(mention);
         const facts = c.facts;
         var memory = mention;
@@ -3409,7 +3417,7 @@ fn writesPartsRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Conte
                     } else return false;
                     var aliased: Walk = .init(c, decl.file, alias, true, depth);
                     try aliased.collect();
-                    for (aliased.mentions.items) |each| {
+                    for (aliased.mentions) |each| {
                         const up = model.parentOf(each) orelse return false;
                         if ((try c.facts.lengthOf(aliased.file, up)) != null) continue;
                         const use = (try aliased.given(each, true, tree.nodeMainToken(each))) orelse continue;
@@ -4243,7 +4251,7 @@ fn undefinesRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context
         if (exits.failure) failing |= again.left;
     }
     var known = true;
-    for (walk.mentions.items) |mention| {
+    for (walk.mentions) |mention| {
         walk.unknown = false;
         walk.failing = 0;
         walk.leaving = 0;
@@ -4367,7 +4375,22 @@ fn merge(a: State, b: State) State {
 
 /// The fields of a struct (`container`), by name: none for a union, an enum, a tuple, one of
 /// no fields or of more than 64. A `comptime` field holds its value already.
+const ShapeKey = struct { file: Project.FileId, scope: Model.Scope.Id };
+const Shapes = struct { of: std.AutoHashMapUnmanaged(ShapeKey, Shape) = .empty };
+
+/// The parts of a container, of its syntax: read once for the run.
 fn fieldsOf(c: *Context, container: Facts.Container) Context.Error!Shape {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
+    const key: ShapeKey = .{ .file = container.file, .scope = container.scope };
+    if ((try c.facts.memo(Shapes)).of.get(key)) |known| return known;
+    const shape = try fieldsRead(c, container);
+    try (try c.facts.memo(Shapes)).of.put(c.allocator, key, shape);
+    return shape;
+}
+
+fn fieldsRead(c: *Context, container: Facts.Container) Context.Error!Shape {
     const source = c.project.at(container.file);
     const tree = &source.file.tree;
     const scope = source.model.scopes[@backingInt(container.scope)];
