@@ -490,6 +490,9 @@ const Walk = struct {
         }
         const container = switch (try w.c.facts.resolve(w.file, kind)) {
             .container => |container| container,
+            // A choice of types has no one list of parts: the local is read whole
+            // (`Shape.none`), a part it sets counting for nothing and a part read a read of it.
+            .alternatives => return .none,
             else => return .none,
         };
         const shape = try fieldsOf(w.c, container);
@@ -501,6 +504,8 @@ const Walk = struct {
     fn partsOfValue(w: *Walk, first: Ast.Node.Index) Context.Error!Shape {
         const container = switch (try w.c.facts.resolve(w.file, first)) {
             .instance => |container| container,
+            // A choice of types, read whole as `partsOf` reads one.
+            .alternatives => return .none,
             else => return .none,
         };
         const shape = try fieldsOf(w.c, container);
@@ -2036,11 +2041,9 @@ const Walk = struct {
         const value = try w.c.facts.resolve(w.file, call.ast.fn_expr);
         if (value != .alternatives) return null;
         var found: ?Choice = null;
-        for (value.alternatives) |each| {
-            const origin = switch (each) {
-                .function => |function| function,
-                else => return null,
-            };
+        for (Facts.valueParts(&value)) |each| {
+            if (each != .function) return null;
+            const origin = each.function;
             const index = try parameterAt(w.c, w.file, call, position) orelse return null;
             const this: Choice = if (try named(w.c, &std_fills, origin, index)) fill: {
                 if (!try w.failureLeaves(node, origin)) return null;
@@ -2077,12 +2080,16 @@ const Walk = struct {
         } else null;
         const name = literal orelse return switch (try w.c.facts.resolve(w.file, call.ast.fn_expr)) {
             .function => |decl| decl,
+            // A choice of functions is no one callee: `callees` and `chosen` read each.
+            .alternatives => null,
             else => null,
         };
         const container = (try w.c.facts.resultContainer(w.file, node)) orelse return null;
         const decl = w.c.facts.member(container, name) orelse return null;
         return switch (try w.c.facts.declaration(decl)) {
             .function => |function| function,
+            // A declaration literal's choice of functions: no one callee, as above.
+            .alternatives => null,
             else => null,
         };
     }
@@ -2316,6 +2323,8 @@ const Walk = struct {
         if (std.mem.findScalar(Ast.Node.Index, made.ast.fields, value) == null) return null;
         const container = if (made.ast.type_expr.unwrap()) |type_expr| switch (try w.c.facts.resolve(w.file, type_expr)) {
             .container => |found| found,
+            // A choice of types is no one writer's: the literal is read as any other.
+            .alternatives => return null,
             else => return null,
         } else (try w.c.facts.resultContainer(w.file, literal)) orelse return null;
         const facts = w.c.facts;
@@ -2921,6 +2930,8 @@ fn vtableSlot(c: *Context, file: Project.FileId, function: Ast.Node.Index) Conte
     if (value == .pointer) value = value.pointer.child.*;
     const container = switch (value) {
         .instance => |container| container,
+        // A choice of interfaces: no one slot, so what the call reaches is not known.
+        .alternatives => return null,
         else => return null,
     };
     const table = c.facts.member(container, "vtable") orelse return null;
@@ -3139,18 +3150,28 @@ fn holderKept(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8
 /// what is not known.
 fn heldField(c: *Context, file: Project.FileId, access: Ast.Node.Index) Context.Error!enum { number, holder, memory } {
     const tree = &c.project.at(file).file.tree;
-    switch (try c.facts.resolve(file, access)) {
-        .primitive, .scalar, .error_set => return .number,
-        .instance => return .holder,
-        else => {},
+    // Each part of what it is (`Facts.valueParts`): a number where every part is one, a holder
+    // where every part is a struct; else what its declared type says.
+    const value = try c.facts.resolve(file, access);
+    var number: Facts.Join = .{};
+    var holder: Facts.Join = .{};
+    for (Facts.valueParts(&value)) |part| {
+        number.add(part, part == .primitive or part == .scalar or part == .error_set);
+        holder.add(part, part == .instance);
     }
+    if (number.all() == true) return .number;
+    if (holder.all() == true) return .holder;
     const object, const member = tree.nodeData(access).node_and_token;
     const container = switch (try c.facts.resolve(file, object)) {
         .instance => |found| found,
         .pointer => |to| switch (to.child.*) {
             .instance => |found| found,
+            // A pointer to a choice of holders: no one field, so what may be memory.
+            .alternatives => return .memory,
             else => return .memory,
         },
+        // A choice of holders: no one field, so what may be memory.
+        .alternatives => return .memory,
         else => return .memory,
     };
     const source = c.project.at(container.file);
@@ -3198,14 +3219,13 @@ fn holderKeptBy(c: *Context, file: Project.FileId, id: Model.Declaration.Id, dep
 /// per-build choice, a function-pointer field's stored functions) keeps it where each does.
 fn holderKeptThrough(c: *Context, file: Project.FileId, call: Ast.full.Call, position: ?usize, depth: u8) Context.Error!bool {
     const value = try c.facts.resolve(file, call.ast.fn_expr);
-    for (if (value == .alternatives) value.alternatives else &.{value}) |each| {
-        const decl = switch (each) {
-            .function => |function| function,
-            else => return false,
-        };
-        if (!try holderKeptIn(c, file, call, decl, position, depth)) return false;
+    // Kept where every function it may reach keeps it (`Facts.Join.all`); a part that is no
+    // function, or a choice of none, leaves it not kept.
+    var kept: Facts.Join = .{};
+    for (Facts.valueParts(&value)) |each| {
+        kept.add(each, if (each == .function) try holderKeptIn(c, file, call, each.function, position, depth) else null);
     }
-    return true;
+    return kept.all() orelse false;
 }
 
 fn holderKeptIn(c: *Context, file: Project.FileId, call: Ast.full.Call, decl: Facts.Decl, position: ?usize, depth: u8) Context.Error!bool {
@@ -3433,6 +3453,8 @@ fn holderOf(c: *Context, use: Facts.Key, container: Facts.Container) Context.Err
     while (true) switch (value) {
         .pointer => |inner| value = inner.child.*,
         .optional => |inner| value = inner.*,
+        // A choice is not known, below.
+        .alternatives => break,
         else => break,
     };
     return switch (value) {
@@ -3569,11 +3591,13 @@ fn keepsWriterAt(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth:
         .member => |access| {
             // A method called on it is given it, or its address; a field is only read.
             if (try Facts.accesses.useOf(facts, file, access) != .callee) return true;
-            const decl = switch (try facts.resolve(file, access)) {
-                .function => |function| function,
-                else => return false,
-            };
-            return keepsWriter(c, decl, 0, depth);
+            // Kept where every method it may reach keeps it (`Facts.Join.all`).
+            const methods = try facts.resolve(file, access);
+            var keeps: Facts.Join = .{};
+            for (Facts.valueParts(&methods)) |part| {
+                keeps.add(part, if (part == .function) try keepsWriter(c, part.function, 0, depth) else null);
+            }
+            return keeps.all() orelse false;
         },
         .address => |address| {
             const argument = switch (try Facts.accesses.useOf(facts, file, address)) {
@@ -3656,12 +3680,15 @@ fn keepsPointerAt(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth
         else => {
             const call = tree.fullCall(&buffer, parent) orelse return false;
             const position = std.mem.findScalar(Ast.Node.Index, call.ast.params, node) orelse return false;
-            const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
-                .function => |function| function,
-                else => return false,
-            };
+            const callees = try c.facts.resolve(file, call.ast.fn_expr);
+            if (callees != .function and callees != .alternatives) return false;
             const index = try parameterAt(c, file, call, position) orelse return false;
-            return keepsWriter(c, decl, index, depth);
+            // Kept where every function it may reach keeps it (`Facts.Join.all`).
+            var keeps: Facts.Join = .{};
+            for (Facts.valueParts(&callees)) |part| {
+                keeps.add(part, if (part == .function) try keepsWriter(c, part.function, index, depth) else null);
+            }
+            return keeps.all() orelse false;
         },
     }
 }
@@ -3816,23 +3843,45 @@ fn fixedBetween(c: *Context, file: Project.FileId, node: Ast.Node.Index, from: A
     const read = (try Facts.accesses.memberRead(c.facts, file, at)) orelse return false;
     const held = read.receiver.?; // unreachable: a member's step has its holder
     const value = read.holder.?; // unreachable: a member's step has its holder's value
-    if ((try c.facts.lengthOf(file, at)) != null) switch (value) {
-        .array => return true,
-        .pointer => |inner| switch (inner.child.*) {
-            .array => return true,
-            .container, .instance, .unknown => return false,
-            else => return fixedBetween(c, file, held, from, to, depth + 1),
-        },
-        else => {},
+    if ((try c.facts.lengthOf(file, at)) != null) switch (lengthBy(value)) {
+        .fixed => return true,
+        .not_fixed => return false,
+        .holder => return fixedBetween(c, file, held, from, to, depth + 1),
+        .other => {},
     };
     const member = read.name orelse return false;
-    return switch (value) {
-        .container => |container| constantMember(c, container, member),
-        .alternatives => |each| for (each) |one| {
-            if (one != .container or !constantMember(c, one.container, member)) break false;
-        } else true,
-        else => false,
-    };
+    // A constant of every type it may be (`Facts.Join.all`); a choice of none is not known.
+    var constant: Facts.Join = .{};
+    for (Facts.valueParts(&value)) |part| constant.add(part, part == .container and constantMember(c, part.container, member));
+    return constant.all() orelse false;
+}
+
+/// What fixes a length read through a holder of `value`, each part of it read
+/// (`Facts.valueParts`): an array's own (`fixed`), as one a pointer to an array reads; what
+/// holds a pointer to anything else, a slice's (`holder`). A pointer to a container, an
+/// instance (its `len` field written through the pointer) or what is not known is not fixed,
+/// nor a choice whose parts differ in kind; `other` where no part is an array or a pointer.
+fn lengthBy(value: Facts.Value) enum { fixed, not_fixed, holder, other } {
+    const parts = Facts.valueParts(&value);
+    var shaped: usize = 0;
+    var through_holder = false;
+    for (parts) |part| {
+        if (part == .array) {
+            shaped += 1;
+            continue;
+        }
+        if (part != .pointer) continue;
+        shaped += 1;
+        const children = Facts.valueParts(part.pointer.child);
+        if (children.len == 0) return .not_fixed;
+        for (children) |child| {
+            if (child == .container or child == .instance or child == .unknown) return .not_fixed;
+            if (child != .array) through_holder = true;
+        }
+    }
+    if (shaped == 0) return .other;
+    if (shaped != parts.len) return .not_fixed;
+    return if (through_holder) .holder else .fixed;
 }
 
 /// Whether `container` declares `name` a constant.
