@@ -13,3 +13,8 @@ pub fn put(f: std.Io.File, io: std.Io, comptime frame: bool) !usize {
     var w = f.writer(io, &buf);
     return (if (frame) framed else plain)(&w.interface) catch return w.err.?;
 }
+
+/// A binding: the ruling's remedy for a public generic nothing else binds.
+pub fn both(f: std.Io.File, io: std.Io) !usize {
+    return try put(f, io, false) + try put(f, io, true);
+}
