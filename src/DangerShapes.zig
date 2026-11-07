@@ -3302,29 +3302,28 @@ fn literalState(c: *Context, hold: StateHold, name: []const u8, type_expr: Facts
 /// Whether a node is a store that computes its target's new value from its old one by
 /// arithmetic or bits (`+=`, `-%=`, `<<=`, `|=`).
 fn opArithmetic(tree: *const Ast, node: Ast.Node.Index) bool {
-    return switch (tree.nodeTag(node)) {
-        .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat, .assign_bit_and, .assign_bit_or, .assign_bit_xor => true,
-        else => false,
-    };
+    return Facts.accesses.formOf(tree.nodeTag(node)) == .compound_assign;
 }
 
 /// Whether `node` computes by arithmetic or bits over a read of the state (`uses`).
 fn readsSelf(tree: *const Ast, file: Project.FileId, node: Ast.Node.Index, uses: []const Facts.Key, depth: u8) bool {
     if (depth == 8) return false;
-    switch (tree.nodeTag(node)) {
-        .grouped_expression => return readsSelf(tree, file, tree.nodeData(node).node_and_token[0], uses, depth + 1),
-        .add, .sub, .mul, .div, .mod, .shl, .shr, .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .shl_sat, .bit_and, .bit_or, .bit_xor => {
-            const first = tree.firstToken(node);
-            const last = tree.lastToken(node);
-            for (uses) |use| {
-                if (use.file != file) continue;
-                const token = tree.nodeMainToken(use.node);
-                if (token >= first and token <= last) return true;
-            }
-            return false;
-        },
-        else => return false,
+    const at = Facts.ungrouped(tree, node);
+    // A binary operator (`accesses.formOf`); a negation or a complement moves nothing by itself.
+    if (Facts.accesses.formOf(tree.nodeTag(at)) != .operator or unaryOperator(tree, at)) return false;
+    const first = tree.firstToken(at);
+    const last = tree.lastToken(at);
+    for (uses) |use| {
+        if (use.file != file) continue;
+        const token = tree.nodeMainToken(use.node);
+        if (token >= first and token <= last) return true;
     }
+    return false;
+}
+
+/// Whether an operator (`accesses.formOf`'s `operator`) takes one operand: `-x`, `~x`, `-%x`.
+fn unaryOperator(tree: *const Ast, node: Ast.Node.Index) bool {
+    return tree.nodeTag(node) == .negation or tree.nodeTag(node) == .bit_not or tree.nodeTag(node) == .negation_wrap;
 }
 
 /// Whether a written value is a literal choice of the state `hold` (`literalState`): an enum
@@ -3361,30 +3360,37 @@ fn literalChoice(c: *Context, file: Project.FileId, node: Ast.Node.Index, hold: 
         if (hold != .integral and init.ast.type_expr == .none and init.ast.fields.len == 1) return .literal;
         return .default;
     }
-    return switch (tree.nodeTag(node)) {
-        .grouped_expression => literalChoice(c, file, tree.nodeData(node).node_and_token[0], hold, name, depth + 1),
+    // Parentheses (`Facts.ungrouped`) give what they hold.
+    const inner = Facts.ungrouped(tree, node);
+    if (inner != node) return literalChoice(c, file, inner, hold, name, depth + 1);
+    // A builtin (`Facts.builtinArgs`): `@as`'s value; an enum tag's integer, for a state held
+    // as one; any other, no literal. `@field` is among them, read as no member here.
+    if (Facts.accesses.formOf(tree.nodeTag(node)) == .builtin) {
+        var buffer: [2]Ast.Node.Index = undefined;
+        const args = Facts.builtinArgs(tree, node, &buffer);
+        if (args.len == 0 or args.len > 2) return .other;
+        if (Facts.isBuiltin(tree, node, "@as")) return if (args.len == 2) literalChoice(c, file, args[1], hold, name, depth + 1) else .other;
+        if (hold == .integral and (Facts.isBuiltin(tree, node, "@intFromEnum") or Facts.isBuiltin(tree, node, "@backingInt"))) {
+            if (try c.facts.literalOf(file, args[0])) |literal| if (literal == .enum_literal) return .literal;
+            if (try Facts.accesses.memberRead(c.facts, file, args[0]) != null) return switch (try declaredTag(c, file, args[0])) {
+                .yes => .literal,
+                .no => .other,
+                .unknown => .unknown,
+            };
+        }
+        return .other;
+    }
+    // A declared tag (`Phase.idle`), by the declaration the member read names.
+    if (try Facts.accesses.memberRead(c.facts, file, node) != null) return if (hold == .integral) .other else switch (try declaredTag(c, file, node)) {
+        .yes => .literal,
+        .no => .other,
+        .unknown => .unknown,
+    };
+    // A literal (`Facts.literalOf`): an enum literal of a state held as a tag; a number or a
+    // character of one held as an integer.
+    return switch ((try c.facts.literalOf(file, node)) orelse return .other) {
         .enum_literal => if (hold != .integral) .literal else .other,
-        .field_access => if (hold == .integral) .other else switch (try declaredTag(c, file, node)) {
-            .yes => .literal,
-            .no => .other,
-            .unknown => .unknown,
-        },
-        .number_literal, .char_literal => if (hold == .integral) .literal else .other,
-        .builtin_call_two, .builtin_call_two_comma => {
-            const builtin = tree.tokenSlice(tree.nodeMainToken(node));
-            const argument = tree.nodeData(node).opt_node_and_opt_node[0].unwrap() orelse return .other;
-            if (std.mem.eql(u8, builtin, "@as")) return literalChoice(c, file, tree.nodeData(node).opt_node_and_opt_node[1].unwrap() orelse return .other, hold, name, depth + 1);
-            // An enum tag's integer, for a state held as one.
-            if (hold == .integral and (std.mem.eql(u8, builtin, "@intFromEnum") or std.mem.eql(u8, builtin, "@backingInt"))) {
-                if (tree.nodeTag(argument) == .enum_literal) return .literal;
-                if (tree.nodeTag(argument) == .field_access) return switch (try declaredTag(c, file, argument)) {
-                    .yes => .literal,
-                    .no => .other,
-                    .unknown => .unknown,
-                };
-            }
-            return .other;
-        },
+        .number, .char => if (hold == .integral) .literal else .other,
         else => .other,
     };
 }

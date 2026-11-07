@@ -1207,7 +1207,7 @@ test "A015 reads a type built by reflection on its argument: the fields a compti
         \\    return struct { options: Options(T), commands: Commands(T), sets: Partial(T) };
         \\}
         \\pub fn Keep(comptime T: type) type {
-        \\    return struct { held: Partial(T), pub fn deinit(k: *@This()) void { k.held.deinit(); } };
+        \\    return struct { held: Partial(T), pub fn deinit(k: *@This()) void { inline for (@typeInfo(T).@"struct".field_names) |name| if (@field(k.held, name)) |held| held.close(); } };
         \\}
         \\pub fn Tag(comptime T: type) type {
         \\    return switch (@typeInfo(T)) {
