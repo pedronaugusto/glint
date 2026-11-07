@@ -964,7 +964,16 @@ fn released(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
         // `closeMany` idiom) holds it.
         .address, .dereferenced, .element, .sliced, .index => |whole| return released(c, file, whole, next),
         // Converted (`@as(T, x)`), the value is it.
-        .builtin_argument => |argument| if (argument.position == 1 and Facts.isBuiltin(tree, argument.call, "@as")) return released(c, file, argument.call, next),
+        .builtin_argument => |argument| {
+            if (argument.position == 1 and Facts.isBuiltin(tree, argument.call, "@as")) return released(c, file, argument.call, next);
+            // The holder of a member a type function reads by a name it computes (`@field(k.held,
+            // name)`, over each of its type's fields): released where that member is, read for
+            // its value only where it is not.
+            if (argument.position == 0 and Facts.isBuiltin(tree, argument.call, "@field") and try typeFunctionOf(c, file, node) != null) {
+                const step = (try Facts.accesses.memberRead(c.facts, file, argument.call)) orelse return .unknown;
+                if (step.name == null) return released(c, file, argument.call, next);
+            }
+        },
         // Compared, it is read for its value only.
         .compared => return .no,
         // In arithmetic (a `handle` summed) the result may still be it; given to `x op= v`, the
@@ -989,13 +998,7 @@ fn released(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
             .unknown => if (try Facts.accesses.useOf(c.facts, file, access) == .callee) {
                 if (try typeFunctionOf(c, file, access) == null) return .unknown;
                 return if (releasing(tree.tokenSlice(tree.nodeData(access).node_and_token[1]))) .yes else .no;
-            } else {
-                const through = try released(c, file, access, next);
-                // A member a type function reads by a name it computes (`@field(k.held, name)`),
-                // released where it is read: its holder's, whichever member the instance has.
-                if (through == .yes and Facts.isBuiltin(tree, access, "@field") and try typeFunctionOf(c, file, access) != null) return .yes;
-                return if (through == .no) .no else .unknown;
-            },
+            } else return if (try released(c, file, access, next) == .no) .no else .unknown,
             .no => if (try Facts.accesses.useOf(c.facts, file, access) != .callee) return .no,
         },
         .returned => |ret| return releasedReturn(c, file, ret, next),
