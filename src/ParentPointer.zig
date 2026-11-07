@@ -38,10 +38,11 @@ fn shown(c: *Context, node: Ast.Node.Index) Context.Error!?struct { Field, Facts
     const tree = &c.project.at(c.file).file.tree;
     var buffer: [2]Ast.Node.Index = undefined;
     const args = Facts.builtinArgs(tree, node, &buffer);
-    if (args.len != 2 or tree.nodeTag(args[0]) != .string_literal) return null;
-    const name = std.zig.string_literal.parseAlloc(c.allocator, tree.tokenSlice(tree.nodeMainToken(args[0]))) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return null,
+    if (args.len != 2) return null;
+    // The one name it spells (`Facts.fieldName`).
+    const name = switch (try c.facts.fieldName(c.file, args[0])) {
+        .name => |name| name,
+        .each_of, .names, .computed => return null,
     };
     const parent = pointee(try resultType(c, c.file, node)) orelse return null;
     const field = c.facts.member(parent, name) orelse return null;
@@ -75,14 +76,12 @@ fn interfaceField(c: *Context, node: Ast.Node.Index, pointer: Ast.Node.Index, fi
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
     // `p` is the converting function's own parameter, a pointer to F's type.
-    if (tree.nodeTag(pointer) != .identifier) return false;
-    const index = (model.reference(pointer) orelse return false).declaration orelse return false;
+    const index = (try declaredIn(c, c.file, pointer)) orelse return false;
     const param = model.declarations[@backingInt(index)];
     if (param.kind != .parameter) return false;
     const function = enclosingFunction(tree, model, node) orelse return false;
     if (!parameterOf(tree, function, param.token)) return false;
-    const param_type = tree.fullPtrType(param.node) orelse return false;
-    const interface = held(try c.facts.resolve(c.file, param_type.ast.child_type)) orelse return false;
+    const interface = pointee(try c.facts.resolve(c.file, param.node)) orelse return false;
     if (!same(interface, kind)) return false;
     if (!try reachedOnlyInstalled(c, function, param.token, field, kind, 0)) return false;
     if (!try calledOnlyOnItself(c, kind)) return false;
@@ -101,21 +100,21 @@ fn calledOnlyOnItself(c: *Context, kind: Facts.Container) Context.Error!bool {
     for (source.model.declarations) |decl| {
         if (decl.kind != .field or decl.scope != kind.scope) continue;
         const declared = (source.model.containerField(tree, decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
-        if (functionPointer(tree, declared)) |proto| {
-            const given = (try interfaceParameters(c, kind.file, proto, kind)) orelse return false;
+        const declared_type = try c.facts.resolve(kind.file, declared);
+        if (functionPointer(declared_type)) |proto| {
+            const given = (try interfaceParameters(c, proto, kind)) orelse return false;
             if (!try readsCalledOnSelf(c, decl.name, kind, false, given)) return false;
             continue;
         }
         // A vtable: each of its functions, read through this field.
-        const pointer = tree.fullPtrType(declared) orelse continue;
-        const table = held(try c.facts.resolve(kind.file, pointer.ast.child_type)) orelse continue;
+        const table = pointee(declared_type) orelse continue;
         const inner = c.project.at(table.file);
         var any = false;
         for (inner.model.declarations) |entry| {
             if (entry.kind != .field or entry.scope != table.scope) continue;
             const entry_type = (inner.model.containerField(&inner.file.tree, entry.node) orelse continue).ast.type_expr.unwrap() orelse continue;
-            const proto = functionPointer(&inner.file.tree, entry_type) orelse continue;
-            const given = (try interfaceParameters(c, table.file, proto, kind)) orelse return false;
+            const proto = functionPointer(try c.facts.resolve(table.file, entry_type)) orelse continue;
+            const given = (try interfaceParameters(c, proto, kind)) orelse return false;
             if (!try readsCalledOnSelf(c, entry.name, table, true, given)) return false;
             any = true;
         }
@@ -132,7 +131,7 @@ fn calledOnlyOnItself(c: *Context, kind: Facts.Container) Context.Error!bool {
         for (file_tree.nodes.items(.tag), 0..) |_, i| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
             if (!Facts.isBuiltin(file_tree, node, "@field")) continue;
-            if (each.model.parentOf(node)) |parent| if (file_tree.nodeTag(parent) == .assign and file_tree.nodeData(parent).node_and_node[0] == node) continue;
+            if (try Facts.accesses.useOf(c.facts, each.id, node) == .written) continue;
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(file_tree, node, &buffer);
             if (args.len != 2) continue;
@@ -142,11 +141,12 @@ fn calledOnlyOnItself(c: *Context, kind: Facts.Container) Context.Error!bool {
             for (source.model.declarations) |decl| {
                 if (decl.kind != .field or decl.scope != kind.scope) continue;
                 const declared = (source.model.containerField(tree, decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
-                if (functionPointer(tree, declared)) |_| {
+                const declared_type = try c.facts.resolve(kind.file, declared);
+                if (functionPointer(declared_type)) |_| {
                     // A member of it read, indexed or iterated: no function pointer.
-                    if (notFunction(file_tree, &each.model, node)) continue;
-                } else if (tree.fullPtrType(declared) == null) continue;
-                if (try namedBy(c, file_tree, &each.model, args[1], decl.name)) return false;
+                    if (try notFunction(c, each.id, node)) continue;
+                } else if (declared_type != .pointer) continue;
+                if (try namedBy(c, each.id, args[1], decl.name)) return false;
             }
         }
     }
@@ -166,34 +166,33 @@ fn tableReadInPlace(c: *Context, name: []const u8, kind: Facts.Container) Contex
             return false;
         }
         if (!isParent(value, kind)) continue;
-        if (!tableInPlace(tree, model, use.node)) return false;
+        if (!try tableInPlace(c, use.file, use.node)) return false;
     }
     return true;
 }
 
-/// Whether the vtable read `use` reads a function of the table, is written, or is compared.
-fn tableInPlace(tree: *const Ast, model: *const Model, use: Ast.Node.Index) bool {
-    const parent = model.parentOf(use) orelse return false;
-    return switch (tree.nodeTag(parent)) {
-        .field_access, .equal_equal, .bang_equal => true,
-        .assign => tree.nodeData(parent).node_and_node[0] == use,
+/// Whether the vtable read `use` reads a function of the table, is written, or is compared
+/// (`Facts.accesses.useOf`).
+fn tableInPlace(c: *Context, file: Project.FileId, use: Ast.Node.Index) Context.Error!bool {
+    return switch (try Facts.accesses.useOf(c.facts, file, use)) {
+        .member, .written, .compared => true,
         else => false,
     };
 }
 
 /// The positions of the parameters of the function type `proto` that are pointers to `kind`,
 /// as bits; null where a type there does not resolve, or a position is past 63.
-fn interfaceParameters(c: *Context, file: Project.FileId, proto: Ast.Node.Index, kind: Facts.Container) Context.Error!?u64 {
-    const tree = &c.project.at(file).file.tree;
+fn interfaceParameters(c: *Context, proto: Facts.Key, kind: Facts.Container) Context.Error!?u64 {
+    const tree = &c.project.at(proto.file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
-    const full = tree.fullFnProto(&buffer, proto) orelse return null;
+    const full = tree.fullFnProto(&buffer, proto.node) orelse return null;
     var positions: u64 = 0;
     var it = full.iterate(tree);
     var position: u7 = 0;
     while (it.next()) |param| : (position += 1) {
         if (position == 64) return null;
         const declared = param.type_expr orelse return null;
-        const value = try c.facts.resolve(file, declared);
+        const value = try c.facts.resolve(proto.file, declared);
         if (value == .unknown) return null;
         if (pointee(value)) |to| if (same(to, kind)) {
             positions |= @as(u64, 1) << @intCast(position);
@@ -212,24 +211,20 @@ fn readsCalledOnSelf(c: *Context, name: []const u8, holder: Facts.Container, thr
         const receiver = tree.nodeData(use.node).node_and_token[0];
         const value = try c.facts.resolve(use.file, receiver);
         if (value == .unknown) {
-            if (try namesType(c, use.file, receiver) or notFunction(tree, model, use.node) or generic(tree, model, use.node)) continue;
+            if (try namesType(c, use.file, receiver) or try notFunction(c, use.file, use.node) or generic(tree, model, use.node)) continue;
             return false;
         }
         if (!isParent(value, holder)) continue;
-        if (!calledOnSelf(tree, model, use.node, through, given)) return false;
+        if (!try calledOnSelf(c, use.file, use.node, through, given)) return false;
     }
     return true;
 }
 
 /// Whether the member read `use` is no function pointer: something reads a member of it,
-/// indexes, slices or iterates it, which Zig allows no function pointer.
-fn notFunction(tree: *const Ast, model: *const Model, use: Ast.Node.Index) bool {
-    const parent = model.parentOf(use) orelse return false;
-    if (tree.fullFor(parent)) |loop| return std.mem.findScalar(Ast.Node.Index, loop.ast.inputs, use) != null;
-    return switch (tree.nodeTag(parent)) {
-        .field_access => tree.nodeData(parent).node_and_token[0] == use,
-        .array_access => tree.nodeData(parent).node_and_node[0] == use,
-        .slice, .slice_open, .slice_sentinel => true,
+/// indexes, slices or iterates it, which Zig allows no function pointer (`Facts.accesses.useOf`).
+fn notFunction(c: *Context, file: Project.FileId, use: Ast.Node.Index) Context.Error!bool {
+    return switch (try Facts.accesses.useOf(c.facts, file, use)) {
+        .member, .element, .sliced, .looped => true,
         else => false,
     };
 }
@@ -239,85 +234,99 @@ fn notFunction(tree: *const Ast, model: *const Model, use: Ast.Node.Index) bool 
 /// or captured from its optional (`if (x.f) |f|`) or bound to a constant (`const f = x.f orelse
 /// return e;`) and only called so, on an interface a parameter, a capture or a constant names,
 /// which nothing changes in between. A read compared (`x.f != null`) calls nothing.
-fn calledOnSelf(tree: *const Ast, model: *const Model, use: Ast.Node.Index, through: bool, given: u64) bool {
+fn calledOnSelf(c: *Context, file: Project.FileId, use: Ast.Node.Index, through: bool, given: u64) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
     const receiver = tree.nodeData(use).node_and_token[0];
-    // The interface: the receiver, or what the vtable was read from.
+    // The interface: the receiver, or what the vtable was read from (`accesses.pathOf`).
     var interface = receiver;
     if (through) {
-        if (tree.nodeTag(receiver) != .field_access) return false;
-        interface = tree.nodeData(receiver).node_and_token[0];
+        const path = try Facts.accesses.pathOf(c.facts, file, receiver);
+        if (path.steps.len < 2 or path.steps[0].kind != .field) return false;
+        interface = path.steps[1].node;
     }
     var callee = use;
-    var outer = model.parentOf(use) orelse return false;
-    switch (tree.nodeTag(outer)) {
-        .equal_equal, .bang_equal => return true,
+    switch (try Facts.accesses.useOf(c.facts, file, use)) {
+        .compared => return true,
+        .tested => |owner| {
+            const branch = tree.fullIf(owner) orelse return false;
+            if (!try fixed(c, file, interface)) return false;
+            const payload = branch.payload_token orelse return false;
+            if (tree.tokenTag(payload) == .asterisk) return false;
+            for (model.declarations, 0..) |decl, d| {
+                if (decl.kind != .capture or decl.node != owner or decl.token != payload) continue;
+                return onlyCalledOnSelf(c, file, @fromBackingInt(@intCast(d)), interface, given);
+            }
+            return false;
+        },
+        .carried => |carry| if (carry.how == .unwrapped) {
+            callee = carry.into;
+        },
         else => {},
     }
-    if (tree.fullIf(outer)) |branch| {
-        if (branch.ast.cond_expr != use or !fixed(tree, model, interface)) return false;
-        const payload = branch.payload_token orelse return false;
-        if (tree.tokenTag(payload) == .asterisk) return false;
-        for (model.declarations, 0..) |decl, d| {
-            if (decl.kind != .capture or decl.node != outer or decl.token != payload) continue;
-            return onlyCalledOnSelf(tree, model, @fromBackingInt(@intCast(d)), interface, given);
-        }
-        return false;
-    }
-    if (tree.nodeTag(outer) == .unwrap_optional) {
-        callee = outer;
-        outer = model.parentOf(outer) orelse return false;
-    }
-    if (boundConstant(tree, model, callee)) |index| return fixed(tree, model, interface) and onlyCalledOnSelf(tree, model, index, interface, given);
-    var buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&buffer, outer) orelse return false;
-    if (call.ast.fn_expr != callee) return false;
-    return givenSelf(tree, call, interface, given);
+    if (try boundConstant(c, file, callee)) |index| return try fixed(c, file, interface) and try onlyCalledOnSelf(c, file, index, interface, given);
+    return switch (try Facts.accesses.useOf(c.facts, file, callee)) {
+        .callee => |call| givenSelf(c, file, call, interface, given),
+        else => false,
+    };
 }
 
-/// Whether `call` is given `interface` at each position `given`, by value or by address.
-fn givenSelf(tree: *const Ast, call: Ast.full.Call, interface: Ast.Node.Index, given: u64) bool {
-    for (call.ast.params, 0..) |param, position| {
+/// Whether the call `call_node` is given `interface` at each position `given` (`Facts.calls`'
+/// arguments), by value or by address: the place it names, or the one it points at
+/// (`accesses.pointed`), is the interface's (`accesses.samePlace`).
+fn givenSelf(c: *Context, file: Project.FileId, call_node: Ast.Node.Index, interface: Ast.Node.Index, given: u64) Context.Error!bool {
+    const call = (try Facts.calls.at(c.facts, file, call_node)) orelse return false;
+    const args = switch (call.args) {
+        .known => |known| known,
+        .unknown => return false,
+    };
+    for (args, 0..) |argument, position| {
         if (position >= 64 or given & (@as(u64, 1) << @intCast(position)) == 0) continue;
-        var argument = Facts.ungrouped(tree, param);
-        if (tree.nodeTag(argument) == .address_of) argument = Facts.ungrouped(tree, tree.nodeData(argument).node);
-        if (!sameTokens(tree, argument, interface)) return false;
+        if (try Facts.accesses.samePlace(c.facts, file, argument, interface) == .yes) continue;
+        const place = (try Facts.accesses.pointed(c.facts, file, argument)) orelse return false;
+        if (try Facts.accesses.samePlace(c.facts, file, place, interface) != .yes) return false;
     }
-    return call.ast.params.len >= 64 or given >> @intCast(call.ast.params.len) == 0;
+    return args.len >= 64 or given >> @intCast(args.len) == 0;
 }
 
 /// Whether each reference to the capture or constant `index` calls it, `.?` unwrapping it at
 /// most, given `interface` at each position `given`.
-fn onlyCalledOnSelf(tree: *const Ast, model: *const Model, index: Model.Declaration.Id, interface: Ast.Node.Index, given: u64) bool {
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .identifier) continue;
-        const reference: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        if ((model.reference(reference) orelse continue).declaration != index) continue;
+fn onlyCalledOnSelf(c: *Context, file: Project.FileId, index: Model.Declaration.Id, interface: Ast.Node.Index, given: u64) Context.Error!bool {
+    for (try namings(c, file, .{ .file = file, .index = index }, false)) |reference| {
         var callee = reference;
-        var outer = model.parentOf(reference) orelse return false;
-        if (tree.nodeTag(outer) == .unwrap_optional) {
-            callee = outer;
-            outer = model.parentOf(outer) orelse return false;
+        switch (try Facts.accesses.useOf(c.facts, file, reference)) {
+            .carried => |carry| if (carry.how == .unwrapped) {
+                callee = carry.into;
+            },
+            else => {},
         }
-        var call_buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&call_buffer, outer) orelse return false;
-        if (call.ast.fn_expr != callee or !givenSelf(tree, call, interface, given)) return false;
+        switch (try Facts.accesses.useOf(c.facts, file, callee)) {
+            .callee => |call| if (!try givenSelf(c, file, call, interface, given)) return false,
+            else => return false,
+        }
     }
     return true;
 }
 
 /// The constant the function read `node` (`x.f`, `x.f.?`) is bound to, alone or by an `orelse`
 /// that leaves (`const f = x.f orelse return e;`): it holds what the read gave.
-fn boundConstant(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Model.Declaration.Id {
+fn boundConstant(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Model.Declaration.Id {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
     var init = node;
-    const parent = model.parentOf(node) orelse return null;
-    if (tree.nodeTag(parent) == .@"orelse") {
-        const value, const otherwise = tree.nodeData(parent).node_and_node;
-        if (value != node or !leaves(tree, otherwise)) return null;
-        init = parent;
+    switch (try Facts.accesses.useOf(c.facts, file, node)) {
+        .carried => |carry| if (carry.how == .payload) {
+            if (tree.nodeTag(carry.into) != .@"orelse" or !leaves(tree, tree.nodeData(carry.into).node_and_node[1])) return null;
+            init = carry.into;
+        },
+        else => {},
     }
-    const holder = model.parentOf(init) orelse return null;
+    const holder = switch (try Facts.accesses.useOf(c.facts, file, init)) {
+        .initializes => |holder| holder,
+        else => return null,
+    };
     const variable = tree.fullVarDecl(holder) orelse return null;
-    if (variable.ast.init_node.unwrap() != init or tree.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
+    if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
     for (model.declarations, 0..) |decl, d| {
         if (decl.kind == .variable and decl.node == holder) return @fromBackingInt(@intCast(d));
     }
@@ -334,34 +343,47 @@ fn leaves(tree: *const Ast, node: Ast.Node.Index) bool {
 
 /// The member read a capture or constant `node` names holds: an `if`'s (`if (x.f) |f|`), or
 /// one `boundConstant` reads (`const f = x.f orelse return e;`).
-fn capturedRead(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Ast.Node.Index {
-    if (tree.nodeTag(node) != .identifier) return null;
-    const index = (model.reference(node) orelse return null).declaration orelse return null;
+fn capturedRead(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Ast.Node.Index {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    const index = (try declaredIn(c, file, node)) orelse return null;
     const decl = model.declarations[@backingInt(index)];
     switch (decl.kind) {
         .capture => {
             const branch = tree.fullIf(decl.node) orelse return null;
-            if (branch.payload_token != decl.token or tree.nodeTag(branch.ast.cond_expr) != .field_access) return null;
+            if (branch.payload_token != decl.token or !try memberRead(c, file, branch.ast.cond_expr)) return null;
             return branch.ast.cond_expr;
         },
         .variable => {
             const variable = tree.fullVarDecl(decl.node) orelse return null;
-            var bound = variable.ast.init_node.unwrap() orelse return null;
-            if (tree.nodeTag(bound) == .@"orelse") bound = tree.nodeData(bound).node_and_node[0];
-            const read = if (tree.nodeTag(bound) == .unwrap_optional) tree.nodeData(bound).node_and_token[0] else bound;
-            if (tree.nodeTag(read) != .field_access) return null;
-            const found = boundConstant(tree, model, bound) orelse return null;
-            return if (found == index) read else null;
+            // The read its value carries (`accesses.carriedFrom`: through `orelse`, `.?`).
+            var read = variable.ast.init_node.unwrap() orelse return null;
+            for (0..3) |_| {
+                if (try memberRead(c, file, read)) break;
+                read = Facts.accesses.carriedFrom(tree, read) orelse return null;
+            } else return null;
+            if (try boundConstant(c, file, read) == index) return read;
+            switch (try Facts.accesses.useOf(c.facts, file, read)) {
+                .carried => |carry| if (carry.how == .unwrapped and try boundConstant(c, file, carry.into) == index) return read,
+                else => {},
+            }
+            return null;
         },
         else => return null,
     }
 }
 
+/// Whether `node` is itself a member read (`x.f`, `@field(x, "f")`), by its place's path.
+fn memberRead(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    const path = try Facts.accesses.pathOf(c.facts, file, node);
+    return path.steps.len > 1 and path.steps[0].kind == .field and path.steps[0].node == node;
+}
+
 /// Whether `node` names a parameter, a capture or a constant: what it holds cannot change.
-fn fixed(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
-    if (tree.nodeTag(node) != .identifier) return false;
-    const index = (model.reference(node) orelse return false).declaration orelse return false;
-    const decl = model.declarations[@backingInt(index)];
+fn fixed(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    const index = (try declaredIn(c, file, node)) orelse return false;
+    const decl = c.project.at(file).model.declarations[@backingInt(index)];
     return switch (decl.kind) {
         .parameter, .capture => true,
         .variable => if (tree.fullVarDecl(decl.node)) |variable| tree.tokenTag(variable.ast.mut_token) == .keyword_const else false,
@@ -369,25 +391,36 @@ fn fixed(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
     };
 }
 
-/// The function type a pointer to a function, or an optional one, points at.
-fn functionPointer(tree: *const Ast, kind: Ast.Node.Index) ?Ast.Node.Index {
-    var at = kind;
-    if (tree.nodeTag(at) == .optional_type) at = tree.nodeData(at).node;
-    const pointer = tree.fullPtrType(at) orelse return null;
-    var buffer: [1]Ast.Node.Index = undefined;
-    return if (tree.fullFnProto(&buffer, pointer.ast.child_type) != null) pointer.ast.child_type else null;
+/// The declaration of `file` a name names (`Facts.definition`); null for anything else.
+fn declaredIn(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Model.Declaration.Id {
+    return switch (try c.facts.definition(file, node)) {
+        .decl => |decl| if (decl.file == file) decl.index else null,
+        .none, .unknown => null,
+    };
 }
 
-/// Whether two expressions are spelled the same, token by token.
-fn sameTokens(tree: *const Ast, a: Ast.Node.Index, b: Ast.Node.Index) bool {
-    const first_a = tree.firstToken(a);
-    const first_b = tree.firstToken(b);
-    const count = tree.lastToken(a) - first_a;
-    if (tree.lastToken(b) - first_b != count) return false;
-    for (0..count + 1) |i| {
-        if (!std.mem.eql(u8, tree.tokenSlice(first_a + @as(Ast.TokenIndex, @intCast(i))), tree.tokenSlice(first_b + @as(Ast.TokenIndex, @intCast(i))))) return false;
+/// The nodes of `file` that name `decl`: each reference Model resolves to it, and where `members`
+/// (a container's member), each member read that may name it (`mayName`).
+fn namings(c: *Context, file: Project.FileId, decl: Facts.Decl, members: bool) Context.Error![]const Ast.Node.Index {
+    var out: std.ArrayList(Ast.Node.Index) = .empty;
+    if (decl.file == file) for (c.project.at(file).model.references) |reference| {
+        if (reference.unknown == null and reference.declaration == decl.index) try out.append(c.allocator, reference.node);
+    };
+    if (!members) return out.items;
+    const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+    for (try c.facts.memberUses(record.name)) |use| {
+        if (use.file == file and try mayName(c, file, use.node, decl)) try out.append(c.allocator, use.node);
     }
-    return true;
+    return out.items;
+}
+
+/// The function type a pointer to a function, or an optional one, points at.
+fn functionPointer(value: Facts.Value) ?Facts.Key {
+    return switch (value) {
+        .optional => |inner| functionPointer(inner.*),
+        .pointer => |to| if (to.child.* == .fn_type) to.child.fn_type else null,
+        else => null,
+    };
 }
 
 /// Whether the parameter at `token` of `function` is only ever given a pointer to C.F: the
@@ -410,42 +443,40 @@ fn reachedOnlyInstalled(c: *Context, function: Ast.Node.Index, token: Ast.TokenI
         if (param.name_token == token) break;
     } else return false;
     var called = false;
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        switch (tag) {
-            .identifier => if ((model.reference(node) orelse continue).declaration != decl) continue,
-            .field_access => {
-                if (!try mayName(c, c.file, node, .{ .file = c.file, .index = decl })) continue;
-                // Called on a value, it is handed that value first: no helper's call.
-                if (try c.facts.resolve(c.file, tree.nodeData(node).node_and_token[0]) != .container) return false;
-            },
-            else => continue,
+    for (try namings(c, c.file, .{ .file = c.file, .index = decl }, true)) |node| {
+        // Read off a value, or off a holder that does not resolve: no install shown, nor a
+        // helper's call (called on a value, it is handed that value first).
+        if (try memberRead(c, c.file, node)) {
+            const holder = (try Facts.accesses.pathOf(c.facts, c.file, node)).steps[0].holder orelse return false;
+            if (holder != .container) return false;
         }
         // Installed here, into C.F's value as C's own code does: no call to follow.
         if (try installs(c, node, field, 4)) {
             called = true;
             continue;
         }
-        var buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&buffer, model.parentOf(node) orelse return false) orelse return false;
-        if (call.ast.fn_expr != node or position >= call.ast.params.len) return false;
-        const arg = Facts.ungrouped(tree, call.ast.params[position]);
-        if (tree.nodeTag(arg) != .identifier) return false;
-        const given = model.declarations[@backingInt((model.reference(arg) orelse return false).declaration orelse return false)];
+        const call_node = switch (try Facts.accesses.useOf(c.facts, c.file, node)) {
+            .callee => |call| call,
+            else => return false,
+        };
+        const call = (try Facts.calls.at(c.facts, c.file, call_node)) orelse return false;
+        const args = switch (call.args) {
+            .known => |known| known,
+            .unknown => return false,
+        };
+        if (call.receiver != .none or position >= args.len) return false;
+        const given_index = (try declaredIn(c, c.file, Facts.ungrouped(tree, args[position]))) orelse return false;
+        const given = model.declarations[@backingInt(given_index)];
         if (given.kind != .parameter) return false;
         const caller = enclosingFunction(tree, model, node) orelse return false;
         if (!parameterOf(tree, caller, given.token)) return false;
-        const given_type = tree.fullPtrType(given.node) orelse return false;
-        if (!same(held(try c.facts.resolve(c.file, given_type.ast.child_type)) orelse return false, kind)) return false;
+        if (!same(pointee(try c.facts.resolve(c.file, given.node)) orelse return false, kind)) return false;
         if (!try reachedOnlyInstalled(c, caller, given.token, field, kind, depth + 1)) return false;
         called = true;
     }
     return called and !try namedByField(c, decl);
 }
 
-/// Whether every reference to `decl` in the checked file installs it into C.F's value, from
-/// C's file; up to `through` constants that are not `pub` may stand between (a vtable, a
-/// struct holding one), each named only so in turn.
 /// Whether the member access `node` of `file` may name `decl`: by its declaration where known;
 /// where not, by the name it spells, as a member access names only a declaration of its name;
 /// never a declaration that is not `pub` from another file, which Zig refuses, nor through a
@@ -468,22 +499,13 @@ fn mayName(c: *Context, file: Project.FileId, node: Ast.Node.Index, decl: Facts.
     };
 }
 
+/// Whether every reference to `decl` in the checked file installs it into C.F's value, from
+/// C's file; up to `through` constants that are not `pub` may stand between (a vtable, a
+/// struct holding one), each named only so in turn.
 fn namedOnlyInstalling(c: *Context, decl: Model.Declaration.Id, field: Field, through: u8) Context.Error!bool {
-    const tree = &c.project.at(c.file).file.tree;
-    const model = &c.project.at(c.file).model;
-    var named = false;
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const refers = switch (tag) {
-            .identifier => if (model.reference(node)) |ref| ref.declaration == decl else false,
-            .field_access => try mayName(c, c.file, node, .{ .file = c.file, .index = decl }),
-            else => false,
-        };
-        if (!refers) continue;
-        named = true;
-        if (!try installs(c, node, field, through)) return false;
-    }
-    return named and !try namedByField(c, decl);
+    const names = try namings(c, c.file, .{ .file = c.file, .index = decl }, true);
+    for (names) |node| if (!try installs(c, node, field, through)) return false;
+    return names.len != 0 and !try namedByField(c, decl);
 }
 
 /// Whether a `@field(C, "f")` in the checked file may name the function `decl`: it installs
@@ -503,75 +525,68 @@ fn namedByField(c: *Context, decl: Model.Declaration.Id) Context.Error!bool {
             .unknown => {},
             else => continue,
         }
-        if (try namedBy(c, tree, model, args[1], record.name)) return true;
+        if (try namedBy(c, c.file, args[1], record.name)) return true;
     }
     return false;
 }
 
-/// Whether the expression around `reference` puts it into C.F's value, in C's file: through
-/// literals and addresses up to `.F = …` of a literal that is a C or `x.F = …` of a C, or,
-/// while `through` allows, into a container constant that is not `pub` whose every reference
-/// does so. The function is not `pub`: only its own file names it.
+/// Whether the expression around `reference` puts it into C.F's value, in C's file, read by
+/// each use it stands in (`Facts.accesses.useOf`): through literals, addresses and an `if`'s
+/// branches up to `.F = …` of a literal that is a C, `x.F = …` of a C, or C.F's own default;
+/// or, while `through` allows, into a container constant that is not `pub` whose every
+/// reference does so. The function is not `pub`: only its own file names it.
 fn installs(c: *Context, reference: Ast.Node.Index, field: Field, through: u8) Context.Error!bool {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
     var at = reference;
     for (0..16) |_| {
-        const parent = model.parentOf(at) orelse return false;
-        switch (tree.nodeTag(parent)) {
-            .address_of, .grouped_expression => {
-                at = parent;
-                continue;
+        switch (try Facts.accesses.useOf(c.facts, c.file, at)) {
+            .address => |taken| at = taken,
+            .element_of => |element| at = element.literal,
+            .carried => |carry| switch (carry.how) {
+                .grouped => at = carry.into,
+                // `if (c) f else null`: what is installed is it or the other branch's value.
+                .prong => {
+                    const branch = tree.fullIf(carry.into) orelse return false;
+                    if (branch.payload_token != null or branch.error_token != null) return false;
+                    at = carry.into;
+                },
+                else => return false,
             },
-            .assign => {
-                const target, const value = tree.nodeData(parent).node_and_node;
-                if (value != at or tree.nodeTag(target) != .field_access) return false;
-                if (!std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(target).node_and_token[1])), field.name)) return false;
-                if (!isParent(try c.facts.resolve(c.file, tree.nodeData(target).node_and_token[0]), field.parent)) return false;
+            // `x.F = f` of a C (`accesses.pathOf` of the store's target).
+            .stored => |store| {
+                const path = try Facts.accesses.pathOf(c.facts, c.file, store.target orelse return false);
+                if (path.steps.len < 2 or path.steps[0].kind != .field) return false;
+                if (!std.mem.eql(u8, path.steps[0].name orelse return false, field.name)) return false;
+                if (!isParent(path.steps[0].holder orelse return false, field.parent)) return false;
                 return field.parent.file == c.file;
             },
-            else => {},
+            .initializes => |holder| {
+                // C.F's own default value, declared in C.
+                if (model.containerField(tree, holder) != null) {
+                    const own = c.facts.member(field.parent, field.name) orelse return false;
+                    return own.file == c.file and model.declarations[@backingInt(own.index)].node == holder;
+                }
+                const variable = tree.fullVarDecl(holder) orelse return false;
+                if (through == 0 or variable.visib_token != null or tree.tokenTag(variable.ast.mut_token) != .keyword_const) return false;
+                if (!containerLevel(tree, model, holder)) return false;
+                const constant = for (model.declarations, 0..) |each, d| {
+                    if (each.node == holder and each.kind == .variable) break @as(Model.Declaration.Id, @fromBackingInt(@intCast(d)));
+                } else return false;
+                return namedOnlyInstalling(c, constant, field, through - 1);
+            },
+            // `.F = …` of a literal C is the install; another field's value, the literal's.
+            .field_of => |given| {
+                if (std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(given.name)), field.name)) {
+                    var buffer: [2]Ast.Node.Index = undefined;
+                    const literal = tree.fullStructInit(&buffer, given.literal) orelse return false;
+                    const container = if (literal.ast.type_expr.unwrap()) |t| held(try c.facts.resolve(c.file, t)) else try c.facts.resultContainer(c.file, given.literal);
+                    if (container) |made| if (same(made, field.parent)) return field.parent.file == c.file;
+                }
+                at = given.literal;
+            },
+            else => return false,
         }
-        // `if (c) f else null`: what is installed is it or the other branch's value.
-        if (tree.fullIf(parent)) |branch| {
-            if (branch.ast.cond_expr == at or branch.payload_token != null or branch.error_token != null) return false;
-            at = parent;
-            continue;
-        }
-        // C.F's own default value, declared in C.
-        if (model.containerField(tree, parent)) |declared| {
-            if (declared.ast.value_expr.unwrap() != at) return false;
-            if (!std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(declared.ast.main_token)), field.name)) return false;
-            return field.parent.file == c.file and model.parentOf(parent) == model.scopes[@backingInt(field.parent.scope)].node;
-        }
-        if (tree.fullVarDecl(parent)) |variable| {
-            if (through == 0 or variable.ast.init_node.unwrap() != at) return false;
-            if (variable.visib_token != null or tree.tokenTag(variable.ast.mut_token) != .keyword_const) return false;
-            if (!containerLevel(tree, model, parent)) return false;
-            const constant = for (model.declarations, 0..) |each, d| {
-                if (each.node == parent and each.kind == .variable) break @as(Model.Declaration.Id, @fromBackingInt(@intCast(d)));
-            } else return false;
-            return namedOnlyInstalling(c, constant, field, through - 1);
-        }
-        var buffer: [2]Ast.Node.Index = undefined;
-        if (tree.fullStructInit(&buffer, parent)) |literal| {
-            if (std.mem.findScalar(Ast.Node.Index, literal.ast.fields, at) == null) return false;
-            // `.F = …` of a literal C is: the install.
-            const first = tree.firstToken(at);
-            if (first >= 2 and tree.tokenTag(first - 1) == .equal and tree.tokenTag(first - 2) == .identifier and
-                std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(first - 2)), field.name))
-            {
-                const container = if (literal.ast.type_expr.unwrap()) |t| held(try c.facts.resolve(c.file, t)) else try c.facts.resultContainer(c.file, parent);
-                if (container) |made| if (same(made, field.parent)) return field.parent.file == c.file;
-            }
-            at = parent;
-            continue;
-        }
-        if (tree.fullArrayInit(&buffer, parent) != null) {
-            at = parent;
-            continue;
-        }
-        return false;
     }
     return false;
 }
@@ -592,11 +607,10 @@ fn addressedOnly(c: *Context, field: Field, kind: Facts.Container, interface: bo
             if (try namesType(c, use.file, tree.nodeData(use.node).node_and_token[0]) or generic(tree, model, use.node)) continue;
             return false;
         }
-        const parent = model.parentOf(use.node) orelse return false;
-        switch (tree.nodeTag(parent)) {
-            .address_of => if (!try follow.stays(use.file, parent)) return false,
-            .assign => if (tree.nodeData(parent).node_and_node[0] != use.node) return false,
-            .field_access => if (!try follow.member(use.file, parent)) return false,
+        switch (try Facts.accesses.useOf(c.facts, use.file, use.node)) {
+            .address => |taken| if (!try follow.stays(use.file, taken)) return false,
+            .written => {},
+            .member => |access| if (!try follow.member(use.file, access)) return false,
             else => return false,
         }
     }
@@ -607,7 +621,7 @@ fn addressedOnly(c: *Context, field: Field, kind: Facts.Container, interface: bo
         for (tree.nodes.items(.tag), 0..) |_, i| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
             if (!Facts.isBuiltin(tree, node, "@field")) continue;
-            if (source.model.parentOf(node)) |parent| if (tree.nodeTag(parent) == .assign and tree.nodeData(parent).node_and_node[0] == node) continue;
+            if (try Facts.accesses.useOf(c.facts, source.id, node) == .written) continue;
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, node, &buffer);
             if (args.len != 2) continue;
@@ -615,62 +629,24 @@ fn addressedOnly(c: *Context, field: Field, kind: Facts.Container, interface: bo
             const receiver = try c.facts.resolve(source.id, args[0]);
             if (receiver != .unknown and !isParent(receiver, field.parent)) continue;
             if (receiver == .unknown and (generic(tree, &source.model, node) or try namesType(c, source.id, args[0]))) continue;
-            if (try namedBy(c, tree, &source.model, args[1], field.name)) return false;
+            if (try namedBy(c, source.id, args[1], field.name)) return false;
         }
     }
     const model = &c.project.at(c.file).model;
-    const tree = &c.project.at(c.file).file.tree;
     for (model.declarations, 0..) |decl, d| {
         if (decl.kind != .parameter) continue;
-        const declared = tree.fullPtrType(decl.node) orelse continue;
-        const to = held(try c.facts.resolve(c.file, declared.ast.child_type)) orelse continue;
+        const to = pointee(try c.facts.resolve(c.file, decl.node)) orelse continue;
         if (!same(to, kind)) continue;
         if (!try follow.local(c.file, @fromBackingInt(@intCast(d)))) return false;
     }
     return true;
 }
 
-/// Whether a `@field` name may be `name`: it is spelled so, or computed as the program compiles
-/// to what may be. A capture of a `for` over a list of string literals, written in place or a
-/// constant's, takes only those.
-fn namedBy(c: *Context, tree: *const Ast, model: *const Model, spelling: Ast.Node.Index, name: []const u8) Context.Error!bool {
-    if (tree.nodeTag(spelling) == .string_literal) return spelledAs(c, tree, spelling, name);
-    var buffer: [2]Ast.Node.Index = undefined;
-    const names = literalNames(tree, model, spelling, &buffer) orelse return true;
-    for (names) |each| if (try spelledAs(c, tree, each, name)) return true;
-    return false;
-}
-
-/// Whether the string literal `literal` spells `name`; one that does not parse may.
-fn spelledAs(c: *Context, tree: *const Ast, literal: Ast.Node.Index, name: []const u8) Context.Error!bool {
-    const spelled = std.zig.string_literal.parseAlloc(c.allocator, tree.tokenSlice(tree.nodeMainToken(literal))) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return true,
-    };
-    return std.mem.eql(u8, spelled, name);
-}
-
-/// The string literals the capture `node` names may be: those of the list a `for` takes it
-/// from, written in place (`.{ "a", "b" }`) or a constant's (`const names = [_][]const u8{ … }`).
-fn literalNames(tree: *const Ast, model: *const Model, node: Ast.Node.Index, buffer: *[2]Ast.Node.Index) ?[]const Ast.Node.Index {
-    if (tree.nodeTag(node) != .identifier) return null;
-    const decl = model.declarations[@backingInt((model.reference(node) orelse return null).declaration orelse return null)];
-    if (decl.kind != .capture or tree.tokenTag(decl.token -| 1) == .asterisk) return null;
-    const loop = tree.fullFor(decl.node) orelse return null;
-    const position = Model.capturePosition(tree, loop, decl.token) orelse return null;
-    if (position >= loop.ast.inputs.len) return null;
-    var list = Facts.ungrouped(tree, loop.ast.inputs[position]);
-    if (tree.nodeTag(list) == .address_of) list = Facts.ungrouped(tree, tree.nodeData(list).node);
-    if (tree.nodeTag(list) == .identifier) {
-        const named = model.declarations[@backingInt((model.reference(list) orelse return null).declaration orelse return null)];
-        if (named.kind != .variable) return null;
-        const variable = tree.fullVarDecl(named.node) orelse return null;
-        if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
-        list = Facts.ungrouped(tree, variable.ast.init_node.unwrap() orelse return null);
-    }
-    const literal = tree.fullArrayInit(buffer, list) orelse return null;
-    for (literal.ast.elements) |each| if (tree.nodeTag(each) != .string_literal) return null;
-    return literal.ast.elements;
+/// Whether a `@field` name may be `name` (`Facts.fieldName`, read by `Facts.mayName`): it spells
+/// it, ranges over a list that names it or a struct that has it, or is computed as the program
+/// compiles.
+fn namedBy(c: *Context, file: Project.FileId, spelling: Ast.Node.Index, name: []const u8) Context.Error!bool {
+    return c.facts.mayName(try c.facts.fieldName(file, spelling), name);
 }
 
 /// A pointer to an interface of type `kind` followed to every place it goes: through the
@@ -690,129 +666,128 @@ const Follow = struct {
     seen: std.AutoHashMapUnmanaged(Facts.Decl, void) = .empty,
     steps: usize = 0,
 
-    /// Whether the pointer `node` in `file` stays one wherever its value goes.
+    /// Whether the pointer `node` in `file` stays one wherever its value goes, read by the use
+    /// it stands in (`Facts.accesses.useOf`).
     fn stays(f: *Follow, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
         f.steps += 1;
         if (f.steps > 4096) return false;
         const c = f.c;
         const tree = &c.project.at(file).file.tree;
-        const model = &c.project.at(file).model;
-        const parent = model.parentOf(node) orelse return false;
-        switch (tree.nodeTag(parent)) {
-            .grouped_expression, .@"try", .unwrap_optional, .@"orelse", .@"catch" => return f.stays(file, parent),
-            .equal_equal, .bang_equal => return true,
-            .deref => {
-                // `p.*.x` reads or calls a part; `p.* = v` writes the whole in place.
-                const up = model.parentOf(parent) orelse return false;
-                if (tree.nodeTag(up) == .assign and tree.nodeData(up).node_and_node[0] == parent) return true;
-                if (tree.nodeTag(up) == .field_access) return f.member(file, up);
+        switch (try Facts.accesses.useOf(c.facts, file, node)) {
+            // Parentheses, `try`, `.?`, either side of `orelse` and `catch`, a branch's or a
+            // prong's result, a `break`'s value: what holds it is the pointer.
+            .carried => |carry| switch (carry.how) {
+                .grouped, .tried, .unwrapped, .payload, .otherwise, .prong, .broken => return f.stays(file, carry.into),
+                .compile_time, .@"nosuspend" => return false,
+            },
+            .compared => return true,
+            // `p.*.x` reads or calls a part; `p.* = v` writes the whole in place.
+            .dereferenced => |deref| return switch (try Facts.accesses.useOf(c.facts, file, deref)) {
+                .written => true,
+                .member => |access| f.member(file, access),
+                else => false,
+            },
+            .member => |access| return f.member(file, access),
+            // The pointer itself replaced, or dropped.
+            .written, .discarded => return true,
+            .stored => |store| return f.stored(file, store.target orelse return false),
+            .returned => |returning| return f.returned(file, returning),
+            .builtin_argument => |argument| {
+                if (Facts.isBuiltin(tree, argument.call, "@fieldParentPtr")) return true;
+                if (!Facts.isBuiltin(tree, argument.call, "@as")) return false;
+                var buffer: [2]Ast.Node.Index = undefined;
+                const args = Facts.builtinArgs(tree, argument.call, &buffer);
+                if (args.len != 2 or argument.position != 1 or !f.pointer(try c.facts.resolve(file, args[0]))) return false;
+                return f.stays(file, argument.call);
+            },
+            .tested => |owner| {
+                if (tree.fullIf(owner)) |branch| return f.tested(file, owner, branch.payload_token, branch.error_token);
+                if (tree.fullWhile(owner)) |loop| return f.tested(file, owner, loop.payload_token, loop.error_token);
                 return false;
             },
-            .field_access => return f.member(file, parent),
-            .assign => {
-                const target, const value = tree.nodeData(parent).node_and_node;
-                // The pointer itself replaced.
-                if (target == node) return true;
-                if (value != node) return false;
-                return f.stored(file, target);
+            .argument => |given| return f.passed(file, given.call, node),
+            .initializes => |holder| {
+                const variable = tree.fullVarDecl(holder) orelse return false;
+                if (variable.ast.type_node.unwrap()) |declared| if (!f.pointer(try c.facts.resolve(file, declared))) return false;
+                for (c.project.at(file).model.declarations, 0..) |each, d| {
+                    if (each.node == holder and each.kind == .variable) return f.local(file, @fromBackingInt(@intCast(d)));
+                }
+                return false;
             },
-            .@"return" => return f.returned(file, parent),
-            // A switch prong's value, a labeled block's: what the switch or block is.
-            .switch_case_one, .switch_case, .switch_case_inline_one, .switch_case_inline => return f.stays(file, model.parentOf(parent) orelse return false),
-            .@"break" => return f.stays(file, labeled(tree, model, parent) orelse return false),
-            else => {},
+            // `const a, const b = .{ x, p }`: the local it is destructured into.
+            .element_of => |element| return (try f.destructured(file, element.literal, element.position)) orelse false,
+            // `.{ .w = p }`: the field of the literal's type it is put in.
+            .field_of => |given| {
+                var fields: [2]Ast.Node.Index = undefined;
+                const literal = tree.fullStructInit(&fields, given.literal) orelse return false;
+                const container = (if (literal.ast.type_expr.unwrap()) |t| held(try c.facts.resolve(file, t)) else try c.facts.resultContainer(file, given.literal)) orelse return false;
+                const decl = c.facts.member(container, try Model.identifier(c.allocator, tree.tokenSlice(given.name))) orelse return false;
+                return f.field(decl);
+            },
+            else => return false,
         }
-        if (Facts.isBuiltin(tree, parent, "@fieldParentPtr")) return true;
-        if (Facts.isBuiltin(tree, parent, "@as")) {
-            var buffer: [2]Ast.Node.Index = undefined;
-            const args = Facts.builtinArgs(tree, parent, &buffer);
-            if (args.len != 2 or args[1] != node or !f.pointer(try c.facts.resolve(file, args[0]))) return false;
-            return f.stays(file, parent);
-        }
-        if (tree.fullIf(parent)) |branch| {
-            if (branch.ast.cond_expr == node) return f.tested(file, parent, branch.payload_token, branch.error_token);
-            return f.stays(file, parent);
-        }
-        if (tree.fullWhile(parent)) |loop| {
-            if (loop.ast.cond_expr == node) return f.tested(file, parent, loop.payload_token, loop.error_token);
-            return false;
-        }
-        var buffer: [1]Ast.Node.Index = undefined;
-        if (tree.fullCall(&buffer, parent)) |call| {
-            if (call.ast.fn_expr == node) return false;
-            const position = std.mem.findScalar(Ast.Node.Index, call.ast.params, node) orelse return false;
-            // Through a function pointer field (`o.vtable.see(o, n)`): what the interface's
-            // functions are handed, each installed one's parameter followed with its file's.
-            var callee = call.ast.fn_expr;
-            if (tree.nodeTag(callee) == .unwrap_optional) callee = tree.nodeData(callee).node_and_token[0];
-            if (capturedRead(tree, model, callee)) |read| callee = read;
-            // A member not known is read as the callee resolves, below.
-            if (tree.nodeTag(callee) == .field_access) switch (try c.facts.definition(file, callee)) {
-                .decl => |slot| {
-                    const record = c.project.at(slot.file).model.declarations[@backingInt(slot.index)];
-                    if (record.kind == .field) {
-                        const slot_tree = &c.project.at(slot.file).file.tree;
-                        const declared = (c.project.at(slot.file).model.containerField(slot_tree, record.node) orelse return false).ast.type_expr.unwrap() orelse return false;
-                        const proto = functionPointer(slot_tree, declared) orelse return false;
-                        const given = (try interfaceParameters(c, slot.file, proto, f.kind)) orelse return false;
-                        return position < 64 and given & (@as(u64, 1) << @intCast(position)) != 0;
-                    }
-                },
-                .none, .unknown => {},
-            };
-            var index = position;
-            if (tree.nodeTag(call.ast.fn_expr) == .field_access) switch (try c.facts.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
-                .instance, .pointer, .optional => index += 1,
-                else => {},
-            };
-            const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
-                .function => |function| function,
-                else => return false,
-            };
-            return f.handed(decl, index);
-        }
-        if (tree.fullVarDecl(parent)) |variable| {
-            if (variable.ast.init_node.unwrap() != node) return false;
-            if (variable.ast.type_node.unwrap()) |declared| if (!f.pointer(try c.facts.resolve(file, declared))) return false;
-            for (model.declarations, 0..) |each, d| {
-                if (each.node == parent and each.kind == .variable) return f.local(file, @fromBackingInt(@intCast(d)));
-            }
-            return false;
-        }
-        // `const a, const b = .{ x, p }`: the local it is destructured into.
-        if (try f.destructured(file, parent, node)) |kept| return kept;
-        // `.{ .w = p }`: the field of the literal's type it is put in.
-        var fields: [2]Ast.Node.Index = undefined;
-        if (tree.fullStructInit(&fields, parent)) |literal| {
-            if (std.mem.findScalar(Ast.Node.Index, literal.ast.fields, node) == null) return false;
-            const first = tree.firstToken(node);
-            if (first < 2 or tree.tokenTag(first - 1) != .equal or tree.tokenTag(first - 2) != .identifier) return false;
-            const container = (if (literal.ast.type_expr.unwrap()) |t| held(try c.facts.resolve(file, t)) else try c.facts.resultContainer(file, parent)) orelse return false;
-            const decl = c.facts.member(container, try Model.identifier(c.allocator, tree.tokenSlice(first - 2))) orelse return false;
-            return f.field(decl);
-        }
-        return false;
     }
 
-    /// `node`, an element of the tuple literal `literal` destructured where it is made (`const
-    /// a, const b = .{ x, p };`): followed as the local it goes to, as `const b = p;` is; into
-    /// a place, not shown. Null where `literal` is no such literal.
-    fn destructured(f: *Follow, file: Project.FileId, literal: Ast.Node.Index, node: Ast.Node.Index) Context.Error!?bool {
+    /// The element at `position` of the tuple literal `literal` destructured where it is made
+    /// (`const a, const b = .{ x, p };`): followed as the local it goes to, as `const b = p;`
+    /// is; into a place, not shown. Null where `literal` is no such literal.
+    fn destructured(f: *Follow, file: Project.FileId, literal: Ast.Node.Index, position: usize) Context.Error!?bool {
         const tree = &f.c.project.at(file).file.tree;
         const model = &f.c.project.at(file).model;
+        const whole = switch (try Facts.accesses.useOf(f.c.facts, file, literal)) {
+            .destructured => |statement| statement,
+            else => return null,
+        };
         var buffer: [2]Ast.Node.Index = undefined;
         const elements = (tree.fullArrayInit(&buffer, literal) orelse return null).ast.elements;
-        const whole = model.parentOf(literal) orelse return null;
-        if (tree.nodeTag(whole) != .assign_destructure) return null;
         const full = tree.assignDestructure(whole);
-        if (full.ast.value_expr != literal or full.ast.variables.len != elements.len) return null;
-        const target = full.ast.variables[std.mem.findScalar(Ast.Node.Index, elements, node) orelse return null];
+        if (full.ast.variables.len != elements.len or position >= elements.len) return null;
+        const target = full.ast.variables[position];
         const variable = tree.fullVarDecl(target) orelse return false;
         if (variable.ast.type_node.unwrap()) |declared| if (!f.pointer(try f.c.facts.resolve(file, declared))) return false;
         for (model.declarations, 0..) |each, d| {
             if (each.node == target and each.kind == .variable) return try f.local(file, @fromBackingInt(@intCast(d)));
         }
         return false;
+    }
+
+    /// The pointer handed to the call `call_node` as `node`: through a function pointer field
+    /// (`o.vtable.see(o, n)`), what the interface's functions are handed, each installed one's
+    /// parameter followed with its file's; to a function, its parameter there (`Facts.calls`'
+    /// arguments), followed.
+    fn passed(f: *Follow, file: Project.FileId, call_node: Ast.Node.Index, node: Ast.Node.Index) Context.Error!bool {
+        const c = f.c;
+        const tree = &c.project.at(file).file.tree;
+        const call = (try Facts.calls.at(c.facts, file, call_node)) orelse return false;
+        var callee = call.callee_expr;
+        while (Facts.accesses.carriedFrom(tree, callee)) |inner| callee = inner;
+        if (try capturedRead(c, file, callee)) |read| callee = read;
+        // A member not known is read as the callee resolves, below.
+        if (try memberRead(c, file, callee)) switch (try c.facts.definition(file, callee)) {
+            .decl => |slot| {
+                const record = c.project.at(slot.file).model.declarations[@backingInt(slot.index)];
+                if (record.kind == .field) {
+                    const slot_tree = &c.project.at(slot.file).file.tree;
+                    const declared = (c.project.at(slot.file).model.containerField(slot_tree, record.node) orelse return false).ast.type_expr.unwrap() orelse return false;
+                    const proto = functionPointer(try c.facts.resolve(slot.file, declared)) orelse return false;
+                    const given = (try interfaceParameters(c, proto, f.kind)) orelse return false;
+                    var buffer: [1]Ast.Node.Index = undefined;
+                    const params = (tree.fullCall(&buffer, call_node) orelse return false).ast.params;
+                    const position = std.mem.findScalar(Ast.Node.Index, params, node) orelse return false;
+                    return position < 64 and given & (@as(u64, 1) << @intCast(position)) != 0;
+                }
+            },
+            .none, .unknown => {},
+        };
+        const decl = switch (call.callee) {
+            .function => |function| function,
+            .choice, .any => return false,
+        };
+        const args = switch (call.args) {
+            .known => |known| known,
+            .unknown => return false,
+        };
+        return f.handed(decl, std.mem.findScalar(Ast.Node.Index, args, node) orelse return false);
     }
 
     /// An optional pointer an `if` or `while` tests (`while (it) |n|`): compared with null, and
@@ -843,8 +818,6 @@ const Follow = struct {
     /// takes it by pointer: std's, or the program's, followed into.
     fn member(f: *Follow, file: Project.FileId, access: Ast.Node.Index) Context.Error!bool {
         const c = f.c;
-        const tree = &c.project.at(file).file.tree;
-        const model = &c.project.at(file).model;
         // A member not known is not shown kept in place.
         const decl = switch (try c.facts.definition(file, access)) {
             .decl => |d| d,
@@ -853,9 +826,7 @@ const Follow = struct {
         const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
         if (record.kind == .field) return true;
         if (record.kind != .function) return false;
-        var buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&buffer, model.parentOf(access) orelse return false) orelse return false;
-        if (call.ast.fn_expr != access) return false;
+        if (try Facts.accesses.useOf(c.facts, file, access) != .callee) return false;
         return f.handed(decl, 0);
     }
 
@@ -891,13 +862,7 @@ const Follow = struct {
     fn local(f: *Follow, file: Project.FileId, index: Model.Declaration.Id) Context.Error!bool {
         const c = f.c;
         if ((try f.seen.getOrPut(c.allocator, .{ .file = file, .index = index })).found_existing) return true;
-        const tree = &c.project.at(file).file.tree;
-        const model = &c.project.at(file).model;
-        for (tree.nodes.items(.tag), 0..) |tag, i| {
-            if (tag != .identifier) continue;
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            const ref = model.reference(node) orelse continue;
-            if (ref.declaration != index) continue;
+        for (try namings(c, file, .{ .file = file, .index = index }, false)) |node| {
             if (!try f.stays(file, node)) return false;
         }
         return true;
@@ -906,8 +871,6 @@ const Follow = struct {
     /// `x = p` where `x` is a local or a field of the interface's pointer type.
     fn stored(f: *Follow, file: Project.FileId, target: Ast.Node.Index) Context.Error!bool {
         const c = f.c;
-        const tree = &c.project.at(file).file.tree;
-        if (tree.nodeTag(target) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) return true;
         const decl = switch (try c.facts.definition(file, target)) {
             .decl => |d| d,
             .none, .unknown => return false,
@@ -968,19 +931,11 @@ const Follow = struct {
         }
         const index = functionDecl(model, function) orelse return false;
         if ((try f.seen.getOrPut(c.allocator, .{ .file = file, .index = index })).found_existing) return true;
-        for (tree.nodes.items(.tag), 0..) |tag, i| {
-            const each: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            const refers = switch (tag) {
-                .identifier => if (model.reference(each)) |ref| ref.declaration == index else false,
-                .field_access => try mayName(c, file, each, .{ .file = file, .index = index }),
-                else => false,
-            };
-            if (!refers) continue;
-            var call_buffer: [1]Ast.Node.Index = undefined;
-            const call_node = model.parentOf(each) orelse return false;
-            const call = tree.fullCall(&call_buffer, call_node) orelse return false;
-            if (call.ast.fn_expr != each) return false;
-            if (!try f.stays(file, call_node)) return false;
+        for (try namings(c, file, .{ .file = file, .index = index }, true)) |each| {
+            switch (try Facts.accesses.useOf(c.facts, file, each)) {
+                .callee => |call| if (!try f.stays(file, call)) return false,
+                else => return false,
+            }
         }
         return true;
     }
@@ -1041,9 +996,9 @@ const Carry = struct {
                 const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
                 var buffer: [1]Ast.Node.Index = undefined;
                 const call = tree.fullCall(&buffer, node) orelse continue;
-                for (call.ast.params, 0..) |argument, position| {
+                for (call.ast.params) |argument| {
                     const shape = (try k.carries(source.id, argument, 0)) orelse continue;
-                    verdict = worst(verdict, try k.handedOn(source.id, call, position, shape, true));
+                    verdict = worst(verdict, try k.handedOn(source.id, node, argument, shape, true));
                     if (verdict == .open) return .open;
                 }
             }
@@ -1057,7 +1012,8 @@ const Carry = struct {
         const c = k.c;
         const tree = &c.project.at(file).file.tree;
         const at = Facts.ungrouped(tree, node);
-        if (tree.nodeTag(at) == .address_of) return k.carries(file, tree.nodeData(at).node, depth + 1);
+        // `&x`: what it points at (`accesses.pointed`).
+        if (try Facts.accesses.pointed(c.facts, file, at)) |place| if (place != at) return k.carries(file, place, depth + 1);
         var buffer: [2]Ast.Node.Index = undefined;
         if (tree.fullStructInit(&buffer, at)) |literal| {
             for (literal.ast.fields) |value| if (try k.carries(file, value, depth + 1) != null) return .held;
@@ -1084,28 +1040,30 @@ const Carry = struct {
         };
     }
 
-    /// A call given a carrier at `position`: the callee's parameter there followed through its
-    /// body. A parameter of the program's own that is a C or a pointer to one is read by the
-    /// program-wide checks already.
-    fn handedOn(k: *Carry, file: Project.FileId, call: Ast.full.Call, position: usize, shape: Shape, from_program: bool) Context.Error!Verdict {
+    /// The call `call_node` given a carrier as `argument`: the callee's parameter it is
+    /// (`Facts.calls`' arguments, a bound receiver first) followed through its body. A parameter
+    /// of the program's own that is a C or a pointer to one is read by the program-wide checks
+    /// already.
+    fn handedOn(k: *Carry, file: Project.FileId, call_node: Ast.Node.Index, argument: Ast.Node.Index, shape: Shape, from_program: bool) Context.Error!Verdict {
         const c = k.c;
         const tree = &c.project.at(file).file.tree;
-        var index = position;
-        if (tree.nodeTag(call.ast.fn_expr) == .field_access) switch (try c.facts.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
-            .instance, .pointer, .optional => index += 1,
-            else => {},
-        };
-        const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
+        const call = (try Facts.calls.at(c.facts, file, call_node)) orelse return .undecided;
+        const decl = switch (call.callee) {
             .function => |function| function,
-            else => return .undecided,
+            .choice, .any => return .undecided,
         };
+        const args = switch (call.args) {
+            .known => |known| known,
+            .unknown => return .undecided,
+        };
+        const index = std.mem.findScalar(Ast.Node.Index, args, argument) orelse return .undecided;
         // std's `Io.async` and `Io.concurrent`, a `Group`'s and a `Select`'s, call `function`
         // with `args`, the tuple they copy whole: a carrier in a tuple written there is handed
         // to `function` where it stands in it.
-        if (position > 0 and try spawnArguments(c, decl, index)) {
+        if (index > 0 and try spawnArguments(c, decl, index)) {
             var buffer: [2]Ast.Node.Index = undefined;
-            if (tree.fullArrayInit(&buffer, Facts.ungrouped(tree, call.ast.params[position]))) |tuple| {
-                return k.spawned(file, call.ast.params[position - 1], tuple.ast.elements, from_program);
+            if (tree.fullArrayInit(&buffer, Facts.ungrouped(tree, argument))) |tuple| {
+                return k.spawned(file, args[index - 1], tuple.ast.elements, from_program);
             }
         }
         return k.parameter(decl, index, shape, from_program);
@@ -1164,97 +1122,77 @@ const Carry = struct {
     fn local(k: *Carry, file: Project.FileId, index: Model.Declaration.Id, shape: Shape) Context.Error!Verdict {
         const c = k.c;
         if ((try k.seen.getOrPut(c.allocator, .{ .{ .file = file, .index = index }, shape })).found_existing) return .shown;
-        const tree = &c.project.at(file).file.tree;
-        const model = &c.project.at(file).model;
         var verdict: Verdict = .shown;
-        for (tree.nodes.items(.tag), 0..) |tag, i| {
-            if (tag != .identifier) continue;
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            const ref = model.reference(node) orelse continue;
-            if (ref.declaration != index) continue;
+        for (try namings(c, file, .{ .file = file, .index = index }, false)) |node| {
             verdict = worst(verdict, try k.goes(file, node, shape));
             if (verdict == .open) return .open;
         }
         return verdict;
     }
 
-    /// Where the carrier `node` goes.
+    /// Where the carrier `node` goes, by the use it stands in (`Facts.accesses.useOf`).
     fn goes(k: *Carry, file: Project.FileId, node: Ast.Node.Index, shape: Shape) Context.Error!Verdict {
         k.steps += 1;
         if (k.steps > budget) return .undecided;
         const c = k.c;
         const tree = &c.project.at(file).file.tree;
         const model = &c.project.at(file).model;
-        const parent = model.parentOf(node) orelse return .undecided;
-        switch (tree.nodeTag(parent)) {
-            .grouped_expression, .@"try", .unwrap_optional, .@"orelse", .@"catch", .deref, .address_of => return k.goes(file, parent, shape),
-            .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => return .shown,
-            .add, .sub, .mul, .div, .mod, .shl, .shr, .bit_and, .bit_or, .bit_xor, .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .bool_and, .bool_or, .bool_not, .negation, .bit_not => return .shown,
-            .field_access => return k.member(file, parent, shape),
-            .assign => {
-                const target, const value = tree.nodeData(parent).node_and_node;
-                if (target == node) return .shown;
-                if (value != node) return .undecided;
-                return k.into(file, target, shape);
+        switch (try Facts.accesses.useOf(c.facts, file, node)) {
+            // Through parentheses, `try`, `.?`, `orelse` and `catch`, a branch's, a prong's or a
+            // `break`'s value, `.*` and `&`: what holds it carries it.
+            .carried => |carry| return switch (carry.how) {
+                .compile_time, .@"nosuspend" => .undecided,
+                else => k.goes(file, carry.into, shape),
             },
-            else => {},
-        }
-        if (tree.fullVarDecl(parent)) |variable| {
-            if (variable.ast.init_node.unwrap() != node) return .shown;
-            for (model.declarations, 0..) |each, d| {
-                if (each.node == parent and each.kind == .variable) return k.local(file, @fromBackingInt(@intCast(d)), shape);
-            }
-            return .undecided;
-        }
-        if (tree.fullIf(parent)) |branch| {
-            if (branch.ast.cond_expr != node) return k.goes(file, parent, shape);
-            return k.captured(file, parent, branch.payload_token, branch.error_token, shape);
-        }
-        if (tree.fullWhile(parent)) |loop| {
-            if (loop.ast.cond_expr != node) return .undecided;
-            return k.captured(file, parent, loop.payload_token, loop.error_token, shape);
-        }
-        if (tree.fullFor(parent)) |loop| {
-            if (std.mem.findScalar(Ast.Node.Index, loop.ast.inputs, node) == null) return .undecided;
+            .dereferenced, .address => |outer| return k.goes(file, outer, shape),
+            // Compared, an operator's operand, written over, a type: no copy of C.F.
+            .compared, .operand, .written, .updated, .discarded, .typed => return .shown,
+            .member => |access| return k.member(file, access, shape),
+            .stored => |store| return k.into(file, store.target orelse return .undecided, shape),
+            .initializes => |holder| {
+                _ = tree.fullVarDecl(holder) orelse return .undecided;
+                for (model.declarations, 0..) |each, d| {
+                    if (each.node == holder and each.kind == .variable) return k.local(file, @fromBackingInt(@intCast(d)), shape);
+                }
+                return .undecided;
+            },
+            .tested => |owner| {
+                if (tree.fullIf(owner)) |branch| return k.captured(file, owner, branch.payload_token, shape);
+                if (tree.fullWhile(owner)) |loop| return k.captured(file, owner, loop.payload_token, shape);
+                return .undecided;
+            },
             // Its elements, each captured: any of them may be a C.
-            var verdict: Verdict = .shown;
-            for (model.declarations, 0..) |each, d| {
-                if (each.kind != .capture or each.node != parent) continue;
-                verdict = worst(verdict, try k.local(file, @fromBackingInt(@intCast(d)), .held));
-            }
-            return verdict;
-        }
-        var buffer: [1]Ast.Node.Index = undefined;
-        if (tree.fullCall(&buffer, parent)) |call| {
-            if (call.ast.fn_expr == node) return .undecided;
-            const position = std.mem.findScalar(Ast.Node.Index, call.ast.params, node) orelse return .undecided;
-            return k.handedOn(file, call, position, shape, false);
-        }
-        var literal_buffer: [2]Ast.Node.Index = undefined;
-        if (tree.fullStructInit(&literal_buffer, parent) != null or tree.fullArrayInit(&literal_buffer, parent) != null) return k.goes(file, parent, .held);
-        switch (tree.nodeTag(parent)) {
-            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {},
+            .looped => |input| {
+                var verdict: Verdict = .shown;
+                for (model.declarations, 0..) |each, d| {
+                    if (each.kind != .capture or each.node != input.loop) continue;
+                    verdict = worst(verdict, try k.local(file, @fromBackingInt(@intCast(d)), .held));
+                }
+                return verdict;
+            },
+            .argument => |given| return k.handedOn(file, given.call, node, shape, false),
+            .element_of => |element| return k.goes(file, element.literal, .held),
+            .field_of => |given| return k.goes(file, given.literal, .held),
+            .builtin_argument => |given| {
+                for ([_][]const u8{ "@TypeOf", "@sizeOf", "@alignOf", "@bitSizeOf", "@hasField", "@hasDecl", "@intFromPtr" }) |typed| {
+                    if (Facts.isBuiltin(tree, given.call, typed)) return .shown;
+                }
+                if (Facts.isBuiltin(tree, given.call, "@as")) return k.goes(file, given.call, shape);
+                if (Facts.isBuiltin(tree, given.call, "@field")) {
+                    var args_buffer: [2]Ast.Node.Index = undefined;
+                    const args = Facts.builtinArgs(tree, given.call, &args_buffer);
+                    if (args.len != 2 or given.position != 0) return .shown;
+                    return k.part(file, given.call, args[1], shape);
+                }
+                if (Facts.isBuiltin(tree, given.call, "@call")) return .undecided;
+                return .open;
+            },
             else => return .undecided,
         }
-        const name = tree.tokenSlice(tree.nodeMainToken(parent));
-        for ([_][]const u8{ "@TypeOf", "@sizeOf", "@alignOf", "@bitSizeOf", "@hasField", "@hasDecl", "@intFromPtr" }) |typed| {
-            if (std.mem.eql(u8, name, typed)) return .shown;
-        }
-        if (std.mem.eql(u8, name, "@as")) return k.goes(file, parent, shape);
-        if (std.mem.eql(u8, name, "@field")) {
-            var args_buffer: [2]Ast.Node.Index = undefined;
-            const args = Facts.builtinArgs(tree, parent, &args_buffer);
-            if (args.len != 2 or args[0] != node) return .shown;
-            return k.part(file, parent, args[1], shape);
-        }
-        if (std.mem.eql(u8, name, "@call")) return .undecided;
-        return .open;
     }
 
-    /// `if (x) |v|`, `while (x) |v|`: the capture holds the carrier; an error's capture does
-    /// not.
-    fn captured(k: *Carry, file: Project.FileId, owner: Ast.Node.Index, payload: ?Ast.TokenIndex, error_token: ?Ast.TokenIndex, shape: Shape) Context.Error!Verdict {
-        _ = error_token;
+    /// `if (x) |v|`, `while (x) |v|`: the capture holds the carrier.
+    fn captured(k: *Carry, file: Project.FileId, owner: Ast.Node.Index, payload: ?Ast.TokenIndex, shape: Shape) Context.Error!Verdict {
         const token = payload orelse return .shown;
         const tree = &k.c.project.at(file).file.tree;
         const name = if (tree.tokenTag(token) == .asterisk) token + 1 else token;
@@ -1265,23 +1203,16 @@ const Carry = struct {
     }
 
     /// `x = carrier`: into a local, followed; into a carrier's own place (`a.* = b.*`), a C
-    /// where a C was; elsewhere undecided.
+    /// where a C was; elsewhere undecided. The place by its path (`accesses.pathOf`).
     fn into(k: *Carry, file: Project.FileId, target: Ast.Node.Index, shape: Shape) Context.Error!Verdict {
         const c = k.c;
-        const tree = &c.project.at(file).file.tree;
-        const model = &c.project.at(file).model;
-        if (tree.nodeTag(target) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) return .shown;
-        var root = Facts.ungrouped(tree, target);
-        while (true) switch (tree.nodeTag(root)) {
-            .deref, .unwrap_optional => root = Facts.ungrouped(tree, tree.nodeData(root).node),
-            .field_access => root = Facts.ungrouped(tree, tree.nodeData(root).node_and_token[0]),
-            .array_access => root = Facts.ungrouped(tree, tree.nodeData(root).node_and_node[0]),
-            else => break,
+        const path = try Facts.accesses.pathOf(c.facts, file, target);
+        const root = switch (path.root) {
+            .decl => |decl| decl,
+            .none, .unknown => return .undecided,
         };
-        if (tree.nodeTag(root) != .identifier) return .undecided;
-        const index = (model.reference(root) orelse return .undecided).declaration orelse return .undecided;
-        if (root == target) return k.local(file, index, shape);
-        if (k.seen.contains(.{ .{ .file = file, .index = index }, .whole }) or k.seen.contains(.{ .{ .file = file, .index = index }, .held })) return .shown;
+        if (path.steps.len == 1) return k.local(root.file, root.index, shape);
+        if (k.seen.contains(.{ root, .whole }) or k.seen.contains(.{ root, .held })) return .shown;
         return .undecided;
     }
 
@@ -1292,18 +1223,13 @@ const Carry = struct {
         return k.named(file, access, name, shape);
     }
 
-    /// `@field(carrier, name)`: a name computed as the program compiles may be any part.
+    /// `@field(carrier, name)`: the one name it spells (`Facts.fieldName`); a name computed as
+    /// the program compiles may be any part.
     fn part(k: *Carry, file: Project.FileId, access: Ast.Node.Index, spelling: Ast.Node.Index, shape: Shape) Context.Error!Verdict {
-        const c = k.c;
-        const tree = &c.project.at(file).file.tree;
-        if (tree.nodeTag(spelling) == .string_literal) {
-            const spelled = std.zig.string_literal.parseAlloc(c.allocator, tree.tokenSlice(tree.nodeMainToken(spelling))) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return k.anyPart(file, access),
-            };
-            return k.named(file, access, spelled, shape);
-        }
-        return k.anyPart(file, access);
+        return switch (try k.c.facts.fieldName(file, spelling)) {
+            .name => |name| k.named(file, access, name, shape),
+            .each_of, .names, .computed => k.anyPart(file, access),
+        };
     }
 
     fn anyPart(k: *Carry, file: Project.FileId, access: Ast.Node.Index) Context.Error!Verdict {
@@ -1333,26 +1259,23 @@ const Carry = struct {
     }
 
     /// C.F itself, reached in a body: its address followed, a part of it read or a method of
-    /// it called, written whole; anything else copies it.
+    /// it called, written whole; anything else copies it (`Facts.accesses.useOf`).
     fn interface(k: *Carry, file: Project.FileId, access: Ast.Node.Index) Context.Error!Verdict {
-        const tree = &k.c.project.at(file).file.tree;
-        const parent = k.c.project.at(file).model.parentOf(access) orelse return .undecided;
-        switch (tree.nodeTag(parent)) {
-            .address_of => return if (try k.follow.stays(file, parent)) .shown else .open,
-            .field_access => {
+        const c = k.c;
+        switch (try Facts.accesses.useOf(c.facts, file, access)) {
+            .address => |taken| return if (try k.follow.stays(file, taken)) .shown else .open,
+            .member => |outer| {
                 // Its part or method by name on F's type: in a generic, `x` does not resolve.
-                const c = k.c;
-                const name = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(parent).node_and_token[1]));
+                const path = try Facts.accesses.pathOf(c.facts, file, outer);
+                const name = path.steps[0].name orelse return .open;
                 const decl = c.facts.member(k.follow.kind, name) orelse return .open;
                 const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
                 if (record.kind == .field) return .shown;
                 if (record.kind != .function) return .open;
-                var buffer: [1]Ast.Node.Index = undefined;
-                const call = tree.fullCall(&buffer, k.c.project.at(file).model.parentOf(parent) orelse return .open) orelse return .open;
-                if (call.ast.fn_expr != parent) return .open;
+                if (try Facts.accesses.useOf(c.facts, file, outer) != .callee) return .open;
                 return if (try k.follow.handed(decl, 0)) .shown else .open;
             },
-            .assign => return if (tree.nodeData(parent).node_and_node[0] == access) .shown else .open,
+            .written => return .shown,
             else => return .open,
         }
     }
@@ -1437,11 +1360,14 @@ pub fn contract(c: *Context, rule: Rule) Context.Error!void {
         return c.undecided(rule, 0, .budget_exhausted, "std's Io.Writer and Io.Reader are not read within the fact budget: no interface in this file is checked");
     if (kinds.len == 0) return;
     const tree = &c.project.at(c.file).file.tree;
-    const model = &c.project.at(c.file).model;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        switch (tag) {
-            .identifier, .field_access, .deref, .array_access, .unwrap_optional, .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma, .call_one, .call_one_comma, .call, .call_comma => {},
+        // What reads a value that may be an interface (`Facts.accesses.formOf`): a name, a
+        // member, an element, `.*`, `.?`, a call or a builtin's result.
+        const form = Facts.accesses.formOf(tag);
+        switch (form) {
+            .member, .deref, .array_access, .unwrap_optional, .call, .builtin => {},
+            .leaf => if (try c.facts.definition(c.file, node) == .none) continue,
             else => continue,
         }
         const token = tree.nodeMainToken(node);
@@ -1451,16 +1377,12 @@ pub fn contract(c: *Context, rule: Rule) Context.Error!void {
             continue;
         };
         const value = try c.facts.resolve(c.file, node);
-        const called = switch (tag) {
-            .call_one, .call_one_comma, .call, .call_comma => true,
-            else => false,
-        };
         // A call's result is a value of its own; a copy that made it was flagged where made.
-        if (!called) if (held(value)) |container| if (value == .instance and interfaceOf(kinds, container) != null and copied(tree, model, node) and !try ownStorage(c, node)) {
+        if (form != .call) if (held(value)) |container| if (value == .instance and interfaceOf(kinds, container) != null and try copied(c, c.file, node) and !try ownStorage(c, node)) {
             try c.at(rule, token, "a copy of an interface: its functions recover the struct around it by @fieldParentPtr, which a copy is not in; keep it where it was installed and pass its address");
             continue;
         };
-        if (tag == .field_access and !try readInPlace(c, kinds, node)) {
+        if (form == .member and !try readInPlace(c, kinds, node)) {
             try c.at(rule, token, "an interface's function or vtable read out, or called on another interface: it recovers its parent by @fieldParentPtr from the interface it is given");
             continue;
         }
@@ -1521,12 +1443,10 @@ fn interfaces(c: *Context) Context.Error!?[]const Facts.Container {
             const args = Facts.builtinArgs(tree, node, &buffer);
             if (args.len != 2) continue;
             const pointer = Facts.ungrouped(tree, args[1]);
-            if (tree.nodeTag(pointer) != .identifier) continue;
-            const index = (source.model.reference(pointer) orelse continue).declaration orelse continue;
+            const index = (try declaredIn(c, source.id, pointer)) orelse continue;
             const param = source.model.declarations[@backingInt(index)];
             if (param.kind != .parameter) continue;
-            const declared = tree.fullPtrType(param.node) orelse continue;
-            const kind = held(try c.facts.resolve(source.id, declared.ast.child_type)) orelse continue;
+            const kind = pointee(try c.facts.resolve(source.id, param.node)) orelse continue;
             if (interfaceOf(kinds.items, kind) == null) try kinds.append(c.allocator, kind);
         }
     }
@@ -1542,49 +1462,32 @@ fn interfaceOf(kinds: []const Facts.Container, container: Facts.Container) ?Fact
 /// Whether the value `node` is copied where it is: put in a local, a place, a literal, given
 /// by value, returned, captured by value. A part read, an address taken, a type asked, a write
 /// to it, are not.
-fn copied(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
+fn copied(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
     var at = node;
-    while (true) {
-        const parent = model.parentOf(at) orelse return false;
-        switch (tree.nodeTag(parent)) {
-            .grouped_expression, .@"try", .@"orelse", .@"catch" => {
-                at = parent;
-                continue;
-            },
-            .field_access, .address_of, .unwrap_optional, .deref, .equal_equal, .bang_equal => return false,
-            .assign => {
-                const target, _ = tree.nodeData(parent).node_and_node;
-                if (target == at) return false;
-                return !(tree.nodeTag(target) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_"));
-            },
-            .switch_case_one, .switch_case, .switch_case_inline_one, .switch_case_inline => {
-                at = model.parentOf(parent) orelse return true;
-                continue;
-            },
-            else => {},
-        }
-        if (tree.fullVarDecl(parent)) |variable| return variable.ast.init_node.unwrap() == at;
-        if (tree.fullIf(parent)) |branch| {
-            if (branch.ast.cond_expr == at) return branch.payload_token != null and tree.tokenTag(branch.payload_token.?) != .asterisk;
-            at = parent;
-            continue;
-        }
-        if (tree.fullWhile(parent)) |loop| return loop.ast.cond_expr == at and loop.payload_token != null and tree.tokenTag(loop.payload_token.?) != .asterisk;
-        switch (tree.nodeTag(parent)) {
-            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
-                const name = tree.tokenSlice(tree.nodeMainToken(parent));
-                for ([_][]const u8{ "@TypeOf", "@sizeOf", "@alignOf", "@bitSizeOf", "@hasField", "@hasDecl", "@field" }) |typed| {
-                    if (std.mem.eql(u8, name, typed)) return false;
-                }
-                if (std.mem.eql(u8, name, "@as")) {
-                    at = parent;
-                    continue;
-                }
-                return true;
-            },
-            else => return true,
-        }
-    }
+    while (true) switch (try Facts.accesses.useOf(c.facts, file, at)) {
+        .carried => |carry| switch (carry.how) {
+            // Its value goes on as what holds it: parentheses, `try`, `orelse` and `catch`, a
+            // branch's or a prong's result.
+            .grouped, .tried, .payload, .otherwise, .prong => at = carry.into,
+            .unwrapped => return false,
+            .broken, .compile_time, .@"nosuspend" => return true,
+        },
+        // A part read, an address taken, compared, written over, dropped, a type: no copy.
+        .member, .address, .dereferenced, .compared, .written, .discarded, .typed => return false,
+        .tested => |owner| {
+            const payload = if (tree.fullIf(owner)) |branch| branch.payload_token else if (tree.fullWhile(owner)) |loop| loop.payload_token else return true;
+            return payload != null and tree.tokenTag(payload.?) != .asterisk;
+        },
+        .builtin_argument => |given| {
+            for ([_][]const u8{ "@TypeOf", "@sizeOf", "@alignOf", "@bitSizeOf", "@hasField", "@hasDecl", "@field" }) |typed| {
+                if (Facts.isBuiltin(tree, given.call, typed)) return false;
+            }
+            if (!Facts.isBuiltin(tree, given.call, "@as")) return true;
+            at = given.call;
+        },
+        else => return true,
+    };
 }
 
 /// Whether the member read `access` of an interface (or of its vtable) is in place: a function
@@ -1592,17 +1495,16 @@ fn copied(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
 /// compared or written. Another member, or another type's, is not one of these.
 fn readInPlace(c: *Context, kinds: []const Facts.Container, access: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(c.file).file.tree;
-    const model = &c.project.at(c.file).model;
     // A function written in is an installation, which the conversion it reaches judges.
-    if (model.parentOf(access)) |parent| if (tree.nodeTag(parent) == .assign and tree.nodeData(parent).node_and_node[0] == access) return true;
+    if (try Facts.accesses.useOf(c.facts, c.file, access) == .written) return true;
     const receiver = try c.facts.resolve(c.file, tree.nodeData(access).node_and_token[0]);
     const name = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(access).node_and_token[1]));
     for (kinds) |kind| {
         for (try functions(c, kind)) |slot| {
             if (!std.mem.eql(u8, slot.name, name) or !isParent(receiver, slot.holder)) continue;
-            if (slot.table) return tableInPlace(tree, model, access);
+            if (slot.table) return tableInPlace(c, c.file, access);
             const given = slot.given orelse return false;
-            if (!calledOnSelf(tree, model, access, slot.through, given)) return false;
+            if (!try calledOnSelf(c, c.file, access, slot.through, given)) return false;
         }
     }
     return true;
@@ -1626,19 +1528,19 @@ fn functions(c: *Context, kind: Facts.Container) Context.Error![]const Slot {
     for (source.model.declarations) |decl| {
         if (decl.kind != .field or decl.scope != kind.scope) continue;
         const declared = (source.model.containerField(tree, decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
-        if (functionPointer(tree, declared)) |proto| {
-            try slots.append(c.allocator, .{ .holder = kind, .name = decl.name, .given = try interfaceParameters(c, kind.file, proto, kind) });
+        const declared_type = try c.facts.resolve(kind.file, declared);
+        if (functionPointer(declared_type)) |proto| {
+            try slots.append(c.allocator, .{ .holder = kind, .name = decl.name, .given = try interfaceParameters(c, proto, kind) });
             continue;
         }
-        const pointer = tree.fullPtrType(declared) orelse continue;
-        const table = held(try c.facts.resolve(kind.file, pointer.ast.child_type)) orelse continue;
+        const table = pointee(declared_type) orelse continue;
         const inner = c.project.at(table.file);
         var any = false;
         for (inner.model.declarations) |entry| {
             if (entry.kind != .field or entry.scope != table.scope) continue;
             const entry_type = (inner.model.containerField(&inner.file.tree, entry.node) orelse continue).ast.type_expr.unwrap() orelse continue;
-            const proto = functionPointer(&inner.file.tree, entry_type) orelse continue;
-            try slots.append(c.allocator, .{ .holder = table, .name = entry.name, .through = true, .given = try interfaceParameters(c, table.file, proto, kind) });
+            const proto = functionPointer(try c.facts.resolve(table.file, entry_type)) orelse continue;
+            try slots.append(c.allocator, .{ .holder = table, .name = entry.name, .through = true, .given = try interfaceParameters(c, proto, kind) });
             any = true;
         }
         if (any) try slots.append(c.allocator, .{ .holder = kind, .name = decl.name, .table = true });
@@ -1656,87 +1558,90 @@ fn namesFunction(c: *Context, kinds: []const Facts.Container, node: Ast.Node.Ind
     const receiver = try c.facts.resolve(c.file, args[0]);
     for (kinds) |kind| for (try functions(c, kind)) |slot| {
         if (!isParent(receiver, slot.holder)) continue;
-        if (try namedBy(c, tree, &c.project.at(c.file).model, args[1], slot.name)) return true;
+        if (try namedBy(c, c.file, args[1], slot.name)) return true;
     };
     return false;
 }
 
-/// Whether an interface (or a pointer to one) `node` is handed only where it stays in place:
-/// to a function of a file this run checks whose parameter is a pointer to it, whose copies
-/// the contract reports there; to any other function (std's, a dependency's, the program's
-/// in a file not checked) whose body is followed and keeps it so. A part read, a function of it called on itself, is no handing.
 /// Whether `node` names the payload an `if` or a `while` captures by value from a field it reads
 /// (`if (h.f) |f|`): what that field holds.
 fn capturedField(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
-    if (tree.nodeTag(node) != .identifier) return false;
-    const index = (model.reference(node) orelse return false).declaration orelse return false;
+    const index = (try declaredIn(c, c.file, node)) orelse return false;
     const record = model.declarations[@backingInt(index)];
     if (record.kind != .capture) return false;
     const payload = if (tree.fullIf(record.node)) |branch| branch.payload_token else if (tree.fullWhile(record.node)) |loop| loop.payload_token else return false;
     if (payload != record.token) return false;
     const source = Facts.ungrouped(tree, c.facts.captureSource(c.file, record) orelse return false);
-    if (tree.nodeTag(source) != .field_access) return false;
+    if (!try memberRead(c, c.file, source)) return false;
     return switch (try c.facts.definition(c.file, source)) {
         .decl => |member| c.project.at(member.file).model.declarations[@backingInt(member.index)].kind == .field,
         .none, .unknown => false,
     };
 }
 
+/// Whether an interface (or a pointer to one) `node` is handed only where it stays in place:
+/// to a function of a file this run checks whose parameter is a pointer to it, whose copies
+/// the contract reports there; to any other function (std's, a dependency's, the program's
+/// in a file not checked) whose body is followed and keeps it so. A part read, a function of it
+/// called on itself, is no handing. Read by the use it stands in (`Facts.accesses.useOf`) and
+/// the call's arguments (`Facts.calls`).
 fn handedInPlace(c: *Context, kind: Facts.Container, value: Ast.Node.Index) Context.Error!Verdict {
     // What it keeps in its memo stays for the run.
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
     const tree = &c.project.at(c.file).file.tree;
-    const model = &c.project.at(c.file).model;
     // `&w.*`, `(w)`: the same interface handed.
     var node = value;
-    var parent = model.parentOf(node) orelse return .shown;
-    while (tree.nodeTag(parent) == .grouped_expression or tree.nodeTag(parent) == .address_of) {
-        node = parent;
-        parent = model.parentOf(node) orelse return .shown;
+    var use = try Facts.accesses.useOf(c.facts, c.file, node);
+    while (true) {
+        node = switch (use) {
+            .carried => |carry| if (carry.how == .grouped) carry.into else break,
+            .address => |taken| taken,
+            else => break,
+        };
+        use = try Facts.accesses.useOf(c.facts, c.file, node);
     }
     var decl: Facts.Decl = undefined;
     var index: usize = 0;
-    if (tree.nodeTag(parent) == .field_access) {
-        if (tree.nodeData(parent).node_and_token[0] != node) return .shown;
-        const found = switch (try c.facts.definition(c.file, parent)) {
-            .decl => |d| d,
-            // No member so named: nothing is handed.
-            .none => return .shown,
-            .unknown => return .undecided,
-        };
-        if (c.project.at(found.file).model.declarations[@backingInt(found.index)].kind != .function) return .shown;
-        var buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&buffer, model.parentOf(parent) orelse return .shown) orelse return .shown;
-        if (call.ast.fn_expr != parent) return .shown;
-        decl = found;
-    } else {
-        var buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&buffer, parent) orelse return .shown;
-        const position = std.mem.findScalar(Ast.Node.Index, call.ast.params, node) orelse return .shown;
-        index = position;
-        // Through a function field (`o.vtable.see(o, n)`, `h.f.?(h)`): no receiver is passed,
-        // and the read is judged where it is, by `readInPlace`, whatever the field may hold.
-        const callee = Facts.ungrouped(tree, call.ast.fn_expr);
-        const read = if (tree.nodeTag(callee) == .unwrap_optional) Facts.ungrouped(tree, tree.nodeData(callee).node_and_token[0]) else callee;
-        // Or through what a capture reads out of one (`if (h.f) |f| f(h)`), the same call.
-        if (try capturedField(c, read)) return .shown;
-        // A member not known is read as the callee resolves, below.
-        if (tree.nodeTag(read) == .field_access) switch (try c.facts.definition(c.file, read)) {
-            .decl => |member| if (c.project.at(member.file).model.declarations[@backingInt(member.index)].kind == .field) return .shown,
-            .none, .unknown => {},
-        };
-        if (tree.nodeTag(call.ast.fn_expr) == .field_access) switch (try c.facts.resolve(c.file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
-            .instance, .pointer, .optional => index += 1,
-            else => {},
-        };
-        // A callee that is no one function (a pointer, a choice, one not known) is not followed.
-        decl = switch (try c.facts.resolve(c.file, call.ast.fn_expr)) {
-            .function => |function| function,
-            else => return .undecided,
-        };
+    switch (use) {
+        .member => |access| {
+            const found = switch (try c.facts.definition(c.file, access)) {
+                .decl => |d| d,
+                // No member so named: nothing is handed.
+                .none => return .shown,
+                .unknown => return .undecided,
+            };
+            if (c.project.at(found.file).model.declarations[@backingInt(found.index)].kind != .function) return .shown;
+            if (try Facts.accesses.useOf(c.facts, c.file, access) != .callee) return .shown;
+            decl = found;
+        },
+        .argument => |given| {
+            const call = (try Facts.calls.at(c.facts, c.file, given.call)) orelse return .shown;
+            // Through a function field (`o.vtable.see(o, n)`, `h.f.?(h)`): no receiver is passed,
+            // and the read is judged where it is, by `readInPlace`, whatever the field may hold.
+            var read = call.callee_expr;
+            while (Facts.accesses.carriedFrom(tree, read)) |inner| read = inner;
+            // Or through what a capture reads out of one (`if (h.f) |f| f(h)`), the same call.
+            if (try capturedField(c, read)) return .shown;
+            // A member not known is read as the callee resolves, below.
+            if (try memberRead(c, c.file, read)) switch (try c.facts.definition(c.file, read)) {
+                .decl => |member| if (c.project.at(member.file).model.declarations[@backingInt(member.index)].kind == .field) return .shown,
+                .none, .unknown => {},
+            };
+            // A callee that is no one function (a pointer, a choice, one not known) is not followed.
+            decl = switch (call.callee) {
+                .function => |function| function,
+                .choice, .any => return .undecided,
+            };
+            const args = switch (call.args) {
+                .known => |known| known,
+                .unknown => return .undecided,
+            };
+            index = std.mem.findScalar(Ast.Node.Index, args, node) orelse return .shown;
+        },
+        else => return .shown,
     }
     var follow: Follow = .{ .c = c, .kind = kind, .contract = true };
     // A function of a checked file taking a pointer to it: its body is checked as this is.
@@ -1812,84 +1717,99 @@ const Source = union(enum) { any, same, list: Facts.Decl };
 
 /// Where the node `node` comes from, if it is `&c.F` of a C or out of one list: its `first` or
 /// `last`, `popFirst()` or `popLast()`, or a node's `next` or `prev` out of the same list, also
-/// through a local whose every value is one, or a capture of one.
+/// through a local whose every value is one, or a capture of one. std's members by their
+/// declarations (`stdMember`).
 fn nodeSource(c: *Context, file: Project.FileId, node: Ast.Node.Index, field: Field, list: List, tracing: ?Model.Declaration.Id, depth: usize) Context.Error!?Source {
     if (depth == 8) return null;
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
     const at = Facts.ungrouped(tree, node);
+    // `&c.F` of a C: the place it points at (`accesses.pointed`).
+    if (try Facts.accesses.pointed(c.facts, file, at)) |place| if (place != at) {
+        const path = try Facts.accesses.pathOf(c.facts, file, place);
+        if (path.steps.len < 2 or path.steps[0].kind != .field) return null;
+        if (!std.mem.eql(u8, path.steps[0].name orelse return null, field.name)) return null;
+        if (!isParent(path.steps[0].holder orelse return null, field.parent)) return null;
+        return .any;
+    };
     switch (tree.nodeTag(at)) {
-        .address_of => {
-            const operand = tree.nodeData(at).node;
-            if (tree.nodeTag(operand) != .field_access) return null;
-            if (!std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(operand).node_and_token[1])), field.name)) return null;
-            if (!isParent(try c.facts.resolve(file, tree.nodeData(operand).node_and_token[0]), field.parent)) return null;
-            return .any;
-        },
-        .unwrap_optional => return nodeSource(c, file, tree.nodeData(at).node_and_token[0], field, list, tracing, depth + 1),
-        .@"orelse" => {
-            // `x orelse return null`: the other side leaves, adding nothing; a value there is a
-            // node too.
+        // `x orelse return null`: the other side leaves, adding nothing; a value there is a
+        // node too.
+        .@"orelse", .@"catch" => {
             const value, const otherwise = tree.nodeData(at).node_and_node;
             const found = (try nodeSource(c, file, value, field, list, tracing, depth + 1)) orelse return null;
-            switch (tree.nodeTag(otherwise)) {
-                .@"return", .unreachable_literal, .@"break", .@"continue" => return found,
-                else => return joinSource(found, (try nodeSource(c, file, otherwise, field, list, tracing, depth + 1)) orelse return null),
-            }
+            if (leaves(tree, otherwise)) return found;
+            return joinSource(found, (try nodeSource(c, file, otherwise, field, list, tracing, depth + 1)) orelse return null);
         },
-        .field_access => {
-            const receiver, const member_token = tree.nodeData(at).node_and_token;
-            const member = try Model.identifier(c.allocator, tree.tokenSlice(member_token));
-            if (std.mem.eql(u8, member, "first") or std.mem.eql(u8, member, "last")) return listOf(c, file, receiver, list);
-            if (std.mem.eql(u8, member, "next") or std.mem.eql(u8, member, "prev")) {
-                const from = (try nodeSource(c, file, receiver, field, list, tracing, depth + 1)) orelse return null;
-                // A C's own node is in no list this shows.
-                return if (from == .any) null else from;
-            }
-            return null;
-        },
-        .call_one, .call_one_comma => {
-            var buffer: [1]Ast.Node.Index = undefined;
-            const call = tree.fullCall(&buffer, at).?; // unreachable: the tag is a call's
-            if (call.ast.params.len != 0 or tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
-            const receiver, const member_token = tree.nodeData(call.ast.fn_expr).node_and_token;
-            const member = try Model.identifier(c.allocator, tree.tokenSlice(member_token));
-            if (!std.mem.eql(u8, member, "popFirst") and !std.mem.eql(u8, member, "popLast")) return null;
-            return listOf(c, file, receiver, list);
-        },
-        .identifier => {
-            const index = (model.reference(at) orelse return null).declaration orelse return null;
-            if (tracing == index) return .same;
-            const decl = model.declarations[@backingInt(index)];
-            if (decl.kind == .capture) {
-                // `while (it) |n|` or `if (x) |n|`: what the condition gives.
-                const condition = if (tree.fullWhile(decl.node)) |loop| loop.ast.cond_expr else if (tree.fullIf(decl.node)) |branch| branch.ast.cond_expr else return null;
-                return nodeSource(c, file, condition, field, list, tracing, depth + 1);
-            }
-            if (decl.kind != .variable) return null;
-            const variable = tree.fullVarDecl(decl.node) orelse return null;
-            var found: ?Source = null;
-            if (variable.ast.init_node.unwrap()) |init| found = (try nodeSource(c, file, init, field, list, index, depth + 1)) orelse return null;
-            // Every later value put in it, out of the same list; its address writes it
-            // wherever that goes.
-            for (tree.nodes.items(.tag), 0..) |tag, i| {
-                if (tag == .address_of) {
-                    const operand = Facts.ungrouped(tree, tree.nodeData(@fromBackingInt(@intCast(i))).node);
-                    if (tree.nodeTag(operand) == .identifier) if (model.reference(operand)) |ref| if (ref.declaration == index) return null;
-                    continue;
-                }
-                if (tag != .assign) continue;
-                const target, const value = tree.nodeData(@fromBackingInt(@intCast(i))).node_and_node;
-                if (tree.nodeTag(target) != .identifier) continue;
-                const ref = model.reference(target) orelse continue;
-                if (ref.declaration != index) continue;
-                const next = (try nodeSource(c, file, value, field, list, index, depth + 1)) orelse return null;
-                found = joinSource(found, next) orelse return null;
-            }
-            return found;
-        },
-        else => return null,
+        else => {},
     }
+    // `x.?`, `try x`: what it carries.
+    if (Facts.accesses.carriedFrom(tree, at)) |inner| return nodeSource(c, file, inner, field, list, tracing, depth + 1);
+    // `l.popFirst()`, `l.popLast()`: a node out of the list it is called on.
+    if (try Facts.calls.at(c.facts, file, at)) |call| {
+        const callee = switch (call.callee) {
+            .function => |decl| decl,
+            .choice, .any => return null,
+        };
+        if (!try stdMember(c, callee, list, &.{ "popFirst", "popLast" }, false)) return null;
+        return switch (call.receiver) {
+            .bound => |receiver| listOf(c, file, receiver, list),
+            .none, .unknown => null,
+        };
+    }
+    // `l.first`, `l.last`: out of the list; `n.next`, `n.prev`: out of the one `n` is.
+    if (try memberRead(c, file, at)) {
+        const receiver = (try Facts.accesses.pathOf(c.facts, file, at)).steps[1].node;
+        const member = switch (try c.facts.definition(file, at)) {
+            .decl => |decl| decl,
+            .none, .unknown => return null,
+        };
+        if (try stdMember(c, member, list, &.{ "first", "last" }, false)) return listOf(c, file, receiver, list);
+        if (try stdMember(c, member, list, &.{ "next", "prev" }, true)) {
+            const from = (try nodeSource(c, file, receiver, field, list, tracing, depth + 1)) orelse return null;
+            // A C's own node is in no list this shows.
+            return if (from == .any) null else from;
+        }
+        return null;
+    }
+    const index = (try declaredIn(c, file, at)) orelse return null;
+    if (tracing == index) return .same;
+    const decl = model.declarations[@backingInt(index)];
+    if (decl.kind == .capture) {
+        // `while (it) |n|` or `if (x) |n|`: what the condition gives.
+        const condition = if (tree.fullWhile(decl.node)) |loop| loop.ast.cond_expr else if (tree.fullIf(decl.node)) |branch| branch.ast.cond_expr else return null;
+        return nodeSource(c, file, condition, field, list, tracing, depth + 1);
+    }
+    if (decl.kind != .variable) return null;
+    // Its first value, and every later one put in it whole (`Facts.accesses.writes`), out of
+    // the same list; its address writes it wherever that goes.
+    var found: ?Source = null;
+    const in_file = [_]Project.FileId{file};
+    var writes = Facts.accesses.writes(c.facts, .{ .declaration = .{ .file = file, .index = index } }, &in_file);
+    while (try writes.next()) |write| switch (write.kind) {
+        .read => {},
+        .init, .set => {
+            if (write.part) return null;
+            const value = write.value orelse return null;
+            const next = (try nodeSource(c, file, value, field, list, index, depth + 1)) orelse return null;
+            found = joinSource(found, next) orelse return null;
+        },
+        .update, .covered, .address, .open => return null,
+    };
+    return found;
+}
+
+/// Whether `decl` is one of std's `list` members `names` (of its `Node` where `node`).
+fn stdMember(c: *Context, decl: Facts.Decl, list: List, names: []const []const u8, node: bool) Context.Error!bool {
+    const type_name = switch (list) {
+        .doubly => "DoublyLinkedList",
+        .singly => "SinglyLinkedList",
+    };
+    for (names) |name| {
+        const path = try c.allocator.print("{s}{s}.{s}", .{ type_name, if (node) ".Node" else "", name });
+        if (try Governed.isStd(c, decl, path) == .yes) return true;
+    }
+    return false;
 }
 
 fn joinSource(a: ?Source, b: Source) ?Source {
@@ -1927,14 +1847,14 @@ fn listOf(c: *Context, file: Project.FileId, receiver: Ast.Node.Index, list: Lis
 /// nothing of. An insertion named any other way (`@call`, `const add = L.append`, a type's
 /// member read out), a link's address, or a `@field` that may name either, shows nothing.
 fn insertsOnlyParents(c: *Context, field: Field, list: List, source: Source) Context.Error!bool {
-    const inserts: []const []const u8 = switch (list) {
-        .doubly => &.{ "append", "prepend", "insertAfter", "insertBefore", "concatByMoving" },
-        .singly => &.{ "prepend", "insertAfter" },
+    const Insert = struct { name: []const u8, moves: bool = false };
+    const inserts: []const Insert = switch (list) {
+        .doubly => &.{ .{ .name = "append" }, .{ .name = "prepend" }, .{ .name = "insertAfter" }, .{ .name = "insertBefore" }, .{ .name = "concatByMoving", .moves = true } },
+        .singly => &.{ .{ .name = "prepend" }, .{ .name = "insertAfter" } },
     };
     const links = [_][]const u8{ "first", "last", "next", "prev" };
-    for (inserts) |method| for (try c.facts.memberUses(method)) |use| {
+    for (inserts) |insert| for (try c.facts.memberUses(insert.name)) |use| {
         const tree = &c.project.at(use.file).file.tree;
-        const model = &c.project.at(use.file).model;
         // Which it is, by its receiver's type: std's list or its node; a receiver that does
         // not resolve may be either.
         const receiver = tree.nodeData(use.node).node_and_token[0];
@@ -1945,29 +1865,35 @@ fn insertsOnlyParents(c: *Context, field: Field, list: List, source: Source) Con
             .container => return false,
             else => {},
         }
-        const outer = model.parentOf(use.node) orelse return false;
-        var buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&buffer, outer) orelse return false;
-        if (call.ast.fn_expr != use.node) return false;
-        if (std.mem.eql(u8, method, "concatByMoving")) {
+        const call_node = switch (try Facts.accesses.useOf(c.facts, use.file, use.node)) {
+            .callee => |call| call,
+            else => return false,
+        };
+        if (insert.moves) {
             if (of != .node and try mayBe(c, use.file, receiver, source)) return false;
             continue;
         }
         if (of == .list and !try mayBe(c, use.file, receiver, source)) continue;
         // The node put in: the last argument.
-        if (call.ast.params.len == 0) return false;
-        const inserted = (try nodeSource(c, use.file, call.ast.params[call.ast.params.len - 1], field, list, null, 0)) orelse return false;
+        const call = (try Facts.calls.at(c.facts, use.file, call_node)) orelse return false;
+        const args = switch (call.args) {
+            .known => |known| known,
+            .unknown => return false,
+        };
+        if (args.len < 2) return false;
+        const inserted = (try nodeSource(c, use.file, args[args.len - 1], field, list, null, 0)) orelse return false;
         if (inserted != .any) return false;
     };
     for (links) |link| for (try c.facts.memberUses(link)) |use| {
         const tree = &c.project.at(use.file).file.tree;
-        const model = &c.project.at(use.file).model;
         if ((try receiverKind(c, use.file, tree.nodeData(use.node).node_and_token[0], list)) == null) continue;
-        const parent = model.parentOf(use.node) orelse continue;
-        // A link's address writes it wherever that goes.
-        if (tree.nodeTag(parent) == .address_of) return false;
-        if (tree.nodeTag(parent) != .assign or tree.nodeData(parent).node_and_node[0] != use.node) continue;
-        const value = Facts.ungrouped(tree, tree.nodeData(parent).node_and_node[1]);
+        const store = switch (try Facts.accesses.useOf(c.facts, use.file, use.node)) {
+            // A link's address writes it wherever that goes.
+            .address => return false,
+            .written => |store| store,
+            else => continue,
+        };
+        const value = Facts.ungrouped(tree, store.value orelse return false);
         if (tree.nodeTag(value) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "null")) continue;
         const stored = (try nodeSource(c, use.file, value, field, list, null, 0)) orelse return false;
         // A C's own node anywhere; a node out of a list only into that same list's links.
@@ -1989,7 +1915,7 @@ fn insertsOnlyParents(c: *Context, field: Field, list: List, source: Source) Con
             if (args.len != 2) continue;
             if ((try receiverKind(c, each.id, args[0], list)) == null) continue;
             for (links ++ [_][]const u8{ "append", "prepend", "insertAfter", "insertBefore", "concatByMoving" }) |name| {
-                if (try namedBy(c, tree, &each.model, args[1], name)) return false;
+                if (try namedBy(c, each.id, args[1], name)) return false;
             }
         }
     }
@@ -2320,19 +2246,4 @@ fn typeFunction(c: *Context, file: Project.FileId, callee: Ast.Node.Index) Conte
     return typeKeyword(tree, proto.ast.return_type.unwrap() orelse return false);
 }
 
-/// The labeled block a `break :label value` gives its value to.
-fn labeled(tree: *const Ast, model: *const Model, jump: Ast.Node.Index) ?Ast.Node.Index {
-    const label = tree.tokenSlice(tree.nodeData(jump).opt_token_and_opt_node[0].unwrap() orelse return null);
-    var at = jump;
-    while (model.parentOf(at)) |up| : (at = up) {
-        switch (tree.nodeTag(up)) {
-            .fn_decl => return null,
-            .block, .block_semicolon, .block_two, .block_two_semicolon => {
-                const brace = tree.nodeMainToken(up);
-                if (brace >= 2 and tree.tokenTag(brace - 1) == .colon and std.mem.eql(u8, tree.tokenSlice(brace - 2), label)) return up;
-            },
-            else => {},
-        }
-    }
-    return null;
-}
+
