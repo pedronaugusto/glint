@@ -1984,16 +1984,16 @@ fn gathered(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
     const met = c.facts.open_met;
     const was_short = c.facts.short;
     const all = try gatherAt(c, file, node);
-    var held: std.ArrayList(Fact) = .empty;
-    for (all) |fact| if (!fact.differs and !fact.read) try held.append(c.allocator, fact);
-    if (c.facts.remaining == 0 or c.facts.wideSince(wide) or c.facts.open_met != met or c.facts.short != was_short) return .{ .all = all, .held = held.items };
+    var comparisons: std.ArrayList(Fact) = .empty;
+    for (all) |fact| if (!fact.differs and !fact.read) try comparisons.append(c.allocator, fact);
+    if (c.facts.remaining == 0 or c.facts.wideSince(wide) or c.facts.open_met != met or c.facts.short != was_short) return .{ .all = all, .held = comparisons.items };
     // What it keeps in its memo stays for the run.
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
-    const kept: Gathered = .{ .all = try c.allocator.dupe(Fact, all), .held = try c.allocator.dupe(Fact, held.items) };
+    const memoized: Gathered = .{ .all = try c.allocator.dupe(Fact, all), .held = try c.allocator.dupe(Fact, comparisons.items) };
     // Asked again: a walk read meanwhile may have replaced the memo (`Facts.dropMemos`).
-    try (try c.facts.memo(Gatherings)).found.put(c.allocator, key, kept);
-    return kept;
+    try (try c.facts.memo(Gatherings)).found.put(c.allocator, key, memoized);
+    return memoized;
 }
 
 fn gatherAt(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error![]const Fact {
