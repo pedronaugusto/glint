@@ -417,6 +417,8 @@ fn functionPointer(value: Facts.Value) ?Facts.Key {
     return switch (value) {
         .optional => |inner| functionPointer(inner.*),
         .pointer => |to| if (to.child.* == .fn_type) to.child.fn_type else null,
+        // A choice of types is no one function's, as a type written by a condition is not.
+        .alternatives => null,
         else => null,
     };
 }
@@ -1329,6 +1331,8 @@ fn spawnArguments(c: *Context, decl: Facts.Decl, index: usize) Context.Error!boo
         // The function the tuple's type is made by, as `spawned` reads a callee.
         const made_by = switch (try c.facts.resolve(decl.file, tuple.ast.fn_expr)) {
             .function => |made_by| made_by,
+            // A choice of functions is not std's one `ArgsTuple`.
+            .alternatives => return false,
             else => return false,
         };
         if (try Governed.isStd(c, made_by, "meta.ArgsTuple") != .yes) return false;
