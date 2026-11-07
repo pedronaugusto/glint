@@ -2186,7 +2186,6 @@ fn generic(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Erro
     return false;
 }
 
-
 /// Whether the parameter named at `token` is one of the prototype `function`'s own.
 fn parameterOf(tree: *const Ast, function: Ast.Node.Index, token: Ast.TokenIndex) bool {
     var buffer: [1]Ast.Node.Index = undefined;
