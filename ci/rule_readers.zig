@@ -86,6 +86,8 @@ const tables = [_]Allowed{
     .{ .file = "src/Token.zig", .function = "recoverShaped", .reason = "import spellings: the token-level import walk before any model exists" },
     .{ .file = "src/Token.zig", .function = "classify", .reason = "import spellings: the token-level import walk before any model exists" },
     .{ .file = "src/Governed.zig", .function = "Lookups.found", .reason = "a configured declaration path is the query, its answer a resolved declaration; program uses match by the declaration it resolves to" },
+    .{ .file = "src/Facts.zig", .function = "Analysis.named", .reason = "Zig's member lookup on an unknown holder: the name is all the holder gives, as the compiler looks it up" },
+    .{ .file = "src/Facts.zig", .function = "Analysis.Sites.by_name", .reason = "the sites a name is spelled at, an index only: each is read by resolution (reachedFromSite), none answered by its spelling" },
 };
 
 fn checkTables(context: *glint.RuleContext, list: []const Allowed) glint.RuleContext.Error!void {

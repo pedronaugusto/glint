@@ -90,7 +90,6 @@ compiled_with: std.AutoHashMapUnmanaged(Project.FileId, Files) = .empty,
 /// as one; the functions and container-level constants by name; and the budget of resolutions
 /// that reading spends, its own as a fact of the whole run.
 file_parts: std.AutoHashMapUnmanaged(Project.FileId, *const FileParts) = .empty,
-declarations_named: ?std.StringHashMapUnmanaged(std.ArrayList(Decl)) = null,
 remaining: usize = 100_000,
 /// Whether this Facts is the one building the analysis (`analysis`): it reads each declaration
 /// as one a compilation may analyze, in any reading.
@@ -2778,25 +2777,57 @@ pub fn reachedUnder(self: *Facts, env: ?*const Env, file: Project.FileId, node: 
     var at = node;
     while (model.parentOf(at)) |parent| : (at = parent) {
         if (tree.nodeTag(parent) == .fn_decl) return true;
-        if (tree.fullIf(parent)) |branch| {
-            if (branch.payload_token != null or branch.error_token != null or at == branch.ast.cond_expr) continue;
-            const taken = try self.comptimeTruth(env, file, branch.ast.cond_expr) orelse continue;
-            if (at == branch.ast.then_expr and !taken) return false;
-            if (branch.ast.else_expr.unwrap() == at and taken) return false;
-            continue;
-        }
-        if (tree.fullSwitch(parent)) |choice| {
-            if (at == choice.ast.condition) continue;
-            const taken = try self.takenProng(env, file, choice) orelse continue;
-            if (!taken.has(std.mem.findScalar(Ast.Node.Index, choice.ast.cases, at).?)) return false; // unreachable: past its condition, a switch's child is a case
-            continue;
-        }
         var buffer: [2]Ast.Node.Index = undefined;
-        const statements = tree.blockStatements(&buffer, parent) orelse continue;
+        if (tree.blockStatements(&buffer, parent)) |statements| {
+            for (statements) |statement| {
+                if (statement == at) break;
+                if (try self.leavesUnder(env, file, statement)) return false;
+            }
+        } else if (!try self.branchTaken(env, file, parent, at)) return false;
+    }
+    return true;
+}
+
+/// `reachedUnder` for every node one reading of a part reads (`reachAll`): each node decided
+/// once, by its parent's answer and the step from the parent to it, a block's statements in
+/// one pass. What `cache` holds is the reading's alone.
+fn reachedCached(self: *Facts, cache: *std.AutoHashMapUnmanaged(Ast.Node.Index, bool), env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
+    if (cache.get(node)) |known| return known;
+    const tree = &self.project.at(file).file.tree;
+    const parent = self.project.at(file).model.parentOf(node) orelse return true;
+    const reached = reached: {
+        if (tree.nodeTag(parent) == .fn_decl) break :reached true;
+        if (!try self.reachedCached(cache, env, file, parent)) break :reached false;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const statements = tree.blockStatements(&buffer, parent) orelse break :reached try self.branchTaken(env, file, parent, node);
+        // A statement after one that leaves on the reading is not reached.
+        var left = false;
         for (statements) |statement| {
-            if (statement == at) break;
-            if (try self.leavesUnder(env, file, statement)) return false;
+            try cache.put(self.gpa, statement, !left);
+            if (!left) left = try self.leavesUnder(env, file, statement);
         }
+        return cache.get(node).?; // unreachable otherwise: a block's child is a statement
+    };
+    try cache.put(self.gpa, node, reached);
+    return reached;
+}
+
+/// Whether the reading `env` binds may take the step from `parent` to its child `at`, `parent`
+/// no block: an `if` whose condition the bindings decide takes one branch, a `switch` on type
+/// information the prongs it takes (`reachedUnder`).
+fn branchTaken(self: *Facts, env: ?*const Env, file: Project.FileId, parent: Ast.Node.Index, at: Ast.Node.Index) ResolveError!bool {
+    const tree = &self.project.at(file).file.tree;
+    if (tree.fullIf(parent)) |branch| {
+        if (branch.payload_token != null or branch.error_token != null or at == branch.ast.cond_expr) return true;
+        const taken = try self.comptimeTruth(env, file, branch.ast.cond_expr) orelse return true;
+        if (at == branch.ast.then_expr) return taken;
+        if (branch.ast.else_expr.unwrap() == at) return !taken;
+        return true;
+    }
+    if (tree.fullSwitch(parent)) |choice| {
+        if (at == choice.ast.condition) return true;
+        const taken = try self.takenProng(env, file, choice) orelse return true;
+        return taken.has(std.mem.findScalar(Ast.Node.Index, choice.ast.cases, at).?); // unreachable: past its condition, a switch's child is a case
     }
     return true;
 }
@@ -3974,10 +4005,10 @@ fn storeCounts(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolve
     // `dropMemos` drops what one kept regardless.
     self.wide += 1;
     if (found.everything) return true;
-    const part = try self.partOf(file, node) orelse return true;
+    const part = try self.partOf(file, node) orelse return found.files.contains(file);
     const index = (try self.partsOf(file)).declared.get(part) orelse return switch (self.project.at(file).file.tree.nodeTag(part)) {
         .test_decl => try self.program(file),
-        else => true,
+        else => found.files.contains(file),
     };
     return found.reached.contains(.{ .file = file, .index = index });
 }
@@ -4075,6 +4106,19 @@ fn mayHoldStruct(self: *Facts, value: Value, file: Project.FileId, scope: Model.
 /// in (`every`: one binding nothing, so each instantiation's).
 pub const Analysis = struct {
     reached: std.AutoHashMapUnmanaged(Decl, Readings) = .empty,
+    /// The files Zig analyzes: the program's, std's root, and each one the walk reaches, by a
+    /// part of it read or an `@import` naming it read (`enterFile`). Only such a file's
+    /// container-level `comptime` blocks, loose parts and exported declarations are analyzed.
+    files: std.AutoHashMapUnmanaged(Project.FileId, void) = .empty,
+    /// The member names the walk met on a holder that does not resolve (`reachNamed`): Zig's
+    /// member lookup on an unknown holder. A function or container-level constant so named, in
+    /// a file Zig analyzes, may be analyzed (`lazilyAnalyzed`); the walk reads none of them.
+    named: std.StringHashMapUnmanaged(void) = .empty,
+    /// What code the walk did not read may analyze, found when a reader asks (`lazilyAnalyzed`,
+    /// `lazilyEntered`), and the sites that may name a declaration or a file (`Sites`).
+    lazy: Lazy = .{},
+    /// A reach that only records what a site names (`reachedFromSite`): no part is queued.
+    checking: bool = false,
     /// Per function, the members of containers it declares reached with no instance known:
     /// each is read in every reading of the function, those found later too.
     members: std.AutoHashMapUnmanaged(Decl, std.ArrayList(Decl)) = .empty,
@@ -4089,6 +4133,32 @@ pub const Analysis = struct {
     built: bool = false,
 
     pub const Limit = struct { file: Project.FileId, node: Ast.Node.Index, why: enum { refused, budget, reflected } };
+    pub const Lazy = struct {
+        decls: std.AutoHashMapUnmanaged(Decl, Answer) = .empty,
+        files: std.AutoHashMapUnmanaged(Project.FileId, Answer) = .empty,
+        /// What answered no while a query it depends on was still open: kept as no once the
+        /// outermost query answers no (`lazilyAnalyzed`), dropped where it answers yes.
+        provisional: std.ArrayList(LazyKey) = .empty,
+        /// What the outermost question in progress answered (`lazyQuery`).
+        answered: std.ArrayList(LazyKey) = .empty,
+        met_open: bool = false,
+        depth: usize = 0,
+        steps: usize = 0,
+        /// The steps one question may take (`lazy_steps`; a test asks with fewer).
+        limit: usize = lazy_steps,
+        sites: ?Sites = null,
+        pub const Answer = enum { open, yes, no };
+    };
+    /// Each site that may name a declaration or a file, found once over every file: by the name
+    /// it spells (an identifier, a member access, a decl literal), each `@field` (whose name may
+    /// be any), and each `@import` by the file it names, or among those naming none the program
+    /// holds.
+    pub const Sites = struct {
+        by_name: std.StringHashMapUnmanaged(std.ArrayList(Key)) = .empty,
+        reflected: std.ArrayList(Key) = .empty,
+        imports: std.AutoHashMapUnmanaged(Project.FileId, std.ArrayList(Key)) = .empty,
+        unresolved_imports: std.ArrayList(Key) = .empty,
+    };
     pub const Readings = struct { every: bool = false, envs: std.ArrayList(*const Env) = .empty };
 };
 
@@ -4111,12 +4181,14 @@ const reading_limit = 64;
 const reading_budget = 100_000;
 
 /// What a compilation of the program analyzes, found once. The roots are every function and
-/// container-level constant of the program's files, each exported declaration, each file's
-/// container-level `comptime` blocks and loose parts, and the program's tests. From each part
+/// container-level constant of the program's files and the program's tests; of each file Zig
+/// analyzes (`Analysis.files`: the program's, std's root, one the walk reaches), each exported
+/// declaration, its container-level `comptime` blocks and its loose parts. From each part
 /// read, in the reading it is reached in: a call reaches its callee in the reading it makes
 /// (`calls.under`, `readingAt`); a name, a member, a decl literal or an `@field` naming a
-/// function or a container-level constant reaches it (no binding); one whose holder does not
-/// resolve reaches every declaration so named; an `@field` of a value names a field, of a type
+/// function or a container-level constant reaches it (no binding); a member of a holder that
+/// does not resolve is named (`Analysis.named`), what it may be found when a reader asks
+/// (`lazilyAnalyzed`); an `@field` of a value names a field, of a type
 /// whose name is not known each of its declarations, and with neither known anything.
 pub fn analysis(self: *Facts) ResolveError!*const Analysis {
     const found = try self.memo(Analysis);
@@ -4171,27 +4243,24 @@ fn reachAll(self: *Facts, found: *Analysis) ResolveError!void {
             found.everything = true;
             continue;
         }
-        const file = source.id;
-        const own = try self.program(file);
-        const model = &source.model;
-        for (model.declarations, 0..) |record, d| {
-            if (!own and !record.exported) continue;
-            const decl: Decl = .{ .file = file, .index = @fromBackingInt(@intCast(d)) };
-            // An instantiated one is read in the instantiations the walk reaches it in; one a
-            // consumer may instantiate (the program's public one), in each.
-            if (!self.instantiated(decl) or (own and record.public)) try self.reachDeclaration(found, &next, decl, null);
-        }
-        const tree = &source.file.tree;
-        var parts = (try self.partsOf(file)).nodes.keyIterator();
-        while (parts.next()) |part| {
-            const loose = part.* == .root;
-            if (loose or tree.nodeTag(part.*) == .@"comptime" or (own and tree.nodeTag(part.*) == .test_decl)) try next.append(self.gpa, .{ .file = file, .part = part.*, .env = null });
-        }
+        if (try self.program(source.id)) try self.enterFile(found, &next, source.id);
     }
+    // Every compilation analyzes std's root, which reaches `start` (`comptime { _ = start; }`).
+    for (self.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, "std")) try self.enterFile(found, &next, mapping.target);
     // Each reading is a unit on a budget of its own; what it reads is memoized for the others.
+    var cache: std.AutoHashMapUnmanaged(Ast.Node.Index, bool) = .empty;
+    defer cache.deinit(self.gpa);
     while (next.pop()) |reading| {
+        // A part of a file read: the file's container is analyzed, so its own roots are.
+        try self.enterFile(found, &next, reading.file);
+        // A reading queued before its declaration came to be read binding nothing (`every`)
+        // is one that reading covers, as `readDeclaration` makes no new one past it.
+        if (reading.env != null) if ((try self.partsOf(reading.file)).declared.get(reading.part)) |d| {
+            if (found.reached.get(.{ .file = reading.file, .index = d })) |readings| if (readings.every) continue;
+        };
+        cache.clearRetainingCapacity();
         const asker = self.enter(reading_budget);
-        const read = self.readPart(found, &next, reading);
+        const read = self.readPart(found, &next, &cache, reading);
         const short = self.leave(asker);
         try read;
         if (!short) continue;
@@ -4200,15 +4269,52 @@ fn reachAll(self: *Facts, found: *Analysis) ResolveError!void {
     }
 }
 
-/// Reads one part in its reading (`reachAll`).
-fn readPart(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), reading: PartRead) ResolveError!void {
+/// Reads one part in its reading (`reachAll`), `cache` the reading's reachability (`reachedCached`).
+fn readPart(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), cache: *std.AutoHashMapUnmanaged(Ast.Node.Index, bool), reading: PartRead) ResolveError!void {
     const nodes = (try self.partsOf(reading.file)).nodes.get(reading.part) orelse return;
     for (nodes.items) |node| {
         // A branch the reading's bindings rule out is not analyzed in it (`.array`
         // of a `switch (@typeInfo(T))` reading a pointer `T`).
-        if (!try self.reachedUnder(reading.env, reading.file, node)) continue;
+        if (!try self.reachedCached(cache, reading.env, reading.file, node)) continue;
         try self.reachFrom(found, next, reading.file, node, reading.env);
     }
+}
+
+/// Queues the roots of a file Zig analyzes, once (`Analysis.files`): of the program's, every
+/// function and container-level constant and each test; of any, each exported declaration,
+/// its container-level `comptime` blocks and its loose parts. A file no compilation imports is
+/// never analyzed, nor anything in it.
+fn enterFile(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), file: Project.FileId) ResolveError!void {
+    const source = self.project.at(file);
+    if (source.file.status != .parsed or source.file.tree.mode != .zig) return;
+    const entry = try found.files.getOrPut(self.gpa, file);
+    if (entry.found_existing or found.checking) return;
+    const own = try self.program(file);
+    const model = &source.model;
+    for (model.declarations, 0..) |record, d| {
+        if (!own and !record.exported) continue;
+        const decl: Decl = .{ .file = file, .index = @fromBackingInt(@intCast(d)) };
+        // An instantiated one is read in the instantiations the walk reaches it in; one a
+        // consumer may instantiate (the program's public one), in each.
+        if (!self.instantiated(decl) or (own and record.public)) try self.reachDeclaration(found, next, decl, null);
+    }
+    const tree = &source.file.tree;
+    var parts = (try self.partsOf(file)).nodes.keyIterator();
+    while (parts.next()) |part| {
+        const loose = part.* == .root;
+        if (loose or tree.nodeTag(part.*) == .@"comptime" or (own and tree.nodeTag(part.*) == .test_decl)) try next.append(self.gpa, .{ .file = file, .part = part.*, .env = null });
+    }
+}
+
+/// Whether a file's container-level `comptime` blocks and loose parts are analyzed: the walk
+/// entered it (`enterFile`), or anything may be analyzed.
+fn fileAnalyzed(self: *Facts, file: Project.FileId) ResolveError!bool {
+    if (self.building_analysis) {
+        self.wide += 1;
+        return true;
+    }
+    const found = try self.builtAnalysis();
+    return found.everything or found.files.contains(file) or try self.lazilyEntered(found, file);
 }
 
 /// Whether an answer wider than the analysis gives once built was given since `mark` (`wide`, read
@@ -4223,18 +4329,18 @@ pub fn analyzed(self: *Facts, decl: Decl) ResolveError!bool {
         self.wide += 1;
         return true;
     }
-    const found = try self.analysis();
-    return found.everything or found.reached.contains(decl);
+    const found = try self.builtAnalysis();
+    return found.everything or found.reached.contains(decl) or try self.lazilyAnalyzed(found, decl);
 }
 
 /// Whether the part of a file holding `node` is analyzed: its function's or constant's
-/// declaration is; a `comptime` block or a loose part of a file is; a test is in the program's
-/// files.
+/// declaration is; a `comptime` block or a loose part of a file the walk entered is
+/// (`fileAnalyzed`); a test is in the program's files.
 pub fn analyzedAt(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
-    const part = try self.partOf(file, node) orelse return true;
+    const part = try self.partOf(file, node) orelse return self.fileAnalyzed(file);
     const d = (try self.partsOf(file)).declared.get(part) orelse return switch (self.project.at(file).file.tree.nodeTag(part)) {
         .test_decl => try self.program(file),
-        else => true,
+        else => try self.fileAnalyzed(file),
     };
     return self.analyzed(.{ .file = file, .index = d });
 }
@@ -4246,10 +4352,319 @@ pub fn analyzedReadings(self: *Facts, decl: Decl) ResolveError!?[]const *const E
         self.wide += 1;
         return null;
     }
-    const found = try self.analysis();
+    const found = try self.builtAnalysis();
     if (found.everything) return null;
+    // Code the walk did not read reads it binding nothing, as each instantiation's; a member of
+    // a container a function declares, in each reading of that function.
+    if (try self.lazilyAnalyzed(found, decl)) return self.lazyReadings(found, decl);
     const readings = found.reached.get(decl) orelse return &.{};
     return if (readings.every) null else readings.envs.items;
+}
+
+/// The analysis once built (`analysis`), which keeps the answers its readers' questions of code
+/// the walk did not read find (`Analysis.lazy`).
+fn builtAnalysis(self: *Facts) ResolveError!*Analysis {
+    _ = try self.analysis();
+    return self.memo(Analysis);
+}
+
+/// Most steps one reader's question of code the walk did not read takes (`lazilyAnalyzed`):
+/// past them, the answer is that it may be analyzed.
+const lazy_steps = 200_000;
+
+/// Whether code the walk did not read may analyze `decl` (`analysis` reaches only by
+/// declaration): Zig's lazy analysis asked backwards, its least fixpoint. A function or
+/// container-level constant is, in a file Zig analyzes (`lazilyEntered`), where the walk met a
+/// member of an unknown holder spelled as its name (`Analysis.named`), where it is exported from
+/// a file the walk did not enter, or where a site that may name it (`Sites`) lies in code the
+/// walk did not read that is analyzed, read binding nothing (`reachedFromSite`). A cycle no root
+/// reaches is analyzed nowhere, as in Zig. Past `lazy_steps`, it may be.
+fn lazilyAnalyzed(self: *Facts, found: *Analysis, decl: Decl) ResolveError!bool {
+    const lazy = &found.lazy;
+    if (lazy.decls.get(decl)) |known| switch (known) {
+        .yes => return true,
+        .no => return false,
+        .open => {
+            lazy.met_open = true;
+            return false;
+        },
+    };
+    return self.lazyQuery(found, .{ .decl = decl });
+}
+
+/// Whether code the walk did not read imports `file` (`lazilyAnalyzed`): an `@import` naming it
+/// in such code that is analyzed, or one naming no file the program holds in analyzed code.
+fn lazilyEntered(self: *Facts, found: *Analysis, file: Project.FileId) ResolveError!bool {
+    const lazy = &found.lazy;
+    if (lazy.files.get(file)) |known| switch (known) {
+        .yes => return true,
+        .no => return false,
+        .open => {
+            lazy.met_open = true;
+            return false;
+        },
+    };
+    return self.lazyQuery(found, .{ .file = file });
+}
+
+const LazyKey = union(enum) { decl: Decl, file: Project.FileId };
+
+/// One question of `lazilyAnalyzed` or `lazilyEntered`. The outermost is a unit of its own, as
+/// each reading of the walk is (`enter`): the reader asking is charged nothing for it, and where
+/// it runs short of its budget, what it answered no is dropped and its answer is that it may be.
+fn lazyQuery(self: *Facts, found: *Analysis, key: LazyKey) ResolveError!bool {
+    const lazy = &found.lazy;
+    if (lazy.depth != 0) return self.lazyAsk(found, key, false);
+    lazy.steps = 0;
+    lazy.answered.clearRetainingCapacity();
+    const asker = self.enter(reading_budget);
+    const inner = self.lazyAsk(found, key, true);
+    const short = self.leave(asker);
+    const yes = try inner;
+    if (!short) return yes;
+    for (lazy.answered.items) |each| switch (each) {
+        .decl => |d| if (lazy.decls.get(d) == .no) {
+            _ = lazy.decls.remove(d);
+        },
+        .file => |f| if (lazy.files.get(f) == .no) {
+            _ = lazy.files.remove(f);
+        },
+    };
+    switch (key) {
+        .decl => |d| try lazy.decls.put(self.gpa, d, .yes),
+        .file => |f| try lazy.files.put(self.gpa, f, .yes),
+    }
+    return true;
+}
+
+/// `lazyQuery`'s question, kept: yes always, no once nothing it read was open, or once the
+/// outermost question answers no (what it read then reaches no root).
+fn lazyAsk(self: *Facts, found: *Analysis, key: LazyKey, outermost: bool) ResolveError!bool {
+    const lazy = &found.lazy;
+    switch (key) {
+        .decl => |d| try lazy.decls.put(self.gpa, d, .open),
+        .file => |f| try lazy.files.put(self.gpa, f, .open),
+    }
+    const met_before = lazy.met_open;
+    lazy.met_open = false;
+    lazy.depth += 1;
+    const answer = switch (key) {
+        .decl => |d| self.lazyDecl(found, d),
+        .file => |f| self.lazyFile(found, f),
+    };
+    lazy.depth -= 1;
+    const yes = answer catch |err| {
+        switch (key) {
+            .decl => |d| _ = lazy.decls.remove(d),
+            .file => |f| _ = lazy.files.remove(f),
+        }
+        return err;
+    };
+    const met = lazy.met_open;
+    lazy.met_open = met_before or met;
+    const kept: Analysis.Lazy.Answer = if (yes) .yes else .no;
+    switch (key) {
+        .decl => |d| try lazy.decls.put(self.gpa, d, kept),
+        .file => |f| try lazy.files.put(self.gpa, f, kept),
+    }
+    try lazy.answered.append(self.gpa, key);
+    if (!yes and met and !outermost) try lazy.provisional.append(self.gpa, key);
+    if (outermost) {
+        // A no read while a question was open stands only where the outermost one is no.
+        if (yes) for (lazy.provisional.items) |held| switch (held) {
+            .decl => |d| _ = lazy.decls.remove(d),
+            .file => |f| _ = lazy.files.remove(f),
+        };
+        lazy.provisional.clearRetainingCapacity();
+        lazy.met_open = false;
+    }
+    return yes;
+}
+
+/// `lazilyAnalyzed`'s reading of one declaration.
+fn lazyDecl(self: *Facts, found: *Analysis, decl: Decl) ResolveError!bool {
+    const model = &self.project.at(decl.file).model;
+    const record = model.declarations[@backingInt(decl.index)];
+    if (record.kind != .function and record.kind != .variable) return false;
+    const part = try self.partOf(decl.file, record.node) orelse return false;
+    if ((try self.partsOf(decl.file)).declared.get(part) != decl.index) return false;
+    if (!found.files.contains(decl.file) and !try self.lazilyEntered(found, decl.file)) return false;
+    // A member of a container a function declares exists only in that function's instances
+    // (`reachDeclaration`): analyzed where the function is, in its readings.
+    if (self.instantiated(decl)) if (self.enclosingFunction(decl)) |outer| {
+        if (!found.reached.contains(outer) and !try self.lazilyAnalyzed(found, outer)) return false;
+    };
+    if (found.named.contains(record.name)) return true;
+    if (record.exported and !found.files.contains(decl.file)) return true;
+    const sites = try self.lazySites(found);
+    for ([_][]const Key{ if (sites.by_name.get(record.name)) |list| list.items else &.{}, sites.reflected.items }) |each| for (each) |site| {
+        if (try self.lazyStep(found)) return true;
+        if (!try self.lazilyRead(found, site)) continue;
+        if (try self.reachedFromSite(found, site, decl)) return true;
+    };
+    return false;
+}
+
+/// `lazilyEntered`'s reading of one file.
+fn lazyFile(self: *Facts, found: *Analysis, file: Project.FileId) ResolveError!bool {
+    if (self.project.at(file).file.status != .parsed) return false;
+    const sites = try self.lazySites(found);
+    for ((sites.imports.get(file) orelse return self.importsUnresolved(found, sites)).items) |site| {
+        if (try self.lazyStep(found)) return true;
+        // An import the walk read entered its file already: one it did not, read lazily.
+        if (try self.lazilyRead(found, site)) return true;
+    }
+    return self.importsUnresolved(found, sites);
+}
+
+/// Whether analyzed code holds an `@import` naming no file the program holds, which may be any
+/// (`lazilyEntered`): code the walk read, or code it did not that is analyzed.
+fn importsUnresolved(self: *Facts, found: *Analysis, sites: *const Analysis.Sites) ResolveError!bool {
+    for (sites.unresolved_imports.items) |site| {
+        if (try self.lazyStep(found)) return true;
+        const part = try self.partOf(site.file, site.node) orelse {
+            if (found.files.contains(site.file) or try self.lazilyEntered(found, site.file)) return true;
+            continue;
+        };
+        if ((try self.partsOf(site.file)).declared.get(part)) |d| {
+            if (found.reached.contains(.{ .file = site.file, .index = d })) return true;
+        } else if (found.files.contains(site.file)) return true;
+        if (try self.lazilyRead(found, site)) return true;
+    }
+    return false;
+}
+
+/// Counts a step of a reader's question (`lazy_steps`): true past them, it may be analyzed.
+fn lazyStep(self: *Facts, found: *Analysis) ResolveError!bool {
+    _ = self;
+    found.lazy.steps += 1;
+    return found.lazy.steps > found.lazy.limit;
+}
+
+/// Whether `site` lies in code the walk did not read that is analyzed: a part whose declaration
+/// the walk read in no reading binding nothing, analyzed lazily (`lazilyAnalyzed`); a file's
+/// loose part or `comptime` block where the walk did not enter the file but code it did not read
+/// imports it. A test is the program's, read by the walk.
+fn lazilyRead(self: *Facts, found: *Analysis, site: Key) ResolveError!bool {
+    const part = try self.partOf(site.file, site.node) orelse return !found.files.contains(site.file) and try self.lazilyEntered(found, site.file);
+    const d = (try self.partsOf(site.file)).declared.get(part) orelse return switch (self.project.at(site.file).file.tree.nodeTag(part)) {
+        .test_decl => false,
+        else => !found.files.contains(site.file) and try self.lazilyEntered(found, site.file),
+    };
+    const decl: Decl = .{ .file = site.file, .index = d };
+    if (found.reached.get(decl)) |readings| if (readings.every) return false;
+    return self.lazilyAnalyzed(found, decl);
+}
+
+/// The readings code the walk did not read analyzes `decl` in, where it may (`lazilyAnalyzed`):
+/// a member of a container a function declares, each reading of that function, where the walk
+/// read the function in each it has (code it did not read analyzes the function nowhere, so
+/// makes no other instance); otherwise null, each one's (binding nothing).
+fn lazyReadings(self: *Facts, found: *Analysis, decl: Decl) ResolveError!?[]const *const Env {
+    if (!self.instantiated(decl)) return null;
+    const outer = self.enclosingFunction(decl) orelse return null;
+    const readings = found.reached.get(outer) orelse return null;
+    if (readings.every or try self.lazilyAnalyzed(found, outer)) return null;
+    return readings.envs.items;
+}
+
+/// Whether what `site` names, read in the readings code the walk did not read analyzes its part
+/// in (`lazyReadings`), may be `decl`: a reach of it by declaration, or a member of an unknown
+/// holder spelled as its name, as the walk reads the site (`reachFrom`) and the call the site
+/// is the callee of, recording what it reaches only.
+fn reachedFromSite(self: *Facts, found: *Analysis, site: Key, decl: Decl) ResolveError!bool {
+    const envs: ?[]const *const Env = if (try self.partOf(site.file, site.node)) |part| if ((try self.partsOf(site.file)).declared.get(part)) |d| try self.lazyReadings(found, .{ .file = site.file, .index = d }) else null else null;
+    var check: Analysis = .{ .checking = true };
+    var next: std.ArrayList(PartRead) = .empty;
+    // A unit of its own (`enter`): the reader asking is charged nothing for it.
+    const asker = self.enter(reading_budget);
+    const read = if (envs) |each| self.readSiteIn(&check, &next, site, each) else self.readSite(&check, &next, site, null);
+    if (self.leave(asker)) return true;
+    if (!try read) return false;
+    if (check.everything or check.reached.contains(decl)) return true;
+    const record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+    return check.named.contains(record.name);
+}
+
+/// `readSite` in each of `envs`: false where none reaches the site.
+fn readSiteIn(self: *Facts, check: *Analysis, next: *std.ArrayList(PartRead), site: Key, envs: []const *const Env) ResolveError!bool {
+    var any = false;
+    for (envs) |env| {
+        if (try self.readSite(check, next, site, env)) any = true;
+    }
+    return any;
+}
+
+/// Reads one site and the call it is the callee of in `env` (`reachedFromSite`).
+/// False where the reading does not reach the site (`reachedUnder`).
+fn readSite(self: *Facts, check: *Analysis, next: *std.ArrayList(PartRead), site: Key, env: ?*const Env) ResolveError!bool {
+    if (!try self.reachedUnder(env, site.file, site.node)) return false;
+    try self.reachFrom(check, next, site.file, site.node, env);
+    const model = &self.project.at(site.file).model;
+    var at = site.node;
+    var parent = model.parentOf(at) orelse return true;
+    if (self.project.at(site.file).file.tree.nodeTag(parent) == .deref) {
+        at = parent;
+        parent = model.parentOf(at) orelse return true;
+    }
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = self.project.at(site.file).file.tree.fullCall(&buffer, parent) orelse return true;
+    if (call.ast.fn_expr == at) try self.reachFrom(check, next, site.file, parent, env);
+    return true;
+}
+
+/// The sites of every file (`Analysis.Sites`), found once.
+fn lazySites(self: *Facts, found: *Analysis) ResolveError!*const Analysis.Sites {
+    if (found.lazy.sites) |*known| return known;
+    var sites: Analysis.Sites = .{};
+    for (self.project.sources) |*source| {
+        if (source.file.status != .parsed or source.file.tree.mode != .zig) continue;
+        const tree = &source.file.tree;
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            const spelled: Ast.TokenIndex = switch (tag) {
+                .identifier, .enum_literal => tree.nodeMainToken(node),
+                .field_access => tree.nodeData(node).node_and_token[1],
+                .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+                    const builtin_name = tree.tokenSlice(tree.nodeMainToken(node));
+                    if (std.mem.eql(u8, builtin_name, "@field")) try sites.reflected.append(self.gpa, .{ .file = source.id, .node = node });
+                    if (std.mem.eql(u8, builtin_name, "@import")) try self.importSite(&sites, source.id, node);
+                    continue;
+                },
+                else => continue,
+            };
+            const entry = try sites.by_name.getOrPut(self.gpa, try self.memberName(tree.tokenSlice(spelled)));
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            try entry.value_ptr.append(self.gpa, .{ .file = source.id, .node = node });
+        }
+    }
+    found.lazy.sites = sites;
+    return &found.lazy.sites.?;
+}
+
+/// Files an `@import` site names (`lazySites`): each the project maps it to, or none it holds
+/// (one Zig's own build makes, `builtin` or `root`, names none of the program's).
+fn importSite(self: *Facts, sites: *Analysis.Sites, file: Project.FileId, node: Ast.Node.Index) ResolveError!void {
+    const tree = &self.project.at(file).file.tree;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = builtinArgs(tree, node, &buffer);
+    const site: Key = .{ .file = file, .node = node };
+    if (args.len != 1 or tree.nodeTag(args[0]) != .string_literal) return sites.unresolved_imports.append(self.gpa, site);
+    const spelling = std.zig.string_literal.parseAlloc(self.gpa, tree.tokenSlice(tree.nodeMainToken(args[0]))) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidLiteral => return sites.unresolved_imports.append(self.gpa, site),
+    };
+    var reached: [2]Project.FileId = undefined;
+    const targets = self.project.importedAll(file, spelling, &reached);
+    if (targets.len == 0) {
+        if (self.project.absent(file, spelling) or try self.zigOwn(file, spelling)) return;
+        return sites.unresolved_imports.append(self.gpa, site);
+    }
+    for (targets) |target| {
+        const entry = try sites.imports.getOrPut(self.gpa, target);
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        try entry.value_ptr.append(self.gpa, site);
+    }
 }
 
 /// Reaches a function or a container-level constant in `env`, queueing its part to be read in
@@ -4261,6 +4676,10 @@ fn reachDeclaration(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRea
     const part = try self.partOf(decl.file, record.node) orelse return;
     // Only a part's own declaration: a local reaches nothing beyond its function.
     if ((try self.partsOf(decl.file)).declared.get(part) != decl.index) return;
+    if (found.checking) {
+        _ = try found.reached.getOrPut(self.gpa, decl);
+        return;
+    }
     // A member of a container a function declares, reached with no instance known, generic
     // itself or not: read in each reading of that function, the ones it is reached in later
     // too, its own comptime parameters unbound there; none while nothing reaches the function,
@@ -4360,9 +4779,21 @@ fn reachFrom(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), fil
             }
         },
         .builtin_call_two, .builtin_call_two_comma => {
-            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) return;
             var buffer: [2]Ast.Node.Index = undefined;
             const args = builtinArgs(tree, node, &buffer);
+            // An import read analyzes the file it names, either one where two compilations
+            // bind the name apart.
+            if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import")) {
+                if (args.len != 1 or tree.nodeTag(args[0]) != .string_literal) return;
+                const spelling = std.zig.string_literal.parseAlloc(self.gpa, tree.tokenSlice(tree.nodeMainToken(args[0]))) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvalidLiteral => return,
+                };
+                var reached: [2]Project.FileId = undefined;
+                for (self.project.importedAll(file, spelling, &reached)) |target| try self.enterFile(found, next, target);
+                return;
+            }
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) return;
             if (args.len != 2) return;
             try self.reachReflected(found, next, file, node, args[0], args[1], env);
         },
@@ -4482,7 +4913,9 @@ fn reachMember(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), h
         .pointer => |p| try self.reachMember(found, next, p.child.*, name, env, is_callee),
         .optional => |inner| try self.reachMember(found, next, inner.*, name, env, is_callee),
         .alternatives => |each| for (each) |one| try self.reachMember(found, next, one, name, env, is_callee),
-        .unknown => try self.reachNamed(found, next, name),
+        // Zig's own per-build file (`builtin`, `root`) holds values and none of the program's
+        // types: a member of it not called is a field. A method called on one may be std's.
+        .unknown => |why| if (is_callee or why != .zig_own) try self.reachNamed(found, next, name),
         else => {},
     }
 }
@@ -5035,20 +5468,12 @@ fn fieldNames(self: *Facts, container: Container) []const []const u8 {
     return names.items;
 }
 
-/// Reaches every function and container-level constant named `name`.
+/// Records a member name met on a holder that does not resolve (`Analysis.named`): Zig's member
+/// lookup with the holder unknown, which may name any function or container-level constant so
+/// named. The walk reads none of them; a reader's query does (`lazilyAnalyzed`).
 fn reachNamed(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), name: []const u8) ResolveError!void {
-    if (self.declarations_named == null) {
-        var index: std.StringHashMapUnmanaged(std.ArrayList(Decl)) = .empty;
-        for (self.project.sources) |*source| for (source.model.declarations, 0..) |record, d| {
-            if (record.kind != .function and record.kind != .variable) continue;
-            const entry = try index.getOrPut(self.gpa, record.name);
-            if (!entry.found_existing) entry.value_ptr.* = .empty;
-            try entry.value_ptr.append(self.gpa, .{ .file = source.id, .index = @fromBackingInt(@intCast(d)) });
-        };
-        self.declarations_named = index;
-    }
-    const decls = self.declarations_named.?.get(name) orelse return;
-    for (decls.items) |decl| try self.reachDeclaration(found, next, decl, null);
+    _ = next;
+    try found.named.put(self.gpa, name, {});
 }
 
 /// The part of a file Zig analyzes as one that holds `node`: its function (`fn_decl`, or an
@@ -9827,6 +10252,9 @@ fn calledOutside(self: *Facts, name: []const u8) ResolveError!bool {
         found.built = true;
         for (self.project.sources) |*source| {
             if (source.file.status != .parsed or try self.program(source.id)) continue;
+            // A file no compilation analyzes calls nothing (`fileAnalyzed`): no part of it is
+            // read unless the walk entered it.
+            if (!try self.fileAnalyzed(source.id)) continue;
             const tree = &source.file.tree;
             for (tree.nodes.items(.tag), 0..) |tag, i| {
                 const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
@@ -16810,4 +17238,210 @@ test "a guard on a value the program fixes prunes per binding: `comptime kind(T)
     try std.testing.expectEqual(@as(?Comptime, null), try facts.comptimeValue(null, file, node.of(tree, "x orelse null")));
     try std.testing.expectEqual(@as(?bool, null), try facts.knownBool(file, node.of(tree, "maybe(k) != null")));
     try std.testing.expect(try facts.reachedUnder(null, file, node.of(tree, "emitScalar(k)")));
+}
+
+/// The function or container-level constant `name` of the project's `source`th file, for the
+/// tests of what code the walk did not read analyzes (`lazilyAnalyzed`).
+fn testDecl(project: *const Project, source: usize, name: []const u8) Decl {
+    const model = &project.sources[source].model;
+    for (model.declarations, 0..) |d, i| if (std.mem.eql(u8, d.name, name) and (d.kind == .function or d.kind == .variable)) return .{ .file = project.sources[source].id, .index = @fromBackingInt(@intCast(i)) };
+    unreachable; // unreachable: the source declares each name asked
+}
+
+test "code the walk did not read is analyzed where a site that may name it lies in analyzed code: a name, a member, a decl literal, an @field of a type, an export or a comptime block of a file it imports; a cycle no root reaches is analyzed nowhere" {
+    const root =
+        \\const std = @import("std");
+        \\const missing = @import("missing");
+        \\pub fn main() void {
+        \\    missing.T.viaName();
+        \\}
+    ;
+    const library =
+        \\const missing = @import("missing");
+        \\const Kind = struct {
+        \\    tag: u8,
+        \\    pub const default: Kind = .{ .tag = 0 };
+        \\    pub fn make() Kind {
+        \\        return .{ .tag = 1 };
+        \\    }
+        \\};
+        \\pub const Holder = struct {
+        \\    pub fn first() void {}
+        \\    pub fn second() void {}
+        \\};
+        \\pub const Kept = struct {
+        \\    pub fn kept() void {}
+        \\};
+        \\pub fn viaName() void {
+        \\    idTarget();
+        \\    Kept.kept();
+        \\    const k: Kind = .default;
+        \\    const m: Kind = .make();
+        \\    _ = .{ k, m };
+        \\    inline for (@typeInfo(Holder).@"struct".decls) |d| _ = @field(Holder, d.name);
+        \\    missing.U.viaMember();
+        \\    _ = @import("other.zig").from_other;
+        \\    liveJ();
+        \\}
+        \\fn idTarget() void {}
+        \\fn deadCaller() void {
+        \\    deadTarget();
+        \\    _ = @import("dead.zig");
+        \\}
+        \\fn deadTarget() void {}
+        \\fn cycA() void {
+        \\    cycB();
+        \\}
+        \\fn cycB() void {
+        \\    cycA();
+        \\}
+        \\fn liveH() void {
+        \\    liveI();
+        \\}
+        \\fn liveI() void {
+        \\    liveH();
+        \\}
+        \\fn liveJ() void {
+        \\    liveH();
+        \\}
+    ;
+    const other =
+        \\pub const from_other = 1;
+        \\pub fn viaMember() void {}
+        \\export fn exported() void {}
+        \\comptime {
+        \\    _ = comptimeTarget;
+        \\}
+        \\fn comptimeTarget() void {}
+        \\fn otherUnused() void {}
+    ;
+    const dead_file =
+        \\export fn deadExport() void {}
+        \\comptime {
+        \\    _ = deadComptime;
+        \\}
+        \\fn deadComptime() void {}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{
+        .{ .name = "root", .bytes = root, .absent = &.{"missing"} },
+        .{ .name = "std/std.zig", .bytes = library, .selected = false, .absent = &.{"missing"} },
+        .{ .name = "std/other.zig", .bytes = other, .selected = false },
+        .{ .name = "std/dead.zig", .bytes = dead_file, .selected = false },
+    }, &.{
+        .{ .from = 0, .spelling = "std", .target = 1 },
+        .{ .from = 1, .spelling = "other.zig", .target = 2 },
+        .{ .from = 1, .spelling = "dead.zig", .target = 3 },
+    }, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const found = try facts.analysis();
+    try std.testing.expect(!found.everything);
+    try std.testing.expectEqual(0, found.limits.items.len);
+    // The walk reaches none of std's: `missing.T.viaName()` names `viaName` on an unknown
+    // holder (Zig's member lookup), and a reader's question finds the rest backwards.
+    try std.testing.expect(!found.reached.contains(testDecl(&project, 1, "idTarget")));
+    // The cycle first: `liveH`'s site in `liveI` reads `liveI` while `liveH` is open (no, held),
+    // then its site in `liveJ`, which `viaName` calls: yes, and `liveI` is asked again.
+    try std.testing.expect(try facts.analyzed(testDecl(&project, 1, "liveH")));
+    try std.testing.expect(try facts.analyzed(testDecl(&project, 1, "liveI")));
+    try std.testing.expect(try facts.analyzed(testDecl(&project, 1, "liveJ")));
+    try std.testing.expect(!try facts.analyzed(testDecl(&project, 1, "cycA")));
+    try std.testing.expect(!try facts.analyzed(testDecl(&project, 1, "cycB")));
+    for ([_]struct { usize, []const u8 }{
+        .{ 1, "viaName" }, // a member of an unknown holder the walk met
+        .{ 1, "idTarget" }, // a name
+        .{ 1, "kept" }, // a member of a type
+        .{ 1, "default" }, // a decl literal
+        .{ 1, "make" }, // a decl literal called
+        .{ 1, "first" }, // @field of a type, its name computed: each declaration
+        .{ 1, "second" },
+        .{ 2, "viaMember" }, // a member of an unknown holder in code read lazily
+        .{ 2, "exported" }, // an export of a file an import read lazily enters
+        .{ 2, "comptimeTarget" }, // a name in that file's comptime block
+    }) |each| {
+        errdefer std.debug.print("not analyzed: {s}\n", .{each[1]});
+        try std.testing.expect(try facts.analyzed(testDecl(&project, each[0], each[1])));
+    }
+    for ([_]struct { usize, []const u8 }{
+        .{ 1, "deadCaller" },
+        .{ 1, "deadTarget" },
+        .{ 2, "otherUnused" },
+        .{ 3, "deadExport" }, // a file only code nothing analyzes imports
+        .{ 3, "deadComptime" },
+    }) |each| {
+        errdefer std.debug.print("analyzed: {s}\n", .{each[1]});
+        try std.testing.expect(!try facts.analyzed(testDecl(&project, each[0], each[1])));
+    }
+    try std.testing.expect(try facts.fileAnalyzed(project.sources[2].id));
+    try std.testing.expect(!try facts.fileAnalyzed(project.sources[3].id));
+}
+
+test "an @field whose name is computed of a holder that does not resolve, in code read lazily, may name every declaration: each is analyzed" {
+    const root =
+        \\const std = @import("std");
+        \\const missing = @import("missing");
+        \\pub fn main() void {
+        \\    missing.T.viaName();
+        \\}
+    ;
+    const library =
+        \\const missing = @import("missing");
+        \\pub fn viaName() void {
+        \\    inline for (@typeInfo(missing.T).@"struct".decls) |d| _ = @field(missing.T, d.name);
+        \\}
+        \\fn anyDecl() void {}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{
+        .{ .name = "root", .bytes = root, .absent = &.{"missing"} },
+        .{ .name = "std/std.zig", .bytes = library, .selected = false, .absent = &.{"missing"} },
+    }, &.{.{ .from = 0, .spelling = "std", .target = 1 }}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    try std.testing.expect(!(try facts.analysis()).everything);
+    try std.testing.expect(try facts.analyzed(testDecl(&project, 1, "anyDecl")));
+}
+
+test "a reader's question past its steps, or code read lazily that imports what no file holds, answers that it may be analyzed" {
+    const root =
+        \\const std = @import("std");
+        \\const missing = @import("missing");
+        \\pub fn main() void {
+        \\    missing.T.viaName();
+        \\}
+    ;
+    const library =
+        \\pub fn viaName() void {
+        \\    _ = @import("nowhere");
+        \\}
+        \\fn deadCaller() void {
+        \\    deadTarget();
+        \\}
+        \\fn deadTarget() void {}
+    ;
+    const lone =
+        \\export fn alone() void {}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{
+        .{ .name = "root", .bytes = root, .absent = &.{"missing"} },
+        .{ .name = "std/std.zig", .bytes = library, .selected = false },
+        .{ .name = "std/lone.zig", .bytes = lone, .selected = false },
+    }, &.{.{ .from = 0, .spelling = "std", .target = 1 }}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    // `@import("nowhere")` in `viaName`, which is analyzed: any file may be imported.
+    try std.testing.expect(try facts.analyzed(testDecl(&project, 2, "alone")));
+    try std.testing.expect(!try facts.analyzed(testDecl(&project, 1, "deadTarget")));
+    var short: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer short.deinit();
+    (try short.builtAnalysis()).lazy.limit = 0;
+    try std.testing.expect(try short.analyzed(testDecl(&project, 1, "deadTarget")));
 }
