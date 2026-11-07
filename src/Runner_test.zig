@@ -807,6 +807,53 @@ test "P006 reads what a package declares it replaces: in every package that impo
     try std.testing.expectEqualSlices(u32, &.{ 5, 6, 114, 117 }, lines[0..n]);
 }
 
+/// An airlock whose two replacements, `syncFile` and `syncDir`, share their implementation: a
+/// helper both call, a container-level constant and an `extern` only they reach; `extra` is more
+/// of its file.
+fn door(comptime extra: []const u8) []const u8 {
+    return "const std = @import(\"std\");\n" ++
+        "pub fn syncFile(fd: i32) void {\n    shared(fd);\n    flushAll();\n}\n" ++
+        "pub fn syncDir(fd: i32) void {\n    shared(fd);\n    _ = full;\n}\n" ++
+        "fn shared(fd: i32) void {\n    std.posix.fdatasync(fd);\n}\n" ++
+        "const full = std.posix.fdatasync;\n" ++
+        "extern \"c\" fn fsync(fd: c_int) c_int;\n" ++
+        "fn flushAll() void {\n    _ = fsync(1);\n}\n" ++ extra ++
+        "pub const lint_rules = .{ .version = 1, .replaces = .{ .{ .std = std.posix.fdatasync, .with = syncFile, .why = \"durability belongs to airlock\" }, .{ .symbol = \"fsync\", .with = syncDir, .why = \"durability belongs to airlock\" } } };\n";
+}
+
+/// The lines of a report's P006 findings in airlock's file (file 1).
+fn airlockLines(report: glint.Report, out: []u32) []u32 {
+    var n: usize = 0;
+    for (report.diagnostics) |d| if (@backingInt(d.span.file) == 1) {
+        out[n] = d.span.line;
+        n += 1;
+    };
+    std.mem.sort(u32, out[0..n], {}, std.sort.asc(u32));
+    return out[0..n];
+}
+
+test "P006 reads the replacements a package declares as one door: what only they reach, shared or not, is theirs, a container-level constant and an extern by what references them; a use from outside the door is judged, an unresolved call into it undecided" {
+    var buffer: [8]u32 = undefined;
+    // A helper two replacements share (line 11), a constant only syncDir reads (13) and an extern
+    // only syncFile's helper calls (its call, 16): the door's own.
+    var shared = try replacedRun(door(""));
+    defer shared.deinit();
+    try std.testing.expect(shared.complete);
+    try std.testing.expectEqualSlices(u32, &.{}, airlockLines(shared, &buffer));
+    // The helper and the constant, also reached from a private function outside the door that a
+    // public one calls, are judged where they are written (11, 13), as is that function's own call
+    // of the extern (21); the door's call of it (16) stays the door's.
+    var stray = try replacedRun(door("fn stray() void {\n    shared(1);\n    _ = full;\n    _ = fsync(1);\n}\npub fn other() void {\n    stray();\n}\n"));
+    defer stray.deinit();
+    try std.testing.expect(stray.complete);
+    try std.testing.expectEqualSlices(u32, &.{ 11, 13, 21 }, airlockLines(stray, &buffer));
+    // A call that may be of the helper does not resolve: undecided at its site, never exempt.
+    var unresolved = try replacedRun(door("const gone = @import(\"gone\");\npub fn reach() void {\n    gone.shared(1);\n}\n"));
+    defer unresolved.deinit();
+    try std.testing.expect(!unresolved.complete);
+    try std.testing.expectEqualSlices(u32, &.{}, airlockLines(unresolved, &buffer));
+}
+
 /// airlock's replacement reached through a chain of `steps` private functions, each called once by
 /// the next: every one of them only the replacement reaches.
 fn chained(steps: usize) ![]u8 {
