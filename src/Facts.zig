@@ -2465,8 +2465,9 @@ fn comptimeTruthRead(self: *Facts, env: ?*const Env, file: Project.FileId, node:
 }
 
 /// `@hasField(T, name)` on the reading `env` binds: of a container resolved, whether its scope
-/// declares a field so named; of a struct literal's type (`@TypeOf(declared)`), whether the
-/// literal sets one. Null where neither is known.
+/// declares a field so named; of a choice of types, what each of them agrees on (`Join.agreed`);
+/// of a struct literal's type (`@TypeOf(declared)`), whether the literal sets one. Null where
+/// none of these is known.
 fn hasFieldTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?bool {
     const tree = &self.project.at(file).file.tree;
     var buffer: [2]Ast.Node.Index = undefined;
@@ -2474,13 +2475,18 @@ fn hasFieldTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
     if (args.len != 2) return null;
     const name = try self.nameIn(env, file, args[1], 0) orelse return null;
     if (try self.literalOfType(env, file, args[0])) |literal| return (try self.comptimeLiteralField(literal, name)) != null;
-    const container = switch (try self.resolveIn(env, file, args[0])) {
-        .container => |c| c,
-        else => return null,
-    };
-    if (container.symbolic) return null;
-    const decl = self.project.at(container.file).model.scopes[@backingInt(container.scope)].names.get(name) orelse return false;
-    return self.project.at(container.file).model.declarations[@backingInt(decl)].kind == .field;
+    const held = try self.resolveIn(env, file, args[0]);
+    var joined: Join = .{};
+    for (valueParts(&held)) |part| joined.add(part, self.declaresField(part, name));
+    return joined.agreed();
+}
+
+/// Whether one part of a type (`valueParts`) declares a field `name`: a container resolved that
+/// does (`hasField`: a scope's names hold no field, so a field is found among its declarations);
+/// null for any other part, or a container whose members are not known.
+fn declaresField(self: *Facts, part: Value, name: []const u8) ?bool {
+    if (part != .container or part.container.symbolic) return null;
+    return self.hasField(part.container, name);
 }
 
 /// The struct literal `@TypeOf(x)` at `node` is the type of, where `x` is one the program fixes.
@@ -16691,6 +16697,36 @@ fn testKnownBool(facts: *Facts, source: usize, name: []const u8) !?bool {
         return facts.knownBool(project.sources[source].id, init);
     };
     unreachable; // unreachable: the source declares each name asked
+}
+
+test "@hasField of a choice of types is what every type agrees on: each declaring the field, yes; none, no; some, not known" {
+    const source =
+        \\const builtin = @import("builtin");
+        \\const A = struct { x: u8, y: u8 };
+        \\const B = struct { x: u8 };
+        \\const C = struct { z: u8 };
+        \\const T = if (builtin.mode == .Debug) A else B;
+        \\const U = if (builtin.mode == .Debug) B else C;
+        \\const both = @hasField(T, "x");
+        \\const neither = @hasField(T, "z");
+        \\const some = @hasField(T, "y");
+        \\const mixed = @hasField(U, "x");
+        \\const one = @hasField(B, "x");
+        \\const one_not = @hasField(B, "z");
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    try std.testing.expectEqual(@as(?bool, true), try testKnownBool(&facts, 0, "both"));
+    try std.testing.expectEqual(@as(?bool, false), try testKnownBool(&facts, 0, "neither"));
+    try std.testing.expectEqual(@as(?bool, null), try testKnownBool(&facts, 0, "some"));
+    try std.testing.expectEqual(@as(?bool, null), try testKnownBool(&facts, 0, "mixed"));
+    // One type: a field it declares is found among its declarations (a scope's names hold none).
+    try std.testing.expectEqual(@as(?bool, true), try testKnownBool(&facts, 0, "one"));
+    try std.testing.expectEqual(@as(?bool, false), try testKnownBool(&facts, 0, "one_not"));
 }
 
 test "a value the program fixes decides a condition: strand's scalars.kind(T) read per type, through @hasDecl, a constant's struct literal, @typeInfo(@TypeOf(...)), @hasField, a contract number and enum tags; a switch on the tag it gives takes its prong" {
