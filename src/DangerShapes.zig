@@ -3544,14 +3544,14 @@ fn stateWrites(c: *Context, field: Facts.Decl, hold: StateHold, writes: *std.Arr
             // atomic.Value's own operations do with it (`atomicWrite`).
             // A tagged union's payload taken by address (`.a => |*p|`) is written through it,
             // never its tag: no write of the state.
-            .address => if (site.reach == .holder or (hold == .tagged and payloadCapture(tree, site.node))) continue else if (hold == .atomic) switch (atomicWrite(tree, &c.project.at(site.file).model, site.target orelse site.node)) {
+            .address => if (site.reach == .holder or (hold == .tagged and payloadCapture(tree, site.node))) continue else if (hold == .atomic) switch (try atomicWrite(c, site.file, site.target orelse site.node)) {
                 .read => continue,
                 .write => |value| value,
                 .unknown => null,
             } else null,
             .set => if (site.value) |value| written: {
                 // `undefined` gives it no state: reading it after is illegal.
-                if (undefinedValue(tree, value)) continue;
+                if (try undefinedValue(c, site.file, value)) continue;
                 if (site.reach == .holder and !try madeValue(c, site.file, value, state, 0)) continue;
                 break :written value;
             } else null,
@@ -3637,9 +3637,10 @@ fn choosesState(c: *Context, file: Project.FileId, node: Ast.Node.Index, state: 
     return false;
 }
 
-/// Whether `node` is `undefined`.
-fn undefinedValue(tree: *const Ast, node: Ast.Node.Index) bool {
-    return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "undefined");
+/// Whether `node` is `undefined` (`Facts.literalOf`).
+fn undefinedValue(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    const literal = (try c.facts.literalOf(file, node)) orelse return false;
+    return literal == .undefined;
 }
 
 /// Whether a whole holder's value `node` is one made here, which sets a state, rather than a
@@ -3664,31 +3665,34 @@ fn madeValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, state: Fac
         for (choice.ast.cases) |case_node| if (try madeValue(c, file, tree.fullSwitchCase(case_node).?.ast.target_expr, state, depth + 1)) return true; // unreachable: a switch's cases are cases.
         return false;
     }
-    switch (tree.nodeTag(node)) {
-        .grouped_expression => return madeValue(c, file, tree.nodeData(node).node_and_token[0], state, depth + 1),
-        .@"try" => return madeValue(c, file, tree.nodeData(node).node, state, depth + 1),
-        .builtin_call_two, .builtin_call_two_comma => {
-            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@as")) return true;
-            const value = tree.nodeData(node).opt_node_and_opt_node[1].unwrap() orelse return true;
-            return madeValue(c, file, value, state, depth + 1);
-        },
-        .identifier => {
-            const d = (model.reference(node) orelse return true).declaration orelse return true;
-            const record = model.declarations[@backingInt(d)];
+    const inner = Facts.ungrouped(tree, node);
+    if (inner != node) return madeValue(c, file, inner, state, depth + 1);
+    if (tree.nodeTag(node) == .@"try") return madeValue(c, file, tree.nodeData(node).node, state, depth + 1);
+    if (Facts.isBuiltin(tree, node, "@as")) {
+        var buffer: [2]Ast.Node.Index = undefined;
+        const args = Facts.builtinArgs(tree, node, &buffer);
+        return if (args.len == 2) madeValue(c, file, args[1], state, depth + 1) else true;
+    }
+    // A declaration of a type or a namespace (`Job.empty`) is a constant; a field is a place.
+    if (try Facts.accesses.memberRead(c.facts, file, node)) |step| return step.holder.? == .container; // unreachable: a member's step has its holder's value
+    switch (try c.facts.definition(file, node)) {
+        .decl => |decl| {
+            if (decl.file != file) return true;
+            const record = model.declarations[@backingInt(decl.index)];
             if (record.kind != .variable) return false;
             const variable = tree.fullVarDecl(record.node) orelse return true;
             // A constant's value is made where it is declared; a var's may be copied in later.
             if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return false;
             return madeValue(c, file, variable.ast.init_node.unwrap() orelse return true, state, depth + 1);
         },
-        .field_access => {
-            // A declaration of a type or a namespace (`Job.empty`) is a constant; a field is a place.
-            const held = try c.facts.resolve(file, tree.nodeData(node).node_and_token[0]);
-            return held == .container;
-        },
-        .deref, .array_access, .unwrap_optional => return false,
-        else => return true,
+        .unknown => return true,
+        .none => {},
     }
+    // Another place's value: `p.*`, an element, a payload.
+    return switch ((try Facts.accesses.pathOf(c.facts, file, node)).steps[0].kind) {
+        .deref, .index, .unwrap => false,
+        else => true,
+    };
 }
 
 /// Whether the call `node`, which covers a whole holder given as `target`, writes no state of
@@ -3720,13 +3724,15 @@ fn constParameter(c: *Context, call: *const Facts.calls.Call, target: ?Ast.Node.
         .known => |args| args,
         .unknown => return false,
     };
-    const tree = &c.project.at(call.file).file.tree;
-    const model = &c.project.at(call.file).model;
     var at = target orelse return false;
     var position = std.mem.findScalar(Ast.Node.Index, args, at);
+    // Through its address and parentheses, to the argument.
     while (position == null) {
-        at = model.parentOf(at) orelse return false;
-        if (tree.nodeTag(at) != .address_of and tree.nodeTag(at) != .grouped_expression) return false;
+        at = switch (try Facts.accesses.useOf(c.facts, call.file, at)) {
+            .address => |address| address,
+            .carried => |onward| if (onward.how == .grouped) onward.into else return false,
+            else => return false,
+        };
         position = std.mem.findScalar(Ast.Node.Index, args, at);
     }
     const choices: []const Facts.Decl = switch (call.callee) {
@@ -3755,16 +3761,24 @@ fn constParameter(c: *Context, call: *const Facts.calls.Call, target: ?Ast.Node.
 /// state, does with it: `load` reads it; `store` and `swap` write their value; `cmpxchg*` and
 /// the read-modify-writes write a value chosen on its own (the call); another, or an access
 /// that is no call, may write anything.
-fn atomicWrite(tree: *const Ast, model: *const Model, at: Ast.Node.Index) union(enum) { read, write: Ast.Node.Index, unknown } {
-    const node = model.parentOf(at) orelse return .unknown;
-    if (tree.nodeTag(node) != .field_access or tree.nodeData(node).node_and_token[0] != at) return .unknown;
-    const name = tree.tokenSlice(tree.nodeData(node).node_and_token[1]);
-    if (std.mem.eql(u8, name, "load")) return .read;
-    const call_node = model.parentOf(node) orelse return .unknown;
+fn atomicWrite(c: *Context, file: Project.FileId, at: Ast.Node.Index) Context.Error!union(enum) { read, write: Ast.Node.Index, unknown } {
+    const tree = &c.project.at(file).file.tree;
+    const node = switch (try Facts.accesses.useOf(c.facts, file, at)) {
+        .member => |access| access,
+        else => return .unknown,
+    };
+    const operation = switch (try c.facts.definition(file, node)) {
+        .decl => |decl| decl,
+        .none, .unknown => return .unknown,
+    };
+    if (try stdAmong(c, operation, &.{"atomic.Value.load"}) == .yes) return .read;
+    const call_node = switch (try Facts.accesses.useOf(c.facts, file, node)) {
+        .callee => |call| call,
+        else => return .unknown,
+    };
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, call_node) orelse return .unknown;
-    if (call.ast.fn_expr != node) return .unknown;
-    if (std.mem.eql(u8, name, "store") or std.mem.eql(u8, name, "swap")) return if (call.ast.params.len > 0) .{ .write = call.ast.params[0] } else .unknown;
+    if (try stdAmong(c, operation, &.{ "atomic.Value.store", "atomic.Value.swap" }) == .yes) return if (call.ast.params.len > 0) .{ .write = call.ast.params[0] } else .unknown;
     return .{ .write = call_node };
 }
 
