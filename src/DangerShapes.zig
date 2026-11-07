@@ -1880,87 +1880,73 @@ fn implements(c: *Context, index: Model.Declaration.Id, maybe_vtable: ?Facts.Con
 }
 
 fn viewed(c: *Context, resources: []const ?Facts.Container, file: Project.FileId, node: Ast.Node.Index, depth: u8, bound: ?*const Binding) Context.Error!bool {
-    const tree = &c.project.at(file).file.tree;
-    const model = &c.project.at(file).model;
     if (depth >= 16) return false;
-    const next = depth + 1;
-    switch (tree.nodeTag(node)) {
-        .grouped_expression => return viewed(c, resources, file, tree.nodeData(node).node_and_token[0], next, bound),
-        .unwrap_optional => return viewed(c, resources, file, tree.nodeData(node).node_and_token[0], next, bound),
-        .array_access => return viewed(c, resources, file, tree.nodeData(node).node_and_node[0], next, bound),
-        .@"orelse" => {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            return try viewed(c, resources, file, lhs, next, bound) and try viewed(c, resources, file, rhs, next, bound);
-        },
-        .field_access => {
-            var root = node;
-            while (tree.nodeTag(root) == .field_access or tree.nodeTag(root) == .unwrap_optional or tree.nodeTag(root) == .array_access) root = switch (tree.nodeTag(root)) {
-                .array_access => tree.nodeData(root).node_and_node[0],
-                else => tree.nodeData(root).node_and_token[0],
+    // Each value it may give, through parentheses, `.?`, `try`, `orelse` and `catch`, a
+    // branch's or a prong's result, a labeled block's `break`s and `@as`: a view where each is.
+    // An exit gives none (a prong that never returns, `orelse return null`).
+    const leaves = switch (try Facts.accesses.valuesOf(c.facts, file, node)) {
+        .leaves => |leaves| leaves,
+        .unknown => return false,
+    };
+    for (leaves) |leaf| if (!try leafViewed(c, resources, file, leaf, depth + 1, bound)) return false;
+    return true;
+}
+
+/// `viewed` of one value of no form that carries another: a part of a place a view holds, an
+/// `own.Owned`'s `borrow().*`, a name, a call, a std resource's literal made from its handle.
+fn leafViewed(c: *Context, resources: []const ?Facts.Container, file: Project.FileId, node: Ast.Node.Index, next: u8, bound: ?*const Binding) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    if (Facts.isNull(tree, node)) return true;
+    // A name (a member read resolves to its declaration too, and is a place's part below).
+    if (try Facts.accesses.memberOf(c.facts, file, node) == null) switch (try c.facts.definition(file, node)) {
+        .decl => return nameViewed(c, resources, file, node, next, bound),
+        .unknown => return false,
+        .none => {},
+    };
+    const path = try Facts.accesses.pathOf(c.facts, file, node);
+    if (path.steps.len > 1) switch (path.steps[0].kind) {
+        // An element of what is a view.
+        .index => return viewed(c, resources, file, path.steps[1].node, next, bound),
+        // A member of what a name holds, through members, elements and payloads: a view where
+        // the name is.
+        .field => {
+            for (path.steps[0 .. path.steps.len - 1]) |step| switch (step.kind) {
+                .field, .index, .unwrap => {},
+                else => return false,
             };
-            return tree.nodeTag(root) == .identifier and try viewed(c, resources, file, root, next, bound);
+            if (path.root != .decl) return false;
+            return viewed(c, resources, file, path.steps[path.steps.len - 1].node, next, bound);
         },
-        // No value: a prong that never returns, or one that leaves (`orelse return null`).
-        .unreachable_literal, .@"return", .@"continue" => return true,
         // An `own.Owned`'s `borrow().*`: the owner keeps what it lends. Any other `p.*` reads
         // what `p` points at, a view where `p` is one.
         .deref => {
-            const pointer = tree.nodeData(node).node;
-            var buffer: [1]Ast.Node.Index = undefined;
-            const call = tree.fullCall(&buffer, pointer) orelse return viewed(c, resources, file, pointer, next, bound);
-            if (call.ast.params.len != 0 or tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
-            const receiver, const method = tree.nodeData(call.ast.fn_expr).node_and_token;
-            if (!std.mem.eql(u8, tree.tokenSlice(method), "borrow")) return false;
-            return try c.role(Contract.library, try c.facts.resolve(file, receiver)) == .owned;
+            const pointer = path.steps[1].node;
+            const call = (try Facts.calls.at(c.facts, file, pointer)) orelse return viewed(c, resources, file, pointer, next, bound);
+            const args = switch (call.args) {
+                .known => |args| args,
+                .unknown => return false,
+            };
+            if (call.receiver != .bound or args.len != 1) return false;
+            const method = (try Facts.accesses.memberOf(c.facts, file, call.callee_expr)) orelse return false;
+            if (!std.mem.eql(u8, method.name orelse return false, "borrow")) return false;
+            return try c.role(Contract.library, try c.facts.resolve(file, call.receiver.bound)) == .owned;
         },
-        .identifier => return nameViewed(c, resources, file, node, next, bound),
-        .@"switch", .switch_comma => {
-            const full = tree.fullSwitch(node).?;
-            for (full.ast.cases) |case| if (!try viewed(c, resources, file, tree.fullSwitchCase(case).?.ast.target_expr, next, bound)) return false;
-            return true;
-        },
-        // `@as(T, v)` is `v`.
-        .builtin_call_two, .builtin_call_two_comma => {
-            var buffer: [2]Ast.Node.Index = undefined;
-            const args = Facts.builtinArgs(tree, node, &buffer);
-            if (args.len != 2 or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@as")) return false;
-            return viewed(c, resources, file, args[1], next, bound);
-        },
-        // A labeled block holds what each `break` to it gives.
-        .block, .block_semicolon, .block_two, .block_two_semicolon => {
-            const lbrace = tree.nodeMainToken(node);
-            if (lbrace < 2 or tree.tokenTag(lbrace - 1) != .colon) return false;
-            var any = false;
-            for (tree.nodes.items(.tag), 0..) |tag, i| {
-                if (tag != .@"break") continue;
-                const jump: Ast.Node.Index = @fromBackingInt(@intCast(i));
-                const label, const value = tree.nodeData(jump).opt_token_and_opt_node;
-                if (breakTarget(tree, model, jump, label.unwrap() orelse continue) != node) continue;
-                if (!try viewed(c, resources, file, value.unwrap() orelse return false, next, bound)) return false;
-                any = true;
-            }
-            return any;
-        },
-        else => {
-            if (tree.fullIf(node)) |branch| {
-                const otherwise = branch.ast.else_expr.unwrap() orelse return false;
-                return try viewed(c, resources, file, branch.ast.then_expr, next, bound) and try viewed(c, resources, file, otherwise, next, bound);
-            }
-            if (try Facts.calls.at(c.facts, file, node)) |call| return callViewed(c, resources, file, &call, next, bound);
-            var init_buffer: [2]Ast.Node.Index = undefined;
-            if (tree.fullStructInit(&init_buffer, node)) |literal| {
-                // A std handle made from one it is given: the literal of a std resource type.
-                const made = byValue(try c.facts.literalType(file, node)) orelse return false;
-                if (find(resources, made) == null) return false;
-                for (literal.ast.fields) |value| {
-                    if (!std.mem.eql(u8, tree.tokenSlice(Model.initName(tree, value) orelse continue), "handle")) continue;
-                    return viewed(c, resources, file, value, next, bound);
-                }
-                return false;
-            }
-            return false;
-        },
+        else => {},
+    };
+    if (try Facts.calls.at(c.facts, file, node)) |call| return callViewed(c, resources, file, &call, next, bound);
+    var init_buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullStructInit(&init_buffer, node)) |literal| {
+        // A std handle made from one it is given: the literal of a std resource type.
+        const made = byValue(try c.facts.literalType(file, node)) orelse return false;
+        if (find(resources, made) == null) return false;
+        for (literal.ast.fields) |value| {
+            const field = c.facts.member(made, tree.tokenSlice(Model.initName(tree, value) orelse continue)) orelse continue;
+            if (try stdAmong(c, field, &handle_paths) != .yes) continue;
+            return viewed(c, resources, file, value, next, bound);
+        }
+        return false;
     }
+    return false;
 }
 
 /// What a name holds is a view: `null`, a parameter that is one (or what a call passes it,
@@ -1968,10 +1954,13 @@ fn viewed(c: *Context, resources: []const ?Facts.Container, file: Project.FileId
 fn nameViewed(c: *Context, resources: []const ?Facts.Container, file: Project.FileId, node: Ast.Node.Index, next: u8, bound: ?*const Binding) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "null")) return true;
-    const reference = model.reference(node) orelse return false;
-    const d = reference.declaration orelse return false;
-    const record = model.declarations[@backingInt(d)];
+    if (Facts.isNull(tree, node)) return true;
+    const decl = switch (try c.facts.definition(file, node)) {
+        .decl => |decl| decl,
+        .none, .unknown => return false,
+    };
+    if (decl.file != file) return false;
+    const record = model.declarations[@backingInt(decl.index)];
     // A parameter is a view in its own function; read through a call (`Binding`), it is
     // what that call passes. One that points (`s: *Scratch`, a method's receiver) reaches
     // memory its caller holds, whatever the call passes: what is read through it stays there.
@@ -1982,8 +1971,7 @@ fn nameViewed(c: *Context, resources: []const ?Facts.Container, file: Project.Fi
     // A capture holds what it binds: a view where that is one (an owner a call made,
     // unwrapped, is handed over).
     if (record.kind == .capture) {
-        const captured: ?Ast.Node.Index = if (tree.fullIf(record.node)) |branch| branch.ast.cond_expr else if (tree.fullWhile(record.node)) |loop| loop.ast.cond_expr else if (tree.fullFor(record.node)) |loop| (if (loop.ast.inputs.len == 1) loop.ast.inputs[0] else null) else if (tree.fullSwitchCase(record.node) != null) (if (tree.fullSwitch(model.parentOf(record.node) orelse return false)) |full| full.ast.condition else null) else null;
-        return viewed(c, resources, file, captured orelse return false, next, bound);
+        return viewed(c, resources, file, c.facts.captureSource(file, record) orelse return false, next, bound);
     }
     if (record.kind != .variable) return false;
     const variable = tree.fullVarDecl(record.node) orelse return false;
@@ -1998,16 +1986,14 @@ fn nameViewed(c: *Context, resources: []const ?Facts.Container, file: Project.Fi
 /// What a call returns is a view: an `own.Lent`'s `get()`, the program's function whose every
 /// return is one, or std's handles to the process's own streams and directory.
 fn callViewed(c: *Context, resources: []const ?Facts.Container, file: Project.FileId, call: *const Facts.calls.Call, next: u8, bound: ?*const Binding) Context.Error!bool {
-    const tree = &c.project.at(file).file.tree;
     const args = switch (call.args) {
         .known => |args| args,
         .unknown => return false,
     };
     // An `own.Lent`'s `get()`: a copy its owner lends.
-    if (call.receiver == .bound and args.len == 1 and tree.nodeTag(call.callee_expr) == .field_access) {
-        const method = tree.nodeData(call.callee_expr).node_and_token[1];
-        if (std.mem.eql(u8, tree.tokenSlice(method), "get") and try c.role(Contract.library, try c.facts.resolve(file, call.receiver.bound)) == .lent) return true;
-    }
+    if (call.receiver == .bound and args.len == 1) if (try Facts.accesses.memberOf(c.facts, file, call.callee_expr)) |method| {
+        if (std.mem.eql(u8, method.name orelse "", "get") and try c.role(Contract.library, try c.facts.resolve(file, call.receiver.bound)) == .lent) return true;
+    };
     // One that does not resolve is no view: what it gives is judged an owner. Of a choice, each
     // must give one.
     const choices: []const Facts.Decl = switch (call.callee) {
