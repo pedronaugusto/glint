@@ -989,7 +989,13 @@ fn released(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
             .unknown => if (try Facts.accesses.useOf(c.facts, file, access) == .callee) {
                 if (try typeFunctionOf(c, file, access) == null) return .unknown;
                 return if (releasing(tree.tokenSlice(tree.nodeData(access).node_and_token[1]))) .yes else .no;
-            } else return if (try released(c, file, access, next) == .no) .no else .unknown,
+            } else {
+                const through = try released(c, file, access, next);
+                // A member a type function reads by a name it computes (`@field(k.held, name)`),
+                // released where it is read: its holder's, whichever member the instance has.
+                if (through == .yes and Facts.isBuiltin(tree, access, "@field") and try typeFunctionOf(c, file, access) != null) return .yes;
+                return if (through == .no) .no else .unknown;
+            },
             .no => if (try Facts.accesses.useOf(c.facts, file, access) != .callee) return .no,
         },
         .returned => |ret| return releasedReturn(c, file, ret, next),

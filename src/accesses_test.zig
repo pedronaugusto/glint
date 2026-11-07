@@ -964,6 +964,7 @@ test "consolidate: a member read's step, which language field it is, the program
         \\    inline for (listed) |one| _ = @field(s, one);
         \\    inline for (&listed) |one| _ = @field(s, one);
         \\    comptime var held = [_][]const u8{"g"};
+        \\    held[0] = "g";
         \\    inline for (held) |one| _ = @field(s, one);
         \\    _ = b.ptr;
         \\    return s.len + b.len + a.len + x.len + s.ptr;
