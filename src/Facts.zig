@@ -496,10 +496,10 @@ pub fn returnedContainers(gpa: std.mem.Allocator, made: Value) error{OutOfMemory
         },
         .alternatives => |choices| {
             const found = try gpa.alloc(Container, choices.len);
-            for (choices, found) |choice, *each| each.* = switch (choice) {
-                .container, .instance => |one| one,
-                else => return &.{},
-            };
+            // Each a part of the choice (`valueParts`): never a choice itself.
+            for (choices, found) |choice, *each| {
+                if (choice == .container) each.* = choice.container else if (choice == .instance) each.* = choice.instance else return &.{};
+            }
             return found;
         },
         else => return &.{},
@@ -566,6 +566,8 @@ fn published(self: *Facts, root: Project.FileId, path: []const u8) ResolveError!
             // find may still make one.
             .function => |function| switch ((try self.template(function)) orelse return .{ .unknown = .unsupported }) {
                 .container, .instance => |c| c,
+                // A choice of templates, as any other: not one container.
+                .alternatives => return .{ .unknown = .unsupported },
                 else => return .{ .unknown = .unsupported },
             },
             // A type that declares nothing, or a value of one, names no member.
@@ -581,6 +583,8 @@ fn published(self: *Facts, root: Project.FileId, path: []const u8) ResolveError!
         .function => |decl| .{ .found = .{ .function = decl } },
         .container => |c| .{ .found = .{ .container = .{ .file = c.file, .scope = c.scope } } },
         .unknown => |why| .{ .unknown = why },
+        // A choice of declarations: not one the library publishes.
+        .alternatives => .{ .unknown = .unsupported },
         // A declaration of the name the library's is, of a kind no role names: there, but
         // not what the library publishes there.
         else => .{ .unknown = .unsupported },
@@ -1795,11 +1799,12 @@ fn instantiations(self: *Facts, env: *const Env) ResolveError![]const *const Env
 /// its fields' types, a primitive), never a value of one.
 fn choiceOfTypes(value: Value) bool {
     if (value != .alternatives) return false;
-    for (value.alternatives) |one| switch (one) {
-        .container, .primitive => {},
-        .reified => |built| if (built.value) return false,
-        else => return false,
-    };
+    // Each a part of the choice (`valueParts`): never a choice itself.
+    for (value.alternatives) |one| {
+        if (one == .container or one == .primitive) continue;
+        if (one == .reified and !one.reified.value) continue;
+        return false;
+    }
     return true;
 }
 
@@ -2453,6 +2458,8 @@ fn comptimeTruthRead(self: *Facts, env: ?*const Env, file: Project.FileId, node:
     if (args.len != 2) return null;
     const container = switch (try self.resolveIn(env, file, args[0])) {
         .container => |c| c,
+        // A choice of types: not decided here.
+        .alternatives => return null,
         else => return null,
     };
     if (container.symbolic) return null;
@@ -2762,13 +2769,17 @@ fn sameType(one: Value, other: Value) ?bool {
                 return if (a.made_by == null and b.made_by == null) true else null;
             },
             .primitive => return if (a.symbolic) null else false,
+            // A choice of types: not known to be one.
+            .alternatives => return null,
             else => return null,
         },
         .primitive => |a| switch (other) {
             .primitive => |b| return std.mem.eql(u8, a, b),
             .container => return sameType(other, one),
+            .alternatives => return null,
             else => return null,
         },
+        .alternatives => return null,
         else => return null,
     }
 }
@@ -3020,6 +3031,8 @@ fn builtinField(self: *Facts, file: Project.FileId, args: []const Ast.Node.Index
             }
             const holder = switch (held) {
                 .container, .instance => |c| c,
+                // A choice of holders: each one's field is the build's.
+                .alternatives => return .{ .unknown = .comptime_dependent },
                 else => return .{ .unknown = .comptime_dependent },
             };
             if (holder.symbolic and holder.made_by == null) return .{ .unknown = .comptime_dependent };
@@ -3200,6 +3213,10 @@ fn unknownWithin(value: Value) bool {
         .unknown => true,
         .pointer => |inner| unknownWithin(inner.child.*),
         .optional, .error_union, .array => |inner| unknownWithin(inner.*),
+        // A choice: unknown where any of its parts is.
+        .alternatives => |parts| for (parts) |part| {
+            if (unknownWithin(part)) break true;
+        } else false,
         else => false,
     };
 }
@@ -3263,6 +3280,8 @@ pub fn integerType(value: Value, pointer: u16) IntegerType {
             const bits = std.fmt.parseUnsigned(u16, name[1..], 10) catch return .unknown;
             return .{ .int = .{ .bits = bits, .signed = name[0] == 'i' } };
         },
+        // A choice of types: no one integer type.
+        .alternatives => return .unknown,
         else => return .unknown,
     }
 }
@@ -3305,6 +3324,8 @@ fn fieldType(self: *Facts, of: Value, field_name: ?[]const u8) ResolveError!Valu
     const container = switch (of) {
         .container => |c| c,
         .unknown => |why| return .{ .unknown = why },
+        // A choice of types: no one container's field.
+        .alternatives => return .{ .unknown = .unsupported },
         else => return .{ .unknown = .unsupported },
     };
     // A container a type function makes has its fields' types where the call that made it is
@@ -3476,6 +3497,11 @@ pub fn returnedErrors(self: *Facts, file: Project.FileId, proto: Ast.full.FnProt
     return switch (try self.resolve(file, result)) {
         .error_union => .{ .unknown = .unsupported },
         .unknown => |why| .{ .unknown = why },
+        // A choice of result types: none only where no part is an error union or unknown.
+        .alternatives => |parts| for (parts) |part| {
+            if (part == .unknown) break .{ .unknown = part.unknown };
+            if (part == .error_union) break .{ .unknown = .unsupported };
+        } else .none,
         else => .none,
     };
 }
