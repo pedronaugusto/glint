@@ -12629,6 +12629,10 @@ pub const accesses = struct {
         /// for no index (`walking`).
         walked: std.AutoHashMapUnmanaged(Project.FileId, void) = .empty,
         reads: std.AutoHashMapUnmanaged(Project.FileId, *const File) = .empty,
+        /// Of each file, its declaring nodes (`declaredIn`).
+        declared: std.AutoHashMapUnmanaged(Project.FileId, *const Declared) = .empty,
+        /// Of each cast, what it covers (`Walk.castCovers`).
+        casts: std.AutoHashMapUnmanaged(Facts.Key, CastCovers) = .empty,
         /// Of each file, the write sites a query for a field of one name reads (`Filter`).
         fields: std.HashMapUnmanaged(Narrow, *const File, Narrow.Context, std.hash_map.default_max_load_percentage) = .empty,
         /// Of each pointer handed to a call, the fields it reaches as a whole value or as bytes.
@@ -13493,12 +13497,34 @@ pub const accesses = struct {
         };
     }
 
+    const CastCovers = struct { containers: []const Facts.Container, whole: bool };
+    const Declared = std.AutoHashMapUnmanaged(Ast.Node.Index, Model.Declaration.Id);
+    /// What a walk that reads no declaring node holds (`reads`).
+    const no_declarations: Declared = .empty;
+
+    /// The declaration each declaring node of `file` makes, a variable's or a field's: once for
+    /// the run, of the file's syntax.
+    fn declaredIn(facts: *Facts, file: Project.FileId) Error!*const Declared {
+        const state = try facts.memo(State);
+        if (state.declared.get(file)) |known| return known;
+        const made = try facts.gpa.create(Declared);
+        made.* = .empty;
+        for (facts.project.at(file).model.declarations, 0..) |record, d| switch (record.kind) {
+            .variable, .field => try made.put(facts.gpa, record.node, @fromBackingInt(@intCast(d))),
+            else => {},
+        };
+        try state.declared.put(facts.gpa, file, made);
+        return made;
+    }
+
     const Walk = struct {
         facts: *Facts,
         file: Project.FileId,
         index: *File,
         /// The declaration each declaring node makes, a variable's or a field's.
-        declarations: std.AutoHashMapUnmanaged(Ast.Node.Index, Model.Declaration.Id) = .empty,
+        declarations: *const Declared = &no_declarations,
+        /// Where the containers a shape would be found are kept instead (`castCovers`).
+        recording: ?*std.ArrayList(Facts.Container) = null,
         /// Null for every site; else only those a field query needs.
         filter: ?Filter = null,
         /// The stores through a pointer a `var` of the file holds, judged once the file's
@@ -13617,10 +13643,7 @@ pub const accesses = struct {
             if (facts.project.at(w.file).file.status != .parsed) return w.unresolved(.{ .file = w.file, .node = .root, .kind = .covered });
             const tree = w.syntax();
             const own = try facts.program(w.file);
-            for (w.lexicon().declarations, 0..) |record, d| switch (record.kind) {
-                .variable, .field => try w.declarations.put(facts.gpa, record.node, @fromBackingInt(@intCast(d))),
-                else => {},
-            };
+            w.declarations = try declaredIn(facts, w.file);
             for (tree.nodes.items(.tag), 0..) |tag, i| {
                 const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
                 switch (tag) {
@@ -13917,6 +13940,29 @@ pub const accesses = struct {
         /// The containers a value of `value`'s type holds by value, each stored or read whole at
         /// `site`, through the fields of each in turn; with `behind`, also those its pointers reach.
         /// Unresolved where a type on the way does not resolve.
+        /// The containers a cast at `node` makes a value of (`shapes` of its result type), and
+        /// whether those are all of them. Of the cast alone: every walk of the file meets it, one
+        /// per name a field query asks, and reads it once, by the core's one memo rule.
+        fn castCovers(w: *Walk, node: Ast.Node.Index, pointer: bool) Error!CastCovers {
+            const facts = w.facts;
+            const key: Facts.Key = .{ .file = w.file, .node = node };
+            if ((try facts.memo(State)).casts.get(key)) |known| return known;
+            const wide = facts.wide;
+            const met = facts.open_met;
+            const was_short = facts.short;
+            var containers: std.ArrayList(Facts.Container) = .empty;
+            const outer = w.recording;
+            w.recording = &containers;
+            defer w.recording = outer;
+            const made = try w.valued(try facts.castTypeIn(null, w.file, node));
+            var seen: std.AutoHashMapUnmanaged(Seen, void) = .empty;
+            const covered = w.make(node, null, .covered, null);
+            const whole = try w.collect(covered, if (pointer) held(made) else made, false, false, &seen, 0);
+            const covers: CastCovers = .{ .containers = containers.items, .whole = whole };
+            if (facts.remaining != 0 and !facts.wideSince(wide) and facts.open_met == met and facts.short == was_short) try (try facts.memo(State)).casts.put(facts.gpa, key, covers);
+            return covers;
+        }
+
         fn shapes(w: *Walk, site: Site, value: Facts.Value, behind: bool) Error!void {
             var seen: std.AutoHashMapUnmanaged(Seen, void) = .empty;
             if (!try w.collect(site, value, behind, false, &seen, 0)) try w.unresolved(site);
@@ -13928,7 +13974,9 @@ pub const accesses = struct {
                 .instance => |container| {
                     const own = !behind or past;
                     if ((try seen.getOrPut(w.facts.gpa, .{ .shape = .{ .file = container.file, .scope = container.scope }, .own = own })).found_existing) return true;
-                    if (own) try w.shape(container, site);
+                    if (own) {
+                        if (w.recording) |list| try list.append(w.facts.gpa, container) else try w.shape(container, site);
+                    }
                     // Each field's type, read with the arguments of the call that made a generic
                     // container: by value the containers it holds are stored whole with it.
                     const model = &w.facts.project.at(container.file).model;
@@ -14013,8 +14061,9 @@ pub const accesses = struct {
                 // where neither it (a parameter's or a `const` declaration's address) nor the place
                 // the result goes (`[]const u8`) is const.
                 const covered = w.make(node, null, .covered, null);
-                const made = try w.valued(try w.facts.castTypeIn(null, w.file, node));
-                try w.shapes(covered, if (std.mem.eql(u8, name, "@ptrCast")) held(made) else made, false);
+                const covers = try w.castCovers(node, std.mem.eql(u8, name, "@ptrCast"));
+                for (covers.containers) |container| try w.shape(container, covered);
+                if (!covers.whole) try w.unresolved(covered);
                 if (std.mem.eql(u8, name, "@ptrCast") and args.len == 1 and !w.immutableAddress(args[0]) and !try w.facts.constPointerPlace(w.file, node)) try w.shapes(covered, held(try w.facts.resolve(w.file, uncast(tree, args[0]))), false);
                 return;
             }
