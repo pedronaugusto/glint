@@ -424,27 +424,26 @@ const Walk = struct {
     fn collect(w: *Walk) Context.Error!void {
         const name = w.model.declarations[@backingInt(w.local)].name;
         w.aliases = try aliasesOf(w.c.allocator, w.c.facts, w.file, w.local, w.param);
-        for (w.tree.nodes.items(.tag), 0..) |tag, i| {
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            if (tag == .@"return") {
-                if (w.param) try w.returns.append(w.c.allocator, node);
-                continue;
-            }
-            if (tag == .@"try") {
-                if (w.param) try w.tries.append(w.c.allocator, node);
-                continue;
-            }
-            if (tag == .asm_output) {
-                // `[a] "b" (c)` names its variable by the token before `)`; `(-> T)` returns one.
-                const lhs, const rparen = w.tree.nodeData(node).opt_node_and_token;
-                if (lhs != .none or !std.mem.eql(u8, w.tree.tokenSlice(rparen - 1), name)) continue;
-                const asm_node = w.enclosingAsm(rparen) orelse continue;
-                try w.outputs.append(w.c.allocator, .{ .token = rparen - 1, .asm_node = asm_node });
-                continue;
-            }
-            const decl = (try nameOf(w.c.facts, w.file, node)) orelse continue;
-            if (decl == w.local or std.mem.findScalar(Model.Declaration.Id, w.aliases, decl) != null) try w.mentions.append(w.c.allocator, node);
+        const index = try indexOf(w.c.facts, w.file);
+        if (w.param) {
+            try w.returns.appendSlice(w.c.allocator, index.returns.items);
+            try w.tries.appendSlice(w.c.allocator, index.tries.items);
         }
+        for (index.outputs.items) |node| {
+            // `[a] "b" (c)` names its variable by the token before `)`; `(-> T)` returns one.
+            const lhs, const rparen = w.tree.nodeData(node).opt_node_and_token;
+            if (lhs != .none or !std.mem.eql(u8, w.tree.tokenSlice(rparen - 1), name)) continue;
+            const asm_node = w.enclosingAsm(rparen) orelse continue;
+            try w.outputs.append(w.c.allocator, .{ .token = rparen - 1, .asm_node = asm_node });
+        }
+        // The local's identifiers and its aliases', in node order.
+        if (index.named.get(w.local)) |list| try w.mentions.appendSlice(w.c.allocator, list.items);
+        for (w.aliases) |alias| if (index.named.get(alias)) |list| try w.mentions.appendSlice(w.c.allocator, list.items);
+        if (w.aliases.len != 0) std.mem.sort(Ast.Node.Index, w.mentions.items, {}, struct {
+            fn less(_: void, a: Ast.Node.Index, b: Ast.Node.Index) bool {
+                return @backingInt(a) < @backingInt(b);
+            }
+        }.less);
         w.shape = try w.partsOf();
     }
 
@@ -2970,25 +2969,70 @@ fn installed(c: *Context, slot: Slot) Context.Error!?[]const Facts.Decl {
     return found.items;
 }
 
+/// What `Walk.collect` and `aliasesOf` read of a file, gathered once for the run: each
+/// declaration's identifiers (`nameOf`), the file's `return`s, `try`s and asm outputs, and its
+/// variables whose initializer names a declaration of the file or its address, each in order.
+const FileIndex = struct {
+    named: std.AutoHashMapUnmanaged(Model.Declaration.Id, std.ArrayList(Ast.Node.Index)) = .empty,
+    returns: std.ArrayList(Ast.Node.Index) = .empty,
+    tries: std.ArrayList(Ast.Node.Index) = .empty,
+    outputs: std.ArrayList(Ast.Node.Index) = .empty,
+    bindings: std.ArrayList(Binding) = .empty,
+
+    const Binding = struct { id: Model.Declaration.Id, of: Model.Declaration.Id, address: bool };
+};
+
+const FileIndexes = struct { files: std.AutoHashMapUnmanaged(Project.FileId, *const FileIndex) = .empty };
+
+fn indexOf(facts: *Facts, file: Project.FileId) Context.Error!*const FileIndex {
+    const memo = try facts.memo(FileIndexes);
+    if (memo.files.get(file)) |known| return known;
+    const gpa = facts.gpa;
+    const tree = &facts.project.at(file).file.tree;
+    const model = &facts.project.at(file).model;
+    const index = try gpa.create(FileIndex);
+    index.* = .{};
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        switch (tag) {
+            .@"return" => try index.returns.append(gpa, node),
+            .@"try" => try index.tries.append(gpa, node),
+            .asm_output => try index.outputs.append(gpa, node),
+            else => {
+                const decl = (try nameOf(facts, file, node)) orelse continue;
+                const entry = try index.named.getOrPut(gpa, decl);
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(gpa, node);
+            },
+        }
+    }
+    for (model.declarations, 0..) |decl, d| {
+        if (decl.kind != .variable) continue;
+        const variable = tree.fullVarDecl(decl.node) orelse continue;
+        const init = Facts.ungrouped(tree, variable.ast.init_node.unwrap() orelse continue);
+        const address = Facts.accesses.formOf(tree.nodeTag(init)) == .address_of;
+        const spelled = Facts.ungrouped(tree, if (address) tree.nodeData(init).node else init);
+        const of = (try nameOf(facts, file, spelled)) orelse continue;
+        try index.bindings.append(gpa, .{ .id = @fromBackingInt(@intCast(d)), .of = of, .address = address });
+    }
+    try memo.files.put(gpa, file, index);
+    return index;
+}
+
 /// The locals that hold the address of `local`'s memory as it is, with no step through it:
 /// `const p = &x` for a local, `const q = p` for a parameter's pointer (`param`), and one of
 /// those again (`const r = q`).
 fn aliasesOf(gpa: std.mem.Allocator, facts: *Facts, file: Project.FileId, local: Model.Declaration.Id, param: bool) Context.Error![]const Model.Declaration.Id {
-    const tree = &facts.project.at(file).file.tree;
-    const model = &facts.project.at(file).model;
+    const index = try indexOf(facts, file);
     var found: std.ArrayList(Model.Declaration.Id) = .empty;
     var grown = true;
     while (grown) {
         grown = false;
-        for (model.declarations, 0..) |decl, d| {
-            if (decl.kind != .variable) continue;
-            const id: Model.Declaration.Id = @fromBackingInt(@intCast(d));
+        for (index.bindings.items) |binding| {
+            const id = binding.id;
             if (id == local or std.mem.findScalar(Model.Declaration.Id, found.items, id) != null) continue;
-            const variable = tree.fullVarDecl(decl.node) orelse continue;
-            const init = Facts.ungrouped(tree, variable.ast.init_node.unwrap() orelse continue);
-            const address = Facts.accesses.formOf(tree.nodeTag(init)) == .address_of;
-            const spelled = Facts.ungrouped(tree, if (address) tree.nodeData(init).node else init);
-            const of = (try nameOf(facts, file, spelled)) orelse continue;
+            const address = binding.address;
+            const of = binding.of;
             // The local's address, or a parameter's pointer as it is; an alias's, as it is.
             const alias = if (of == local) address != param else !address and std.mem.findScalar(Model.Declaration.Id, found.items, of) != null;
             if (!alias) continue;
