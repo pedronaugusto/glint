@@ -6,6 +6,11 @@
 const std = @import("std");
 const Context = @import("RuleContext.zig");
 const Facts = @import("Facts.zig");
+const Range = @import("Range.zig");
+const accesses = Facts.accesses;
+const formAt = Range.formAt;
+const nameRef = Range.nameRef;
+const spellsName = Range.spellsName;
 const Model = @import("Model.zig");
 const Project = @import("Project.zig");
 const Program = @import("Program.zig");
@@ -82,6 +87,18 @@ fn kindOf(c: *Context, ks: *const Kinds, file: Project.FileId, node: Ast.Node.In
     const held = switch (value) {
         .instance, .container => |k| k,
         .unknown => return .unresolved,
+        // A choice is the one stream every part is; parts of two kinds, or a part not known, may
+        // be either; parts none of which is a stream, none.
+        .alternatives => |parts| {
+            var found: ?Kind = null;
+            for (parts) |part| {
+                const one = (try kindOfValue(ks, part)) orelse continue;
+                if (one == .unresolved) return .unresolved;
+                if (found) |known| if (!std.meta.eql(known, one)) return .unresolved;
+                found = one;
+            }
+            return found;
+        },
         else => return null,
     };
     for (ks.each, 0..) |each, at| {
@@ -89,6 +106,44 @@ fn kindOf(c: *Context, ks: *const Kinds, file: Project.FileId, node: Ast.Node.In
         if (k.file == held.file and k.scope == held.scope) return .{ .known = at };
     }
     return if (ks.unknown) .unresolved else null;
+}
+
+/// `kindOf` of one part of a choice.
+fn kindOfValue(ks: *const Kinds, given: Facts.Value) Context.Error!?Kind {
+    var value = given;
+    if (value == .pointer) value = value.pointer.child.*;
+    const held = switch (value) {
+        .instance, .container => |k| k,
+        .unknown, .alternatives => return .unresolved,
+        else => return null,
+    };
+    for (ks.each, 0..) |each, at| {
+        const k = each orelse continue;
+        if (k.file == held.file and k.scope == held.scope) return .{ .known = at };
+    }
+    return if (ks.unknown) .unresolved else null;
+}
+
+/// Whether the member read `node` is the field `name` its holder's own type declares (a
+/// stream's `interface`, a reader's `err`), by declaration: null where `node` is no member read
+/// or its holder's type does not resolve.
+fn ownField(c: *Context, file: Project.FileId, node: Ast.Node.Index, name: []const u8) Context.Error!?bool {
+    const tree = &c.project.at(file).file.tree;
+    if (formAt(tree, node) != .member) return false;
+    var value = try c.facts.resolve(file, tree.nodeData(node).node_and_token[0]);
+    while (value == .pointer) value = value.pointer.child.*;
+    const holder = switch (value) {
+        .instance, .container => |k| k,
+        // A holder chosen per build: its field is not one known.
+        .alternatives => return null,
+        else => return null,
+    };
+    const declared = c.facts.member(holder, name) orelse return false;
+    return switch (try c.facts.definition(file, node)) {
+        .decl => |found| std.meta.eql(found, declared),
+        .none => false,
+        .unknown => null,
+    };
 }
 
 /// A place a stream is named by: a declaration and the fields read from it (`self.source`),
@@ -138,10 +193,10 @@ fn placeOf(c: *Context, ks: *const Kinds, file: Project.FileId, node: Ast.Node.I
     if (depth >= 8) return null;
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    switch (tree.nodeTag(node)) {
-        .grouped_expression => return placeOf(c, ks, file, tree.nodeData(node).node_and_token[0], depth + 1),
+    switch (formAt(tree, node)) {
+        .grouped => return placeOf(c, ks, file, tree.nodeData(node).node_and_token[0], depth + 1),
         .address_of, .deref => return placeOf(c, ks, file, tree.nodeData(node).node, depth + 1),
-        .field_access => {
+        .member => {
             const object, const name = tree.nodeData(node).node_and_token;
             var p = (try placeOf(c, ks, file, object, depth + 1)) orelse return null;
             if (p.len == Place.max) return null;
@@ -150,12 +205,12 @@ fn placeOf(c: *Context, ks: *const Kinds, file: Project.FileId, node: Ast.Node.I
             p.nodes[p.len] = node;
             return p;
         },
-        .identifier => {
-            const id = (model.reference(node) orelse return null).declaration orelse return null;
+        .leaf => {
+            const id = (nameRef(model, node) orelse return null).declaration orelse return null;
             const record = model.declarations[@backingInt(id)];
             if (record.kind == .variable) if (tree.fullVarDecl(record.node)) |variable| if (variable.ast.init_node.unwrap()) |init| {
                 // A constant pointer to a place is that place.
-                if (tree.tokenTag(variable.ast.mut_token) == .keyword_const and tree.nodeTag(init) == .address_of) {
+                if (tree.tokenTag(variable.ast.mut_token) == .keyword_const and formAt(tree, init) == .address_of) {
                     if (try placeOf(c, ks, file, init, depth + 1)) |p| return p;
                 }
                 if (try wrapped(c, ks, file, node, init, depth)) |p| return p;
@@ -171,9 +226,10 @@ fn placeOf(c: *Context, ks: *const Kinds, file: Project.FileId, node: Ast.Node.I
 /// The stream a local wraps: its value has an `interface` of its own and is made by a call on a
 /// stream's interface or given one (`r.interface.limited(...)`, `.init(&r.interface, ...)`).
 fn wrapped(c: *Context, ks: *const Kinds, file: Project.FileId, local: Ast.Node.Index, init: Ast.Node.Index, depth: u8) Context.Error!?Place {
-    const tree = &c.project.at(file).file.tree;
     switch (try c.facts.resolve(file, local)) {
         .instance, .container => |k| if (c.facts.member(k, "interface") == null) return null,
+        // A wrapper chosen per build is no one stream's.
+        .alternatives => return null,
         else => return null,
     }
     if (try kindOf(c, ks, file, local) != null) return null;
@@ -183,7 +239,7 @@ fn wrapped(c: *Context, ks: *const Kinds, file: Project.FileId, local: Ast.Node.
         .unknown => return null,
     };
     for (args) |operand| {
-        if (!interface(tree, operand)) continue;
+        if (!try interface(c, file, operand)) continue;
         const p = (try placeOf(c, ks, file, operand, depth + 1)) orelse continue;
         return p.parent();
     }
@@ -191,14 +247,18 @@ fn wrapped(c: *Context, ks: *const Kinds, file: Project.FileId, local: Ast.Node.
 }
 
 /// Whether `node` (or what it points at) is `x.interface`.
-fn interface(tree: *const Ast, node: Ast.Node.Index) bool {
+fn interface(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    return (try ownField(c, file, interfaceRead(&c.project.at(file).file.tree, node), "interface")) orelse false;
+}
+
+/// The member read under `&` and parentheses (`&r.interface`).
+fn interfaceRead(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
     var at = node;
-    while (tree.nodeTag(at) == .address_of or tree.nodeTag(at) == .grouped_expression) at = switch (tree.nodeTag(at)) {
-        .address_of => tree.nodeData(at).node,
-        else => tree.nodeData(at).node_and_token[0],
+    while (true) switch (formAt(tree, at)) {
+        .address_of => at = tree.nodeData(at).node,
+        .grouped => at = tree.nodeData(at).node_and_token[0],
+        else => return at,
     };
-    if (tree.nodeTag(at) != .field_access) return false;
-    return std.mem.eql(u8, tree.tokenSlice(tree.nodeData(at).node_and_token[1]), "interface");
 }
 
 /// An operation a call makes on a stream: the stream's place (null where it is reached by what
@@ -227,26 +287,21 @@ fn operations(c: *Context, ks: *const Kinds, file: Project.FileId, call: *const 
     };
     // What it passes, the receiver first, in the callee's parameter order (Facts.calls).
     for (args, 0..) |operand, position| {
-        if (interface(tree, operand)) {
+        if (try interface(c, file, operand)) {
             // By its place, a wrapper read as the stream it wraps; else by the expression.
             if (try placeOf(c, ks, file, operand, 0)) |p| {
                 const stream = p.parent();
                 const kind = (try kindOf(c, ks, stream.file, stream.node())) orelse continue;
                 try out.append(c.allocator, .{ .place = stream, .stream = stream.node(), .file = stream.file, .kind = kind });
             } else {
-                var at = operand;
-                while (tree.nodeTag(at) != .field_access) at = switch (tree.nodeTag(at)) {
-                    .address_of => tree.nodeData(at).node,
-                    else => tree.nodeData(at).node_and_token[0],
-                };
-                const stream = tree.nodeData(at).node_and_token[0];
+                const stream = tree.nodeData(interfaceRead(tree, operand)).node_and_token[0];
                 const kind = (try kindOf(c, ks, file, stream)) orelse continue;
                 try out.append(c.allocator, .{ .place = null, .stream = stream, .file = file, .kind = kind });
             }
             continue;
         }
         // A wrapper, or an alias of an interface, read as its stream.
-        if (try placeOf(c, ks, file, operand, 0)) |p| if (p.len > 0 and std.mem.eql(u8, p.last().?, "interface") and p.root != rootOf(c, file, operand)) {
+        if (try placeOf(c, ks, file, operand, 0)) |p| if (p.len > 0 and (try ownField(c, p.file, p.node(), "interface") orelse false) and p.root != rootOf(c, file, operand)) {
             const stream = p.parent();
             const kind = (try kindOf(c, ks, file, stream.node())) orelse continue;
             try out.append(c.allocator, .{ .place = stream, .stream = stream.node(), .file = p.file, .kind = kind });
@@ -291,9 +346,9 @@ fn unknownArgs(c: *Context, ks: *const Kinds, file: Project.FileId, call: *const
     const tree = &c.project.at(file).file.tree;
     var out: std.ArrayList(Operation) = .empty;
     var receiver: ?Ast.Node.Index = null;
-    if (tree.nodeTag(call.callee_expr) == .field_access) {
+    if (formAt(tree, call.callee_expr) == .member) {
         const holder, const method = tree.nodeData(call.callee_expr).node_and_token;
-        if (tree.nodeTag(holder) == .field_access and interface(tree, holder)) {
+        if (formAt(tree, holder) == .member and try interface(c, file, holder)) {
             const stream = tree.nodeData(holder).node_and_token[0];
             const kind = (try kindOf(c, ks, file, stream)) orelse return &.{};
             try out.append(c.allocator, .{ .place = try placeOf(c, ks, file, stream, 0), .stream = stream, .file = file, .kind = kind, .side = sideOf(c, ks, tree.tokenSlice(method)) });
@@ -317,18 +372,11 @@ fn unknownArgs(c: *Context, ks: *const Kinds, file: Project.FileId, call: *const
 fn unknownOperand(c: *Context, ks: *const Kinds, file: Project.FileId, operand: Ast.Node.Index, out: *std.ArrayList(Operation)) Context.Error!void {
     const tree = &c.project.at(file).file.tree;
     // A literal of a tag, a number, a string or a character holds no stream.
-    switch (tree.nodeTag(operand)) {
-        .enum_literal, .number_literal, .string_literal, .multiline_string_literal, .char_literal => return,
+    if (try c.facts.literalOf(file, operand)) |written| switch (written) {
+        .enum_literal, .number, .string, .char => return,
         else => {},
-    }
-    const stream = if (interface(tree, operand)) at: {
-        var at = operand;
-        while (tree.nodeTag(at) != .field_access) at = switch (tree.nodeTag(at)) {
-            .address_of => tree.nodeData(at).node,
-            else => tree.nodeData(at).node_and_token[0],
-        };
-        break :at tree.nodeData(at).node_and_token[0];
-    } else operand;
+    };
+    const stream = if (try interface(c, file, operand)) tree.nodeData(interfaceRead(tree, operand)).node_and_token[0] else operand;
     const kind = (try kindOf(c, ks, file, stream)) orelse return;
     try out.append(c.allocator, .{ .place = try placeOf(c, ks, file, stream, 0), .stream = stream, .file = file, .kind = kind });
 }
@@ -349,10 +397,10 @@ fn sideOf(c: *Context, ks: *const Kinds, method: []const u8) ?usize {
 fn rootOf(c: *Context, file: Project.FileId, node: Ast.Node.Index) ?Model.Declaration.Id {
     const tree = &c.project.at(file).file.tree;
     var at = node;
-    while (true) at = switch (tree.nodeTag(at)) {
-        .grouped_expression, .field_access => tree.nodeData(at).node_and_token[0],
+    while (true) at = switch (formAt(tree, at)) {
+        .grouped, .member => tree.nodeData(at).node_and_token[0],
         .address_of, .deref => tree.nodeData(at).node,
-        .identifier => return ((c.project.at(file).model.reference(at) orelse return null).declaration),
+        .leaf => return ((nameRef(&c.project.at(file).model, at) orelse return null).declaration),
         else => return null,
     };
 }
@@ -365,7 +413,7 @@ fn mayFail(c: *Context, callee: Facts.Decl, name: []const u8) Context.Error!bool
     var buffer: [1]Ast.Node.Index = undefined;
     const proto = tree.fullFnProto(&buffer, model.declarations[@backingInt(callee.index)].node) orelse return true;
     const result = proto.ast.return_type.unwrap() orelse return true;
-    if (tree.nodeTag(result) != .error_union) {
+    if (formAt(tree, result) != .error_union) {
         const before = tree.firstToken(result);
         // `!T`: what it returns is inferred.
         return before > 0 and tree.tokenTag(before - 1) == .bang;
@@ -377,20 +425,22 @@ fn mayFail(c: *Context, callee: Facts.Decl, name: []const u8) Context.Error!bool
 fn names(c: *Context, file: Project.FileId, node: Ast.Node.Index, name: []const u8, depth: u8) Context.Error!bool {
     if (depth >= 8) return true;
     const tree = &c.project.at(file).file.tree;
-    switch (tree.nodeTag(node)) {
-        .grouped_expression => return names(c, file, tree.nodeData(node).node_and_token[0], name, depth + 1),
-        .merge_error_sets => {
+    switch (formAt(tree, node)) {
+        .grouped => return names(c, file, tree.nodeData(node).node_and_token[0], name, depth + 1),
+        .merged_errors => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             return try names(c, file, lhs, name, depth + 1) or try names(c, file, rhs, name, depth + 1);
         },
-        .error_set_decl => {
-            var token = tree.nodeMainToken(node) + 2;
-            while (token < tree.lastToken(node)) : (token += 1) {
-                if (tree.tokenTag(token) == .identifier and std.mem.eql(u8, tree.tokenSlice(token), name)) return true;
+        .leaf, .member => {
+            // `error{A, B}`: its names, each a global identity; a name, the set it names.
+            if (formAt(tree, node) == .leaf and !spellsName(tree, node)) {
+                if (tree.tokenTag(tree.nodeMainToken(node)) != .keyword_error) return true;
+                var token = tree.nodeMainToken(node) + 2;
+                while (token < tree.lastToken(node)) : (token += 1) {
+                    if (tree.tokenTag(token) == .identifier and std.mem.eql(u8, tree.tokenSlice(token), name)) return true;
+                }
+                return false;
             }
-            return false;
-        },
-        .identifier, .field_access => {
             const decl = switch (try c.facts.definition(file, node)) {
                 .decl => |found| found,
                 .none, .unknown => return true,
@@ -447,11 +497,17 @@ fn mayHold(c: *Context, ks: *const Kinds, function: Facts.Decl, position: usize)
     while (true) value = switch (value) {
         .pointer => |inner| inner.child.*,
         .optional => |inner| inner.*,
+        .alternatives => break,
         else => break,
     };
     const held = switch (value) {
         .unknown => return true,
         .container, .instance => |k| k,
+        // A parameter whose type is chosen per build may hold a stream where any part may.
+        .alternatives => |parts| {
+            for (parts) |part| if (try kindOfValue(ks, part) != null) return true;
+            return false;
+        },
         else => return false,
     };
     if (ks.unknown) return true;
@@ -507,9 +563,9 @@ fn handling(c: *Context, ks: *const Kinds, file: Project.FileId, call: Ast.Node.
     };
     var at = call;
     while (model.parentOf(at)) |parent| : (at = parent) {
-        switch (tree.nodeTag(parent)) {
-            .grouped_expression => continue,
-            .@"try", .@"return" => return .passed,
+        switch (formAt(tree, parent)) {
+            .grouped => continue,
+            .tried, .@"return" => return .passed,
             .@"catch" => {
                 const lhs, const rhs = tree.nodeData(parent).node_and_node;
                 if (lhs != at) return .kept;
@@ -548,13 +604,13 @@ fn clears(c: *Context, ks: *const Kinds, file: Project.FileId, whole: Ast.Node.I
     const tree = &c.project.at(file).file.tree;
     const stream = op.place orelse return false;
     var h = handler;
-    while (tree.nodeTag(h) == .grouped_expression) h = tree.nodeData(h).node_and_token[0];
+    h = Facts.ungrouped(tree, h);
     var returned = false;
     if (tree.nodeTag(h) == .@"return") if (tree.nodeData(h).opt_node.unwrap()) |value| if (tree.fullSwitch(value) != null) {
         h = value;
         returned = true;
     };
-    if (capture) |name| if (tree.fullSwitch(h)) |chosen| if (tree.nodeTag(chosen.ast.condition) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(chosen.ast.condition)), tree.tokenSlice(name))) {
+    if (capture) |name| if (tree.fullSwitch(h)) |chosen| if (spellsName(tree, chosen.ast.condition) and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(chosen.ast.condition)), tree.tokenSlice(name))) {
         var otherwise: ?Ast.Node.Index = null;
         var named = false;
         for (chosen.ast.cases) |case_node| {
@@ -573,7 +629,8 @@ fn clears(c: *Context, ks: *const Kinds, file: Project.FileId, whole: Ast.Node.I
 
 /// Whether `node` is `error.<name>`.
 fn errorNamed(tree: *const Ast, node: Ast.Node.Index, name: []const u8) bool {
-    return tree.nodeTag(node) == .error_value and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node) + 2), name);
+    // An error name is a global identity: `error.<name>` by its token.
+    return formAt(tree, node) == .leaf and tree.tokenTag(tree.nodeMainToken(node)) == .keyword_error and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node) + 2), name);
 }
 
 /// Whether every way a handler's path leaves gives the stream's cause: each `return` before a
@@ -603,9 +660,9 @@ fn leaves(c: *Context, file: Project.FileId, whole: Ast.Node.Index) bool {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
     var at = whole;
-    while (model.parentOf(at)) |parent| : (at = parent) switch (tree.nodeTag(parent)) {
-        .grouped_expression => {},
-        .@"try", .@"return" => return true,
+    while (model.parentOf(at)) |parent| : (at = parent) switch (formAt(tree, parent)) {
+        .grouped => {},
+        .tried, .@"return" => return true,
         else => return false,
     };
     return false;
@@ -645,7 +702,8 @@ fn causeless(c: *Context, ks: *const Kinds, file: Project.FileId, node: Ast.Node
 /// Whether `place`'s expression is the stream's `err`.
 fn isErr(c: *Context, ks: *const Kinds, file: Project.FileId, node: Ast.Node.Index, stream: *const Place) Context.Error!bool {
     const p = (try placeOf(c, ks, file, node, 0)) orelse return false;
-    if (p.len == 0 or !std.mem.eql(u8, p.last().?, "err")) return false;
+    // The stream's own `err`, by the declaration its type gives the name.
+    if (p.len == 0 or !(try ownField(c, p.file, p.node(), "err") orelse false)) return false;
     const holder = p.parent();
     return holder.same(stream);
 }
@@ -704,12 +762,12 @@ fn canceledProng(tree: *const Ast, chosen: Ast.full.Switch) ?Ast.Node.Index {
 fn causeOf(c: *Context, ks: *const Kinds, file: Project.FileId, node: Ast.Node.Index, stream: *const Place) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    switch (tree.nodeTag(node)) {
-        .grouped_expression, .unwrap_optional => return causeOf(c, ks, file, tree.nodeData(node).node_and_token[0], stream),
+    switch (formAt(tree, node)) {
+        .grouped, .unwrap_optional => return causeOf(c, ks, file, tree.nodeData(node).node_and_token[0], stream),
         .@"orelse" => return causeOf(c, ks, file, tree.nodeData(node).node_and_node[0], stream),
-        .field_access => return isErr(c, ks, file, node, stream),
-        .identifier => {
-            const id = (model.reference(node) orelse return false).declaration orelse return false;
+        .member => return isErr(c, ks, file, node, stream),
+        .leaf => {
+            const id = (nameRef(model, node) orelse return false).declaration orelse return false;
             const record = model.declarations[@backingInt(id)];
             switch (record.kind) {
                 .capture => return causeOf(c, ks, file, c.facts.captureSource(file, record) orelse return false, stream),
@@ -732,13 +790,16 @@ fn causeOf(c: *Context, ks: *const Kinds, file: Project.FileId, node: Ast.Node.I
 fn cause(c: *Context, ks: *const Kinds, file: Project.FileId, node: Ast.Node.Index, stream: *const Place, depth: u8) Context.Error!bool {
     if (depth >= 8) return false;
     const tree = &c.project.at(file).file.tree;
-    switch (tree.nodeTag(node)) {
-        .grouped_expression => return cause(c, ks, file, tree.nodeData(node).node_and_token[0], stream, depth),
+    switch (formAt(tree, node)) {
+        .grouped => return cause(c, ks, file, tree.nodeData(node).node_and_token[0], stream, depth),
         .@"return" => return cause(c, ks, file, tree.nodeData(node).opt_node.unwrap() orelse return false, stream, depth),
-        .unreachable_literal => return true,
-        .error_value => return errorNamed(tree, node, "Canceled"),
-        .unwrap_optional, .@"orelse", .identifier, .field_access => return causeOf(c, ks, file, node, stream),
-        .builtin_call_two, .builtin_call_two_comma => {
+        .leaf => switch (tree.tokenTag(tree.nodeMainToken(node))) {
+            .keyword_unreachable => return true,
+            .keyword_error => return errorNamed(tree, node, "Canceled"),
+            else => if (spellsName(tree, node)) return causeOf(c, ks, file, node, stream),
+        },
+        .unwrap_optional, .@"orelse", .member => return causeOf(c, ks, file, node, stream),
+        .builtin => {
             // `@errorCast(e)`, `@as(E, e)`.
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, node, &buffer);
@@ -756,7 +817,7 @@ fn cause(c: *Context, ks: *const Kinds, file: Project.FileId, node: Ast.Node.Ind
     if (tree.fullSwitch(node)) |chosen| {
         if (try causeOf(c, ks, file, chosen.ast.condition, stream)) {
             const prong = canceledProng(tree, chosen) orelse return false;
-            if (tree.nodeTag(prong) == .identifier) if (prongCapture(tree, chosen, prong)) return true;
+            if (spellsName(tree, prong)) if (prongCapture(tree, chosen, prong)) return true;
             return cause(c, ks, file, prong, stream, depth + 1);
         }
         for (chosen.ast.cases) |case_node| if (!try cause(c, ks, file, tree.fullSwitchCase(case_node).?.ast.target_expr, stream, depth + 1)) return false;
