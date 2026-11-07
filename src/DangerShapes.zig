@@ -992,7 +992,19 @@ fn releasedUnder(c: *Context, env: ?*const Facts.Env, file: Project.FileId, node
             // A method the reading `env` resolves (`b.v.close()` in `Box(T)` read as
             // `Box(std.Io.File)`) is no handle: by what it does with its receiver.
             .unknown => if (try Facts.accesses.useOf(c.facts, file, access) == .callee) {
-                if (!try methodUnder(c, env, file, access)) return .unknown;
+                if (!try methodUnder(c, env, file, access)) {
+                    // In a type function's body read with no binding (a field's summary, which
+                    // every instance shares): at each binding the program makes of it.
+                    if (env != null) return .unknown;
+                    const function = (try typeFunctionOf(c, file, access)) orelse return .unknown;
+                    const readings = (try bindingsOf(c, function, 0)) orelse return .unknown;
+                    var result: Stored = .no;
+                    for (readings) |reading| {
+                        result = join(result, try releasedUnder(c, reading, file, node, depth));
+                        if (result == .yes) return .yes;
+                    }
+                    return result;
+                }
             } else return if (try releasedUnder(c, env, file, access, next) == .no) .no else .unknown,
             .no => if (try Facts.accesses.useOf(c.facts, file, access) != .callee) return .no,
         },
@@ -1050,6 +1062,53 @@ fn methodUnder(c: *Context, env: ?*const Facts.Env, file: Project.FileId, access
     const call = (try Facts.calls.under(c.facts, reading, file, c.project.at(file).model.parentOf(access) orelse return false)) orelse return false;
     if (call.callee_expr != access) return false;
     return call.callee != .any;
+}
+
+/// The innermost type function (one returning `type`, `Facts.typeIsType`) whose body holds
+/// `node` in `file`; null where none does.
+fn typeFunctionOf(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Facts.Decl {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    var at = node;
+    while (enclosingFunction(model, tree, at)) |function| : (at = function) {
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = tree.fullFnProto(&buffer, tree.nodeData(function).node_and_node[0]) orelse continue;
+        const returned = proto.ast.return_type.unwrap() orelse continue;
+        if (!try c.facts.typeIsType(file, returned)) continue;
+        for (model.declarations, 0..) |record, i| {
+            if (record.kind == .function and record.node == function) return .{ .file = file, .index = @fromBackingInt(@intCast(i)) };
+        }
+        return null;
+    }
+    return null;
+}
+
+/// The readings the program binds the type function `function` with: each call of it
+/// (`Facts.callSites`) bound by `Facts.bindCall`, a call in another type function's body under
+/// each of that one's readings in turn. Null where a call of it is not known (`escapes`), binds
+/// what is not known, or none is made, and past `depth` 4: no reading then decides.
+fn bindingsOf(c: *Context, function: Facts.Decl, depth: u8) Context.Error!?[]const *const Facts.Env {
+    if (depth >= 4) return null;
+    const sites = (try c.facts.callSites(function)) orelse return null;
+    if (sites.len == 0) return null;
+    var out: std.ArrayList(*const Facts.Env) = .empty;
+    for (sites) |site| {
+        if (site.params.len == 0) return null;
+        const call_node = c.project.at(site.file).model.parentOf(site.params[0]) orelse return null;
+        const call = (try Facts.calls.at(c.facts, site.file, call_node)) orelse return null;
+        const outers: []const *const Facts.Env = if (try typeFunctionOf(c, site.file, call_node)) |enclosing|
+            (try bindingsOf(c, enclosing, depth + 1)) orelse return null
+        else
+            &.{};
+        if (outers.len == 0) switch (try c.facts.bindCall(&call, function, null)) {
+            .reading => |reading| try out.append(c.allocator, reading),
+            .unknown => return null,
+        } else for (outers) |outer| switch (try c.facts.bindCall(&call, function, outer)) {
+            .reading => |reading| try out.append(c.allocator, reading),
+            .unknown => return null,
+        };
+    }
+    return out.items;
 }
 
 /// The bindings to read the field read `node` in `file` under: those of the type function call
