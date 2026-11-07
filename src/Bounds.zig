@@ -214,7 +214,12 @@ fn cheapest(rows: []const Lin) ?Var {
 }
 
 /// Whether the constraints are shown to have no rational solution, and so no integer one.
-fn impossible(a: std.mem.Allocator, rows: []const Lin) Error!bool {
+fn impossible(rows: []const Lin) Error!bool {
+    // What the steps work through is the answer's alone: it goes when the answer does, not when
+    // the reading ends.
+    var scratch: std.heap.ArenaAllocator = .init(std.heap.smp_allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
     var work = try canonical(a, rows);
     while (true) {
         for (work) |row| if (row.terms.len == 0 and row.c < 0) return true;
@@ -251,7 +256,7 @@ fn entails(a: std.mem.Allocator, s: State, goal: Lin) Error!bool {
     const rows = try a.alloc(Lin, s.rows.len + 1);
     @memcpy(rows[0..s.rows.len], s.rows);
     rows[s.rows.len] = negated;
-    return impossible(a, rows);
+    return impossible(rows);
 }
 
 /// The state with `row` added; a path it rules out is none.
@@ -263,7 +268,7 @@ fn assume(a: std.mem.Allocator, s: State, row: ?Lin) Error!State {
     rows[s.rows.len] = added;
     var kept = try canonical(a, rows);
     if (kept.len == 1 and kept[0].terms.len == 0) return State.unreachable_state;
-    if (try impossible(a, kept)) return State.unreachable_state;
+    if (try impossible(kept)) return State.unreachable_state;
     if (kept.len > state_rows) kept = try trimmed(a, kept);
     return .{ .rows = kept };
 }
