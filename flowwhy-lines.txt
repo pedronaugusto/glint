@@ -1,0 +1,33 @@
+3238                     .unknown => return unsure(@src().line),
+3240                 if (try f.uses(stmt) != .none) return unsure(@src().line);
+3266                 const paths = (try f.jumps(stmt, state)).settled() orelse return unsure(@src().line);
+3274                 const paths = outcome.settled() orelse return unsure(@src().line);
+3309                 .unknown => return unsure(@src().line),
+3314                 .uncertain => return unsure(@src().line),
+3327         if (f.known != null) return unsure(@src().line);
+3335             const paths = (try each.walk(rest, split.when[value])).settled() orelse return unsure(@src().line);
+3355                     .unknown => return unsure(@src().line),
+3367             var out = (try f.leave(parts[0], state)).settled() orelse return unsure(@src().line);
+3368             const handler = (try f.block(parts[1], state)).settled() orelse return unsure(@src().line);
+3369             out.falls = meet(out.falls, handler.falls) catch return unsure(@src().line);
+3383             var out: Paths = if (own) .{ .falls = state } else (try f.leave(branch.ast.cond_expr, state)).settled() orelse return unsure(@src().line);
+3384             const then_paths = (try f.block(branch.ast.then_expr, state)).settled() orelse return unsure(@src().line);
+3386             const else_paths: Paths = if (branch.ast.else_expr.unwrap()) |other| (try f.block(other, otherwise)).settled() orelse return unsure(@src().line) else .{ 
+3392                 const flag = (try f.correlated(stmt, branch)) orelse return unsure(@src().line);
+3402             var out = (try f.leave(choice.ast.condition, state)).settled() orelse return unsure(@src().line);
+3406                 const paths = (try f.block(prong.ast.target_expr, state)).settled() orelse return unsure(@src().line);
+3407                 falls = meet(falls, paths.falls) catch return unsure(@src().line);
+3586             const paths = (try f.leave(head, state)).settled() orelse return unsure(@src().line);
+3591             const paths = (try f.leave(input, state)).settled() orelse return unsure(@src().line);
+3595         const looped = (try inner.block(body, state)).settled() orelse return unsure(@src().line);
+3596         if (looped.falls) |back| if (back != state) return unsure(@src().line);
+3597         if (!looped.continues.subsetOf(.initOne(state))) return unsure(@src().line);
+3601                 const paths = (try f.block(node, state)).settled() orelse return unsure(@src().line);
+3609         if (it.next() != null) return unsure(@src().line);
+3631             .other => return unsure(@src().line),
+3663                     if (!try f.exit(main, fails, at)) return unsure(@src().line);
+3665                 .other => return unsure(@src().line),
+3744         var paths = (try f.jumps(if (handler != null) call else node, failed)).settled() orelse return unsure(@src().line);
+3746             const caught = (try f.block(h, failed)).settled() orelse return unsure(@src().line);
+3749             paths.falls = meet(.released, caught.falls) catch return unsure(@src().line);
+3752             if (!try f.exit(f.tree.nodeMainToken(stmt), true, failed)) return unsure(@src().line);
