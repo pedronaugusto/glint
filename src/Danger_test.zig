@@ -11260,3 +11260,30 @@ test "A009 and A010 read a field's relation to its siblings: a cursor at most it
     // Loose's start, not shown at most its end: its start and its end, as A009 counts an order.
     try expect(pack.untrusted_input, cursor_program, 2);
 }
+
+test "A009 reads a call's exits apart where its callee has few: an exit the caller's state rules out leaves nothing, so what the others give holds; one it does not rule out still counts" {
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\fn clamped(bytes: []const u8, from: usize) usize {
+        \\    if (from > bytes.len) return bytes.len;
+        \\    return from;
+        \\}
+        \\fn scanned(bytes: []const u8, from: usize) usize {
+        \\    var i = from;
+        \\    while (i < bytes.len) : (i += 1) if (bytes[i] == '\n') return i;
+        \\    return bytes.len;
+        \\}
+        \\fn past(bytes: []const u8, from: usize) usize {
+        \\    if (from > 8) return bytes.len + 1;
+        \\    return from;
+        \\}
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const bytes = try r.take(64);
+        \\    const from: usize = try r.takeInt(u16, 0);
+        \\    if (from > bytes.len) return error.Short;
+        \\    _ = bytes[from..clamped(bytes, from)];
+        \\    _ = bytes[from..scanned(bytes, from)];
+        \\    _ = bytes[from..past(bytes, from)];
+        \\}
+    , 1);
+}

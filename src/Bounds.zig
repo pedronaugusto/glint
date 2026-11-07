@@ -369,6 +369,10 @@ const Callee = struct { file: Project.FileId, function: Ast.Node.Index };
 /// parameter's at entry and, through a pointer, at its exit (`placeSlot`).
 const Summary = struct {
     rows: []const Lin,
+    /// What each successful exit gives, apart, where they are few (`summary_exits`): a call
+    /// reads each where its caller's state lets it be taken, and joins what they leave
+    /// (`Frame.unwrap`). `rows` is their join, read where there are more.
+    exits: []const []const Lin = &.{},
     /// What every failing exit gives of the parameters' slots at entry (`never` where none
     /// fails): an error path of a call is read past only where these hold.
     failing: []const Lin = &never,
@@ -378,6 +382,9 @@ const Summary = struct {
     /// where it may write any.
     written: ?[]const Facts.Decl = null,
 };
+
+/// The most successful exits a summary keeps apart (`Summary.exits`): past them, their join.
+const summary_exits = 4;
 
 /// `-1 ≥ 0`: the summary of a function that never succeeds, or never fails.
 const never = [_]Lin{constant(-1)};
@@ -462,7 +469,11 @@ fn readInto(c: *Context, made: *Analysis, file: Project.FileId, function: Ast.No
     // A reading at a binding, or of std's code, is asked only for its summary (`summaryOf`):
     // what it gives its callees and its verdicts are never read, so they are not kept.
     if (bound == null and try Program.owns(c, file)) try keepReading(c, made, &frame);
-    if (frame.summary) |summary| made.summary = .{ .rows = try persisted(c.allocator, summary.rows), .failing = try persisted(c.allocator, summary.failing), .params = summary.params, .places = try c.allocator.dupe(SlotPlace, summary.places), .written = if (summary.written) |fields| try c.allocator.dupe(Facts.Decl, fields) else null };
+    if (frame.summary) |summary| made.summary = .{ .rows = try persisted(c.allocator, summary.rows), .exits = exits: {
+        const kept = try c.allocator.alloc([]const Lin, summary.exits.len);
+        for (summary.exits, kept) |rows, *copy| copy.* = try persisted(c.allocator, rows);
+        break :exits kept;
+    }, .failing = try persisted(c.allocator, summary.failing), .params = summary.params, .places = try c.allocator.dupe(SlotPlace, summary.places), .written = if (summary.written) |fields| try c.allocator.dupe(Facts.Decl, fields) else null };
 }
 
 /// What a reading of the program's own function gives the run beyond its summary: what it
@@ -1082,6 +1093,9 @@ const Value = struct {
     lin: ?Lin = null,
     length: ?Lin = null,
     unwrapped: []const Lin = &.{},
+    /// Where a call's callee keeps its successful exits apart (`Summary.exits`): what each
+    /// gives, read with `unwrapped` where it is taken.
+    exits: []const []const Lin = &.{},
     /// What holds where it is an error: a call's callee's failing rows, applied to what the
     /// call gives it (`Summary.failing`). Empty where nothing is known.
     failed: []const Lin = &.{},
@@ -1677,7 +1691,18 @@ const Frame = struct {
         const failing = try f.exitsJoined(true);
         // No successful exit: every call that succeeds is unreachable.
         const rows: []const Lin = if (try f.exitsJoined(false)) |s| s.rows else &never;
-        f.summary = .{ .rows = rows, .failing = if (failing) |s| s.rows else &never, .params = f.params.len, .places = f.slot_places, .written = if (f.writes_any) null else f.writes.items };
+        // Each successful exit apart, where they are few: a caller that rules one out reads
+        // the others alone, where their join would lose what only they hold.
+        var apart: std.ArrayList([]const Lin) = .empty;
+        for (f.exits.items) |exit| {
+            if (exit.failed or exit.state.dead) continue;
+            if (apart.items.len == summary_exits) {
+                apart.clearRetainingCapacity();
+                break;
+            }
+            try apart.append(f.a, (try f.project(exit.state)).rows);
+        }
+        f.summary = .{ .rows = rows, .exits = if (apart.items.len > 1) apart.items else &.{}, .failing = if (failing) |s| s.rows else &never, .params = f.params.len, .places = f.slot_places, .written = if (f.writes_any) null else f.writes.items };
     }
 
     /// The join of the exits that fail, or of those that succeed, projected onto the slots;
@@ -2752,7 +2777,16 @@ const Frame = struct {
     fn unwrap(f: *Frame, s: State, value: Value) Error!State {
         var out = s;
         for (value.unwrapped) |row| out = try assume(f.a, out, row);
-        return out;
+        if (value.exits.len == 0 or out.dead) return out;
+        // Each exit the state lets the callee take, and what it leaves: their join. One it rules
+        // out leaves nothing.
+        var joined: State = State.unreachable_state;
+        for (value.exits) |rows| {
+            var taken = out;
+            for (rows) |row| taken = try assume(f.a, taken, row);
+            if (!taken.dead) joined = try f.join(joined, taken);
+        }
+        return joined;
     }
 
     fn tried(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
@@ -3734,9 +3768,12 @@ const Frame = struct {
         // `try`; a result unwrapped later may meet a store to the place first.
         const at_once = !summed.fails or if (f.model.parentOf(node)) |parent| f.tree.nodeTag(parent) == .@"try" else false;
         const rows = try f.appliedRows(summed.rows, summed.params, args.items, &entries, .{ .result = .{ t, try single(f.a, tl) }, .exits = at_once });
+        // Each exit apart, read over the call's slots as the join is.
+        const exits = try f.a.alloc([]const Lin, summed.exits.len);
+        for (summed.exits, exits) |each, *applied| applied.* = try f.appliedRows(each, summed.params, args.items, &entries, .{ .result = .{ t, try single(f.a, tl) }, .exits = at_once });
         // Where it fails: what the call gave, never a result or what it leaves in a place.
         const failed: []const Lin = if (summed.fails) try f.appliedRows(summed.failing, summed.params, args.items, &entries, .{}) else &.{};
-        const value: Value = .{ .lin = t, .length = try single(f.a, tl), .unwrapped = rows, .failed = failed };
+        const value: Value = .{ .lin = t, .length = try single(f.a, tl), .unwrapped = rows, .exits = exits, .failed = failed };
         if (summed.fails) return .{ .s = out, .v = value };
         // A callee that cannot fail returns where it succeeds.
         return .{ .s = try f.unwrap(out, value), .v = .{ .lin = t, .length = value.length } };
@@ -3835,7 +3872,7 @@ const Frame = struct {
     }
 
     /// The summary of the one function of the program a call reaches, at this pointer width.
-    fn summaryOf(f: *Frame, node: Ast.Node.Index, callee: Ast.Node.Index) Error!?struct { rows: []const Lin, failing: []const Lin, params: usize, places: []const SlotPlace, written: ?[]const Facts.Decl, fails: bool, own: bool } {
+    fn summaryOf(f: *Frame, node: Ast.Node.Index, callee: Ast.Node.Index) Error!?struct { rows: []const Lin, exits: []const []const Lin, failing: []const Lin, params: usize, places: []const SlotPlace, written: ?[]const Facts.Decl, fails: bool, own: bool } {
         const decl = switch (try f.c.facts.resolve(f.file, callee)) {
             .function => |d| d,
             .alternatives => return null,
@@ -3868,8 +3905,8 @@ const Frame = struct {
         const fails = formAt(callee_tree, result) == .error_union or
             (callee_tree.firstToken(result) > 0 and callee_tree.tokenTag(callee_tree.firstToken(result) - 1) == .bang) or
             try mayFail(f.c, decl.file, result);
-        if (!own) return .{ .rows = &.{}, .failing = summary.failing, .params = summary.params, .places = &.{}, .written = null, .fails = fails, .own = false };
-        return .{ .rows = summary.rows, .failing = summary.failing, .params = summary.params, .places = summary.places, .written = summary.written, .fails = fails, .own = true };
+        if (!own) return .{ .rows = &.{}, .exits = &.{}, .failing = summary.failing, .params = summary.params, .places = &.{}, .written = null, .fails = fails, .own = false };
+        return .{ .rows = summary.rows, .exits = summary.exits, .failing = summary.failing, .params = summary.params, .places = summary.places, .written = summary.written, .fails = fails, .own = true };
     }
 
     /// Whether a result type named rather than written in place (`R`, `Result(u64)`) may be an
