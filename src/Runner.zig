@@ -82,7 +82,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     }
     try validateRules(config, definitions);
     const known = try knownRules(a, definitions);
-    var runner: Runner = .{ .a = a, .project = project, .config = config, .base = config, .files = options.files, .definitions = definitions, .facts = .{ .project = project, .gpa = a, .known = Contract.package, .remaining = config.fact_budget, .check_records = if (options.summary_check) &Summary.check else null, .read_records = options.summary_records } };
+    var runner: Runner = .{ .a = a, .project = project, .config = config, .base = config, .files = options.files, .definitions = definitions, .facts = .{ .project = project, .gpa = a, .backing = gpa, .known = Contract.package, .remaining = config.fact_budget, .check_records = if (options.summary_check) &Summary.check else null, .read_records = options.summary_records } };
     defer runner.facts.deinit();
     var metrics: std.ArrayList(Report.Metrics.File) = .empty;
     var total: Report.Metrics.Counts = .{};
