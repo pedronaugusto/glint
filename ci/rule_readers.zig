@@ -14,7 +14,7 @@ const std = @import("std");
 const glint = @import("glint");
 const cli = glint.cli;
 const rule_readers: glint.Rule = @fromBackingInt(1000); // safe: this linter owns extension ID 1000, validated by glint.
-pub const rules = ruled(&allowed) ++ tabled(&tables) ++ switched(&switches);
+pub const rules = ruled(&allowed) ++ tabled(&tables) ++ switched(&switches) ++ marked(&unmarked);
 fn ruled(comptime list: []const Allowed) [1]glint.ProjectRule {
     return .{.{ .definition = .{ .id = rule_readers, .name = "RULE_READERS", .group = .family_policy, .purpose = "a rule reads values, writes, calls and types only through glint's shared queries" }, .check = struct {
         fn run(context: *glint.RuleContext) glint.RuleContext.Error!void {
@@ -920,4 +920,185 @@ test "a switch on a resolved value with no alternatives prong is a finding, foun
     try std.testing.expectEqual(0, allowed_site[0]);
     const stale = try switchesAllowing(head ++ "pub fn f(k: Kind) bool { return k == .a; }", &.{.{ .file = "src/Rule.zig", .function = "f", .reason = "pending: warp-fast" }});
     try std.testing.expectEqual(1, stale[0]);
+}
+
+/// LIVE_READS: in Facts (src/Facts.zig, accesses among it), a function that reads what a program
+/// can change marks it (designs/glint-std-unit.md, "Exactness"): a field of Facts that holds the
+/// closed world's answers, or what Project holds of the build (its files, its module mappings).
+/// An entry computed past an unmarked read would be recorded as the same for every program
+/// (`Facts.entryLive`). A read is found by what its holder resolves to (Facts' or Project's own
+/// declaration), a mark by the function its call resolves to; a holder that does not resolve,
+/// read by a guarded name, is undecided.
+const live_reads: glint.Rule = @fromBackingInt(1003); // safe: this linter owns extension ID 1003, validated by glint.
+fn marked(comptime list: []const Allowed) [1]glint.ProjectRule {
+    return .{.{ .definition = .{ .id = live_reads, .name = "LIVE_READS", .group = .family_policy, .purpose = "Facts marks every read of what a program can change, so an entry that read one is never recorded" }, .check = struct {
+        fn run(context: *glint.RuleContext) glint.RuleContext.Error!void {
+            return checkLive(context, list);
+        }
+    }.run }};
+}
+
+/// The functions that read guarded state unmarked, each with its reason, by their name inside
+/// the containers that hold them (`enclosing`). An entry no read of its file's is in is a finding.
+const unmarked = [_]Allowed{
+    .{ .file = "src/Facts.zig", .function = "deinit", .reason = "frees what Facts holds: it reads no answer" },
+    .{ .file = "src/Facts.zig", .function = "fieldRead", .reason = "a test's fixture: it reads the project the test made" },
+    .{ .file = "src/Facts.zig", .function = "storeWalk", .reason = "a test's fixture: it reads the project the test made" },
+    .{ .file = "src/Facts.zig", .function = "inferredEntry", .reason = "sizes a table by how many files there are: it reads no answer" },
+    .{ .file = "src/Facts.zig", .function = "testKnownBool", .reason = "a test's fixture: it reads the project the test made" },
+};
+
+/// Facts' fields that hold the closed world's answers: the program's stores into a field, its
+/// callers, its compilations and module roots, the uses and copies its files hold.
+const closed_fields = [_][]const u8{ "stored", "storing", "callers", "at_bindings", "compiled_with", "imports_read", "module_roots", "member_uses", "comptime_fields", "copier_names" };
+/// Project's members that hold the build's: its files and its module mappings.
+const build_members = [_][]const u8{ "sources", "imports", "importedAll", "imported", "absent" };
+/// Facts' marking accessors.
+const marks = [_][]const u8{ "markBuild", "markClosed" };
+
+fn checkLive(context: *glint.RuleContext, list: []const Allowed) glint.RuleContext.Error!void {
+    const file_name = context.project.at(context.file).input.name;
+    if (!inFile(file_name, "src/Facts.zig")) return;
+    const tree = try context.project.syntax(try context.source());
+    const model = &context.project.at(context.file).model;
+    const facts_type = context.facts.rootOf(context.file);
+    const project_type = switch (try context.facts.declaration(context.facts.member(facts_type, "Project") orelse return)) {
+        .container => |container| container,
+        else => return,
+    };
+    // Each guarded name is one of its holder's: a list that names none is stale.
+    for (closed_fields) |name| if (context.facts.member(facts_type, name) == null) try context.at(live_reads, 0, try context.allocator.print("LIVE_READS guards Facts.{s}, which Facts does not declare: remove it from the list", .{name}));
+    for (build_members) |name| if (context.facts.member(project_type, name) == null) try context.at(live_reads, 0, try context.allocator.print("LIVE_READS guards Project.{s}, which Project does not declare: remove it from the list", .{name}));
+    var marking: std.AutoHashMapUnmanaged(std.zig.Ast.Node.Index, void) = .empty;
+    var mark_decls: [marks.len]?@FieldType(glint.Value, "function") = undefined;
+    for (marks, &mark_decls) |name, *decl| decl.* = context.facts.member(facts_type, name);
+    const LiveRead = struct { node: std.zig.Ast.Node.Index, function: std.zig.Ast.Node.Index, what: union(enum) { read: []const u8, undecided: glint.Unknown } };
+    var reads_found: std.ArrayList(LiveRead) = .empty;
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(index));
+        if (context.inTest(tree.nodeMainToken(node))) continue;
+        const function = functionOf(tree, model, node) orelse continue;
+        var buffer: [1]std.zig.Ast.Node.Index = undefined;
+        if (tree.fullCall(&buffer, node)) |call| {
+            const callee = try context.facts.resolve(context.file, call.ast.fn_expr);
+            if (callee == .function) for (mark_decls) |decl| if (decl != null and std.meta.eql(decl.?, callee.function)) try marking.put(context.allocator, function, {});
+            continue;
+        }
+        if (tag != .field_access) continue;
+        const receiver, const name_token = tree.nodeData(node).node_and_token;
+        const name = tree.tokenSlice(name_token);
+        const guarded: enum { facts, project } = for (closed_fields) |each| {
+            if (std.mem.eql(u8, each, name)) break .facts;
+        } else for (build_members) |each| {
+            if (std.mem.eql(u8, each, name)) break .project;
+        } else continue;
+        const holder = switch (guarded) {
+            .facts => facts_type,
+            .project => project_type,
+        };
+        switch (try heldBy(context, try context.facts.resolve(context.file, receiver), holder)) {
+            .no => {},
+            .yes => try reads_found.append(context.allocator, .{ .node = node, .function = function, .what = .{ .read = name } }),
+            .unknown => |why| try reads_found.append(context.allocator, .{ .node = node, .function = function, .what = .{ .undecided = why } }),
+        }
+    }
+    const used = try context.allocator.alloc(bool, list.len);
+    @memset(used, false);
+    reads: for (reads_found.items) |each| {
+        if (marking.contains(each.function)) continue;
+        const where = try enclosing(context, tree, each.node);
+        for (list, used) |entry, *use| if (inFile(file_name, entry.file) and std.mem.eql(u8, entry.function, where)) {
+            use.* = true;
+            continue :reads;
+        };
+        switch (each.what) {
+            .read => |name| try context.at(live_reads, tree.nodeMainToken(each.node), try context.allocator.print("a read of {s} in a function that marks nothing: what a program can change, read unmarked, is recorded as the same for every program; mark it (Facts.markClosed, Facts.markBuild) or read it through an accessor that does", .{name})),
+            .undecided => |why| try context.unknown(live_reads, each.node, why),
+        }
+    }
+    for (list, used) |entry, use| if (inFile(file_name, entry.file) and !use) {
+        try context.at(live_reads, 0, try context.allocator.print("the allowed unmarked reads of {s} ({s}) are none of this file's: remove the entry", .{ entry.function, entry.reason }));
+    };
+}
+
+/// The function declaration `node` is in, the innermost; null outside any.
+fn functionOf(tree: *const std.zig.Ast, model: anytype, node: std.zig.Ast.Node.Index) ?std.zig.Ast.Node.Index {
+    var at = model.parentOf(node);
+    while (at) |each| : (at = model.parentOf(each)) if (tree.nodeTag(each) == .fn_decl) return each;
+    return null;
+}
+
+/// Whether a resolved holder is an instance of `container`, or a pointer to one, in each part of a
+/// choice; not known where a part does not resolve.
+fn heldBy(context: *glint.RuleContext, value: glint.Value, container: @FieldType(glint.Value, "container")) glint.RuleContext.Error!union(enum) { yes, no, unknown: glint.Unknown } {
+    _ = context;
+    const each: []const glint.Value = if (value == .alternatives) value.alternatives else &.{value};
+    var unknown: ?glint.Unknown = null;
+    for (each) |part| {
+        const held = if (part == .pointer) part.pointer.child.* else part;
+        switch (held) {
+            .instance => |found| if (found.file == container.file and found.scope == container.scope) return .yes,
+            .unknown => |why| unknown = why,
+            else => {},
+        }
+    }
+    return if (unknown) |why| .{ .unknown = why } else .no;
+}
+
+/// A run of LIVE_READS on `facts` as glint's src/Facts.zig, beside a fixture src/Project.zig.
+fn liveReads(facts: []const u8, comptime list: []const Allowed) !struct { usize, usize } {
+    var project = try glint.Project.init(std.testing.allocator, &.{
+        .{ .name = "src/Facts.zig", .bytes = facts },
+        .{ .name = "src/Project.zig", .bytes = "sources: []const u8 = &.{}, imports: []const u8 = &.{},\npub fn importedAll(self: *const @This()) []const u8 { return self.imports; }\npub fn imported(self: *const @This()) ?u8 { _ = self; return null; }\npub fn absent(self: *const @This()) bool { _ = self; return false; }\n", .selected = false },
+    }, &.{.{ .from = 0, .target = 1, .spelling = "Project.zig" }}, .{}); // safe: fixture constants fit the asserted integer widths.
+    defer project.deinit();
+    const config: glint.Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = live_reads, .level = .report }} };
+    var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = &marked(list) });
+    defer report.deinit();
+    var undecided: usize = 0;
+    for (report.coverage) |item| if (item.rule) |each| {
+        if (each == live_reads) undecided += 1;
+    };
+    return .{ report.diagnostics.len, undecided };
+}
+
+test "a read of what a program can change in Facts, in a function that marks nothing, is a finding: a closed-world field of Facts, Project's files or module mappings; a function that marks reads them freely, another holder's field so named is none, and a holder that does not resolve is undecided" {
+    const head =
+        \\const Facts = @This();
+        \\const Project = @import("Project.zig");
+        \\const missing = @import("missing");
+        \\project: *const Project,
+        \\stored: u8 = 0, storing: u8 = 0, callers: u8 = 0, at_bindings: u8 = 0, compiled_with: u8 = 0, imports_read: u8 = 0,
+        \\module_roots: u8 = 0, member_uses: u8 = 0, comptime_fields: u8 = 0, copier_names: u8 = 0, live: u8 = 0,
+        \\pub fn markBuild(self: *Facts) void { self.live += 1; }
+        \\pub fn markClosed(self: *Facts) void { self.live += 1; }
+        \\const Other = struct { stored: u8 = 0, sources: u8 = 0 };
+        \\
+    ;
+    inline for ([_]struct { []const u8, usize, usize }{
+        // The closed world's field, unmarked: a finding; marked: none.
+        .{ "fn a(self: *Facts) u8 { return self.stored; }", 1, 0 },
+        .{ "fn a(self: *Facts) u8 { self.markClosed(); return self.stored; }", 0, 0 },
+        // The build's: Project's files, its mappings, its lookup of one.
+        .{ "fn a(self: *Facts) usize { return self.project.sources.len; }", 1, 0 },
+        .{ "fn a(self: *Facts) []const u8 { return self.project.importedAll(); }", 1, 0 },
+        .{ "fn a(self: *Facts) []const u8 { self.markBuild(); return self.project.importedAll(); }", 0, 0 },
+        // In a nested container's function, held by a parameter.
+        .{ "const In = struct { fn a(facts: *Facts) u8 { return facts.callers; } };", 1, 0 },
+        // Another holder's field so named: none.
+        .{ "fn a(o: Other) u8 { return o.stored + o.sources; }", 0, 0 },
+        // A holder that does not resolve, read by a guarded name: undecided.
+        .{ "fn a() u8 { return missing.stored; }", 0, 1 },
+        // A test reads freely.
+        .{ "test { var f: Facts = undefined; _ = f.stored; }", 0, 0 },
+    }) |row| {
+        const source, const findings, const undecided = row;
+        const got = try liveReads(head ++ source, &.{});
+        try std.testing.expectEqual(findings, got[0]);
+        try std.testing.expectEqual(undecided, got[1]);
+    }
+    // Allowed by its function with a reason: none; an entry no read of its file's is in: a finding itself.
+    const read = "fn a(self: *Facts) u8 { return self.stored; }";
+    try std.testing.expectEqual(0, (try liveReads(head ++ read, &.{.{ .file = "src/Facts.zig", .function = "a", .reason = "an index" }}))[0]);
+    try std.testing.expectEqual(1, (try liveReads(head ++ "fn a() void {}", &.{.{ .file = "src/Facts.zig", .function = "a", .reason = "an index" }}))[0]);
 }

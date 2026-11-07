@@ -120,6 +120,59 @@ read_records: bool = false,
 /// Summaries' cross-check (`Summary.check`): set, each record a query builds is written and
 /// read back, and a record that reads back other than the live answer stops the run.
 check_records: ?*const RecordCheck = null,
+/// What the queries read that a program can change, counted by kind (designs/glint-std-unit.md,
+/// "Exactness"): an entry whose computation moved a count is live (`entryLive`), computed at lint
+/// time and never recorded. Only the marking accessors move them (`markBuild`, `markClosed`);
+/// the project rule LIVE_READS finds any other reader of the state they guard.
+live: Live = .{},
+/// Summaries' unit build: what a query reads on a mark is not memoized, as what it reads on a
+/// wide answer is not (`wide`), so that reading it again marks again. Off, a mark only counts.
+tracking: bool = false,
+
+/// The counts of `live`, one per kind of input a program can change.
+pub const Live = struct {
+    /// Per-build input: a module mapping (`std`, `builtin`, `root`, any module a build binds),
+    /// and so `std.options` and `@import("root")`'s declarations; the build's import graph.
+    build: usize = 0,
+    /// Closed-world query: the program's stores into a field, its calls and callers, what a
+    /// compilation of it analyzes and compiles together, what code outside it may call.
+    closed: usize = 0,
+};
+
+/// A memo type's `live` declaration: what `memo` marks for it, its answers the build's or the
+/// closed world's as its accessor's are.
+pub const LiveKind = enum { build, closed };
+
+/// A read of a per-build input (`Live.build`).
+pub fn markBuild(self: *Facts) void {
+    self.live.build += 1;
+    if (self.tracking) self.wide += 1;
+}
+
+/// A read of a closed-world query (`Live.closed`).
+pub fn markClosed(self: *Facts) void {
+    self.live.closed += 1;
+    if (self.tracking) self.wide += 1;
+}
+
+/// Where an entry's computation started (`entryStart`): the reading it is read in, the marks, and
+/// the budget's signals.
+pub const EntryStart = struct { env: ?*const Env, assumed: bool, live: Live, wide: usize, open_met: usize, short: bool };
+
+/// An entry read in `env` (null: binding nothing), under the asker's settled assumptions.
+pub fn entryStart(self: *const Facts, env: ?*const Env) EntryStart {
+    return .{ .env = env, .assumed = self.assumed != null, .live = self.live, .wide = self.wide, .open_met = self.open_met, .short = self.short };
+}
+
+/// Whether what was computed since `at` may differ by program: it was read in a reading or
+/// under settled assumptions (a call's, never the unit's), it read a per-build input or a
+/// closed-world query, or an answer that is provisional (`open_met`), wider than the analysis
+/// gives (`wide`) or short of the budget (`short`).
+pub fn entryLive(self: *const Facts, at: EntryStart) bool {
+    if (at.env != null or at.assumed or self.assumed != null) return true;
+    if (self.live.build != at.live.build or self.live.closed != at.live.closed) return true;
+    return self.wideSince(at.wide) or self.open_met != at.open_met or self.short;
+}
 
 /// What reads a record back for the cross-check (`check_records`), one for each kind of record.
 pub const RecordCheck = struct {
@@ -403,6 +456,7 @@ fn ofPackage(self: *const Facts, file: Project.FileId, package: Package) bool {
 /// that does not parse is: the members it may lack are gaps the run reports, never a module
 /// it is not. Found once per run.
 pub fn moduleRoots(self: *Facts, module: anytype) ResolveError![]const Project.FileId {
+    self.markBuild();
     const key = @intFromPtr(module.members.ptr);
     if (self.module_roots.get(key)) |found| return found;
     var required = false;
@@ -445,6 +499,7 @@ pub fn moduleRoots(self: *Facts, module: anytype) ResolveError![]const Project.F
 /// Finds what `library` publishes: each module's roots (`moduleRoots`), and each member the
 /// declaration its path names from a root. Found once per run and shared by every rule.
 pub fn publication(self: *Facts, library: anytype) ResolveError!*const Publication {
+    self.markBuild();
     const key = @intFromPtr(library.modules.ptr);
     if (self.publications.get(key)) |found| return found;
     var entries: std.ArrayList(Entry) = .empty;
@@ -883,6 +938,7 @@ pub fn parameterCopies(self: *Facts, function: Decl) ResolveError![]const Parame
 }
 
 fn findCopies(self: *Facts) ResolveError!void {
+    self.markClosed();
     var found: std.AutoHashMapUnmanaged(Decl, []const ParameterCopy) = .empty;
     self.copies = found;
     const std_files = &(try self.outside()).std_files;
@@ -967,6 +1023,7 @@ pub const Copies = enum {
 /// What some function named `name` does with a generic parameter's values: one answer, so a
 /// reader cannot take a mover for a function that copies nothing.
 pub fn copiesBy(self: *Facts, name: []const u8) ResolveError!Copies {
+    self.markClosed();
     if (self.copies == null) try self.findCopies();
     return self.copier_names.get(name) orelse .none;
 }
@@ -996,11 +1053,13 @@ pub fn standard(self: *Facts, file: Project.FileId) ResolveError!bool {
 /// program's as much as a selected one: what they do runs as its own, so a scan of "every use
 /// in the program" reads them, and one that stops at a selection decides nothing past it.
 pub fn program(self: *Facts, file: Project.FileId) ResolveError!bool {
+    self.markClosed();
     return (try self.outside()).own(file);
 }
 
 /// The files that are not the program's, found once: std's and the known libraries'.
 pub fn outside(self: *Facts) ResolveError!*const Outside {
+    self.markBuild();
     const found = try self.memo(Outside);
     if (found.built) return found;
     found.built = true;
@@ -1011,6 +1070,7 @@ pub fn outside(self: *Facts) ResolveError!*const Outside {
     return found;
 }
 pub const Outside = struct {
+    pub const live: LiveKind = .build;
     /// The files std's import reaches.
     std_files: FileSet = .empty,
     /// The files a known library's module roots reach, std's aside.
@@ -1029,6 +1089,7 @@ pub const Outside = struct {
 /// Grows `files` to every file their imports reach. std's reach follows every import of its
 /// own; a library's stops at std, builtin and root, which are not its files.
 fn reach(self: *Facts, files: *FileSet, from: enum { standard, library }) ResolveError!void {
+    self.markBuild();
     var growing = true;
     while (growing) {
         growing = false;
@@ -1770,6 +1831,7 @@ const instantiation_limit = 16;
 /// parameter to (`choiceOfTypes`), as Zig compiles one per type; the reading itself where it
 /// binds none, or more than `instantiation_limit` would be made.
 fn instantiations(self: *Facts, env: *const Env) ResolveError![]const *const Env {
+    self.markClosed();
     var count: usize = 1;
     for (env.args) |arg| if (choiceOfTypes(arg)) {
         count *|= arg.alternatives.len;
@@ -3047,6 +3109,21 @@ fn memoryBuiltin(self: *Facts, env: ?*const Env, file: Project.FileId, name: []c
     return null;
 }
 
+/// The files an import of `spelling` in `file` reaches (`Project.importedAll`): the one way
+/// Facts reads the build's module mappings. A module's name is the build's to bind
+/// (`markBuild`); a path names one file, unless compilations bind it apart (two targets).
+fn importTargets(self: *Facts, file: Project.FileId, spelling: []const u8, buffer: *[2]Project.FileId) []const Project.FileId {
+    const targets = self.project.importedAll(file, spelling, buffer);
+    if (targets.len > 1 or (!std.mem.endsWith(u8, spelling, ".zig") and !std.mem.endsWith(u8, spelling, ".zon"))) self.markBuild();
+    return targets;
+}
+
+/// Whether the build binds no module named `spelling` for `file` (`Project.absent`): the build's.
+fn importAbsent(self: *Facts, file: Project.FileId, spelling: []const u8) bool {
+    self.markBuild();
+    return self.project.absent(file, spelling);
+}
+
 /// What `@import(args)` in `file` gives: the imported Zig file's root container, or the value
 /// a ZON file holds; unknown where the name is computed or no mapping gives it.
 fn importValue(self: *Facts, file: Project.FileId, args: []const Ast.Node.Index) ResolveError!Value {
@@ -3057,8 +3134,8 @@ fn importValue(self: *Facts, file: Project.FileId, args: []const Ast.Node.Index)
         error.InvalidLiteral => return .{ .unknown = .computed_import },
     };
     var reached: [2]Project.FileId = undefined;
-    const targets = self.project.importedAll(file, spelling, &reached);
-    if (targets.len == 0) return .{ .unknown = if (self.project.absent(file, spelling))
+    const targets = self.importTargets(file, spelling, &reached);
+    if (targets.len == 0) return .{ .unknown = if (self.importAbsent(file, spelling))
         .absent
     else if (try self.zigOwn(file, spelling))
         .zig_own
@@ -3201,6 +3278,7 @@ fn unknownWithin(value: Value) bool {
 /// A declaration of std's by its path from std's root (`builtin.StackTrace`), where the
 /// project maps std.
 fn stdMember(self: *Facts, path: []const []const u8) ResolveError!Value {
+    self.markBuild();
     const root = for (self.project.imports) |mapping| {
         if (std.mem.eql(u8, mapping.spelling, "std")) break mapping.target;
     } else return .{ .unknown = .missing_mapping };
@@ -4183,6 +4261,7 @@ fn fieldOwner(lhs: Value) ?Container {
 /// `@import` of a file the program does not hold. Only the files that may share a compilation
 /// with the struct's (`compiledWith`) are read: another program's stores reach no call here.
 fn storedFunctions(self: *Facts, container: Container, name: []const u8) ResolveError!?Value {
+    self.markClosed();
     const field = self.member(container, name) orelse return null;
     if (self.project.at(field.file).model.declarations[@backingInt(field.index)].kind != .field) return null;
     if (self.stored.get(field)) |known| return known;
@@ -4222,6 +4301,7 @@ fn storesOf(self: *Facts, container: Container, field: Decl) ResolveError!?Value
 /// function the program does not hold or `asm` writes holds no function the program declares
 /// that a store here did not give: neither adds one.
 pub fn fieldStores(self: *Facts, field: Decl, files: []const Project.FileId) ResolveError!?[]const Value {
+    self.markClosed();
     var targets: std.ArrayList(Value) = .empty;
     var found_sites = accesses.writesFor(self, .{ .field = field }, files, .{ .holders = false });
     while (try found_sites.next()) |site| {
@@ -4283,6 +4363,7 @@ fn autoLayout(self: *Facts, field: Decl) bool {
 /// only in code nothing compiles is never reached. What an unresolved call reaches (a function
 /// type, `erased`) is no more than that either.
 fn storeCounts(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
+    self.markClosed();
     const found = self.walk orelse return self.analyzedAt(file, node);
     // An answer narrower than the built analysis may give: no memo keeps what reads it, and
     // `dropMemos` drops what one kept regardless.
@@ -4302,6 +4383,7 @@ fn storeCounts(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolve
 /// and its operand's each hold no value of it (`create(T)` with `T` a `u32`; a `[*]u16` field
 /// given a `*anyopaque`'s bytes). False where a reading is not known, or a type does not resolve.
 fn castMisses(self: *Facts, file: Project.FileId, node: Ast.Node.Index, field: Decl) ResolveError!bool {
+    self.markClosed();
     const part = try self.partOf(file, node) orelse return false;
     const index = (try self.partsOf(file)).declared.get(part) orelse return false;
     const function: Decl = .{ .file = file, .index = index };
@@ -4388,6 +4470,7 @@ fn mayHoldStruct(self: *Facts, value: Value, file: Project.FileId, scope: Model.
 /// container-level constant reached from the program's roots, with the readings it is reached
 /// in (`every`: one binding nothing, so each instantiation's).
 pub const Analysis = struct {
+    pub const live: LiveKind = .closed;
     reached: std.AutoHashMapUnmanaged(Decl, Readings) = .empty,
     /// Per function, the members of containers it declares reached with no instance known:
     /// each is read in every reading of the function, those found later too.
@@ -4433,6 +4516,7 @@ const reading_budget = 100_000;
 /// resolve reaches every declaration so named; an `@field` of a value names a field, of a type
 /// whose name is not known each of its declarations, and with neither known anything.
 pub fn analysis(self: *Facts) ResolveError!*const Analysis {
+    self.markClosed();
     const found = try self.memo(Analysis);
     if (found.built) return found;
     found.built = true;
@@ -4478,6 +4562,7 @@ fn dropMemos(self: *Facts) void {
 
 /// Builds `found` (`analysis`).
 fn reachAll(self: *Facts, found: *Analysis) ResolveError!void {
+    self.markClosed();
     var next: std.ArrayList(PartRead) = .empty;
     for (self.project.sources) |*source| {
         if (source.file.status != .parsed) {
@@ -4533,6 +4618,7 @@ pub fn wideSince(self: *const Facts, mark: usize) bool {
 
 /// Whether a compilation of the program may analyze `decl` (`analysis`).
 pub fn analyzed(self: *Facts, decl: Decl) ResolveError!bool {
+    self.markClosed();
     if (self.building_analysis) {
         self.wide += 1;
         return true;
@@ -4545,6 +4631,7 @@ pub fn analyzed(self: *Facts, decl: Decl) ResolveError!bool {
 /// declaration is; a `comptime` block or a loose part of a file is; a test is in the program's
 /// files.
 pub fn analyzedAt(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
+    self.markClosed();
     const part = try self.partOf(file, node) orelse return true;
     const d = (try self.partsOf(file)).declared.get(part) orelse return switch (self.project.at(file).file.tree.nodeTag(part)) {
         .test_decl => try self.program(file),
@@ -4556,6 +4643,7 @@ pub fn analyzedAt(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Reso
 /// The readings a declaration is analyzed in, or null where it is read in each one (binding
 /// nothing) or anything may be analyzed.
 pub fn analyzedReadings(self: *Facts, decl: Decl) ResolveError!?[]const *const Env {
+    self.markClosed();
     if (self.building_analysis) {
         self.wide += 1;
         return null;
@@ -5351,6 +5439,7 @@ fn fieldNames(self: *Facts, container: Container) []const []const u8 {
 
 /// Reaches every function and container-level constant named `name`.
 fn reachNamed(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), name: []const u8) ResolveError!void {
+    self.markClosed();
     if (self.declarations_named == null) {
         var index: std.StringHashMapUnmanaged(std.ArrayList(Decl)) = .empty;
         for (self.project.sources) |*source| for (source.model.declarations, 0..) |record, d| {
@@ -5583,6 +5672,7 @@ const Files = std.AutoHashMapUnmanaged(Project.FileId, void);
 /// so all its imports reach, by the program's import edges. A store in any other file is in
 /// another program, where no call of this one goes.
 fn compiledWith(self: *Facts, file: Project.FileId) ResolveError!*const Files {
+    self.markClosed();
     if (self.compiled_with.getPtr(file)) |known| return known;
     var roots: Files = .empty;
     try roots.put(self.gpa, file, {});
@@ -5614,6 +5704,7 @@ fn compiledWith(self: *Facts, file: Project.FileId) ResolveError!*const Files {
 /// or a name no mapping gives (Zig's own per-build files and names the build declares absent
 /// aside), may hold a store the program does not show.
 fn importsRead(self: *Facts, file: Project.FileId) ResolveError!bool {
+    self.markClosed();
     if (self.imports_read.get(file)) |known| return known;
     const tree = &self.project.at(file).file.tree;
     const read = for (tree.nodes.items(.tag), 0..) |tag, i| switch (tag) {
@@ -7908,6 +7999,11 @@ fn memberName(self: *Facts, raw: []const u8) ResolveError![]const u8 {
 pub fn memo(self: *Facts, comptime T: type) ResolveError!*T {
     const key = comptime std.hash.Wyhash.hash(0, @typeName(T));
     if (self.walk != null) try self.walked.put(self.gpa, key, {});
+    // A memo of closed-world answers, or of the build's, marks as its accessor does.
+    if (@hasDecl(T, "live")) switch (T.live) {
+        .build => self.markBuild(),
+        .closed => self.markClosed(),
+    };
     const memos = if (@hasDecl(T, "lasting")) &self.lasting else &self.memos;
     const entry = try memos.getOrPut(self.gpa, key);
     if (!entry.found_existing) {
@@ -7921,6 +8017,7 @@ pub fn memo(self: *Facts, comptime T: type) ResolveError!*T {
 /// The member accesses (`x.name`) in the program's files (`program`) that spell `name`, each a
 /// `field_access` node: an index built once, for rules that follow one member across files.
 pub fn memberUses(self: *Facts, name: []const u8) ResolveError![]const Key {
+    self.markClosed();
     if (self.member_uses == null) {
         var index: std.StringHashMapUnmanaged(std.ArrayList(Key)) = .empty;
         for (self.project.sources) |*source| {
@@ -7957,6 +8054,7 @@ const FieldBuiltins = struct {
 /// out. Of the program's files only (`Facts.program`): std's and dependencies' `@field`s are
 /// not among them. Beside `memberUses`, which gives `x.name`. In `allocator`.
 pub fn fieldUses(self: *Facts, allocator: std.mem.Allocator, name: []const u8) ResolveError![]const FieldUse {
+    self.markClosed();
     const index = try self.memo(FieldBuiltins);
     if (!index.built) {
         index.built = true;
@@ -9746,6 +9844,7 @@ fn parameterPosition(self: *const Facts, file: Project.FileId, function: Decl, t
 /// The function declaring parameter `decl`, and its position, when it is `anytype` or a
 /// `comptime` type: a parameter only its calls settle.
 fn settledByCalls(self: *Facts, decl: Decl) ResolveError!?usize {
+    self.markClosed();
     const model = &self.project.at(decl.file).model;
     const tree = &self.project.at(decl.file).file.tree;
     const record = model.declarations[@backingInt(decl.index)];
@@ -9862,6 +9961,7 @@ fn scopeNode(self: *const Facts, function: Decl) Ast.Node.Index {
 /// arguments at its position, when every use of the function is a call within the project
 /// and its consumers cannot call it by name. Anything else stays unknown.
 fn boundByCallers(self: *Facts, parameter: Decl, position: usize) ResolveError!Value {
+    self.markClosed();
     const function = self.functionOf(parameter) orelse return .{ .unknown = .comptime_dependent };
     const found = (try self.callArguments(function, position)) orelse return .{ .unknown = .generic };
     // A call that passes something from a module the build does not have is not compiled.
@@ -9886,6 +9986,7 @@ fn absent(value: Value) bool {
 /// The arguments every call of `function` in the project passes at `position`, or null where
 /// code outside the program may call it (`escapes`), or a call passes fewer.
 fn callArguments(self: *Facts, function: Decl, position: usize) ResolveError!?[]const Value {
+    self.markClosed();
     const sites = (try self.callSites(function)) orelse return null;
     var values: std.ArrayList(Value) = .empty;
     for (sites) |site| {
@@ -9906,6 +10007,7 @@ fn callArguments(self: *Facts, function: Decl, position: usize) ResolveError!?[]
 /// function's signature. Null where a call of the function is none the program shows
 /// (`escapes`), or the declaration is none of those.
 pub fn atBindings(self: *Facts, decl: Decl) ResolveError!?[]const Value {
+    self.markClosed();
     if (self.at_bindings.get(decl)) |found| return found;
     const found = try self.readAtBindings(decl);
     try self.at_bindings.put(self.gpa, decl, found);
@@ -9996,16 +10098,21 @@ pub fn escapes(self: *Facts, function: Decl) ResolveError!bool {
 /// `function`: what `escapes` reads but a consumer calling it by its exported name, which hands
 /// it the consumer's own values, as the program's own callers do.
 pub fn handedOut(self: *Facts, function: Decl) ResolveError!bool {
+    self.markClosed();
     return try self.namedCalls(function) == null;
 }
 
 /// One call of a function the program makes: its arguments, after the receiver a method call
 /// on a value passes first (`holder`).
 pub const CallSite = struct { file: Project.FileId, params: []const Ast.Node.Index, receiver: usize, holder: Ast.Node.Index };
-const CallSites = struct { map: std.AutoHashMapUnmanaged(Decl, ?[]const CallSite) = .empty };
+const CallSites = struct {
+    pub const live: LiveKind = .closed;
+    map: std.AutoHashMapUnmanaged(Decl, ?[]const CallSite) = .empty,
+};
 
 /// Every call of `function` the program makes, or null where it `escapes`. Read once.
 pub fn callSites(self: *Facts, function: Decl) ResolveError!?[]const CallSite {
+    self.markClosed();
     const read = try self.memo(CallSites);
     if (read.map.get(function)) |known_sites| return known_sites;
     const found = try self.scanCallSites(function, .consumers);
@@ -10043,6 +10150,7 @@ pub fn judgedAtBindings(self: *Facts, function: Decl) ResolveError!bool {
 /// remedy a test that instantiates it. Null where a binding may be no call a run judges
 /// (`judgedAtBindings`): the body stays undecided as the rule reads it.
 pub fn boundInRun(self: *Facts, function: Decl) ResolveError!?bool {
+    self.markClosed();
     const read = try self.memo(BoundInRun);
     // One being read (a generic that binds itself) binds nothing of its own.
     if (read.map.get(function)) |known| return known orelse false;
@@ -10070,7 +10178,10 @@ pub fn boundInRun(self: *Facts, function: Decl) ResolveError!?bool {
 pub const unbound_generic = "unbound generic: judged at its consumers' bindings";
 
 /// `boundInRun`'s answers, false while one is being read.
-const BoundInRun = struct { map: std.AutoHashMapUnmanaged(Decl, ?bool) = .empty };
+const BoundInRun = struct {
+    pub const live: LiveKind = .closed;
+    map: std.AutoHashMapUnmanaged(Decl, ?bool) = .empty,
+};
 
 /// The function whose body `node` in `file` is in; null at a container's level or in a test.
 fn functionAround(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Decl {
@@ -10091,6 +10202,7 @@ fn functionAround(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Reso
 /// `callers` says whether a consumer calling a public function by its name is a caller no
 /// scan of the program sees (`consumers`), or one judged in the consumer's own run (`program`).
 fn scanCallSites(self: *Facts, function: Decl, callers: enum { consumers, program }) ResolveError!?[]const CallSite {
+    self.markClosed();
     const model = &self.project.at(function.file).model;
     const record = model.declarations[@backingInt(function.index)];
     if (callers == .consumers and record.public) return null;
@@ -10182,6 +10294,7 @@ fn scanCallSites(self: *Facts, function: Decl, callers: enum { consumers, progra
 /// (a generic's type parameter, `anytype`), as `HashMap` calls its context's `hash`. A call in
 /// code no compilation of the program analyzes (`analyzedAt`) calls nothing.
 fn calledOutside(self: *Facts, name: []const u8) ResolveError!bool {
+    self.markClosed();
     const found = try self.memo(OutsideCalls);
     if (!found.built) {
         found.built = true;
@@ -10246,6 +10359,7 @@ const OutsideCalls = struct {
 /// holds is decided there, so never the program's, even where the type itself does not
 /// resolve. A type naming a parameter, a builtin or a name that does not resolve may be.
 fn closedField(self: *Facts, receiver: Key) ResolveError!bool {
+    self.markClosed();
     const tree = &self.project.at(receiver.file).file.tree;
     if (tree.nodeTag(receiver.node) == .identifier) return self.closedLocal(receiver);
     if (tree.nodeTag(receiver.node) != .field_access) return false;
@@ -10349,6 +10463,7 @@ fn closedType(source: *const Project.Source, node: Ast.Node.Index, depth: u8) bo
 }
 
 fn mayBeProgram(self: *Facts, value: Value) ResolveError!bool {
+    self.markClosed();
     return switch (value) {
         .unknown => true,
         .container, .instance => |c| try self.program(c.file),
@@ -10486,6 +10601,7 @@ fn typeKeyword(tree: *const Ast, node: Ast.Node.Index) bool {
 
 /// Whether any container in the project declares a `comptime` field named `name`.
 fn comptimeField(self: *Facts, name: []const u8) ResolveError!bool {
+    self.markClosed();
     if (self.comptime_fields == null) {
         var names: std.StringHashMapUnmanaged(void) = .empty;
         for (self.project.sources) |*source| {
