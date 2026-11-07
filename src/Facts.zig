@@ -7079,14 +7079,33 @@ pub fn sameValue(a: Value, b: Value) bool {
 /// reading's depth is the chain that first made it, so a chain of ever new readings still ends
 /// (Taint's `readingAt`).
 pub fn keptReading(self: *Facts, draft: Env) ResolveError!*const Env {
+    const entry = try self.readingsOf(draft);
+    for (entry.items) |kept| if (sameEnv(kept.*, draft)) return kept;
+    const env = try self.gpa.create(Env);
+    env.* = draft;
+    try entry.append(self.gpa, env);
+    return env;
+}
+
+/// `keptReading` of a draft whose lists are the caller's for now: a reading made keeps copies.
+fn keptCopied(self: *Facts, draft: Env) ResolveError!*const Env {
+    const entry = try self.readingsOf(draft);
+    for (entry.items) |kept| if (sameEnv(kept.*, draft)) return kept;
+    const env = try self.gpa.create(Env);
+    env.* = draft;
+    env.args = try self.gpa.dupe(Value, draft.args);
+    env.truths = try self.gpa.dupe(?bool, draft.truths);
+    env.spelled = try self.gpa.dupe(?Spelled, draft.spelled);
+    env.values = try self.gpa.dupe(bool, draft.values);
+    try entry.append(self.gpa, env);
+    return env;
+}
+
+fn readingsOf(self: *Facts, draft: Env) ResolveError!*std.ArrayList(*const Env) {
     const key: ReadingKey = .{ .function = draft.function, .outer = draft.outer };
     const entry = try self.readings.getOrPut(self.gpa, key);
     if (!entry.found_existing) entry.value_ptr.* = .empty;
-    for (entry.value_ptr.items) |kept| if (sameEnv(kept.*, draft)) return kept;
-    const env = try self.gpa.create(Env);
-    env.* = draft;
-    try entry.value_ptr.append(self.gpa, env);
-    return env;
+    return entry.value_ptr;
 }
 
 const ReadingKey = struct { function: Decl, outer: ?*const Env };
@@ -9009,7 +9028,9 @@ pub const Join = struct {
 /// past the first is one of the run's resolutions (`remaining`): a choice that grows past the
 /// budget is unknown(budget). One value alone costs nothing, as it did.
 fn choose(self: *Facts, values: []const Value) ResolveError!Value {
+    // Most give one value: the list goes with the answer, kept only for a choice.
     var kept: std.ArrayList(Value) = .empty;
+    defer kept.deinit(std.heap.smp_allocator);
     // An unknown that a binding would not settle comes first: the choice is unknown for it.
     for (values) |value| if (value == .unknown and value.unknown != .generic) return value;
     for (values) |value| {
@@ -9024,7 +9045,7 @@ fn choose(self: *Facts, values: []const Value) ResolveError!Value {
                     if (self.remaining == 0) return self.spent();
                     self.remaining -= 1;
                 }
-                try kept.append(self.gpa, part);
+                try kept.append(std.heap.smp_allocator, part);
             }
         }
     }
@@ -9040,7 +9061,7 @@ fn choose(self: *Facts, values: []const Value) ResolveError!Value {
     }
     if (kept.items.len == 0) return .{ .unknown = .unsupported };
     if (kept.items.len == 1) return kept.items[0];
-    return .{ .alternatives = kept.items };
+    return .{ .alternatives = try self.gpa.dupe(Value, kept.items) };
 }
 
 /// Whether a value is a literal with no type of its own and nothing in it, or a pointer to one.
@@ -9768,10 +9789,16 @@ pub const Binding = union(enum) { reading: *const Env, unknown: Unknown };
 /// receiver not among them: `f(a)`'s, or `@call`'s callee and its tuple's elements.
 pub fn bindTo(self: *Facts, file: Project.FileId, fn_expr: Ast.Node.Index, params: []const Ast.Node.Index, function: Decl, outer: ?*const Env) ResolveError!*const Env {
     const tree = &self.project.at(file).file.tree;
+    // Most calls make a reading already kept: the lists go with the answer (`keptCopied`).
+    const lists = std.heap.smp_allocator;
     var args: std.ArrayList(Value) = .empty;
+    defer args.deinit(lists);
     var truths: std.ArrayList(?bool) = .empty;
+    defer truths.deinit(lists);
     var spelled: std.ArrayList(?Spelled) = .empty;
+    defer spelled.deinit(lists);
     var values: std.ArrayList(bool) = .empty;
+    defer values.deinit(lists);
     var reading = self.enclosingReading(outer, function);
     // Whether the arguments stand in the callee's parameter order: a call not through a member,
     // or one whose holder is known to be a value (bound first) or a type (bound to nothing).
@@ -9786,27 +9813,27 @@ pub fn bindTo(self: *Facts, file: Project.FileId, fn_expr: Ast.Node.Index, param
             else => null,
         };
         if (holder) |h| {
-            try args.append(self.gpa, receiver);
-            try truths.append(self.gpa, null);
-            try spelled.append(self.gpa, null);
-            try values.append(self.gpa, try self.valueIn(outer, file, tree.nodeData(fn_expr).node_and_token[0], 0));
+            try args.append(lists, receiver);
+            try truths.append(lists, null);
+            try spelled.append(lists, null);
+            try values.append(lists, try self.valueIn(outer, file, tree.nodeData(fn_expr).node_and_token[0], 0));
             if (h.made_by) |made| reading = try self.madeEnv(made);
             aligned = true;
         }
     }
     for (params) |arg| {
-        try args.append(self.gpa, try self.boundArgument(try self.resolveIn(outer, file, arg)));
-        try truths.append(self.gpa, self.truth(outer, file, arg));
-        try spelled.append(self.gpa, try self.spelledIn(outer, file, arg));
-        try values.append(self.gpa, try self.valueIn(outer, file, arg, 0));
+        try args.append(lists, try self.boundArgument(try self.resolveIn(outer, file, arg)));
+        try truths.append(lists, self.truth(outer, file, arg));
+        try spelled.append(lists, try self.spelledIn(outer, file, arg));
+        try values.append(lists, try self.valueIn(outer, file, arg, 0));
     }
     const draft: Env = .{ .function = function, .args = args.items, .depth = if (outer) |o| o.depth +| 1 else 0, .nested = if (outer) |o| o.nested else 0, .truths = truths.items, .outer = reading, .spelled = spelled.items, .values = values.items };
-    if (!aligned) return self.keptReading(draft);
+    if (!aligned) return self.keptCopied(draft);
     // A typed parameter's argument is read in a reading of its own, then given its declared
     // type: what that reading kept is not the one made with it.
-    const reading_args = try self.keptReading(.{ .function = function, .args = try self.gpa.dupe(Value, args.items), .depth = draft.depth, .nested = draft.nested, .truths = draft.truths, .outer = draft.outer, .spelled = draft.spelled, .values = draft.values });
+    const reading_args = try self.keptCopied(.{ .function = function, .args = args.items, .depth = draft.depth, .nested = draft.nested, .truths = draft.truths, .outer = draft.outer, .spelled = draft.spelled, .values = draft.values });
     try self.typedArguments(reading_args, function, args.items);
-    return self.keptReading(draft);
+    return self.keptCopied(draft);
 }
 
 /// A parameter of a declared type holds a value of that type, whatever its argument reads as
