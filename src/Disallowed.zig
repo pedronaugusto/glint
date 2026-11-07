@@ -45,7 +45,7 @@ pub fn check(self: *Context) Context.Error!void {
         switch (try replacementReach(self, site.node, replacement.with)) {
             .exempt => {},
             .judged => try self.atDefinition(.P006, site.token, try self.allocator.print("replaced by {s}: {s}; use {s}", .{ replacement.package, replacement.why, replacement.name }), site.decl),
-            .unknown => try self.undecided(.P006, self.project.at(self.file).file.tree.tokenStart(site.token), .unresolved, "a site whose function may be reached only from the replacement itself: its callers are not all known"),
+            .unknown => try self.undecided(.P006, self.project.at(self.file).file.tree.tokenStart(site.token), .unresolved, "a site whose function may be reached only from the replacement itself: the budget did not read its callers to their end"),
         }
     }
 }
@@ -113,29 +113,44 @@ fn importedBy(project: *const Project, root: Project.FileId, here: PackageRules.
 
 /// Whether a site in this file is the replacement's own use: in the replacement itself, or in a
 /// function only it reaches (every call of it is in the replacement, or in another such function).
-/// A function whose callers are not all known (one handed out, or reached deeper than this reads)
-/// may be called from anywhere, so its site is judged where the callers are not all the
-/// replacement's, and unknown where they cannot be read.
+/// A function whose callers are not all known (one handed out, or called at a container's level)
+/// may be called from anywhere, so its site is judged; one whose callers the run's budget does not
+/// reach to the end of is unknown.
 const Reach = enum { exempt, judged, unknown };
 fn replacementReach(self: *Context, node: Ast.Node.Index, with: ?Facts.Decl) Context.Error!Reach {
     const replacement = with orelse return .judged;
     const function = enclosingFunction(self.project, self.file, node) orelse return .judged;
-    return onlyFrom(self, function, replacement, 0);
+    return onlyFrom(self, function, replacement);
 }
-fn onlyFrom(self: *Context, function: Facts.Decl, replacement: Facts.Decl, depth: usize) Context.Error!Reach {
-    if (std.meta.eql(function, replacement)) return .exempt;
-    if (depth == 8) return .unknown;
-    const calls = (try self.facts.callSites(function)) orelse return .judged;
-    if (calls.len == 0) return .judged;
-    for (calls) |call| {
-        const caller = enclosingFunction(self.project, call.file, call.holder) orelse return .judged;
-        switch (try onlyFrom(self, caller, replacement, depth + 1)) {
-            .exempt => {},
-            .judged => return .judged,
-            .unknown => return .unknown,
+
+/// `onlyFrom`'s answers, per function and replacement, for the run.
+const Reached = struct { map: std.AutoHashMapUnmanaged(struct { Facts.Decl, Facts.Decl }, Reach) = .empty };
+
+/// Whether every caller of `function`, and every caller of those, to the end, is `replacement` or
+/// only reached from it: the callers read once each (a seen set, so a cycle among them adds
+/// nothing), each one a resolution of the run's budget.
+fn onlyFrom(self: *Context, function: Facts.Decl, replacement: Facts.Decl) Context.Error!Reach {
+    const reached = try self.facts.memo(Reached);
+    if (reached.map.get(.{ function, replacement })) |known| return known;
+    var seen: std.AutoHashMapUnmanaged(Facts.Decl, void) = .empty;
+    var pending: std.ArrayList(Facts.Decl) = .empty;
+    try seen.put(self.allocator, function, {});
+    try pending.append(self.allocator, function);
+    const answer: Reach = walk: while (pending.pop()) |at| {
+        if (std.meta.eql(at, replacement)) continue;
+        if (self.facts.budgetSpent()) break :walk .unknown;
+        self.facts.remaining -= 1;
+        const calls = (try self.facts.callSites(at)) orelse break :walk .judged;
+        if (calls.len == 0) break :walk .judged;
+        for (calls) |call| {
+            const caller = enclosingFunction(self.project, call.file, call.holder) orelse break :walk .judged;
+            if ((try seen.getOrPut(self.allocator, caller)).found_existing) continue;
+            try pending.append(self.allocator, caller);
         }
-    }
-    return .exempt;
+    } else .exempt;
+    // One the budget cut short is not kept: another asker may read it to its end.
+    if (answer != .unknown) try reached.map.put(self.facts.gpa, .{ function, replacement }, answer);
+    return answer;
 }
 
 /// The function whose body holds `node`, by its declaration; null at container level.
