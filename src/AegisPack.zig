@@ -2982,13 +2982,18 @@ fn handedOn(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
 /// undecided, as A003's own.
 fn acquiredOwner(c: *Context, tree: *const Ast, model: *const Model, decl: Model.Declaration, report: bool) Context.Error!?Contract.Kind {
     const init = acquiredFrom(tree, model, decl) orelse return null;
-    var leaves: std.ArrayList(Ast.Node.Index) = .empty;
-    try valueLeaves(c, tree, model, init, &leaves, 0);
+    // Every value the initializer may give (Facts.accesses.valuesOf); a form that reading
+    // does not take is the expression itself, as written.
+    var single = [1]Ast.Node.Index{init};
+    const leaves: []const Ast.Node.Index = switch (try Facts.accesses.valuesOf(c.facts, c.file, init)) {
+        .leaves => |each| each,
+        .unknown => single[0..],
+    };
     // Every way the value is made acquires the same kind of owner, or none does: one where
     // only some do, or kinds differ, may or may not be an owner.
     var kind: ?Contract.Kind = null;
     var plain = false;
-    for (leaves.items) |leaf| {
+    for (leaves) |leaf| {
         const k = (try acquisitionOwner(c, tree, leaf, report)) orelse {
             plain = true;
             continue;
@@ -3027,57 +3032,6 @@ fn acquiredFrom(tree: *const Ast, model: *const Model, decl: Model.Declaration) 
     const literal = tree.fullArrayInit(&buffer, destructure.ast.value_expr) orelse return null;
     if (literal.ast.elements.len != destructure.ast.variables.len) return null;
     return literal.ast.elements[position];
-}
-
-/// The expressions whose value `node`'s is, through what hands one on whole: `try`, parentheses,
-/// `@as`, both sides of `catch` and `orelse`, an `if`'s or a switch prong's result, a labeled
-/// block's `break`s. One that gives no value (`return`, `unreachable`, a jump, an unlabeled
-/// block) is none.
-fn valueLeaves(c: *Context, tree: *const Ast, model: *const Model, node: Ast.Node.Index, into: *std.ArrayList(Ast.Node.Index), depth: u8) Context.Error!void {
-    if (depth == 16) return into.append(c.allocator, node);
-    const next = depth + 1;
-    switch (tree.nodeTag(node)) {
-        .@"try" => return valueLeaves(c, tree, model, tree.nodeData(node).node, into, next),
-        .grouped_expression => return valueLeaves(c, tree, model, tree.nodeData(node).node_and_token[0], into, next),
-        .@"catch", .@"orelse" => {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            try valueLeaves(c, tree, model, lhs, into, next);
-            return valueLeaves(c, tree, model, rhs, into, next);
-        },
-        .@"return", .unreachable_literal, .@"break", .@"continue" => return,
-        .builtin_call_two, .builtin_call_two_comma => {
-            var buffer: [2]Ast.Node.Index = undefined;
-            const args = Facts.builtinArgs(tree, node, &buffer);
-            if (args.len == 2 and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@as")) return valueLeaves(c, tree, model, args[1], into, next);
-        },
-        .@"switch", .switch_comma => {
-            for (tree.fullSwitch(node).?.ast.cases) |case| try valueLeaves(c, tree, model, tree.fullSwitchCase(case).?.ast.target_expr, into, next);
-            return;
-        },
-        .block, .block_semicolon, .block_two, .block_two_semicolon => {
-            const lbrace = tree.nodeMainToken(node);
-            if (lbrace >= 2 and tree.tokenTag(lbrace - 1) == .colon) {
-                const label = tree.tokenSlice(lbrace - 2);
-                for (tree.nodes.items(.tag), 0..) |tag, i| {
-                    if (tag != .@"break") continue;
-                    const jump: Ast.Node.Index = @fromBackingInt(@intCast(i));
-                    const at = tree.nodeMainToken(jump);
-                    if (at < tree.firstToken(node) or at > tree.lastToken(node)) continue;
-                    const target, const value = tree.nodeData(jump).opt_token_and_opt_node;
-                    if (!std.mem.eql(u8, tree.tokenSlice(target.unwrap() orelse continue), label)) continue;
-                    try valueLeaves(c, tree, model, value.unwrap() orelse continue, into, next);
-                }
-            }
-            // An unlabeled block gives no value: one a handler runs leaves (`catch { ...;
-            // return error.Busy; }`).
-            return;
-        },
-        else => if (tree.fullIf(node)) |branch| if (branch.ast.else_expr.unwrap()) |otherwise| {
-            try valueLeaves(c, tree, model, branch.ast.then_expr, into, next);
-            return valueLeaves(c, tree, model, otherwise, into, next);
-        },
-    }
-    try into.append(c.allocator, node);
 }
 
 /// The owner a call at `acquisition` gives: a std handle opened raw, an owner's constructor or
@@ -4221,8 +4175,10 @@ const Flow = struct {
                 .member => |read| read,
                 else => return .holder,
             };
-            if (f.tree.nodeTag(read) != .field_access) return .holder;
-            if (std.mem.eql(u8, f.tree.tokenSlice(f.tree.nodeData(read).node_and_token[1]), field)) {
+            // The member read's name, by the place's path (a computed `@field` name may be any).
+            const member = (try Facts.accesses.pathOf(f.c.facts, f.c.file, read)).steps[0];
+            if (member.kind != .field) return .holder;
+            if (std.mem.eql(u8, member.name orelse return .holder, field)) {
                 at = read;
                 continue;
             }
@@ -4242,8 +4198,12 @@ const Flow = struct {
     fn calledOwner(f: Flow, node: Ast.Node.Index) Context.Error!?[]const u8 {
         if (f.path.len == 0) return ownerCall(f.c, node, f.token);
         const call = (try Facts.calls.at(f.c.facts, f.c.file, node)) orelse return null;
-        if (f.tree.nodeTag(call.callee_expr) != .field_access) return null;
-        if (!try f.mine(f.tree.nodeData(call.callee_expr).node_and_token[0])) return null;
+        // A method called on the owner: the call's bound receiver (Facts.calls).
+        const holder = switch (call.receiver) {
+            .bound => |holder| holder,
+            .none, .unknown => return null,
+        };
+        if (!try f.mine(holder)) return null;
         return memberNamed(f.c, f.c.file, call.callee_expr);
     }
 
