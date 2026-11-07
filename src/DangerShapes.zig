@@ -384,7 +384,7 @@ fn inGeneric(c: *Context, node: Ast.Node.Index) bool {
 /// enclosing generic's bindings; outside one, it is the unnamed callee's to give: undecided.
 fn unnamedBinding(c: *Context, rule: Rule, resources: []const ?Facts.Container, node: Ast.Node.Index) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
-    if (try statementCall(c, node)) return;
+    if (try statementCall(c, c.file, node)) return;
     switch (try heldBy(c, resources, try c.facts.resolve(c.file, node), 0)) {
         .resource, .unknown => try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "which function this call calls does not resolve, and what it makes may hold a std resource by value: it may be a generic's owner handed over"),
         .generic => if (!inGeneric(c, node)) try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "which function this call calls does not resolve, and what it makes may hold a std resource by value: it may be a generic's owner handed over"),
@@ -393,10 +393,10 @@ fn unnamedBinding(c: *Context, rule: Rule, resources: []const ?Facts.Container, 
 }
 
 /// Whether the call `node`, past `try` and parentheses, is a statement of a block or a `defer`.
-fn statementCall(c: *Context, node: Ast.Node.Index) Context.Error!bool {
-    const model = &c.project.at(c.file).model;
+fn statementCall(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    const model = &c.project.at(file).model;
     var at = node;
-    while (true) switch (try Facts.accesses.useOf(c.facts, c.file, at)) {
+    while (true) switch (try Facts.accesses.useOf(c.facts, file, at)) {
         .carried => |onward| switch (onward.how) {
             .tried, .grouped => at = onward.into,
             else => return false,
@@ -2586,7 +2586,7 @@ const Acquisition = union(enum) { no, lock: Lock, unknown: Facts.Unknown };
 fn acquisitionOf(c: *Context, file: Project.FileId, call: *const Facts.calls.Call, depth: u8) Context.Error!Acquisition {
     // A call made a statement gives nothing (Zig refuses to drop a value that is not void):
     // it takes a guard only where it leaves one held through a pointer or its receiver.
-    const statement = discarded(&c.project.at(file).file.tree, &c.project.at(file).model, call.node);
+    const statement = try statementCall(c, file, call.node);
     const choices: []const Facts.Decl = switch (call.callee) {
         .function => |*one| one[0..1],
         .choice => |all| all,
@@ -2606,7 +2606,7 @@ fn acquisitionOf(c: *Context, file: Project.FileId, call: *const Facts.calls.Cal
         if (record.kind == .function and try c.role(Contract.library, owner) == .guarded and Contract.acquisition(record.name)) {
             const ranked = std.mem.find(u8, record.name, "Ordered") != null;
             // Of a choice, ranked only where each is; read before `lock` is written.
-            const found: Lock = .{ .ranked = ranked and (if (lock) |earlier| earlier.ranked else true), .context = if (ranked) contextOf(c, file, call) else null };
+            const found: Lock = .{ .ranked = ranked and (if (lock) |earlier| earlier.ranked else true), .context = if (ranked) try contextOf(c, file, call) else null };
             lock = found;
             continue;
         }
@@ -2624,7 +2624,7 @@ fn acquisitionOf(c: *Context, file: Project.FileId, call: *const Facts.calls.Cal
             .unknown => |why| unknown = why,
             .lock => |inner| {
                 // Ranked through its parameter's context: the caller's argument there.
-                const context = if (inner.context_from) |position| argumentContext(c, file, call, position) else null;
+                const context = if (inner.context_from) |position| try argumentContext(c, file, call, position) else null;
                 const found: Lock = .{ .ranked = inner.ranked and (if (lock) |earlier| earlier.ranked else true), .through = true, .context = context };
                 lock = found;
             },
@@ -2744,20 +2744,6 @@ fn heldAtExit(c: *Context, tree: *const Ast, model: *const Model, function: Ast.
     return out;
 }
 
-/// Whether the call `node` is a statement, through `try` and parentheses, or a `defer`'s.
-fn discarded(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
-    var at = node;
-    while (model.parentOf(at)) |parent| : (at = parent) switch (tree.nodeTag(parent)) {
-        .@"try", .grouped_expression => {},
-        .@"defer", .@"errdefer" => return true,
-        else => {
-            var buffer: [2]Ast.Node.Index = undefined;
-            return tree.blockStatements(&buffer, parent) != null;
-        },
-    };
-    return false;
-}
-
 /// The position among `function`'s parameters of the parameter `decl`, where it is one.
 fn parameterPosition(tree: *const Ast, model: *const Model, function: Ast.Node.Index, decl: Model.Declaration.Id) ?usize {
     const record = model.declarations[@backingInt(decl)];
@@ -2772,34 +2758,43 @@ fn parameterPosition(tree: *const Ast, model: *const Model, function: Ast.Node.I
 
 /// The local or parameter a call's argument at `position` names, `&` or not: the context a
 /// helper ranks through where it is its parameter there.
-fn argumentContext(c: *Context, file: Project.FileId, call: *const Facts.calls.Call, position: usize) ?Model.Declaration.Id {
-    const tree = &c.project.at(file).file.tree;
-    const model = &c.project.at(file).model;
+fn argumentContext(c: *Context, file: Project.FileId, call: *const Facts.calls.Call, position: usize) Context.Error!?Model.Declaration.Id {
     const args = switch (call.args) {
         .known => |args| args,
         .unknown => return null,
     };
     if (position >= args.len) return null;
-    var at = args[position];
-    while (tree.nodeTag(at) == .address_of or tree.nodeTag(at) == .grouped_expression) at = tree.nodeData(at).node;
-    if (tree.nodeTag(at) != .identifier) return null;
-    return (model.reference(at) orelse return null).declaration;
+    return contextNamed(c, file, args[position]);
+}
+
+/// The local or parameter an argument names, `&` or not, through parentheses: by
+/// `Facts.definition` of the name, or of the place `&` takes (`Facts.accesses.pointed`).
+fn contextNamed(c: *Context, file: Project.FileId, argument: Ast.Node.Index) Context.Error!?Model.Declaration.Id {
+    const tree = &c.project.at(file).file.tree;
+    var at = Facts.ungrouped(tree, argument);
+    if (try Facts.accesses.pointed(c.facts, file, at)) |place| switch (try Facts.accesses.useOf(c.facts, file, place)) {
+        .address => |address| if (address == at) {
+            at = Facts.ungrouped(tree, place);
+        },
+        else => {},
+    };
+    if (try Facts.accesses.memberOf(c.facts, file, at) != null) return null;
+    const decl = switch (try c.facts.definition(file, at)) {
+        .decl => |decl| decl,
+        .none, .unknown => return null,
+    };
+    return if (decl.file == file) decl.index else null;
 }
 
 /// The local or parameter a ranked acquisition's `Order.Context` argument names, `&` or not.
-fn contextOf(c: *Context, file: Project.FileId, call: *const Facts.calls.Call) ?Model.Declaration.Id {
-    const tree = &c.project.at(file).file.tree;
-    const model = &c.project.at(file).model;
+fn contextOf(c: *Context, file: Project.FileId, call: *const Facts.calls.Call) Context.Error!?Model.Declaration.Id {
     const args = switch (call.args) {
         .known => |args| args,
         .unknown => return null,
     };
     // The receiver, the Io, the context.
     if (args.len != 3) return null;
-    var at = args[2];
-    while (tree.nodeTag(at) == .address_of or tree.nodeTag(at) == .grouped_expression) at = tree.nodeData(at).node;
-    if (tree.nodeTag(at) != .identifier) return null;
-    return (model.reference(at) orelse return null).declaration;
+    return contextNamed(c, file, args[2]);
 }
 
 /// Whether a value is a guard (`guardValue`), and an Order's ranked one.
@@ -2809,7 +2804,7 @@ const Guard = union(enum) { no, plain, ranked, unknown: Facts.Unknown };
 /// is a guard where its declared result names one.
 fn guardValue(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!Guard {
     return switch (try guardHeld(c, try c.facts.resolve(file, node))) {
-        .unknown => |why| if (try Contract.kind(c, file, node, 0) != .guard) .{ .unknown = why } else if (rankedForm(&c.project.at(file).file.tree, node)) .ranked else .plain,
+        .unknown => |why| if (try Contract.kind(c, file, node, 0) != .guard) .{ .unknown = why } else if (try rankedForm(c, file, node)) .ranked else .plain,
         else => |found| found,
     };
 }
@@ -2838,11 +2833,12 @@ fn guardHeld(c: *Context, value: Facts.Value) Context.Error!Guard {
 
 /// Whether a call is an owner's ranked acquisition by its form (`acquireOrdered`, `readOrdered`,
 /// ...), as AegisContract.kind reads an acquisition whose value does not resolve.
-fn rankedForm(tree: *const Ast, node: Ast.Node.Index) bool {
+fn rankedForm(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, node) orelse return false;
-    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
-    const name = tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]);
+    const method = (try Facts.accesses.memberOf(c.facts, file, call.ast.fn_expr)) orelse return false;
+    const name = method.name orelse return false;
     return Contract.acquisition(name) and std.mem.find(u8, name, "Ordered") != null;
 }
 
@@ -3144,7 +3140,7 @@ pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
         }
         try carried(c, &uses, decl.name);
         var switched = false;
-        for (uses.items) |use| switched = switched or switchedOn(&c.project.at(use.file).file.tree, &c.project.at(use.file).model, use.node, hold);
+        for (uses.items) |use| switched = switched or try switchedOn(c, use.file, use.node, hold);
         if (!switched) continue;
         try stateWrites(c, .{ .file = c.file, .index = @fromBackingInt(@intCast(index)) }, hold, &writes);
         const state: LiteralState = if (hold == .enumerated) .state else try literalState(c, hold, decl.name, .{ .file = c.file, .node = written }, writes.items, uses.items);
@@ -3336,70 +3332,86 @@ fn carried(c: *Context, uses: *std.ArrayList(Facts.Key), name: []const u8) Conte
         const tree = &c.project.at(use.file).file.tree;
         const model = &c.project.at(use.file).model;
         var at = use.node;
-        const parent = while (model.parentOf(at)) |parent| : (at = parent) {
-            if (try madeOf(c, use.file, parent, at, name)) continue;
-            break parent;
-        } else null;
-        const node = parent orelse continue;
+        while (try madeOf(c, use.file, at, name)) |whole| at = whole;
+        const node = model.parentOf(at) orelse continue;
         var local: ?Model.Declaration.Id = null;
-        if (tree.fullVarDecl(node)) |variable| {
-            if (variable.ast.init_node.unwrap() != at) continue;
-            local = declaredBy(model, node);
-        } else if (tree.nodeTag(node) == .assign) {
-            const target, const value = tree.nodeData(node).node_and_node;
-            if (value != at or tree.nodeTag(target) != .identifier) continue;
-            local = (model.reference(target) orelse continue).declaration;
-        } else if (captureOf(tree, node, at)) |token| {
-            for (model.declarations, 0..) |record, i| if (record.kind == .capture and record.token == token) {
-                local = @fromBackingInt(@intCast(i));
-            };
-        } else if (tree.nodeTag(node) == .@"return") {
-            const function = enclosingFunction(model, tree, node) orelse continue;
-            for (try callsOf(c, use.file, function)) |call| try carry(c, uses, call);
-            continue;
-        } else if (destructured(tree, model, node, at)) |variable| {
-            local = declaredBy(model, variable) orelse try localOf(c, file, variable);
-        } else {
-            try parameterOf(c, uses, use.file, node, at);
-            continue;
+        switch (try Facts.accesses.useOf(c.facts, use.file, at)) {
+            .initializes => |declaration| local = declaredBy(model, declaration),
+            .stored => |site| {
+                if (site.node != node) continue;
+                local = try localOf(c, use.file, site.target orelse continue);
+            },
+            .returned => |ret| {
+                const function = enclosingFunction(model, tree, ret) orelse continue;
+                for (try callsOf(c, use.file, function)) |call| try carry(c, uses, call);
+                continue;
+            },
+            .element_of => |element| {
+                const variable = (try destructured(c, use.file, element.literal, element.position)) orelse {
+                    try parameterOf(c, uses, use.file, node, at);
+                    continue;
+                };
+                local = declaredBy(model, variable) orelse try localOf(c, use.file, variable);
+            },
+            else => if (captureOf(tree, node, at)) |token| {
+                for (model.declarations, 0..) |record, i| if (record.kind == .capture and record.token == token) {
+                    local = @fromBackingInt(@intCast(i));
+                };
+            } else {
+                try parameterOf(c, uses, use.file, node, at);
+                continue;
+            },
         }
         const d = local orelse continue;
         for (model.references) |reference| if (reference.declaration == d) try carry(c, uses, .{ .file = use.file, .node = reference.node });
     }
 }
 
-/// Whether `parent` gives a value made of `at`, its operand, that carries a read of the state
-/// `state` on (`carried`). A value a `switch` or an `if` on it chooses carries it unless each it
-/// may choose is read from another place (`otherPlace`): `if (p.len == 1) p.one else
-/// table[p.start + i]` gives a code point, not the state.
-fn madeOf(c: *Context, file: Project.FileId, parent: Ast.Node.Index, at: Ast.Node.Index, state: []const u8) Context.Error!bool {
+/// What gives a value made of `at` that carries a read of the state `state` on (`carried`):
+/// `.?`, parentheses, `orelse`'s and `catch`'s left side, `.*`, `&`, a comparison and the logic
+/// over one, a conversion, std's `atomic.Value` `load` of it, and a `switch` or an `if` whose
+/// value its condition chooses, unless each it may choose is read from another place
+/// (`otherPlace`): `if (p.len == 1) p.one else table[p.start + i]` gives a code point, not the
+/// state. Null where none does.
+fn madeOf(c: *Context, file: Project.FileId, at: Ast.Node.Index, state: []const u8) Context.Error!?Ast.Node.Index {
     const tree = &c.project.at(file).file.tree;
-    switch (tree.nodeTag(parent)) {
-        .unwrap_optional, .grouped_expression, .deref, .address_of, .bool_not => return true,
-        .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bool_and, .bool_or => return true,
-        .@"orelse" => return tree.nodeData(parent).node_and_node[0] == at,
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
-            const name = tree.tokenSlice(tree.nodeMainToken(parent));
-            for ([_][]const u8{ "@as", "@enumFromInt", "@fromBackingInt", "@intFromEnum", "@backingInt", "@intCast", "@truncate", "@atomicLoad" }) |each| if (std.mem.eql(u8, name, each)) return true;
-            return false;
+    switch (try Facts.accesses.useOf(c.facts, file, at)) {
+        .carried => |onward| return switch (onward.how) {
+            .unwrapped, .grouped, .payload => onward.into,
+            else => null,
+        },
+        .dereferenced, .address, .compared => |whole| return whole,
+        .logic => |logic| return logic.whole,
+        .builtin_argument => |argument| {
+            const name = Facts.builtinName(tree, argument.call) orelse return null;
+            for ([_][]const u8{ "@as", "@enumFromInt", "@fromBackingInt", "@intFromEnum", "@backingInt", "@intCast", "@truncate", "@atomicLoad" }) |each| if (std.mem.eql(u8, name, each)) return argument.call;
+            return null;
         },
         // `x.state.load(order)`: the state an atomic.Value holds, read.
-        .field_access => return std.mem.eql(u8, tree.tokenSlice(tree.nodeData(parent).node_and_token[1]), "load"),
-        else => {},
+        .member => |access| return if (try atomicLoad(c, file, access) != .no) access else null,
+        .callee => |call| return if (try atomicLoad(c, file, at) != .no) call else null,
+        .switched => |chosen| {
+            for (tree.fullSwitch(chosen).?.ast.cases) |case| if (!try otherPlace(c, file, tree.fullSwitchCase(case).?.ast.target_expr, state)) return chosen; // unreachable: a switch's operand is a switch's, its cases are cases
+            return null;
+        },
+        .tested => |branch| {
+            const full = tree.fullIf(branch) orelse return null;
+            if (full.payload_token != null) return null;
+            const otherwise = full.ast.else_expr.unwrap() orelse return branch;
+            return if (!try otherPlace(c, file, full.ast.then_expr, state) or !try otherPlace(c, file, otherwise, state)) branch else null;
+        },
+        else => return null,
     }
-    var buffer: [1]Ast.Node.Index = undefined;
-    if (tree.fullCall(&buffer, parent)) |call| return tree.nodeTag(call.ast.fn_expr) == .field_access and call.ast.fn_expr == at and std.mem.eql(u8, tree.tokenSlice(tree.nodeData(at).node_and_token[1]), "load");
-    if (tree.fullSwitch(parent)) |choice| {
-        if (choice.ast.condition != at) return false;
-        for (choice.ast.cases) |case| if (!try otherPlace(c, file, tree.fullSwitchCase(case).?.ast.target_expr, state)) return true; // unreachable: a switch's cases are cases
-        return false;
-    }
-    if (tree.fullIf(parent)) |branch| {
-        if (branch.ast.cond_expr != at or branch.payload_token != null) return false;
-        const otherwise = branch.ast.else_expr.unwrap() orelse return true;
-        return !try otherPlace(c, file, branch.ast.then_expr, state) or !try otherPlace(c, file, otherwise, state);
-    }
-    return false;
+}
+
+/// Whether the member read `access` is std's `atomic.Value` `load`, by its declaration;
+/// unknown where it does not resolve.
+fn atomicLoad(c: *Context, file: Project.FileId, access: Ast.Node.Index) Context.Error!Facts.Is {
+    return switch (try c.facts.definition(file, access)) {
+        .decl => |decl| stdAmong(c, decl, &.{"atomic.Value.load"}),
+        .none => .no,
+        .unknown => |why| .{ .unknown = why },
+    };
 }
 
 /// Whether `value` is read from a place other than the state `name`, by the place it names
@@ -3422,15 +3434,13 @@ fn declaredBy(model: *const Model, node: Ast.Node.Index) ?Model.Declaration.Id {
 
 /// The variable a destructure takes `at`, an element of the tuple it destructures, into
 /// (`const now, const n = .{ j.state, j.n }`).
-fn destructured(tree: *const Ast, model: *const Model, node: Ast.Node.Index, at: Ast.Node.Index) ?Ast.Node.Index {
-    var elements: [2]Ast.Node.Index = undefined;
-    const tuple = tree.fullArrayInit(&elements, node) orelse return null;
-    const position = std.mem.findScalar(Ast.Node.Index, tuple.ast.elements, at) orelse return null;
-    const statement = model.parentOf(node) orelse return null;
-    if (tree.nodeTag(statement) != .assign_destructure) return null;
-    const full = tree.assignDestructure(statement);
-    if (full.ast.value_expr != node or position >= full.ast.variables.len) return null;
-    return full.ast.variables[position];
+fn destructured(c: *Context, file: Project.FileId, tuple: Ast.Node.Index, position: usize) Context.Error!?Ast.Node.Index {
+    const statement = switch (try Facts.accesses.useOf(c.facts, file, tuple)) {
+        .destructured => |statement| statement,
+        else => return null,
+    };
+    const full = c.project.at(file).file.tree.assignDestructure(statement);
+    return if (position < full.ast.variables.len) full.ast.variables[position] else null;
 }
 
 /// Adds the references to the parameter of each function of the program a call gives `at` to,
@@ -3763,37 +3773,39 @@ fn atomicWrite(tree: *const Ast, model: *const Model, at: Ast.Node.Index) union(
 /// `.*`, `&`, parentheses, `@as`, `@atomicLoad` and an atomic.Value's `load`; an integer's
 /// (`integral`) only where it is made its enum on the way (`@enumFromInt`, `@fromBackingInt`)
 /// or the switch's prongs are literals, as a state's are.
-fn switchedOn(tree: *const Ast, model: *const Model, node: Ast.Node.Index, hold: StateHold) bool {
+fn switchedOn(c: *Context, file: Project.FileId, node: Ast.Node.Index, hold: StateHold) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
     var at = node;
     var converted = hold != .integral;
-    while (model.parentOf(at)) |parent| : (at = parent) {
-        if (tree.fullSwitch(parent)) |choice| return choice.ast.condition == at and (converted or literalProngs(tree, choice));
-        var buffer: [1]Ast.Node.Index = undefined;
-        if (tree.fullCall(&buffer, parent)) |call| {
-            if (call.ast.fn_expr != at or tree.nodeTag(at) != .field_access) return false;
-            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeData(at).node_and_token[1]), "load")) return false;
-            continue;
-        }
-        switch (tree.nodeTag(parent)) {
-            .unwrap_optional, .grouped_expression, .address_of, .deref => {},
-            .@"orelse" => if (tree.nodeData(parent).node_and_node[0] != at) return false,
-            .field_access => if (hold != .atomic or !std.mem.eql(u8, tree.tokenSlice(tree.nodeData(parent).node_and_token[1]), "load")) return false,
-            .builtin_call_two, .builtin_call_two_comma => {
-                const name = tree.tokenSlice(tree.nodeMainToken(parent));
-                if (std.mem.eql(u8, name, "@enumFromInt") or std.mem.eql(u8, name, "@fromBackingInt")) {
-                    converted = true;
-                } else if (!std.mem.eql(u8, name, "@as")) return false;
-            },
-            // `@atomicLoad(T, &x.state, order)`: the state, loaded.
-            .builtin_call, .builtin_call_comma => {
-                var args_buffer: [2]Ast.Node.Index = undefined;
-                const args = Facts.builtinArgs(tree, parent, &args_buffer);
-                if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@atomicLoad") or args.len != 3 or args[1] != at) return false;
-            },
+    while (true) switch (try Facts.accesses.useOf(c.facts, file, at)) {
+        .switched => |chosen| return converted or literalProngs(tree, tree.fullSwitch(chosen).?), // unreachable: what is switched on is a switch's
+        .carried => |onward| switch (onward.how) {
+            .unwrapped, .grouped, .payload => at = onward.into,
             else => return false,
-        }
-    }
-    return false;
+        },
+        .address, .dereferenced => |whole| at = whole,
+        // `x.state.load(order)`: the state an atomic.Value holds, loaded.
+        .member => |access| {
+            if (hold != .atomic or try atomicLoad(c, file, access) == .no) return false;
+            at = access;
+        },
+        .callee => |call| {
+            if (try atomicLoad(c, file, at) == .no) return false;
+            at = call;
+        },
+        .builtin_argument => |argument| {
+            const name = Facts.builtinName(tree, argument.call) orelse return false;
+            if (std.mem.eql(u8, name, "@enumFromInt") or std.mem.eql(u8, name, "@fromBackingInt")) {
+                converted = true;
+            } else if (std.mem.eql(u8, name, "@atomicLoad")) {
+                // `@atomicLoad(T, &x.state, order)`: the state, loaded.
+                var args_buffer: [2]Ast.Node.Index = undefined;
+                if (Facts.builtinArgs(tree, argument.call, &args_buffer).len != 3 or argument.position != 1) return false;
+            } else if (!std.mem.eql(u8, name, "@as")) return false;
+            at = argument.call;
+        },
+        else => return false,
+    };
 }
 
 /// Whether a switch's prongs are literals (`0 =>`, `'a' =>`, `1...3 =>`), as a state coded as
