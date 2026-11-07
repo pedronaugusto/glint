@@ -674,7 +674,7 @@ const FieldUse = struct { file: Project.FileId, node: Ast.Node.Index, receiver: 
 fn fieldUses(c: *Context, name: []const u8) Context.Error![]const FieldUse {
     var uses: std.ArrayList(FieldUse) = .empty;
     for (try c.facts.memberUses(name)) |use| {
-        const step = (try Facts.accesses.memberOf(c.facts, use.file, use.node)) orelse continue;
+        const step = (try Facts.accesses.memberRead(c.facts, use.file, use.node)) orelse continue;
         try uses.append(c.allocator, .{ .file = use.file, .node = use.node, .receiver = step.receiver.? }); // unreachable: a member's step has its holder
     }
     for (try c.facts.fieldUses(c.allocator, name)) |use| {
@@ -686,7 +686,7 @@ fn fieldUses(c: *Context, name: []const u8) Context.Error![]const FieldUse {
 /// The receiver, name and name's token of a field read (`Facts.accesses.memberOf`): `x.name`,
 /// or `@field(x, "name")` with the name it spells (null where it is computed).
 fn fieldAccess(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!?struct { receiver: Ast.Node.Index, name: ?[]const u8, token: Ast.TokenIndex } {
-    const step = (try Facts.accesses.memberOf(c.facts, c.file, node)) orelse return null;
+    const step = (try Facts.accesses.memberRead(c.facts, c.file, node)) orelse return null;
     // `x.name` at its name, `@field` at the builtin.
     const token = if (Facts.isBuiltin(tree, node, "@field")) tree.nodeMainToken(node) else tree.lastToken(node);
     return .{ .receiver = step.receiver.?, .name = step.name, .token = token }; // unreachable: a member's step has its holder
@@ -1860,7 +1860,7 @@ fn leafViewed(c: *Context, resources: []const ?Facts.Container, file: Project.Fi
     const tree = &c.project.at(file).file.tree;
     if (Facts.isNull(tree, node)) return true;
     // A name (a member read resolves to its declaration too, and is a place's part below).
-    if (try Facts.accesses.memberOf(c.facts, file, node) == null) switch (try c.facts.definition(file, node)) {
+    if (try Facts.accesses.memberRead(c.facts, file, node) == null) switch (try c.facts.definition(file, node)) {
         .decl => return nameViewed(c, resources, file, node, next, bound),
         .unknown => return false,
         .none => {},
@@ -1889,7 +1889,7 @@ fn leafViewed(c: *Context, resources: []const ?Facts.Container, file: Project.Fi
                 .unknown => return false,
             };
             if (call.receiver != .bound or args.len != 1) return false;
-            const method = (try Facts.accesses.memberOf(c.facts, file, call.callee_expr)) orelse return false;
+            const method = (try Facts.accesses.memberRead(c.facts, file, call.callee_expr)) orelse return false;
             if (!std.mem.eql(u8, method.name orelse return false, "borrow")) return false;
             return try c.role(Contract.library, try c.facts.resolve(file, call.receiver.bound)) == .owned;
         },
@@ -1953,7 +1953,7 @@ fn callViewed(c: *Context, resources: []const ?Facts.Container, file: Project.Fi
         .unknown => return false,
     };
     // An `own.Lent`'s `get()`: a copy its owner lends.
-    if (call.receiver == .bound and args.len == 1) if (try Facts.accesses.memberOf(c.facts, file, call.callee_expr)) |method| {
+    if (call.receiver == .bound and args.len == 1) if (try Facts.accesses.memberRead(c.facts, file, call.callee_expr)) |method| {
         if (std.mem.eql(u8, method.name orelse "", "get") and try c.role(Contract.library, try c.facts.resolve(file, call.receiver.bound)) == .lent) return true;
     };
     // One that does not resolve is no view: what it gives is judged an owner. Of a choice, each
@@ -2379,7 +2379,7 @@ fn localOf(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Erro
         }
         return null;
     }
-    if (try Facts.accesses.memberOf(c.facts, file, node) != null) return null;
+    if (try Facts.accesses.memberRead(c.facts, file, node) != null) return null;
     const decl = switch (try c.facts.definition(file, node)) {
         .decl => |decl| decl,
         .none, .unknown => return null,
@@ -2462,24 +2462,24 @@ fn releases(c: *Context, file: Project.FileId, node: Ast.Node.Index, decl: Model
     }
     if (tree.nodeTag(node) == .@"return") return if (tree.nodeData(node).opt_node.unwrap()) |value| movedBy(c, file, value, decl) else null;
     const call = (try Facts.calls.at(c.facts, file, node)) orelse return null;
-    const method = (try Facts.accesses.memberOf(c.facts, file, call.callee_expr)) orelse return null;
+    const method = (try Facts.accesses.memberRead(c.facts, file, call.callee_expr)) orelse return null;
     var receiver = method.receiver.?; // unreachable: a member's step has its holder
     if (call.receiver == .none) return null;
     if (!try guardRelease(c, call.callee)) {
         // A guard whose type does not resolve, as its acquisition does not, is judged as one:
         // its own `deinit` or `release`, which does not resolve with it, releases it.
-        if (call.callee != .any or member == .named or try Facts.accesses.memberOf(c.facts, file, receiver) != null) return null;
+        if (call.callee != .any or member == .named or try Facts.accesses.memberRead(c.facts, file, receiver) != null) return null;
         const spelled = method.name orelse return null;
         if (!std.mem.eql(u8, spelled, "deinit") and !std.mem.eql(u8, spelled, "release")) return null;
     }
     switch (member) {
         .none => {},
         .named => |name| {
-            const field = (try Facts.accesses.memberOf(c.facts, file, receiver)) orelse return null;
+            const field = (try Facts.accesses.memberRead(c.facts, file, receiver)) orelse return null;
             if (!std.mem.eql(u8, field.name orelse return null, name)) return null;
             receiver = field.receiver.?; // unreachable: a member's step has its holder
         },
-        .any => if (try Facts.accesses.memberOf(c.facts, file, receiver)) |field| {
+        .any => if (try Facts.accesses.memberRead(c.facts, file, receiver)) |field| {
             receiver = field.receiver.?; // unreachable: a member's step has its holder
         },
     }
@@ -2778,7 +2778,7 @@ fn contextNamed(c: *Context, file: Project.FileId, argument: Ast.Node.Index) Con
         },
         else => {},
     };
-    if (try Facts.accesses.memberOf(c.facts, file, at) != null) return null;
+    if (try Facts.accesses.memberRead(c.facts, file, at) != null) return null;
     const decl = switch (try c.facts.definition(file, at)) {
         .decl => |decl| decl,
         .none, .unknown => return null,
@@ -2837,7 +2837,7 @@ fn rankedForm(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.E
     const tree = &c.project.at(file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, node) orelse return false;
-    const method = (try Facts.accesses.memberOf(c.facts, file, call.ast.fn_expr)) orelse return false;
+    const method = (try Facts.accesses.memberRead(c.facts, file, call.ast.fn_expr)) orelse return false;
     const name = method.name orelse return false;
     return Contract.acquisition(name) and std.mem.find(u8, name, "Ordered") != null;
 }
