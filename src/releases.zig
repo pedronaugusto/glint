@@ -321,7 +321,7 @@ fn judge(facts: *Facts, function: Facts.Decl, owner: Owner, comptime base: Base,
     // No body to read: extern, a prototype.
     if (tree.nodeTag(function_node) != .fn_decl) return unknown(.unsupported, null);
     // A generic is read at its binding, which this summary does not take: unknown.
-    if (facts.hasGenericParameter(function)) return unknown(.generic, null);
+    if (try facts.hasGenericParameter(function)) return unknown(.generic, null);
     const body = tree.nodeData(function_node).node_and_node[1];
     const param = parameterAt(tree, model, record.node, owner.parameter) orelse return unknown(.unresolved, null);
     // The owner reached through what the parameter points at: a parameter by value is a copy,

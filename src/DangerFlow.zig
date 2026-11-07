@@ -1712,7 +1712,7 @@ fn passedSinks(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (*C
         for (calls.items) |call| {
             const reached = Taint.functionOf(c, flow, call.decl) orelse continue;
             const caller = Taint.functionKey(flow, file, call.node) orelse continue;
-            const generic = c.facts.hasGenericParameter(call.decl);
+            const generic = try c.facts.hasGenericParameter(call.decl);
             var at: usize = 0;
             while (at < list.items.len) : (at += 1) {
                 const one = list.items[at];
@@ -1785,7 +1785,7 @@ fn judgedAtCalls(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (
             continue;
         }
         const callee = Taint.functionOf(c, flow, decl) orelse continue;
-        const generic = c.facts.hasGenericParameter(decl);
+        const generic = try c.facts.hasGenericParameter(decl);
         const sinks = (try passedSinks(c, flow, rule, check, decl.file, callee)) orelse {
             try passedAt(c, flow, rule, node, decl, .{ .at = .{ .file = decl.file, .node = node }, .holder = callee, .given = try Taint.everyParameter(c, decl), .least = .data, .message = "", .undecided = true });
             continue;

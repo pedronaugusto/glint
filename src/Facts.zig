@@ -4553,7 +4553,7 @@ fn enterFile(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), fil
         const decl: Decl = .{ .file = file, .index = @fromBackingInt(@intCast(d)) };
         // An instantiated one is read in the instantiations the walk reaches it in; one a
         // consumer may instantiate (the program's public one), in each.
-        if (!self.instantiated(decl) or (own and record.public)) try self.reachDeclaration(found, next, decl, null);
+        if (!try self.instantiated(decl) or (own and record.public)) try self.reachDeclaration(found, next, decl, null);
     }
     const tree = &source.file.tree;
     var parts = (try self.partsOf(file)).nodes.keyIterator();
