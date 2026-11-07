@@ -515,54 +515,64 @@ fn noLibraryHolder(c: *Context, name: []const u8, others: []const []const u8) Co
 }
 /// The members other than `name` the file reads of an expression written as `receiver` is: the
 /// same declaration reached through the same fields, unwraps, dereferences, `try`s, elements
-/// and argument-less calls. Zig types each such expression alike, wherever it is written.
-fn receiverMembers(c: *Context, tree: *const Ast, model: *const Model, receiver: Ast.Node.Index, name: []const u8) Context.Error![]const []const u8 {
+/// and argument-less calls (`typedAlike`). Zig types each such expression alike, wherever it is
+/// written.
+fn receiverMembers(c: *Context, tree: *const Ast, receiver: Ast.Node.Index, name: []const u8) Context.Error![]const []const u8 {
     var names: std.ArrayList([]const u8) = .empty;
-    if (!alikeRooted(tree, model, receiver, 0)) return names.items;
+    if (!try typedAlike(c, receiver, receiver, 0)) return names.items;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .field_access) continue;
-        const access_node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const data = tree.nodeData(access_node).node_and_token;
-        if (data[0] == receiver or !typedAlike(tree, model, data[0], receiver, 0)) continue;
-        const read = try Model.identifier(c.allocator, tree.tokenSlice(data[1]));
-        if (std.mem.eql(u8, read, name)) continue;
+        if (Facts.accesses.formOf(tag) != .member) continue;
+        const read = (try Facts.accesses.memberRead(c.facts, c.file, @fromBackingInt(@intCast(i)))) orelse continue;
+        const holder = read.receiver orelse continue;
+        const member = read.name orelse continue;
+        if (holder == receiver or std.mem.eql(u8, member, name)) continue;
+        if (!try typedAlike(c, holder, receiver, 0)) continue;
         for (names.items) |earlier| {
-            if (std.mem.eql(u8, earlier, read)) break;
-        } else try names.append(c.allocator, read);
+            if (std.mem.eql(u8, earlier, member)) break;
+        } else try names.append(c.allocator, member);
     }
     return names.items;
 }
-/// Whether `node` is an expression `typedAlike` compares: rooted at a declaration it names.
-fn alikeRooted(tree: *const Ast, model: *const Model, node: Ast.Node.Index, depth: usize) bool {
+/// Whether `a` and `b` are the same expression to Zig's types (one expression with itself: one
+/// `typedAlike` compares): their paths (Facts.accesses.pathOf) take the same steps, a member by
+/// the same name, from roots alike. A root is alike where both name one declaration, both `try`
+/// alike operands, or both call with no arguments one function through alike callees. Distinct
+/// steps, a member whose name is computed, or a root of any other form are not alike.
+fn typedAlike(c: *Context, a: Ast.Node.Index, b: Ast.Node.Index, depth: usize) Context.Error!bool {
     if (depth == 16) return false;
-    return switch (tree.nodeTag(node)) {
-        .identifier => if (model.reference(node)) |ref| ref.declaration != null else false,
-        .field_access, .unwrap_optional, .grouped_expression => alikeRooted(tree, model, tree.nodeData(node).node_and_token[0], depth + 1),
-        .deref, .@"try" => alikeRooted(tree, model, tree.nodeData(node).node, depth + 1),
-        .array_access => alikeRooted(tree, model, tree.nodeData(node).node_and_node[0], depth + 1),
-        .call_one, .call_one_comma => tree.nodeData(node).node_and_opt_node[1] == .none and alikeRooted(tree, model, tree.nodeData(node).node_and_opt_node[0], depth + 1),
-        else => false,
-    };
-}
-fn typedAlike(tree: *const Ast, model: *const Model, a: Ast.Node.Index, b: Ast.Node.Index, depth: usize) bool {
-    if (depth == 16) return false;
-    const tag = tree.nodeTag(a);
-    if (tag != tree.nodeTag(b)) return false;
-    return switch (tag) {
-        .identifier => blk: {
-            const x = (model.reference(a) orelse break :blk false).declaration orelse break :blk false;
-            const y = (model.reference(b) orelse break :blk false).declaration orelse break :blk false;
-            break :blk x == y;
+    const left = try Facts.accesses.pathOf(c.facts, c.file, a);
+    const right = try Facts.accesses.pathOf(c.facts, c.file, b);
+    if (left.steps.len != right.steps.len) return false;
+    const last = left.steps.len - 1;
+    for (left.steps[0..last], right.steps[0..last]) |x, y| {
+        if (x.kind != y.kind) return false;
+        if (x.kind == .field and !std.mem.eql(u8, x.name orelse return false, y.name orelse return false)) return false;
+    }
+    switch (left.root) {
+        .decl => |declared| return switch (right.root) {
+            .decl => |other| std.meta.eql(declared, other),
+            .none, .unknown => false,
         },
-        .field_access => std.mem.eql(u8, tree.tokenSlice(tree.nodeData(a).node_and_token[1]), tree.tokenSlice(tree.nodeData(b).node_and_token[1])) and
-            typedAlike(tree, model, tree.nodeData(a).node_and_token[0], tree.nodeData(b).node_and_token[0], depth + 1),
-        .unwrap_optional, .grouped_expression => typedAlike(tree, model, tree.nodeData(a).node_and_token[0], tree.nodeData(b).node_and_token[0], depth + 1),
-        .deref, .@"try" => typedAlike(tree, model, tree.nodeData(a).node, tree.nodeData(b).node, depth + 1),
-        .array_access => typedAlike(tree, model, tree.nodeData(a).node_and_node[0], tree.nodeData(b).node_and_node[0], depth + 1),
-        .call_one, .call_one_comma => tree.nodeData(a).node_and_opt_node[1] == .none and tree.nodeData(b).node_and_opt_node[1] == .none and
-            typedAlike(tree, model, tree.nodeData(a).node_and_opt_node[0], tree.nodeData(b).node_and_opt_node[0], depth + 1),
-        else => false,
-    };
+        .unknown => return false,
+        .none => if (right.root != .none) return false,
+    }
+    const tree = &c.project.at(c.file).file.tree;
+    const x = left.steps[last].node;
+    const y = right.steps[last].node;
+    const form = Facts.accesses.formOf(tree.nodeTag(x));
+    if (form != Facts.accesses.formOf(tree.nodeTag(y))) return false;
+    switch (form) {
+        .tried => return typedAlike(c, tree.nodeData(x).node, tree.nodeData(y).node, depth + 1),
+        .call => {
+            var x_buffer: [1]Ast.Node.Index = undefined;
+            var y_buffer: [1]Ast.Node.Index = undefined;
+            const x_call = tree.fullCall(&x_buffer, x).?; // unreachable: the form is a call's
+            const y_call = tree.fullCall(&y_buffer, y).?; // unreachable: the form is a call's
+            if (x_call.ast.params.len != 0 or y_call.ast.params.len != 0) return false;
+            return typedAlike(c, x_call.ast.fn_expr, y_call.ast.fn_expr, depth + 1);
+        },
+        else => return false,
+    }
 }
 /// Whether `node` is a type, whose members are declarations and never a value's fields: a
 /// container named as such, or a parameter or constant declared `type` (`V.maximum` of a
@@ -619,7 +629,7 @@ fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!b
             };
         };
     }
-    const siblings = try receiverMembers(c, tree, model, receiver, name);
+    const siblings = try receiverMembers(c, tree, receiver, name);
     if (siblings.len != 0 and try noLibraryHolder(c, name, siblings)) return true;
     if (member == null and literal == null and !operand and !called) return false;
     const found = try PackageRules.publication(c.facts, Contract.library);
