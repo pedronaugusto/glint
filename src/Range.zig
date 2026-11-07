@@ -1178,19 +1178,6 @@ fn wholeValue(value: Facts.Value) bool {
     };
 }
 
-/// The name a container is declared by (`const Index = struct { … }`), or for a file's own
-/// struct, the file's name (`Index.zig`).
-fn containerName(c: *Context, file: Project.FileId, container_node: Ast.Node.Index) ?[]const u8 {
-    const tree = &c.project.at(file).file.tree;
-    if (container_node == .root) {
-        const base = std.Io.Dir.path.basename(c.project.at(file).input.name);
-        return std.mem.cutSuffix(u8, base, ".zig");
-    }
-    const parent = c.project.at(file).model.parentOf(container_node) orelse return null;
-    const variable = tree.fullVarDecl(parent) orelse return null;
-    return tree.tokenSlice(variable.ast.mut_token + 1);
-}
-
 /// Whether a value is `null` or `undefined`: no number.
 fn empty(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
     const written_here = (try c.facts.literalOf(file, node)) orelse return false;
@@ -3702,33 +3689,118 @@ fn withinOnce(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: 
     return true;
 }
 
-/// Whether `index` is a table's own id read as its integer, `t[@backingInt(id)]`: `id`'s type
-/// is the `Id` the table's element type declares (`ownerOf`), and `t` is memory of that
-/// element (`[]T`, `[N]T`, `*[N]T`). Such an id is made only by `@fromBackingInt` or
-/// `@enumFromInt`, and A009 reports each of those that does not count the table's entries
-/// (`madeId`, `countsEntries`), so it names one of them. The type does not tell which table
-/// of that element: an id of one table read in another of the same element, or in one the
-/// program has shrunk since, is the program's to keep apart.
+/// Whether `index` is a table's own id read as its integer, `t[@backingInt(id)]` (`ownIndex`),
+/// where every make of that id the program writes is shown to count the table's entries
+/// (`countedIds`): then it names one of them. Where one is not shown, the id may name none
+/// (`unprovenId`). The type does not tell which table of that element: an id of one table read in
+/// another of the same element, or in one the program has shrunk since, is the program's to keep
+/// apart.
 pub fn ownId(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: Ast.Node.Index) Context.Error!bool {
-    const tree = &c.project.at(file).file.tree;
-    const at = bare(tree, index);
-    if (!Facts.isBuiltin(tree, at, "@backingInt") and !Facts.isBuiltin(tree, at, "@intFromEnum")) return false;
-    var buffer: [2]Ast.Node.Index = undefined;
-    const args = Facts.builtinArgs(tree, at, &buffer);
-    if (args.len != 1) return false;
-    const id = switch (try c.facts.resolve(file, args[0])) {
-        .instance => |k| k,
-        .alternatives => return false,
-        else => return false,
-    };
-    const owner = ownerOf(c, id) orelse return false;
-    const entries = (try elementOf(c, file, memory)) orelse return false;
-    return owner.file == entries.file and owner.scope == entries.scope;
+    const owner = (try ownIndex(c, file, index, memory)) orelse return false;
+    return countedIds(c, owner);
 }
 
-/// The container whose own id `id` is: `id` is an enum with a backing integer whose one member
-/// is `_` (no named value, so none is made without a conversion), declared by the name `Id`
-/// directly in that container.
+/// Whether `index` is a table's own id read as its integer (`ownIndex`) not every make of which
+/// is shown to count the table's entries: a position that may name no entry, never shown out of
+/// it either.
+pub fn unprovenId(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: Ast.Node.Index) Context.Error!bool {
+    const owner = (try ownIndex(c, file, index, memory)) orelse return false;
+    return !try countedIds(c, owner);
+}
+
+/// The container whose own id `index` reads as its integer to index its table: `index` is
+/// `@backingInt(id)` or `@intFromEnum(id)`, `id`'s type is an id the container declares
+/// (`ownerOf`), and `memory` holds that container's values (`[]T`, `[N]T`, `*[N]T`).
+fn ownIndex(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: Ast.Node.Index) Context.Error!?Facts.Container {
+    const tree = &c.project.at(file).file.tree;
+    const at = bare(tree, index);
+    if (!Facts.isBuiltin(tree, at, "@backingInt") and !Facts.isBuiltin(tree, at, "@intFromEnum")) return null;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = Facts.builtinArgs(tree, at, &buffer);
+    if (args.len != 1) return null;
+    const id = switch (try c.facts.resolve(file, args[0])) {
+        .instance => |k| k,
+        .alternatives => return null,
+        else => return null,
+    };
+    const owner = ownerOf(c, id) orelse return null;
+    const entries = (try elementOf(c, file, memory)) orelse return null;
+    return if (owner.file == entries.file and owner.scope == entries.scope) owner else null;
+}
+
+/// The run's table ids: the containers whose ids index a table of their values somewhere in the
+/// program (`ownIndex`), and for each whether every make of its ids is shown counted.
+const TableIds = struct {
+    indexed: ?[]const Facts.Container = null,
+    counted: std.AutoHashMapUnmanaged(struct { Project.FileId, Model.Scope.Id }, bool) = .empty,
+};
+
+/// The containers whose own ids index a table of their values somewhere in the program.
+fn tableOwners(c: *Context) Context.Error![]const Facts.Container {
+    const memo = try c.facts.memo(TableIds);
+    if (memo.indexed) |known| return known;
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
+    var found: std.ArrayList(Facts.Container) = .empty;
+    for (c.project.sources) |*source| {
+        const file = source.id;
+        if (!try Program.owns(c, file)) continue;
+        const tree = &source.file.tree;
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            if (Facts.accesses.formOf(tag) != .array_access) continue;
+            const memory, const index = tree.nodeData(@fromBackingInt(@intCast(i))).node_and_node;
+            const owner = (try ownIndex(c, file, index, memory)) orelse continue;
+            for (found.items) |known| {
+                if (known.file == owner.file and known.scope == owner.scope) break;
+            } else try found.append(c.allocator, owner);
+        }
+    }
+    memo.indexed = found.items;
+    return found.items;
+}
+
+/// Whether `owner`'s ids index a table of its values somewhere in the program.
+fn isTable(c: *Context, owner: Facts.Container) Context.Error!bool {
+    for (try tableOwners(c)) |known| if (known.file == owner.file and known.scope == owner.scope) return true;
+    return false;
+}
+
+/// Whether every make of `owner`'s id the program writes counts the entries of a table of
+/// `owner` (`countsEntries`): each `@fromBackingInt` or `@enumFromInt` that makes one, none made
+/// by `@bitCast` or `@ptrCast`, and no conversion whose type does not resolve where it may make
+/// one. Read once for the run; while it is being read, not shown.
+fn countedIds(c: *Context, owner: Facts.Container) Context.Error!bool {
+    const memo = try c.facts.memo(TableIds);
+    const key = .{ owner.file, owner.scope };
+    if (memo.counted.get(key)) |known| return known;
+    try memo.counted.put(c.facts.gpa, key, false);
+    const answer = all: for (c.project.sources) |*source| {
+        const file = source.id;
+        if (!try Program.owns(c, file)) continue;
+        const tree = &source.file.tree;
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            if (Facts.accesses.formOf(tag) != .builtin) continue;
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            const counts = Facts.isBuiltin(tree, node, "@fromBackingInt") or Facts.isBuiltin(tree, node, "@enumFromInt");
+            if (!counts and !Facts.isBuiltin(tree, node, "@bitCast") and !Facts.isBuiltin(tree, node, "@ptrCast")) continue;
+            switch (try madeOf(c, file, node, !counts)) {
+                .other => {},
+                .unknown => break :all false,
+                .id => |made| if (made.file == owner.file and made.scope == owner.scope) {
+                    if (!counts or !try countsEntries(c, file, node, owner)) break :all false;
+                },
+            }
+        }
+    } else true;
+    try memo.counted.put(c.facts.gpa, key, answer);
+    return answer;
+}
+
+/// The container whose own id `id` may be, by its structure alone: `id` is an enum with a
+/// backing integer whose one member is `_` (no named value, so none is made without a
+/// conversion), declared directly in that container, whatever it is named. Only a candidate:
+/// what clears an index on it is `countedIds`.
 fn ownerOf(c: *Context, id: Facts.Container) ?Facts.Container {
     if (id.made_by != null or id.symbolic) return null;
     const tree = &c.project.at(id.file).file.tree;
@@ -3745,7 +3817,6 @@ fn ownerOf(c: *Context, id: Facts.Container) ?Facts.Container {
         open = true;
     }
     if (!open) return null;
-    if (!std.mem.eql(u8, containerName(c, id.file, scope.node) orelse return null, "Id")) return null;
     const holder = scope.parent orelse return null;
     if (model.scopes[@backingInt(holder)].kind != .container) return null;
     return .{ .file = id.file, .scope = holder };
@@ -3770,16 +3841,23 @@ fn elementOf(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Context.
 pub const Made = union(enum) { id: Facts.Container, other, unknown };
 
 pub fn madeId(c: *Context, file: Project.FileId, call: Ast.Node.Index) Context.Error!Made {
+    return madeOf(c, file, call, false);
+}
+
+/// What the conversion `call` makes (`madeId`); through a pointer where `pointed` (`@ptrCast`
+/// to a pointer to an id). An id is a table's only where its ids index a table of their
+/// container (`isTable`).
+fn madeOf(c: *Context, file: Project.FileId, call: Ast.Node.Index, pointed: bool) Context.Error!Made {
     var made = switch ((try destined(c, file, call)) orelse return .unknown) {
         .named => |type_node| try c.facts.resolve(type_node.file, type_node.node),
         .assigned => |lhs| try c.facts.resolve(file, lhs),
         .field => |decl| try c.facts.declaration(decl),
         .backing, .shifted => return .other,
     };
-    while (made == .optional) made = made.optional.*;
+    while (made == .optional or (pointed and made == .pointer)) made = if (made == .optional) made.optional.* else made.pointer.child.*;
     return switch (made) {
-        .container, .instance => |k| if (ownerOf(c, k)) |owner| .{ .id = owner } else .other,
-        .unknown => .unknown,
+        .container, .instance => |k| if (ownerOf(c, k)) |owner| (if (try isTable(c, owner)) .{ .id = owner } else .other) else .other,
+        .unknown => if (try declaresIds(c)) .unknown else .other,
         // A choice may hold a table's id: not known.
         .alternatives => .unknown,
         else => .other,
@@ -3820,27 +3898,11 @@ fn entriesOf(c: *Context, file: Project.FileId, table: Ast.Node.Index, owner: Fa
     return entries.file == owner.file and entries.scope == owner.scope;
 }
 
-/// Whether a file of the program declares a table's own id: where none does, a conversion whose
+/// Whether the program has a table's own id (`tableOwners`): where none does, a conversion whose
 /// type does not resolve makes none.
 pub fn declaresIds(c: *Context) Context.Error!bool {
-    // What it keeps in its memo stays for the run.
-    const rule_memory = c.keep();
-    defer c.allocator = rule_memory;
-    const memo = try c.facts.memo(DeclaresIds);
-    if (memo.known) |known| return known;
-    const out = found: for (c.project.sources) |*source| {
-        const file = source.id;
-        if (!try Program.owns(c, file)) continue;
-        for (source.model.scopes, 0..) |scope, s| {
-            if (scope.kind != .container) continue;
-            if (ownerOf(c, .{ .file = file, .scope = @fromBackingInt(@intCast(s)) }) != null) break :found true;
-        }
-    } else false;
-    memo.known = out;
-    return out;
+    return (try tableOwners(c)).len != 0;
 }
-
-const DeclaresIds = struct { known: ?bool = null };
 
 /// Whether `index` is a remainder by `memory`'s length of a value at zero or above: `x %
 /// m.len`, `@mod(x, m.len)`, `@rem(x, m.len)`.

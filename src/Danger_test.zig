@@ -3711,12 +3711,15 @@ test "A009 gives no bound where an integer type's width overflows Range's own ar
     try std.testing.expectEqual(@as(u32, 7), found.lines[0]);
 }
 
-test "A009 trusts a table's own id by its type, and reports each id made from an integer that does not count the table's entries" {
+test "A009 reads a table's own id by its structure, reports each id made from an integer that does not count the table's entries, and leaves the table's positions undecided while one is made so" {
     // A table's own id indexes and slices it (lines 8-10); ids counted over it (13) or its
     // length less one after an append (23) are made. Findings: an id made from input (18), a
-    // constant (19), a counter over another table (21), input made another element's id (25)
-    // indexing this table (26), an id with a named value (27), an id declared outside its
-    // element (28), arithmetic on an id (29), and the length itself, one past the end (31).
+    // constant (19), a counter over another table (21), another element's id indexing this
+    // table (26), an id with a named value (27), an id declared outside its element (28),
+    // arithmetic on an id (29), and the length itself, one past the end (31). Those makes leave
+    // Entry's ids unproven, so its own positions (8-10) are undecided, neither clear nor
+    // findings. Other's ids index no table of Other's: one made from input (25) makes no table's
+    // id.
     const result = try run(pack.untrusted_input,
         \\const std = @import("std");
         \\const Entry = struct { name: u8, pub const Id = enum(u32) { _ }; };
@@ -3751,8 +3754,36 @@ test "A009 trusts a table's own id by its type, and reports each id made from an
         \\    return sum +% t.at(@fromBackingInt(@intCast(t.entries.len)));
         \\}
     );
-    try std.testing.expectEqual(@as(usize, 0), result.undecided);
-    try std.testing.expectEqualSlices(u32, &.{ 18, 19, 21, 25, 26, 27, 28, 29, 31 }, result.lines[0..result.findings]);
+    try std.testing.expectEqual(@as(usize, 3), result.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 18, 19, 21, 26, 27, 28, 29, 31 }, result.lines[0..result.findings]);
+}
+
+test "A009 reads a table's own id by its structure and clears it only on proof: every make counted clears, a make from a peer's number leaves the index undecided, and the id's name changes neither" {
+    inline for (.{ "Id", "Key" }) |name| {
+        const head = "const std = @import(\"std\");\n" ++
+            "const Entry = struct { name: u8, pub const " ++ name ++ " = enum(u32) { _ }; };\n" ++
+            "const Table = struct {\n" ++
+            "    entries: []Entry, keys: []Entry." ++ name ++ ",\n" ++
+            "    fn at(t: *const Table, id: Entry." ++ name ++ ") u8 { return t.entries[@backingInt(id)].name; }\n" ++
+            "    fn fill(t: *Table) void { for (t.entries, 0..) |_, i| t.keys[i] = @fromBackingInt(@intCast(i)); }\n" ++
+            "};\n" ++
+            "pub fn f(r: *std.Io.Reader, t: *Table) !u8 {\n" ++
+            "    t.fill();\n";
+        const tail = "    const pos = try r.takeInt(u32, 0);\n" ++
+            "    if (pos >= t.keys.len) return 0;\n" ++
+            "    return t.at(t.keys[pos]);\n}\n";
+        // Every id made by counting the table's entries (line 6): the index on line 5 names one.
+        const counted = try run(pack.untrusted_input, head ++ tail);
+        try std.testing.expectEqual(@as(usize, 0), counted.findings);
+        try std.testing.expectEqual(@as(usize, 0), counted.undecided);
+        // One made from a peer's number (line 10) is a finding where it is made, and the index
+        // on line 5 is no longer shown to name an entry: undecided, not cleared by the shape.
+        const peer = try run(pack.untrusted_input, head ++
+            "    const made: Entry." ++ name ++ " = @fromBackingInt(try r.takeInt(u32, 0));\n" ++
+            "    _ = t.at(made);\n" ++ tail);
+        try std.testing.expectEqualSlices(u32, &.{10}, peer.lines[0..peer.findings]);
+        try std.testing.expectEqual(@as(usize, 1), peer.undecided);
+    }
 }
 
 /// `run` with `other.zig`, a file of the program the selection leaves out, imported by path.

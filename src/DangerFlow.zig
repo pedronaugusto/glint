@@ -34,6 +34,7 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
             .array_access => {
                 const array, const index = tree.nodeData(node).node_and_node;
                 if (try Proof.within(c, c.file, index, array, false)) continue;
+                if (try unprovenIndex(c, flow, rule, index, array)) continue;
                 try judged(c, flow, rule, index, try Taint.levelAt(c, flow, c.file, index), .data, "input indexes memory: a peer chooses the position; parse it into a refined type with aegis input.Untrusted");
             },
             .slice_open, .slice, .slice_sentinel => {
@@ -45,12 +46,12 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
                 const extent = "input bounds a slice: a peer chooses its extent; parse it into a refined type with aegis input.Untrusted";
                 if (slice.ast.end.unwrap()) |end| {
                     const end_within = try Proof.within(c, c.file, end, slice.ast.sliced, true);
-                    if (!end_within) try sink(c, flow, rule, end, extent);
+                    if (!end_within and !try unprovenIndex(c, flow, rule, end, slice.ast.sliced)) try sink(c, flow, rule, end, extent);
                     if (!try Proof.notAfter(c, c.file, slice.ast.start, end, slice.ast.sliced)) {
                         try sink(c, flow, rule, slice.ast.start, extent);
                         if (end_within) try sink(c, flow, rule, end, extent);
                     }
-                } else if (!try Proof.within(c, c.file, slice.ast.start, slice.ast.sliced, true)) try sink(c, flow, rule, slice.ast.start, extent);
+                } else if (!try Proof.within(c, c.file, slice.ast.start, slice.ast.sliced, true) and !try unprovenIndex(c, flow, rule, slice.ast.start, slice.ast.sliced)) try sink(c, flow, rule, slice.ast.start, extent);
             },
             // A pointer moved by input reaches the address a peer chooses: no length checks it,
             // unless its offset is shown within the memory it came from (`x.ptr + o`, `o < x.len`).
@@ -1485,6 +1486,19 @@ fn within(c: *Context, node: Ast.Node.Index, param: Ast.Node.Index) bool {
 
 /// A sink in the checked file: a finding where the value is input, undecided where the fact
 /// cannot tell.
+/// Whether `node` positions `memory` by a table's own id not every make of which is shown to
+/// count the table's entries (Range.unprovenId): the id may name an entry or not, so where input
+/// may reach it the site is undecided, neither a finding nor clear on the id's shape alone. In a
+/// file the run does not select it is judged at the calls into it, as any sink is.
+fn unprovenIndex(c: *Context, flow: Taint.Fact, rule: Rule, node: Ast.Node.Index, memory: Ast.Node.Index) Context.Error!bool {
+    if (flow.flow.recording != null) return false;
+    if (!try Range.unprovenId(c, c.file, node, memory)) return false;
+    const level = try Taint.levelAt(c, flow, c.file, node);
+    const tree = &c.project.at(c.file).file.tree;
+    if (level == .unknown or level.reaches(.data)) try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a table's own id positions it, and not every make of that id is shown to count the table's entries: it may name no entry");
+    return true;
+}
+
 fn sink(c: *Context, flow: Taint.Fact, rule: Rule, node: Ast.Node.Index, comptime message: []const u8) Context.Error!void {
     try judged(c, flow, rule, node, try Taint.levelAt(c, flow, c.file, node), .data, message);
 }
