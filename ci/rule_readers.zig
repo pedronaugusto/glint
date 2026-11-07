@@ -32,6 +32,7 @@ const Allowed = struct { file: []const u8, function: []const u8, reason: []const
 /// The reads that stay syntactic, each with its reason. A session adds an entry for its rule
 /// with the guard's owner.
 const allowed = [_]Allowed{
+    .{ .file = "src/DangerFlow.zig", .function = "namesCanceled", .reason = "Zig's error names are global identities, one `error.X` program-wide whatever set spells it: no declaration stands behind one" },
     .{ .file = "src/Discards.zig", .function = "refusal", .reason = "Zig's error names are global identities, one `error.X` program-wide whatever set spells it: no declaration stands behind one" },
     .{ .file = "src/Builtins.zig", .function = "unusedImports", .reason = "a member read is written `a.b` or `@field` (read apart by Facts.reflected); Facts.definition decides what each names" },
     .{ .file = "src/Builtins.zig", .function = "priorityRules", .reason = "picks the token a finding is reported at; Facts.calls and Facts.definition decide the callee" },
@@ -88,15 +89,6 @@ const switches = [_]Allowed{
     .{ .file = "src/Danger.zig", .function = "syncType", .reason = "pending: warp-fast" },
     .{ .file = "src/Danger.zig", .function = "typeConstant", .reason = "pending: warp-fast" },
     .{ .file = "src/Danger.zig", .function = "unjudged", .reason = "pending: warp-fast" },
-    .{ .file = "src/DangerFlow.zig", .function = "IoProbe.of", .reason = "pending: bay" },
-    .{ .file = "src/DangerFlow.zig", .function = "argumentOf", .reason = "pending: bay" },
-    .{ .file = "src/DangerFlow.zig", .function = "containerIo", .reason = "pending: bay" },
-    .{ .file = "src/DangerFlow.zig", .function = "heldIo", .reason = "pending: bay" },
-    .{ .file = "src/DangerFlow.zig", .function = "holdsNoError", .reason = "pending: bay" },
-    .{ .file = "src/DangerFlow.zig", .function = "passesParameter", .reason = "pending: bay" },
-    .{ .file = "src/DangerFlow.zig", .function = "predicate", .reason = "pending: bay" },
-    .{ .file = "src/DangerFlow.zig", .function = "spelledIo", .reason = "pending: bay" },
-    .{ .file = "src/DangerFlow.zig", .function = "spellsIo", .reason = "pending: bay" },
     .{ .file = "src/DangerShapes.zig", .function = "acquiresHandle", .reason = "pending: glint-b" },
     .{ .file = "src/DangerShapes.zig", .function = "byPointer", .reason = "pending: glint-b" },
     .{ .file = "src/DangerShapes.zig", .function = "byValue", .reason = "pending: glint-b" },

@@ -3496,6 +3496,13 @@ pub fn inStd(flow: *const Flow, decl: Facts.Decl) bool {
 pub fn readerType(flow: *const Flow) ?Facts.Container {
     return flow.reader;
 }
+/// Whether `decl` is one of the functions `names` std's `Io.Reader` declares, by its declaration.
+pub fn readerFunction(flow: *const Flow, c: *Context, decl: Facts.Decl, names: []const []const u8) bool {
+    const reader = flow.reader orelse return false;
+    for (names) |name| if (memberIs(c, reader, name, decl)) return true;
+    return false;
+}
+
 pub fn directoryType(flow: *const Flow) ?Facts.Container {
     return flow.dir;
 }

@@ -11,6 +11,10 @@ const Project = @import("Project.zig");
 const Taint = @import("Taint.zig");
 const Program = @import("Program.zig");
 const Range = @import("Range.zig");
+const accesses = Facts.accesses;
+const formAt = Range.formAt;
+const nameRef = Range.nameRef;
+const spellsName = Range.spellsName;
 const Proof = @import("Proof.zig");
 const Danger = @import("Danger.zig");
 const Governed = @import("Governed.zig");
@@ -27,7 +31,7 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         if (!readNow(c, flow, node)) continue;
-        switch (tag) {
+        switch (accesses.formOf(tag)) {
             // A position input reaches is a finding unless it is shown within the memory: a
             // table the program sized to the index's range (`[256]` by a byte) holds every
             // value, a shorter or unknown one not.
@@ -37,7 +41,7 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
                 if (try unprovenIndex(c, flow, rule, index, array)) continue;
                 try judged(c, flow, rule, index, try Taint.levelAt(c, flow, c.file, index), .data, "input indexes memory: a peer chooses the position; parse it into a refined type with aegis input.Untrusted");
             },
-            .slice_open, .slice, .slice_sentinel => {
+            .slice => {
                 const slice = tree.fullSlice(node) orelse continue;
                 // A bound the program checked against the memory's length is its own. With an
                 // end, the start must be at most it, which puts the start within the memory
@@ -55,7 +59,8 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
             },
             // A pointer moved by input reaches the address a peer chooses: no length checks it,
             // unless its offset is shown within the memory it came from (`x.ptr + o`, `o < x.len`).
-            .add, .sub, .add_wrap, .sub_wrap, .assign_add, .assign_sub, .assign_add_wrap, .assign_sub_wrap => {
+            .operator, .compound_assign => if (accesses.operatorOf(tag)) |operator| {
+                if ((operator.op != .add and operator.op != .sub) or operator.overflow == .saturating) continue;
                 if (!try Range.addresses(c, c.file, node) or try Range.movedWithin(c, c.file, node)) continue;
                 const offset = tree.nodeData(node).node_and_node[1];
                 try judged(c, flow, rule, offset, try ranged(c, flow, offset), .data, "input moves a pointer: a peer chooses the address it reaches; parse it into a refined type with aegis input.Untrusted");
@@ -70,7 +75,7 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
             },
             // What decides the condition (`decides`): each comparison it joins by `and`, `or` and
             // `!`, a local's each value, a payload's leaf. A truth bounds no number: A020's.
-            .@"while", .while_simple, .while_cont => {
+            .@"while" => {
                 const loop = tree.fullWhile(node) orelse continue;
                 if (try consumes(c, flow, loop.ast.then_expr)) continue;
                 // Passes shown within memory the function holds are no more than the work a peer sent.
@@ -91,7 +96,7 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
             // integer is a finding unless it counts the table's entries, whatever the
             // integer's fact. Where the type it makes does not resolve and the program declares
             // such ids, it may be one.
-            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+            .builtin => {
                 const name = tree.tokenSlice(tree.nodeMainToken(node));
                 if (!std.mem.eql(u8, name, "@fromBackingInt") and !std.mem.eql(u8, name, "@enumFromInt")) continue;
                 switch (try Range.madeId(c, c.file, node)) {
@@ -131,54 +136,57 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        switch (tag) {
+        const form = accesses.formOf(tag);
+        const operator: accesses.Operator = if (accesses.operatorOf(tag)) |known| known else .{ .op = .exchange };
+        const checked_op: Range.Op = if (operator.overflow == .checked) operator.op else .exchange;
+        switch (if (form == .builtin) .nand else if (accesses.unaryOf(tag) == .negation) Range.Op.min else checked_op) {
             // A sum, difference or product overflows on either operand; a quotient or a
             // remainder fails on its divisor (zero, or -1 under the minimum).
-            .add, .mul, .assign_add, .assign_mul => {
+            .add, .mul => {
                 if (!readNow(c, flow, node) or try Range.floating(c, c.file, node)) continue;
                 // An address moved by input reaches memory, A009's; no overflow check stops it.
-                if (tag == .add and try Range.addresses(c, c.file, node)) continue;
+                if (form == .operator and operator.op == .add and try Range.addresses(c, c.file, node)) continue;
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
                 const level = (try Taint.levelAt(c, flow, c.file, lhs)).join(try Taint.levelAt(c, flow, c.file, rhs));
                 if (level.reaches(.data) and try Proof.fits(c, c.file, node)) continue;
                 try judged(c, flow, rule, node, level, .data, "arithmetic on a number from input: a peer's value that overflows it stops the program; aegis int.Checked or Ranged returns the overflow");
             },
             // A difference underflows on what it takes away, a byte of input enough.
-            .sub, .assign_sub => {
+            .sub => {
                 if (!readNow(c, flow, node) or try Range.floating(c, c.file, node)) continue;
-                if (tag == .sub and try Range.addresses(c, c.file, node)) continue;
+                if (form == .operator and try Range.addresses(c, c.file, node)) continue;
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
                 const level = (try Taint.levelAt(c, flow, c.file, lhs)).join(try Taint.levelAt(c, flow, c.file, rhs));
                 if (level.reaches(.data) and try Proof.fits(c, c.file, node)) continue;
                 try judged(c, flow, rule, node, level, .data, "a difference with input: a peer's value that underflows it stops the program; aegis int.Checked or Ranged returns the error");
             },
-            .div, .mod, .assign_div, .assign_mod => {
+            .div, .mod => {
                 if (!readNow(c, flow, node) or try Range.floating(c, c.file, node)) continue;
                 const rhs = tree.nodeData(node).node_and_node[1];
                 if (try Proof.nonzero(c, c.file, rhs)) continue;
                 var level = try Taint.levelAt(c, flow, c.file, rhs);
                 // The length of memory a peer sized is the peer's to make zero (`x % buf.len`
                 // over an empty read), though a length is no peer's number.
-                var divisor = rhs;
-                while (tree.nodeTag(divisor) == .grouped_expression) divisor = tree.nodeData(divisor).node_and_token[0];
-                if (tree.nodeTag(divisor) == .field_access and std.mem.eql(u8, tree.tokenSlice(tree.nodeData(divisor).node_and_token[1]), "len")) {
-                    if ((try Taint.levelAt(c, flow, c.file, tree.nodeData(divisor).node_and_token[0])).reaches(.data)) level = level.join(.data);
+                if (try c.facts.lengthOf(c.file, rhs)) |memory| {
+                    if ((try Taint.levelAt(c, flow, c.file, memory)).reaches(.data)) level = level.join(.data);
                 }
                 try judged(c, flow, rule, node, level, .data, "division by input: a peer's zero stops the program; aegis int.Checked returns the error");
             },
-            .negation => {
+            // A negation (`unaryOf`).
+            .min => {
                 if (!readNow(c, flow, node) or try Range.negates(c, c.file, tree.nodeData(node).node)) continue;
                 try judged(c, flow, rule, node, try Taint.levelAt(c, flow, c.file, tree.nodeData(node).node), .data, "negation of a number from input: a peer's minimum value overflows it and stops the program; aegis int.Checked returns the overflow");
             },
             // A shift's amount past the operand's width (one whose width is no power of two
             // takes an amount type wider than it) stops the program.
-            .shl, .shr, .assign_shl, .assign_shr => {
+            .shl, .shr => {
                 if (!readNow(c, flow, node)) continue;
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
                 if (try amountFits(c, lhs)) continue;
                 try judged(c, flow, rule, node, try Taint.levelAt(c, flow, c.file, rhs), .data, "a shift by an amount from input: a peer's amount past the operand's width stops the program; aegis int.Checked returns the error");
             },
-            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+            // A builtin.
+            .nand => {
                 const name = tree.tokenSlice(tree.nodeMainToken(node));
                 if (try arithmeticBuiltin(c, flow, rule, node, name)) continue;
                 var fallible = false;
@@ -313,7 +321,7 @@ fn fromReader(flow: Taint.Fact, decl: Facts.Decl) bool {
 /// (`Reader.fixed`), which reads no peer's size.
 fn ownReader(c: *Context, flow: Taint.Fact, call: Ast.full.Call) Context.Error!bool {
     const tree = &c.project.at(c.file).file.tree;
-    return tree.nodeTag(call.ast.fn_expr) == .field_access and try Taint.fixedBytes(c, flow.flow, c.file, tree.nodeData(call.ast.fn_expr).node_and_token[0]) != null;
+    return formAt(tree, call.ast.fn_expr) == .member and try Taint.fixedBytes(c, flow.flow, c.file, tree.nodeData(call.ast.fn_expr).node_and_token[0]) != null;
 }
 
 /// A018: an error's text written where a peer reads it: internal text crossing to the peer.
@@ -322,9 +330,9 @@ fn ownReader(c: *Context, flow: Taint.Fact, call: Ast.full.Call) Context.Error!b
 pub fn diagnostics(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     // A write is a call: a file that makes none writes nothing to a peer, whatever the flow.
-    const calls = for (tree.nodes.items(.tag), 0..) |tag, i| switch (tag) {
-        .call_one, .call_one_comma, .call, .call_comma => break true,
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(@fromBackingInt(@intCast(i)))), "@call")) break true,
+    const calls = for (tree.nodes.items(.tag), 0..) |tag, i| switch (accesses.formOf(tag)) {
+        .call => break true,
+        .builtin => if (Facts.isBuiltin(tree, @fromBackingInt(@intCast(i)), "@call")) break true,
         else => {},
     } else false;
     if (!calls) return;
@@ -498,7 +506,7 @@ fn gatherHolders(c: *Context, io_type: Facts.Container, given: *std.AutoHashMapU
     }
     for (model.references) |ref| {
         const id = ref.declaration orelse continue;
-        if (tree.nodeTag(ref.node) != .identifier or c.inTest(ref.token)) continue;
+        if (!spellsName(tree, ref.node) or c.inTest(ref.token)) continue;
         const record = model.declarations[@backingInt(id)];
         // An enclosing function's parameter (a type function's `comptime io: *Io`, closed over
         // by the functions of the type it returns) holds what that function is given.
@@ -560,6 +568,8 @@ fn containerIo(c: *Context, reference: Ast.Node.Index, io_type: Facts.Container)
         const value = try c.facts.resolve(c.file, at);
         const climbs = switch (value) {
             .container, .function => true,
+            // A choice is no one namespace to climb: what it holds is read part by part below.
+            .alternatives => false,
             else => false,
         };
         if (!climbs) {
@@ -568,8 +578,8 @@ fn containerIo(c: *Context, reference: Ast.Node.Index, io_type: Facts.Container)
         }
         const parent = model.parentOf(at) orelse return .{ .node = at, .held = .none };
         var buffer: [1]Ast.Node.Index = undefined;
-        const on = switch (tree.nodeTag(parent)) {
-            .field_access => tree.nodeData(parent).node_and_token[0] == at,
+        const on = switch (formAt(tree, parent)) {
+            .member => tree.nodeData(parent).node_and_token[0] == at,
             else => if (tree.fullCall(&buffer, parent)) |call| call.ast.fn_expr == at else false,
         };
         if (!on) return .{ .node = at, .held = .none };
@@ -605,6 +615,8 @@ fn heldIo(c: *Context, value: Facts.Value, io_type: Facts.Container, depth: u8) 
         // A parameter's type that does not resolve may be an Io; a field's is read by how it
         // is written (`spellsIo`).
         .unknown => return if (depth == 0) .unread else .none,
+        // Each part, as `mentionsIo` reads a choice.
+        .alternatives => return if (try mentionsIo(value, io_type, depth == 0, 0)) .unread else .none,
         else => |other| return if (try mentionsIo(other, io_type, depth == 0, 0)) .unread else .none,
     };
     if (held.file == io_type.file and held.scope == io_type.scope) return .{ .at = "" };
@@ -631,6 +643,8 @@ const IoProbe = struct {
         const io_type: Facts.Container = .{ .file = probe.key.file, .scope = probe.key.scope };
         const out: Facts.Probed = switch (if (value == .pointer) value.pointer.child.* else value) {
             .instance, .container => |k| if (k.file == io_type.file and k.scope == io_type.scope) .is else .{ .holder = k },
+            // Each part, as `mentionsIo` reads a choice.
+            .alternatives => if (try mentionsIo(value, io_type, true, 0)) .maybe else .none,
             else => |other| if (try mentionsIo(other, io_type, true, 0)) .maybe else .none,
         };
         if (out != .none) return out;
@@ -671,6 +685,7 @@ fn spelledIo(c: *Context, node: Ast.Node.Index, io_type: Facts.Container) Contex
         }
         const callee = switch (try c.facts.resolve(c.file, call.ast.fn_expr)) {
             .function => |decl| decl,
+            .alternatives => return true,
             else => return true,
         };
         const record = c.project.at(callee.file).model.declarations[@backingInt(callee.index)];
@@ -678,12 +693,13 @@ fn spelledIo(c: *Context, node: Ast.Node.Index, io_type: Facts.Container) Contex
         const proto = c.project.at(callee.file).file.tree.fullFnProto(&proto_buffer, record.node) orelse return true;
         return spellsIo(c, callee.file, proto.ast.return_type.unwrap() orelse return true, io_type);
     }
-    const decl: Facts.Decl = switch (tree.nodeTag(node)) {
-        .identifier => .{ .file = c.file, .index = ((c.project.at(c.file).model.reference(node) orelse return true).declaration orelse return true) },
-        .field_access => decl: {
+    const decl: Facts.Decl = switch (formAt(tree, node)) {
+        .leaf => .{ .file = c.file, .index = ((nameRef(&c.project.at(c.file).model, node) orelse return true).declaration orelse return true) },
+        .member => decl: {
             const lhs, const name = tree.nodeData(node).node_and_token;
             const holder = switch (try c.facts.resolve(c.file, lhs)) {
                 .container => |k| k,
+                .alternatives => return true,
                 else => return true,
             };
             break :decl c.facts.member(holder, tree.tokenSlice(name)) orelse return true;
@@ -706,14 +722,20 @@ fn spellsIo(c: *Context, file: Project.FileId, type_expr: Ast.Node.Index, io_typ
     const first = tree.firstToken(type_expr);
     const last = tree.lastToken(type_expr);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .identifier and tag != .field_access) continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        if (accesses.formOf(tag) != .member and !spellsName(tree, node)) continue;
         const main = tree.nodeMainToken(node);
         if (main < first or main > last) continue;
         // `std.Io.Limit` names `Io` as a namespace on the way to another type.
-        if (c.project.at(file).model.parentOf(node)) |parent| if (tree.nodeTag(parent) == .field_access and tree.nodeData(parent).node_and_token[0] == node) continue;
+        if (c.project.at(file).model.parentOf(node)) |parent| if (formAt(tree, parent) == .member and tree.nodeData(parent).node_and_token[0] == node) continue;
         switch (try c.facts.resolve(file, node)) {
             .container => |k| if (k.file == io_type.file and k.scope == io_type.scope) return true,
+            // A type chosen per build spells an `Io` where any part of it is one.
+            .alternatives => |parts| for (parts) |part| switch (part) {
+                .container => |k| if (k.file == io_type.file and k.scope == io_type.scope) return true,
+                .alternatives => return true,
+                else => {},
+            },
             else => {},
         }
     }
@@ -846,9 +868,9 @@ fn passedOn(c: *Context, file: Project.FileId, call: Ast.Node.Index) Context.Err
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
     var at = call;
-    while (model.parentOf(at)) |parent| : (at = parent) switch (tree.nodeTag(parent)) {
-        .grouped_expression => {},
-        .@"try", .@"return" => return true,
+    while (model.parentOf(at)) |parent| : (at = parent) switch (formAt(tree, parent)) {
+        .grouped => {},
+        .tried, .@"return" => return true,
         .@"catch" => {
             const caught, const handler = tree.nodeData(parent).node_and_node;
             if (caught != at) return false;
@@ -856,7 +878,7 @@ fn passedOn(c: *Context, file: Project.FileId, call: Ast.Node.Index) Context.Err
             return handled(c, file, parent, handler, if (tree.tokenTag(catch_token + 1) == .pipe) catch_token + 2 else null);
         },
         // `if (call) |v| ... else |err| ...`: the else branch is its handler.
-        .@"if", .if_simple => {
+        .@"if" => {
             const branch = tree.fullIf(parent).?;
             if (branch.ast.cond_expr != at) return false;
             const capture = branch.error_token orelse return false;
@@ -882,12 +904,15 @@ fn passesParameter(c: *Context, file: Project.FileId, call: Ast.full.Call, posit
     // One that does not resolve passes nothing on that is followed: no point.
     const callee = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
         .function => |decl| (try originKnown(c, decl)) orelse return false,
+        .alternatives => return false,
         else => return false,
     };
     if (!try Program.owns(c, callee.file)) return false;
     // A method called on a value takes it first.
-    const skip: usize = if (tree.nodeTag(call.ast.fn_expr) == .field_access) switch (try c.facts.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
+    const skip: usize = if (formAt(tree, call.ast.fn_expr) == .member) switch (try c.facts.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
         .container => 0,
+        // A choice may or may not hand a receiver first: no parameter is read as passed on.
+        .alternatives => return false,
         else => 1,
     } else 0;
     const target = &c.project.at(callee.file).file.tree;
@@ -941,9 +966,9 @@ fn handled(c: *Context, file: Project.FileId, whole: Ast.Node.Index, handler: As
     // The prong's value is the error, and the whole is returned or tried.
     if (!isIt(tree, prong, &names)) return false;
     var at = whole;
-    while (model.parentOf(at)) |parent| : (at = parent) switch (tree.nodeTag(parent)) {
-        .grouped_expression => {},
-        .@"try" => return true,
+    while (model.parentOf(at)) |parent| : (at = parent) switch (formAt(tree, parent)) {
+        .grouped => {},
+        .tried => return true,
         .@"return" => return try errorResult(c, file, parent),
         else => return false,
     };
@@ -954,7 +979,7 @@ fn handled(c: *Context, file: Project.FileId, whole: Ast.Node.Index, handler: As
 /// it, or `else`; null where none does. The whole switch where it switches on something else.
 fn cancelProng(tree: *const Ast, switch_node: Ast.Node.Index, name: Ast.TokenIndex) ?struct { Ast.Node.Index, ?Ast.TokenIndex } {
     const chosen = tree.fullSwitch(switch_node).?; // unreachable: the caller found a switch
-    if (tree.nodeTag(chosen.ast.condition) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(chosen.ast.condition)), tree.tokenSlice(name))) return .{ switch_node, null };
+    if (!spellsName(tree, chosen.ast.condition) or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(chosen.ast.condition)), tree.tokenSlice(name))) return .{ switch_node, null };
     var otherwise: ?Ast.full.SwitchCase = null;
     for (chosen.ast.cases) |case_node| {
         const case = tree.fullSwitchCase(case_node).?; // unreachable: a switch's cases are cases
@@ -970,16 +995,15 @@ fn cancelProng(tree: *const Ast, switch_node: Ast.Node.Index, name: Ast.TokenInd
 /// a function whose result is an error union, where the error goes on as one.
 fn returnsIt(c: *Context, file: Project.FileId, path: Ast.Node.Index, names: []const ?Ast.TokenIndex) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
-    var at = path;
-    while (tree.nodeTag(at) == .grouped_expression) at = tree.nodeData(at).node_and_token[0];
-    switch (tree.nodeTag(at)) {
+    const at = Facts.ungrouped(tree, path);
+    switch (formAt(tree, at)) {
         .@"return" => {
             const value = tree.nodeData(at).opt_node.unwrap() orelse return false;
             return isIt(tree, value, names) and try errorResult(c, file, at);
         },
-        .block, .block_semicolon, .block_two, .block_two_semicolon => {
+        .body => {
             var buffer: [2]Ast.Node.Index = undefined;
-            const statements = tree.blockStatements(&buffer, at).?;
+            const statements = tree.blockStatements(&buffer, at) orelse return false;
             if (statements.len == 0) return false;
             for (statements[0 .. statements.len - 1]) |statement| if (leavesIn(tree, statement)) return false;
             return try returnsIt(c, file, statements[statements.len - 1], names);
@@ -990,16 +1014,14 @@ fn returnsIt(c: *Context, file: Project.FileId, path: Ast.Node.Index, names: []c
 
 /// Whether a value is the error caught: a name it was captured by, or `error.Canceled`.
 fn isIt(tree: *const Ast, node: Ast.Node.Index, names: []const ?Ast.TokenIndex) bool {
-    var value = node;
-    while (tree.nodeTag(value) == .grouped_expression) value = tree.nodeData(value).node_and_token[0];
-    return switch (tree.nodeTag(value)) {
-        .error_value => namesCanceled(tree, value),
-        .identifier => for (names) |name| {
-            const n = name orelse continue;
-            if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), tree.tokenSlice(n))) break true;
-        } else false,
-        else => false,
-    };
+    const value = Facts.ungrouped(tree, node);
+    if (formAt(tree, value) != .leaf) return false;
+    if (tree.tokenTag(tree.nodeMainToken(value)) == .keyword_error) return namesCanceled(tree, value);
+    if (!spellsName(tree, value)) return false;
+    return for (names) |name| {
+        const n = name orelse continue;
+        if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), tree.tokenSlice(n))) break true;
+    } else false;
 }
 
 /// Whether the function holding `node` returns an error union (`!T`, `E!T`) whose payload holds
@@ -1015,7 +1037,7 @@ fn errorResult(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.
     var buffer: [1]Ast.Node.Index = undefined;
     const proto = tree.fullFnProto(&buffer, tree.nodeData(function).node_and_node[0]) orelse return false;
     const result = proto.ast.return_type.unwrap() orelse return false;
-    if (tree.nodeTag(result) == .error_union) return holdsNoError(try c.facts.resolve(file, tree.nodeData(result).node_and_node[1]));
+    if (formAt(tree, result) == .error_union) return holdsNoError(try c.facts.resolve(file, tree.nodeData(result).node_and_node[1]));
     const before = tree.firstToken(result);
     if (before == 0 or tree.tokenTag(before - 1) != .bang) return false;
     return holdsNoError(try c.facts.resolve(file, result));
@@ -1029,6 +1051,10 @@ fn holdsNoError(t: Facts.Value) bool {
         .container => true,
         .pointer => |inner| holdsNoError(inner.child.*),
         .array, .optional => |inner| holdsNoError(inner.*),
+        // Where every part holds none.
+        .alternatives => |parts| for (parts) |part| {
+            if (!holdsNoError(part)) break false;
+        } else parts.len != 0,
         else => false,
     };
 }
@@ -1061,15 +1087,19 @@ fn always(c: *Context, file: Project.FileId, node: Ast.Node.Index, body: Ast.Nod
     var at = node;
     while (at != body) {
         const parent = model.parentOf(at) orelse return false;
-        switch (tree.nodeTag(parent)) {
-            .bool_and, .bool_or, .@"orelse", .@"catch" => if (tree.nodeData(parent).node_and_node[0] != at) return false,
-            .@"switch", .switch_comma => if (tree.nodeData(parent).node_and_extra[0] != at) return false,
-            .fn_decl, .@"defer", .@"errdefer", .@"comptime" => return false,
+        switch (formAt(tree, parent)) {
+            .@"orelse", .@"catch" => if (tree.nodeData(parent).node_and_node[0] != at) return false,
+            .logic => switch (Facts.conditionOf(tree, parent)) {
+                .both, .either => |sides| if (sides[0] != at) return false,
+                .not, .compare, .other => {},
+            },
+            .@"switch" => if (tree.nodeData(parent).node_and_extra[0] != at) return false,
+            .fn_decl, .deferred, .@"comptime" => return false,
             // `@TypeOf`'s operand is never evaluated: what it calls does not run.
-            .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@TypeOf")) return false,
-            .block, .block_semicolon, .block_two, .block_two_semicolon => {
+            .builtin => if (Facts.isBuiltin(tree, parent, "@TypeOf")) return false,
+            .body => {
                 var buffer: [2]Ast.Node.Index = undefined;
-                for (tree.blockStatements(&buffer, parent).?) |statement| {
+                for (tree.blockStatements(&buffer, parent) orelse &.{}) |statement| {
                     if (statement == at) break;
                     if (try skips(c, file, statement, body, function, pass.ending, pass.depth)) return false;
                 }
@@ -1188,15 +1218,15 @@ fn endsOnError(c: *Context, file: Project.FileId, call: Ast.Node.Index, body: As
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
     var at = call;
-    while (model.parentOf(at)) |parent| : (at = parent) switch (tree.nodeTag(parent)) {
-        .grouped_expression => {},
-        .@"try", .@"return" => return true,
+    while (model.parentOf(at)) |parent| : (at = parent) switch (formAt(tree, parent)) {
+        .grouped => {},
+        .tried, .@"return" => return true,
         .@"catch" => {
             const caught, const handler = tree.nodeData(parent).node_and_node;
             return caught == at and try ends(c, file, handler, body);
         },
-        .@"if", .if_simple => {
-            const branch = tree.fullIf(parent).?; // unreachable: the tag is an `if`'s
+        .@"if" => {
+            const branch = tree.fullIf(parent).?; // unreachable: the form is an `if`'s
             if (branch.ast.cond_expr != at or branch.error_token == null) return false;
             return ends(c, file, branch.ast.else_expr.unwrap() orelse return false, body);
         },
@@ -1210,9 +1240,9 @@ fn propagates(c: *Context, file: Project.FileId, call: Ast.Node.Index) bool {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
     var at = call;
-    while (model.parentOf(at)) |parent| : (at = parent) switch (tree.nodeTag(parent)) {
-        .grouped_expression => {},
-        .@"try", .@"return" => return true,
+    while (model.parentOf(at)) |parent| : (at = parent) switch (formAt(tree, parent)) {
+        .grouped => {},
+        .tried, .@"return" => return true,
         else => return false,
     };
     return false;
@@ -1223,8 +1253,8 @@ fn returned(c: *Context, file: Project.FileId, call: Ast.Node.Index) bool {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
     var at = call;
-    while (model.parentOf(at)) |parent| : (at = parent) switch (tree.nodeTag(parent)) {
-        .grouped_expression, .@"try" => {},
+    while (model.parentOf(at)) |parent| : (at = parent) switch (formAt(tree, parent)) {
+        .grouped, .tried => {},
         .@"return" => return true,
         else => return false,
     };
@@ -1242,7 +1272,7 @@ fn endsOf(c: *Context, file: Project.FileId, call: Ast.Node.Index, body: Ast.Nod
     var out: Ends = .{ .errors = try endsOnError(c, file, call, body) };
     var at = call;
     var parent = model.parentOf(at) orelse return out;
-    while (tree.nodeTag(parent) == .grouped_expression or tree.nodeTag(parent) == .@"try") {
+    while (formAt(tree, parent) == .grouped or formAt(tree, parent) == .tried) {
         at = parent;
         parent = model.parentOf(at) orelse return out;
     }
@@ -1252,7 +1282,7 @@ fn endsOf(c: *Context, file: Project.FileId, call: Ast.Node.Index, body: Ast.Nod
         for (choice.ast.cases) |case_node| {
             const case = tree.fullSwitchCase(case_node).?; // unreachable: a switch's cases are cases
             if (!try ends(c, file, case.ast.target_expr, body)) continue;
-            for (case.ast.values) |value| if (tree.nodeTag(value) == .enum_literal) try literals.append(c.allocator, tree.tokenSlice(tree.nodeMainToken(value)));
+            for (case.ast.values) |value| if (try c.facts.literalOf(file, value)) |named| if (named == .enum_literal) try literals.append(c.allocator, named.enum_literal);
         }
         out.literals = literals.items;
         return out;
@@ -1271,8 +1301,8 @@ fn endsOf(c: *Context, file: Project.FileId, call: Ast.Node.Index, body: Ast.Nod
         if (statement == parent) break if (i + 1 < statements.len) statements[i + 1] else return out;
     } else return out;
     const branch = tree.fullIf(next) orelse return out;
-    if (branch.payload_token == null or tree.nodeTag(branch.ast.cond_expr) != .identifier) return out;
-    const tested = (model.reference(branch.ast.cond_expr) orelse return out).declaration orelse return out;
+    if (branch.payload_token == null) return out;
+    const tested = (nameRef(model, branch.ast.cond_expr) orelse return out).declaration orelse return out;
     if (model.declarations[@backingInt(tested)].node != parent) return out;
     out.some = try ends(c, file, branch.ast.then_expr, body);
     return out;
@@ -1282,16 +1312,21 @@ fn endsOf(c: *Context, file: Project.FileId, call: Ast.Node.Index, body: Ast.Nod
 /// enum literal it names, a payload an `if` or `while` captured where any value does; a switch or
 /// an `if` each branch of which does, `unreachable` none.
 fn endsWith(tree: *const Ast, model: *const Model, value: Ast.Node.Index, ending: Ends) bool {
-    switch (tree.nodeTag(value)) {
-        .grouped_expression => return endsWith(tree, model, tree.nodeData(value).node_and_token[0], ending),
-        .error_value => return ending.errors,
-        .unreachable_literal => return true,
-        .enum_literal => {
-            const name = tree.tokenSlice(tree.nodeMainToken(value));
-            for (ending.literals) |each| if (std.mem.eql(u8, each, name)) return true;
-            return false;
-        },
-        .identifier => {
+    switch (formAt(tree, value)) {
+        .grouped => return endsWith(tree, model, tree.nodeData(value).node_and_token[0], ending),
+        .leaf => {
+            const token = tree.nodeMainToken(value);
+            switch (tree.tokenTag(token)) {
+                .keyword_error => return ending.errors,
+                .keyword_unreachable => return true,
+                else => {},
+            }
+            if (!spellsName(tree, value)) {
+                if (tree.tokenTag(token) != .identifier) return false;
+                const name = tree.tokenSlice(token);
+                for (ending.literals) |each| if (std.mem.eql(u8, each, name)) return true;
+                return false;
+            }
             if (!ending.some) return false;
             const declared = (model.reference(value) orelse return false).declaration orelse return false;
             const record = model.declarations[@backingInt(declared)];
@@ -1300,8 +1335,8 @@ fn endsWith(tree: *const Ast, model: *const Model, value: Ast.Node.Index, ending
             if (tree.fullWhile(record.node)) |loop| return loop.payload_token != null and loop.error_token != record.token;
             return false;
         },
-        .@"switch", .switch_comma => {
-            const choice = tree.fullSwitch(value).?; // unreachable: tagged a switch
+        .@"switch" => {
+            const choice = tree.fullSwitch(value).?; // unreachable: a switch's form holds switches
             for (choice.ast.cases) |case| if (!endsWith(tree, model, tree.fullSwitchCase(case).?.ast.target_expr, ending)) return false; // unreachable: a switch's cases are cases
             return true;
         },
@@ -1320,16 +1355,18 @@ fn endsWith(tree: *const Ast, model: *const Model, value: Ast.Node.Index, ending
 fn ends(c: *Context, file: Project.FileId, node: Ast.Node.Index, body: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    switch (tree.nodeTag(node)) {
-        .grouped_expression => return ends(c, file, tree.nodeData(node).node_and_token[0], body),
-        .@"return", .unreachable_literal => return true,
+    const form = formAt(tree, node);
+    switch (form) {
+        .grouped => return ends(c, file, tree.nodeData(node).node_and_token[0], body),
+        .@"return" => return true,
+        .leaf => return tree.tokenTag(tree.nodeMainToken(node)) == .keyword_unreachable,
         .@"break", .@"continue" => {
             const target = jumpTarget(tree, model, node) orelse return false;
-            return endsLoop(tree, model, body, target, tree.nodeTag(node) == .@"break");
+            return endsLoop(tree, model, body, target, form == .@"break");
         },
-        .block, .block_semicolon, .block_two, .block_two_semicolon => {
+        .body => {
             var buffer: [2]Ast.Node.Index = undefined;
-            const statements = tree.blockStatements(&buffer, node).?;
+            const statements = tree.blockStatements(&buffer, node) orelse return false;
             if (statements.len == 0) return false;
             for (statements[0 .. statements.len - 1]) |statement| if (try skips(c, file, statement, body, false, .{}, 0)) return false;
             return ends(c, file, statements[statements.len - 1], body);
@@ -1551,14 +1588,13 @@ fn loopOperand(c: *Context, flow: Taint.Fact, loop: Ast.Node.Index, node: Ast.No
 fn countered(c: *Context, flow: Taint.Fact, loop: Ast.Node.Index, node: Ast.Node.Index) Context.Error!Taint.Level {
     const tree = &c.project.at(c.file).file.tree;
     if (try Taint.counterLevel(c, flow, c.file, loop, node)) |level| return level;
-    switch (tree.nodeTag(node)) {
-        .grouped_expression => return countered(c, flow, loop, tree.nodeData(node).node_and_token[0]),
-        .add, .add_wrap, .add_sat => {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            return (try countered(c, flow, loop, lhs)).join(try countered(c, flow, loop, rhs));
-        },
-        .sub, .sub_wrap, .sub_sat => {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
+    if (formAt(tree, node) == .grouped) return countered(c, flow, loop, tree.nodeData(node).node_and_token[0]);
+    if (formAt(tree, node) != .operator) return Taint.levelAt(c, flow, c.file, node);
+    const operator = accesses.operatorOf(tree.nodeTag(node)) orelse return Taint.levelAt(c, flow, c.file, node);
+    const lhs, const rhs = tree.nodeData(node).node_and_node;
+    switch (operator.op) {
+        .add => return (try countered(c, flow, loop, lhs)).join(try countered(c, flow, loop, rhs)),
+        .sub => {
             const counter = (try Taint.counterLevel(c, flow, c.file, loop, lhs)) orelse return Taint.levelAt(c, flow, c.file, node);
             return counter.join(try countered(c, flow, loop, rhs));
         },
@@ -1765,10 +1801,7 @@ fn passedSinks(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (*C
 fn judgedAtCalls(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (*Context, Rule) Context.Error!void) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
-        switch (tag) {
-            .call_one, .call_one_comma, .call, .call_comma => {},
-            else => continue,
-        }
+        if (accesses.formOf(tag) != .call) continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         if (!readNow(c, flow, node)) continue;
         const reached = (try Taint.reached(c, flow, c.file, node)) orelse continue;
@@ -1909,6 +1942,7 @@ fn predicate(c: *Context, call: Ast.full.Call, bound: ?*const Predicate, into: *
     if (depth >= 8) return unfollowed(into);
     const callee = switch (try c.facts.resolve(c.file, call.ast.fn_expr)) {
         .function => |decl| (try originKnown(c, decl)) orelse return unfollowed(into),
+        .alternatives => return unfollowed(into),
         else => return unfollowed(into),
     };
     if (callee.file != c.file) return unfollowed(into);
@@ -1938,14 +1972,16 @@ fn unfollowed(into: *Decided) void {
 
 fn predicateValue(c: *Context, value: Ast.Node.Index, bound: *const Predicate, into: *Decided, depth: u8) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
-    switch (tree.nodeTag(value)) {
-        .bool_and, .bool_or => {
-            const lhs, const rhs = tree.nodeData(value).node_and_node;
-            try predicateValue(c, lhs, bound, into, depth);
-            return predicateValue(c, rhs, bound, into, depth);
+    switch (formAt(tree, value)) {
+        .logic => switch (Facts.conditionOf(tree, value)) {
+            .both, .either => |sides| {
+                try predicateValue(c, sides[0], bound, into, depth);
+                return predicateValue(c, sides[1], bound, into, depth);
+            },
+            .not => |inner| return predicateValue(c, inner, bound, into, depth),
+            .compare, .other => {},
         },
-        .bool_not => return predicateValue(c, tree.nodeData(value).node, bound, into, depth),
-        .grouped_expression => return predicateValue(c, tree.nodeData(value).node_and_token[0], bound, into, depth),
+        .grouped => return predicateValue(c, tree.nodeData(value).node_and_token[0], bound, into, depth),
         else => {},
     }
     if (comparison(tree.nodeTag(value))) {
@@ -1958,9 +1994,8 @@ fn predicateValue(c: *Context, value: Ast.Node.Index, bound: *const Predicate, i
     // other leaf is a truth, as it is written in the condition itself.
     var buffer: [1]Ast.Node.Index = undefined;
     if (tree.fullCall(&buffer, value)) |call| return predicate(c, call, bound, into, depth);
-    if (tree.nodeTag(value) != .identifier) return;
     const model = &c.project.at(c.file).model;
-    const declared = (model.reference(value) orelse return).declaration orelse return;
+    const declared = (nameRef(model, value) orelse return).declaration orelse return;
     switch (model.declarations[@backingInt(declared)].kind) {
         .parameter => {
             const passed = try argumentOf(c, value, bound) orelse return;
@@ -1982,15 +2017,14 @@ fn predicateValue(c: *Context, value: Ast.Node.Index, bound: *const Predicate, i
 fn argumentOf(c: *Context, operand: Ast.Node.Index, bound: ?*const Predicate) Context.Error!?Ast.Node.Index {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
-    var at = operand;
-    while (tree.nodeTag(at) == .grouped_expression) at = tree.nodeData(at).node_and_token[0];
-    switch (tree.nodeTag(at)) {
-        .number_literal, .char_literal, .string_literal, .enum_literal => return null,
-        .identifier => for ([_][]const u8{ "true", "false", "null", "undefined" }) |literal| {
-            if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), literal)) return null;
-        },
-        else => return at,
-    }
+    const at = Facts.ungrouped(tree, operand);
+    if (formAt(tree, at) != .leaf) return at;
+    // A literal, a constant of the language, holds no operand a peer chooses.
+    if (try c.facts.literalOf(c.file, at)) |written| switch (written) {
+        .number, .char, .string, .enum_literal, .boolean, .null, .undefined => return null,
+        .error_value, .@"unreachable" => return at,
+    };
+    if (!spellsName(tree, at)) return at;
     const binding = bound orelse return at;
     const declared = (model.reference(at) orelse return at).declaration orelse return at;
     const record = model.declarations[@backingInt(declared)];
@@ -2003,10 +2037,12 @@ fn argumentOf(c: *Context, operand: Ast.Node.Index, bound: ?*const Predicate) Co
         if (param.name_token == record.token) break;
     } else return at;
     const call = binding.call;
-    if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
+    if (formAt(tree, call.ast.fn_expr) == .member) {
         const receiver = tree.nodeData(call.ast.fn_expr).node_and_token[0];
         switch (try c.facts.resolve(c.file, receiver)) {
             .container => {},
+            // A choice may or may not hand a receiver first: the argument is read as written.
+            .alternatives => return at,
             else => {
                 if (position == 0) return argumentOf(c, receiver, binding.outer);
                 position -= 1;
@@ -2025,15 +2061,17 @@ fn argumentOf(c: *Context, operand: Ast.Node.Index, bound: ?*const Predicate) Co
 fn decides(c: *Context, condition: Ast.Node.Index, payload: bool, into: *Decided, depth: u8) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
-    switch (tree.nodeTag(condition)) {
-        .bool_and, .bool_or => {
-            const lhs, const rhs = tree.nodeData(condition).node_and_node;
-            try decides(c, lhs, payload, into, depth);
-            return decides(c, rhs, payload, into, depth);
+    switch (formAt(tree, condition)) {
+        .logic => switch (Facts.conditionOf(tree, condition)) {
+            .both, .either => |sides| {
+                try decides(c, sides[0], payload, into, depth);
+                return decides(c, sides[1], payload, into, depth);
+            },
+            .not => |inner| return decides(c, inner, payload, into, depth),
+            .compare, .other => {},
         },
-        .bool_not => return decides(c, tree.nodeData(condition).node, payload, into, depth),
-        .grouped_expression => return decides(c, tree.nodeData(condition).node_and_token[0], payload, into, depth),
-        .identifier => if (depth < 8) if (model.reference(condition)) |reference| if (reference.declaration) |declared| if (localVariable(c, c.file, declared)) {
+        .grouped => return decides(c, tree.nodeData(condition).node_and_token[0], payload, into, depth),
+        .leaf => if (depth < 8) if (nameRef(model, condition)) |reference| if (reference.declaration) |declared| if (localVariable(c, c.file, declared)) {
             const record = model.declarations[@backingInt(declared)];
             if (tree.fullVarDecl(record.node)) |variable| if (variable.ast.init_node.unwrap()) |value| try decides(c, value, payload, into, depth + 1);
             for (tree.nodes.items(.tag), 0..) |tag, i| {
@@ -2041,10 +2079,9 @@ fn decides(c: *Context, condition: Ast.Node.Index, payload: bool, into: *Decided
                 const assignment: Ast.Node.Index = @fromBackingInt(@intCast(i));
                 const written, const value = tree.nodeData(assignment).node_and_node;
                 const target = rootOf(tree, written);
-                if (tree.nodeTag(target) != .identifier) continue;
-                if (((model.reference(target) orelse continue).declaration orelse continue) != declared) continue;
+                if (((nameRef(model, target) orelse continue).declaration orelse continue) != declared) continue;
                 // `left -= 1`, `left.? = n`: what it holds is its own arithmetic, read as itself.
-                if (tag != .assign or target != written) break;
+                if (accesses.formOf(tag) != .assign or target != written) break;
                 try decides(c, value, payload, into, depth + 1);
                 // What decides whether it is given that value decides it too (`if (total ==
                 // seed) more = false`).
@@ -2081,10 +2118,14 @@ fn controls(c: *Context, assignment: Ast.Node.Index, declared: Model.Declaration
             if (std.mem.findScalar(Ast.Node.Index, loop.ast.inputs, at) == null) for (loop.ast.inputs) |each| try controlled(c, each, declared, payload, into, depth);
         } else if (tree.fullSwitch(parent)) |choice| {
             if (choice.ast.condition != at) try controlled(c, choice.ast.condition, declared, payload, into, depth);
-        } else switch (tree.nodeTag(parent)) {
-            .@"catch", .@"orelse", .bool_and, .bool_or => {
+        } else switch (formAt(tree, parent)) {
+            .@"catch", .@"orelse" => {
                 const lhs, _ = tree.nodeData(parent).node_and_node;
                 if (lhs != at) try controlled(c, lhs, declared, payload, into, depth);
+            },
+            .logic => switch (Facts.conditionOf(tree, parent)) {
+                .both, .either => |sides| if (sides[0] != at) try controlled(c, sides[0], declared, payload, into, depth),
+                .not, .compare, .other => {},
             },
             else => {},
         }
@@ -2094,8 +2135,7 @@ fn controls(c: *Context, assignment: Ast.Node.Index, declared: Model.Declaration
 /// `decides` of a condition an assignment runs under, but the variable itself (`while (more)`
 /// around `more = false`), which its values already decide.
 fn controlled(c: *Context, condition: Ast.Node.Index, declared: Model.Declaration.Id, payload: bool, into: *Decided, depth: u8) Context.Error!void {
-    const tree = &c.project.at(c.file).file.tree;
-    if (tree.nodeTag(condition) == .identifier) if (c.project.at(c.file).model.reference(condition)) |reference| if (reference.declaration == declared) return;
+    if (nameRef(&c.project.at(c.file).model, condition)) |reference| if (reference.declaration == declared) return;
     try decides(c, condition, payload, into, depth);
 }
 
@@ -2111,9 +2151,9 @@ fn invariant(c: *Context, condition: Ast.Node.Index, loop: Ast.Node.Index) bool 
         .number_literal, .char_literal, .l_paren, .r_paren, .bang, .keyword_and, .keyword_or, .equal_equal, .bang_equal, .angle_bracket_left, .angle_bracket_left_equal, .angle_bracket_right, .angle_bracket_right_equal, .plus, .minus, .asterisk, .slash, .percent, .ampersand, .pipe, .caret, .angle_bracket_angle_bracket_left, .angle_bracket_angle_bracket_right, .plus_percent, .minus_percent, .asterisk_percent => {},
         else => return false,
     };
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .identifier) continue;
+    for (0..tree.nodes.len) |i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        if (!spellsName(tree, node)) continue;
         const token = tree.nodeMainToken(node);
         if (token < tree.firstToken(condition) or token > tree.lastToken(condition)) continue;
         const reference = model.reference(node) orelse return false;
@@ -2136,8 +2176,7 @@ fn invariant(c: *Context, condition: Ast.Node.Index, loop: Ast.Node.Index) bool 
             const written = tree.nodeMainToken(at);
             if (written < tree.firstToken(loop) or written > tree.lastToken(loop)) continue;
             const target = rootOf(tree, tree.nodeData(at).node_and_node[0]);
-            if (tree.nodeTag(target) != .identifier) continue;
-            if ((model.reference(target) orelse continue).declaration == declared) return false;
+            if ((nameRef(model, target) orelse continue).declaration == declared) return false;
         }
     }
     return true;
@@ -2157,17 +2196,14 @@ fn localVariable(c: *Context, file: Project.FileId, declared: Model.Declaration.
     }
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        switch (tag) {
+        switch (accesses.formOf(tag)) {
             .address_of => {
-                var operand = tree.nodeData(node).node;
-                while (tree.nodeTag(operand) == .grouped_expression) operand = tree.nodeData(operand).node_and_token[0];
-                if (tree.nodeTag(operand) != .identifier) continue;
-                if ((model.reference(operand) orelse continue).declaration == declared) return false;
+                const operand = Facts.ungrouped(tree, tree.nodeData(node).node);
+                if ((nameRef(model, operand) orelse continue).declaration == declared) return false;
             },
-            .assign_destructure => for (tree.assignDestructure(node).ast.variables) |target| {
+            .destructure => for (tree.assignDestructure(node).ast.variables) |target| {
                 const root = rootOf(tree, target);
-                if (tree.nodeTag(root) != .identifier) continue;
-                if ((model.reference(root) orelse continue).declaration == declared) return false;
+                if ((nameRef(model, root) orelse continue).declaration == declared) return false;
             },
             else => {},
         }
@@ -2178,10 +2214,9 @@ fn localVariable(c: *Context, file: Project.FileId, declared: Model.Declaration.
 /// The name an assignment writes through: `x` of `x`, `x.?`, `x.f`, `x[i]`.
 fn rootOf(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
     var at = node;
-    while (true) switch (tree.nodeTag(at)) {
-        .unwrap_optional, .field_access => at = tree.nodeData(at).node_and_token[0],
+    while (true) switch (formAt(tree, at)) {
+        .unwrap_optional, .member, .grouped => at = tree.nodeData(at).node_and_token[0],
         .array_access => at = tree.nodeData(at).node_and_node[0],
-        .grouped_expression => at = tree.nodeData(at).node_and_token[0],
         else => return at,
     };
 }
@@ -2208,10 +2243,9 @@ fn consumes(c: *Context, flow: Taint.Fact, body: Ast.Node.Index) Context.Error!b
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const token = tree.nodeMainToken(node);
         if (token < first or token > last) continue;
-        if (tag == .assign) {
+        if (accesses.formOf(tag) == .assign) {
             const target, const value = tree.nodeData(node).node_and_node;
-            if (tree.nodeTag(value) != .slice_open) continue;
-            const slice = tree.fullSlice(value).?;
+            const slice = Range.openSlice(tree, value) orelse continue;
             // The slice itself, by declaration, and one that outlives the pass: a local made
             // afresh in the body bounds nothing.
             const declared = declaredBy(tree, model, target) orelse continue;
@@ -2223,13 +2257,18 @@ fn consumes(c: *Context, flow: Taint.Fact, body: Ast.Node.Index) Context.Error!b
         }
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
-        if (tree.nodeTag(call.ast.fn_expr) != .field_access) continue;
-        const name = tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]);
-        const counted = std.mem.eql(u8, name, "take") or std.mem.eql(u8, name, "discard") or std.mem.eql(u8, name, "toss") or std.mem.eql(u8, name, "readSliceAll");
-        const whole = std.mem.eql(u8, name, "takeByte") or std.mem.eql(u8, name, "takeByteSigned") or std.mem.eql(u8, name, "takeInt") or std.mem.eql(u8, name, "takeVarInt") or std.mem.eql(u8, name, "takeLeb128") or std.mem.eql(u8, name, "takeEnum");
+        if (formAt(tree, call.ast.fn_expr) != .member) continue;
+        const callee = switch (try c.facts.resolve(c.file, call.ast.fn_expr)) {
+            .function => |function| function,
+            // A choice of functions consumes only where each does: none is read so here.
+            .alternatives => continue,
+            else => continue,
+        };
+        const counted = Taint.readerFunction(flow.flow, c, callee, &.{ "take", "discard", "toss", "readSliceAll" });
+        const whole = Taint.readerFunction(flow.flow, c, callee, &.{ "takeByte", "takeByteSigned", "takeInt", "takeVarInt", "takeLeb128", "takeEnum" });
         const taken = if (whole) true else if (counted and call.ast.params.len == 1) try Proof.nonzero(c, c.file, call.ast.params[0]) else false;
         if (taken and try Taint.isRead(c, flow, c.file, node) and try always(c, c.file, node, body, .{})) return true;
-        if (std.mem.eql(u8, name, "checkCancel") and try passedOn(c, c.file, node) and try always(c, c.file, node, body, .{})) return true;
+        if (try Governed.isStd(c, callee, "Io.checkCancel") == .yes and try passedOn(c, c.file, node) and try always(c, c.file, node, body, .{})) return true;
     }
     return false;
 }
@@ -2319,8 +2358,8 @@ fn clears(c: *Context, condition: Ast.Node.Index, loop: Ast.full.While) Context.
 
 /// The declaration an identifier names, or null for anything else.
 fn declaredBy(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Model.Declaration.Id {
-    if (tree.nodeTag(node) != .identifier) return null;
-    return (model.reference(node) orelse return null).declaration;
+    _ = tree;
+    return (nameRef(model, node) orelse return null).declaration;
 }
 
 fn site(c: *Context, node: Ast.Node.Index) bool {

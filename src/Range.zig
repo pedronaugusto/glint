@@ -135,7 +135,7 @@ fn errorValue(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.E
 }
 
 /// `x[a..]`: a slice with neither an end nor a sentinel. Null for anything else.
-fn openSlice(tree: *const Ast, node: Ast.Node.Index) ?Ast.full.Slice {
+pub fn openSlice(tree: *const Ast, node: Ast.Node.Index) ?Ast.full.Slice {
     if (formAt(tree, node) != .slice) return null;
     const slice = tree.fullSlice(node) orelse return null;
     return if (slice.ast.end == .none and slice.ast.sentinel == .none) slice else null;
