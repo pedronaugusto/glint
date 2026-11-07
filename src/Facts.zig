@@ -4072,10 +4072,12 @@ fn tagWithin(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: u8
             while (true) holder = switch (holder) {
                 .pointer => |inner| inner.child.*,
                 .optional, .error_union => |inner| inner.*,
+                .alternatives => break,
                 else => break,
             };
             const container = switch (holder) {
                 .container, .instance => |k| k,
+                .alternatives => return null,
                 else => return null,
             };
             return if (self.declaresTag(container, name)) .{ .container = container, .name = name } else null;
@@ -4084,6 +4086,7 @@ fn tagWithin(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: u8
             const lhs, const token = tree.nodeData(node).node_and_token;
             const container = switch (try self.resolve(file, lhs)) {
                 .container => |k| k,
+                .alternatives => return null,
                 else => return null,
             };
             const name = try self.memberName(tree.tokenSlice(token));
@@ -4235,8 +4238,10 @@ fn fieldOwner(lhs: Value) ?Container {
         .instance => |c| c,
         .pointer => |to| switch (to.child.*) {
             .instance => |c| c,
+            .alternatives => null,
             else => null,
         },
+        .alternatives => null,
         else => null,
     };
 }
@@ -5221,6 +5226,7 @@ fn madeHolder(value: Value) ?Container {
     return switch (value) {
         .container, .instance => |k| k,
         .pointer => |inner| madeHolder(inner.child.*),
+        .alternatives => null,
         else => null,
     };
 }
@@ -5382,6 +5388,7 @@ fn enumOf(value: Value) ?Container {
     return switch (value) {
         .instance, .container => |k| k,
         .pointer => |inner| enumOf(inner.child.*),
+        .alternatives => null,
         else => null,
     };
 }
@@ -6034,6 +6041,7 @@ fn fieldNamesOf(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
     if (self.namesVar(file, self.throughConsts(file, names.subject))) return null;
     return switch (try self.resolve(file, names.subject)) {
         .container => |found| found,
+        .alternatives => null,
         else => null,
     };
 }
@@ -6156,6 +6164,7 @@ fn typeArgument(self: *Facts, file: Project.FileId, call: Ast.full.Call, decl: D
             .pointer => |p| if (p.child.* == .instance) {
                 receiver = 1;
             } else return null,
+            .alternatives => return null,
             else => return null,
         }
     } else if (tree.nodeTag(call.ast.fn_expr) != .identifier) return null;
@@ -6243,8 +6252,10 @@ fn eachReceiver(self: *Facts, file: Project.FileId, call: Ast.full.Call) Resolve
             .instance, .container => |c| c,
             .pointer => |p| switch (p.child.*) {
                 .instance, .container => |c| c,
+                .alternatives => return null,
                 else => return null,
             },
+            .alternatives => return null,
             else => return null,
         };
         const method = self.member(container, name) orelse return null;
@@ -6263,8 +6274,10 @@ fn madeResultOn(self: *Facts, receiver: Value, decl: Decl) ResolveError!?Value {
         .instance, .container => |c| c,
         .pointer => |p| switch (p.child.*) {
             .instance, .container => |c| c,
+            .alternatives => return null,
             else => return null,
         },
+        .alternatives => return null,
         else => return null,
     };
     const made = container.made_by orelse return null;
@@ -6456,6 +6469,7 @@ pub fn callResult(self: *Facts, callee: Value, _: void) ResolveError!Value {
     const fn_type: ?Key = switch (callee) {
         .fn_type => |key| key,
         .pointer => |to| if (to.child.* == .fn_type) to.child.fn_type else null,
+        .alternatives => null,
         else => null,
     };
     if (fn_type) |key| {
@@ -6673,6 +6687,7 @@ fn kindOfType(self: *Facts, of: Value) ResolveError!?[]const u8 {
         .error_union => "error_union",
         .fn_type, .function => "fn",
         .primitive => |name| primitiveKind(name),
+        .alternatives => null,
         else => null,
     };
 }
@@ -8792,6 +8807,7 @@ fn heldContainer(value: Value) ?Container {
     return switch (value) {
         .container, .instance => |container| container,
         .error_union, .optional => |inner| heldContainer(inner.*),
+        .alternatives => null,
         else => null,
     };
 }
@@ -9414,6 +9430,7 @@ fn reflectedContainer(self: *const Facts, r: Reflected) ?Container {
         // `@typeInfo` takes a type: a value of one in its place (a field's type read as what it
         // holds) is that type.
         .container, .instance => |c| c,
+        .alternatives => return null,
         else => return null,
     };
     const kind = self.kindOf(container) orelse return null;
@@ -12331,6 +12348,7 @@ pub const accesses = struct {
             .container, .instance => |container| container,
             .pointer => |inner| holderContainer(inner.child.*),
             .optional => |inner| holderContainer(inner.*),
+            .alternatives => null,
             else => null,
         };
     }
