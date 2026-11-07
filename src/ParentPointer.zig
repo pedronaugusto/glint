@@ -137,7 +137,7 @@ fn calledOnlyOnItself(c: *Context, kind: Facts.Container) Context.Error!bool {
             if (args.len != 2) continue;
             const receiver = try c.facts.resolve(each.id, args[0]);
             if (receiver != .unknown and !isParent(receiver, kind)) continue;
-            if (receiver == .unknown and (generic(file_tree, &each.model, node) or try namesType(c, each.id, args[0]))) continue;
+            if (receiver == .unknown and (try generic(c, each.id, node) or try namesType(c, each.id, args[0]))) continue;
             for (source.model.declarations) |decl| {
                 if (decl.kind != .field or decl.scope != kind.scope) continue;
                 const declared = (source.model.containerField(tree, decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
@@ -158,11 +158,10 @@ fn calledOnlyOnItself(c: *Context, kind: Facts.Container) Context.Error!bool {
 fn tableReadInPlace(c: *Context, name: []const u8, kind: Facts.Container) Context.Error!bool {
     for (try c.facts.memberUses(name)) |use| {
         const tree = &c.project.at(use.file).file.tree;
-        const model = &c.project.at(use.file).model;
         const receiver = tree.nodeData(use.node).node_and_token[0];
         const value = try c.facts.resolve(use.file, receiver);
         if (value == .unknown) {
-            if (try namesType(c, use.file, receiver) or generic(tree, model, use.node)) continue;
+            if (try namesType(c, use.file, receiver) or try generic(c, use.file, use.node)) continue;
             return false;
         }
         if (!isParent(value, kind)) continue;
@@ -207,11 +206,10 @@ fn interfaceParameters(c: *Context, proto: Facts.Key, kind: Facts.Container) Con
 fn readsCalledOnSelf(c: *Context, name: []const u8, holder: Facts.Container, through: bool, given: u64) Context.Error!bool {
     for (try c.facts.memberUses(name)) |use| {
         const tree = &c.project.at(use.file).file.tree;
-        const model = &c.project.at(use.file).model;
         const receiver = tree.nodeData(use.node).node_and_token[0];
         const value = try c.facts.resolve(use.file, receiver);
         if (value == .unknown) {
-            if (try namesType(c, use.file, receiver) or try notFunction(c, use.file, use.node) or generic(tree, model, use.node)) continue;
+            if (try namesType(c, use.file, receiver) or try notFunction(c, use.file, use.node) or try generic(c, use.file, use.node)) continue;
             return false;
         }
         if (!isParent(value, holder)) continue;
@@ -600,11 +598,10 @@ fn addressedOnly(c: *Context, field: Field, kind: Facts.Container, interface: bo
     var follow: Follow = .{ .c = c, .kind = kind, .contract = interface };
     for (try c.facts.memberUses(field.name)) |use| {
         const tree = &c.project.at(use.file).file.tree;
-        const model = &c.project.at(use.file).model;
         const receiver = try c.facts.resolve(use.file, tree.nodeData(use.node).node_and_token[0]);
         if (receiver != .unknown and !isParent(receiver, field.parent)) continue;
         if (receiver == .unknown) {
-            if (try namesType(c, use.file, tree.nodeData(use.node).node_and_token[0]) or generic(tree, model, use.node)) continue;
+            if (try namesType(c, use.file, tree.nodeData(use.node).node_and_token[0]) or try generic(c, use.file, use.node)) continue;
             return false;
         }
         switch (try Facts.accesses.useOf(c.facts, use.file, use.node)) {
@@ -628,7 +625,7 @@ fn addressedOnly(c: *Context, field: Field, kind: Facts.Container, interface: bo
             // Of another type, it names none of C's fields.
             const receiver = try c.facts.resolve(source.id, args[0]);
             if (receiver != .unknown and !isParent(receiver, field.parent)) continue;
-            if (receiver == .unknown and (generic(tree, &source.model, node) or try namesType(c, source.id, args[0]))) continue;
+            if (receiver == .unknown and (try generic(c, source.id, node) or try namesType(c, source.id, args[0]))) continue;
             if (try namedBy(c, source.id, args[1], field.name)) return false;
         }
     }
@@ -1317,23 +1314,34 @@ fn spawnArguments(c: *Context, decl: Facts.Decl, index: usize) Context.Error!boo
     const proto = tree.fullFnProto(&buffer, c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return false;
     var it = proto.iterate(tree);
     var at: usize = 0;
-    var function: ?[]const u8 = null;
+    var function: ?Ast.TokenIndex = null;
     while (it.next()) |param| : (at += 1) {
         const name = tree.tokenSlice(param.name_token orelse return false);
         if (at + 1 == index) {
             if (param.anytype_ellipsis3 == null) return false;
-            function = name;
+            function = param.name_token;
         }
         if (at != index) continue;
         if (!std.mem.eql(u8, name, "args")) return false;
         // `std.meta.ArgsTuple(@TypeOf(function))`.
         var call_buffer: [1]Ast.Node.Index = undefined;
         const tuple = tree.fullCall(&call_buffer, param.type_expr orelse return false) orelse return false;
-        if (tree.nodeTag(tuple.ast.fn_expr) != .field_access or !std.mem.eql(u8, tree.tokenSlice(tree.nodeData(tuple.ast.fn_expr).node_and_token[1]), "ArgsTuple")) return false;
+        const made_by = switch (try c.facts.definition(decl.file, tuple.ast.fn_expr)) {
+            .decl => |made_by| made_by,
+            .none, .unknown => return false,
+        };
+        if (try Governed.isStd(c, made_by, "meta.ArgsTuple") != .yes) return false;
         if (tuple.ast.params.len != 1 or !Facts.isBuiltin(tree, tuple.ast.params[0], "@TypeOf")) return false;
         var args_buffer: [2]Ast.Node.Index = undefined;
         const typed = Facts.builtinArgs(tree, tuple.ast.params[0], &args_buffer);
-        return typed.len == 1 and tree.nodeTag(typed[0]) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(typed[0])), function orelse return false);
+        if (typed.len != 1) return false;
+        // The `function` parameter itself, by the declaration `@TypeOf`'s operand names.
+        const named = switch (try c.facts.definition(decl.file, typed[0])) {
+            .decl => |named| named,
+            .none, .unknown => return false,
+        };
+        const record = c.project.at(named.file).model.declarations[@backingInt(named.index)];
+        return named.file == decl.file and record.kind == .parameter and record.token == (function orelse return false);
     }
     return false;
 }
@@ -1894,7 +1902,7 @@ fn insertsOnlyParents(c: *Context, field: Field, list: List, source: Source) Con
             else => continue,
         };
         const value = Facts.ungrouped(tree, store.value orelse return false);
-        if (tree.nodeTag(value) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "null")) continue;
+        if (Facts.isNull(tree, value)) continue;
         const stored = (try nodeSource(c, use.file, value, field, list, null, 0)) orelse return false;
         // A C's own node anywhere; a node out of a list only into that same list's links.
         if (stored == .any) continue;
@@ -1946,7 +1954,7 @@ fn listsInPlace(c: *Context, list: List) Context.Error!bool {
                         if (std.mem.eql(u8, name, link)) break true;
                     } else false;
                     const plain = Facts.ungrouped(tree, value);
-                    if (is_link and !(tree.nodeTag(plain) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(plain)), "null"))) linked = true;
+                    if (is_link and !Facts.isNull(tree, plain)) linked = true;
                 }
                 if (!linked) continue;
                 const container = if (literal.ast.type_expr.unwrap()) |t| held(try c.facts.resolve(file, t)) else try c.facts.resultContainer(file, node);
@@ -1954,8 +1962,9 @@ fn listsInPlace(c: *Context, list: List) Context.Error!bool {
                 if (try isList(c, made, "", list) != .no or try isList(c, made, "Node", list) != .no) return false;
                 continue;
             }
-            switch (tag) {
-                .identifier, .field_access, .deref, .array_access, .unwrap_optional => {},
+            // A name, a member, `.*`, an element, a payload: what may be a list in a place.
+            switch (Facts.accesses.formOf(tag)) {
+                .leaf, .member, .deref, .array_access, .unwrap_optional => {},
                 else => continue,
             }
             const value = try c.facts.resolve(file, node);
@@ -1966,21 +1975,18 @@ fn listsInPlace(c: *Context, list: List) Context.Error!bool {
             if (try isList(c, container, "", list) == .no and try isList(c, container, "Node", list) == .no) continue;
             // In place: its address, a member of it, a whole write to it.
             const parent = model.parentOf(node) orelse return false;
-            switch (tree.nodeTag(parent)) {
-                .address_of, .field_access => continue,
-                .assign => {
-                    const target, const assigned = tree.nodeData(parent).node_and_node;
-                    if (target != node) return false;
+            switch (try Facts.accesses.useOf(c.facts, file, node)) {
+                .address, .member => continue,
+                .written => |store| {
                     var literal_buffer: [2]Ast.Node.Index = undefined;
-                    if (tree.fullStructInit(&literal_buffer, Facts.ungrouped(tree, assigned)) == null) return false;
+                    if (tree.fullStructInit(&literal_buffer, Facts.ungrouped(tree, store.value orelse return false)) == null) return false;
                 },
                 else => {
                     // Its declaration names it, as its type, not as a value.
-                    if (tree.nodeTag(node) == .identifier) {
-                        const ref = model.reference(node) orelse return false;
-                        const index = ref.declaration orelse return false;
-                        if (model.declarations[@backingInt(index)].node == parent) continue;
-                    }
+                    if (try Facts.accesses.memberRead(c.facts, file, node) == null) switch (try c.facts.definition(file, node)) {
+                        .decl => |named| if (named.file == file and model.declarations[@backingInt(named.index)].node == parent) continue,
+                        .none, .unknown => {},
+                    };
                     return false;
                 },
             }
@@ -2062,21 +2068,23 @@ fn resultType(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.E
     var at = node;
     for (0..8) |_| {
         const parent = model.parentOf(at) orelse return .{ .unknown = .unresolved };
-        switch (tree.nodeTag(parent)) {
-            .grouped_expression, .@"try" => {
-                at = parent;
-                continue;
+        switch (try Facts.accesses.useOf(c.facts, file, at)) {
+            .carried => |onward| switch (onward.how) {
+                .grouped, .tried => {
+                    at = onward.into;
+                    continue;
+                },
+                else => {},
             },
-            .@"return" => {
-                const function = enclosingFunction(tree, model, parent) orelse return .{ .unknown = .unresolved };
+            .returned => |ret| {
+                const function = enclosingFunction(tree, model, ret) orelse return .{ .unknown = .unresolved };
                 var buffer: [1]Ast.Node.Index = undefined;
                 const proto = tree.fullFnProto(&buffer, function) orelse return .{ .unknown = .unresolved };
                 return c.facts.resolve(file, proto.ast.return_type.unwrap() orelse return .{ .unknown = .unresolved });
             },
-            .assign => {
-                const target, const value = tree.nodeData(parent).node_and_node;
-                if (value != at) return .{ .unknown = .unresolved };
-                return c.facts.resolve(file, target);
+            .stored => |store| {
+                if (store.node != parent) return .{ .unknown = .unresolved };
+                return c.facts.resolve(file, store.target orelse return .{ .unknown = .unresolved });
             },
             else => {},
         }
@@ -2159,26 +2167,25 @@ fn enclosingFunction(tree: *const Ast, model: *const Model, node: Ast.Node.Index
 /// `comptime` parameter, or within a function returning a type. A member read there on what does not resolve is of what its
 /// parameters hold, which a caller hands it: an interface by pointer, followed into the body
 /// (`Follow.handed`), or a struct holding one (`Carry`). The program-wide scans leave it to them.
-fn generic(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
+fn generic(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
     var up = model.parentOf(node);
     while (up) |parent| : (up = model.parentOf(parent)) {
         if (tree.nodeTag(parent) != .fn_decl) continue;
         var buffer: [1]Ast.Node.Index = undefined;
         const proto = tree.fullFnProto(&buffer, tree.nodeData(parent).node_and_node[0]) orelse continue;
-        if (proto.ast.return_type.unwrap()) |returned| if (typeKeyword(tree, returned)) return true;
+        if (proto.ast.return_type.unwrap()) |returned| if (try c.facts.typeIsType(file, returned)) return true;
         var it = proto.iterate(tree);
         while (it.next()) |param| {
             if (param.anytype_ellipsis3 != null) return true;
             if (param.comptime_noalias) |token| if (tree.tokenTag(token) == .keyword_comptime) return true;
-            if (param.type_expr) |declared| if (typeKeyword(tree, declared)) return true;
+            if (param.type_expr) |declared| if (try c.facts.typeIsType(file, declared)) return true;
         }
     }
     return false;
 }
 
-fn typeKeyword(tree: *const Ast, node: Ast.Node.Index) bool {
-    return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "type");
-}
 
 /// Whether the parameter named at `token` is one of the prototype `function`'s own.
 fn parameterOf(tree: *const Ast, function: Ast.Node.Index, token: Ast.TokenIndex) bool {
@@ -2204,14 +2211,10 @@ fn namesType(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Er
     var at_file = file;
     var at = Facts.ungrouped(&c.project.at(file).file.tree, node);
     for (0..8) |_| {
-        const tree = &c.project.at(at_file).file.tree;
-        const decl = switch (tree.nodeTag(at)) {
-            // One not known to name a type may be a value.
-            .identifier, .field_access => switch (try c.facts.definition(at_file, at)) {
-                .decl => |d| d,
-                .none, .unknown => return false,
-            },
-            else => return false,
+        // One not known to name a type may be a value.
+        const decl = switch (try c.facts.definition(at_file, at)) {
+            .decl => |d| d,
+            .none, .unknown => return false,
         };
         const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
         if (record.kind != .variable) return false;
@@ -2243,5 +2246,5 @@ fn typeFunction(c: *Context, file: Project.FileId, callee: Ast.Node.Index) Conte
     const tree = &c.project.at(found.file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
     const proto = tree.fullFnProto(&buffer, function.node) orelse return false;
-    return typeKeyword(tree, proto.ast.return_type.unwrap() orelse return false);
+    return c.facts.typeIsType(found.file, proto.ast.return_type.unwrap() orelse return false);
 }
