@@ -211,7 +211,9 @@ pub fn publication(facts: *Facts, library: anytype) Facts.ResolveError!*const Pu
         for (rules.roles) |declared| {
             const role_value = roleValue(Roles, declared.role) orelse continue;
             const decl = declared.type.declaration() orelse continue;
-            switch (try facts.declaration(decl)) {
+            // A declaration that is a choice (a type chosen per build): each part the role's.
+            const declared_value = try facts.declaration(decl);
+            for (Facts.valueParts(&declared_value)) |part| switch (part) {
                 .function => |function| {
                     try entries.append(facts.gpa, .{ .role = role_value, .target = .{ .function = function }, .internal = declared.internal });
                     // The container a type function returns is also its type: instances declared
@@ -222,10 +224,11 @@ pub fn publication(facts: *Facts, library: anytype) Facts.ResolveError!*const Pu
                     };
                 },
                 .container => |made| try entries.append(facts.gpa, .{ .role = role_value, .target = .{ .container = .{ .file = made.file, .scope = made.scope } }, .internal = declared.internal }),
+                .alternatives => unreachable, // unreachable: valueParts gives no choice as a part
                 // A role on what is no type and no function: the declarer's own lint reports
                 // the form; for its consumers the role is not read.
                 else => try gaps.append(facts.gpa, .{ .root = root, .problem = .{ .file = decl.file, .node = facts.project.at(decl.file).model.declarations[@backingInt(decl.index)].node, .why = .malformed } }),
-            }
+            };
         }
     }
     var files: std.ArrayList(Project.FileId) = .empty;
@@ -528,7 +531,11 @@ const Reader = struct {
         var buffer: [1]Ast.Node.Index = undefined;
         const proto = t.fullFnProto(&buffer, r.facts.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return null;
         if (proto.ast.return_type.unwrap()) |result| {
-            if (owes(try r.facts.resolve(decl.file, result), owing, false)) return .result;
+            // A result that may or may not be an owing type does not settle it.
+            switch (owes(try r.facts.resolve(decl.file, result), owing, false) orelse return null) {
+                true => return .result,
+                false => {},
+            }
         }
         var found: ?usize = null;
         var it = proto.iterate(t);
@@ -536,7 +543,7 @@ const Reader = struct {
         while (it.next()) |param| : (position += 1) {
             const written = param.type_expr orelse continue;
             if (position == 0) continue; // The receiver is the value the obligation leaves.
-            if (!owes(try r.facts.resolve(decl.file, written), owing, true)) continue;
+            if (!(owes(try r.facts.resolve(decl.file, written), owing, true) orelse return null)) continue;
             if (found != null) return null;
             found = position;
         }
@@ -544,16 +551,39 @@ const Reader = struct {
     }
 
     /// The container a type declaration names: the type itself, or the one a type function
-    /// returns. Null where it resolves to neither.
+    /// returns, where every part of a choice names that one. Null where it resolves to neither,
+    /// or a choice names different ones.
     fn containerOf(r: *Reader, decl: Facts.Decl) Error!?Facts.Container {
-        return switch (try r.facts.declaration(decl)) {
-            .container, .instance => |c| c,
-            .function => |function| switch ((try r.facts.template(function)) orelse return null) {
+        const value = try r.facts.declaration(decl);
+        var found: ?Facts.Container = null;
+        for (Facts.valueParts(&value)) |part| {
+            const one = switch (part) {
                 .container, .instance => |c| c,
-                else => null,
-            },
-            else => null,
-        };
+                .function => |function| try r.templateContainer(function) orelse return null,
+                .alternatives => unreachable, // unreachable: valueParts gives no choice as a part
+                else => return null,
+            };
+            if (found) |earlier| if (earlier.file != one.file or earlier.scope != one.scope) return null;
+            found = one;
+        }
+        return found;
+    }
+
+    /// The one container the type function `function` returns, where every part of a choice of
+    /// templates is that one; null otherwise.
+    fn templateContainer(r: *Reader, function: Facts.Decl) Error!?Facts.Container {
+        const returned = (try r.facts.template(function)) orelse return null;
+        var found: ?Facts.Container = null;
+        for (Facts.valueParts(&returned)) |part| {
+            const one = switch (part) {
+                .container, .instance => |c| c,
+                .alternatives => unreachable, // unreachable: valueParts gives no choice as a part
+                else => return null,
+            };
+            if (found) |earlier| if (earlier.file != one.file or earlier.scope != one.scope) return null;
+            found = one;
+        }
+        return found;
     }
 
     /// An operation of a pair: a member of the owing type written as an enum literal (`.deinit`),
@@ -834,21 +864,26 @@ test "a fork's copy of a package is the package by its stated identity, wherever
 }
 
 /// Whether `value` is one of the `owing` types: a value of one, seen through `!` and `?`, or
-/// (`pointer`) a pointer to one.
-fn owes(value: Facts.Value, owing: []const Facts.Container, pointer: bool) bool {
-    var current = value;
-    while (true) switch (current) {
-        .error_union, .optional => |inner| current = inner.*,
-        .pointer => |inner| {
-            if (!pointer) return false;
-            current = inner.child.*;
-        },
-        .container, .instance => |c| {
-            for (owing) |each| if (each.file == c.file and each.scope == c.scope) return true;
-            return false;
-        },
-        else => return false,
-    };
+/// (`pointer`) a pointer to one; a part that does not resolve shows none. A choice is one where
+/// every part is, not where none is, and null where its parts differ.
+fn owes(value: Facts.Value, owing: []const Facts.Container, pointer: bool) ?bool {
+    var some = false;
+    var every = true;
+    for (Facts.valueParts(&value)) |part| {
+        const one: bool = switch (part) {
+            .error_union, .optional => |inner| owes(inner.*, owing, pointer) orelse return null,
+            .pointer => |inner| if (pointer) owes(inner.child.*, owing, pointer) orelse return null else false,
+            .container, .instance => |c| for (owing) |held| {
+                if (held.file == c.file and held.scope == c.scope) break true;
+            } else false,
+            .alternatives => unreachable, // unreachable: valueParts gives no choice as a part
+            else => false,
+        };
+        some = some or one;
+        every = every and one;
+    }
+    if (some != every) return null;
+    return some;
 }
 
 test "a pair of a type names its operations as its members, and where a transfer moves the obligation is read from the member's declaration" {
