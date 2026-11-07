@@ -262,9 +262,20 @@ fn roleValue(comptime Roles: type, name: []const u8) ?u32 {
 }
 
 /// The role `library`'s package declares for a function declaration, or a type or instance of a
-/// container with a role, seen through pointers, optionals and error unions.
+/// container with a role, seen through pointers, optionals and error unions; of a choice, the
+/// role every part agrees on.
 pub fn role(facts: *Facts, library: anytype, value: Facts.Value) Facts.ResolveError!?@TypeOf(library).Role {
     const Roles = @TypeOf(library).Role;
+    // A choice: the role every part agrees on, none where they differ or one has none.
+    if (value == .alternatives) {
+        var agreed: ?Roles = null;
+        for (value.alternatives, 0..) |part, k| {
+            const one = (try role(facts, library, part)) orelse return null;
+            if (k != 0 and one != agreed.?) return null;
+            agreed = one;
+        }
+        return agreed;
+    }
     const found = (try entryOf(facts, library, value)) orelse return null;
     return @as(Roles, @fromBackingInt(@intCast(found.role)));
 }
@@ -291,16 +302,8 @@ fn entryOf(facts: *Facts, library: anytype, value: Facts.Value) Facts.ResolveErr
             for (found.entries) |entry| if (entry.target == .container and entry.target.container.file == c.file and entry.target.container.scope == c.scope) return entry;
             return null;
         },
-        // A choice: the role every part agrees on, none where they differ or one has none.
-        .alternatives => |parts| {
-            var agreed: ?Roles = null;
-            for (parts, 0..) |part, k| {
-                const one = (try role(facts, library, part)) orelse return null;
-                if (k != 0 and one != agreed.?) return null;
-                agreed = one;
-            }
-            return agreed;
-        },
+        // A choice is no one declaration's entry: `role` reads it part by part.
+        .alternatives => return null,
         else => return null,
     };
 }
