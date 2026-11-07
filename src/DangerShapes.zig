@@ -4017,24 +4017,27 @@ fn fixedState(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.E
     var buffer: [2]Ast.Node.Index = undefined;
     if (tree.fullStructInit(&buffer, node)) |literal| {
         if (literal.ast.fields.len != 1) return null;
-        return tree.tokenSlice(tree.firstToken(literal.ast.fields[0]) - 2);
+        return try Model.identifier(c.allocator, tree.tokenSlice(Model.initName(tree, literal.ast.fields[0]) orelse return null));
     }
-    switch (tree.nodeTag(node)) {
-        .enum_literal, .number_literal, .char_literal => return tree.tokenSlice(tree.nodeMainToken(node)),
-        .grouped_expression => return fixedState(c, file, tree.nodeData(node).node_and_token[0]),
-        .field_access => {
-            const held = try c.facts.resolve(file, tree.nodeData(node).node_and_token[0]);
-            if (held != .container or !isEnum(c, held.container)) return null;
-            return tree.tokenSlice(tree.nodeData(node).node_and_token[1]);
-        },
-        .builtin_call_two, .builtin_call_two_comma => {
-            const name = tree.tokenSlice(tree.nodeMainToken(node));
-            if (!std.mem.eql(u8, name, "@backingInt") and !std.mem.eql(u8, name, "@intFromEnum")) return null;
-            const operand = tree.nodeData(node).opt_node_and_opt_node[0].unwrap() orelse return null;
-            return fixedState(c, file, operand);
-        },
-        else => return null,
+    const inner = Facts.ungrouped(tree, node);
+    if (inner != node) return fixedState(c, file, inner);
+    if (try c.facts.literalOf(file, node)) |literal| return switch (literal) {
+        .enum_literal => |name| name,
+        .number, .char => tree.tokenSlice(tree.nodeMainToken(node)),
+        else => null,
+    };
+    // A member of an enum type (`Phase.done`).
+    if (try Facts.accesses.memberRead(c.facts, file, node)) |step| {
+        const held = step.holder.?; // unreachable: a member's step has its holder's value
+        if (held != .container or !isEnum(c, held.container)) return null;
+        return step.name;
     }
+    if (Facts.isBuiltin(tree, node, "@backingInt") or Facts.isBuiltin(tree, node, "@intFromEnum")) {
+        var args: [2]Ast.Node.Index = undefined;
+        const operands = Facts.builtinArgs(tree, node, &args);
+        return if (operands.len == 1) fixedState(c, file, operands[0]) else null;
+    }
+    return null;
 }
 
 /// The calls of the program that call the function declared by `function` in `file`, as
@@ -4256,11 +4259,13 @@ pub fn borrowsStored(c: *Context, rule: Rule) Context.Error!void {
     const namespaces = try containersOf(c, rule, &paths);
     if (namespaces.len == 0) return;
     const tree = &c.project.at(c.file).file.tree;
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .assign) continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const target, const value = tree.nodeData(node).node_and_node;
-        if (tree.nodeTag(target) != .field_access or c.inTest(tree.nodeMainToken(node)) or !Danger.atRuntime(c, node)) continue;
+    // Each store of one value into a field (`s.f = v`, a destructure's element).
+    for (try Facts.accesses.storesIn(c.facts, c.file)) |site| {
+        if (site.kind != .set) continue;
+        const node = site.node;
+        const value = site.value orelse continue;
+        if (try Facts.accesses.memberRead(c.facts, c.file, site.target orelse continue) == null) continue;
+        if (c.inTest(tree.nodeMainToken(node)) or !Danger.atRuntime(c, node)) continue;
         const what = (try borrow(c, tree, namespaces, value)) orelse continue;
         if (try settled(c, node, value)) continue;
         try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("a borrow of a std container's storage ({s}) stored in a field: the next growth moves it; aegis handle keys or scope references stay valid", .{what}));
@@ -4269,32 +4274,32 @@ pub fn borrowsStored(c: *Context, rule: Rule) Context.Error!void {
 
 /// What borrow of std container storage `node` is, if it is one.
 fn borrow(c: *Context, tree: *const Ast, namespaces: []const ?Facts.Container, node: Ast.Node.Index) Context.Error!?[]const u8 {
-    switch (tree.nodeTag(node)) {
-        .grouped_expression => return borrow(c, tree, namespaces, tree.nodeData(node).node_and_token[0]),
-        .unwrap_optional => return borrow(c, tree, namespaces, tree.nodeData(node).node_and_token[0]),
-        .address_of => {
-            const inner = tree.nodeData(node).node;
-            if (tree.nodeTag(inner) != .array_access) return null;
-            return borrow(c, tree, namespaces, tree.nodeData(inner).node_and_node[0]);
-        },
-        .slice_open, .slice, .slice_sentinel => return borrow(c, tree, namespaces, (tree.fullSlice(node) orelse return null).ast.sliced),
-        .field_access => {
-            const receiver, const name = tree.nodeData(node).node_and_token;
-            if (!std.mem.eql(u8, tree.tokenSlice(name), "items")) return null;
-            return if (try ofStd(c, namespaces, receiver)) "items" else null;
-        },
-        else => {
-            var buffer: [1]Ast.Node.Index = undefined;
-            const call = tree.fullCall(&buffer, node) orelse return null;
-            if (tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
-            const receiver, const name = tree.nodeData(call.ast.fn_expr).node_and_token;
-            const spelled = tree.tokenSlice(name);
-            for ([_][]const u8{ "getPtr", "getEntry", "getKeyPtr", "keys", "values" }) |method| if (std.mem.eql(u8, spelled, method)) {
-                return if (try ofStd(c, namespaces, receiver)) method else null;
-            };
-            return null;
-        },
+    const inner = Facts.ungrouped(tree, node);
+    if (inner != node) return borrow(c, tree, namespaces, inner);
+    // An element's address (`&list.items[i]`): of what the element is of.
+    if (try addressOperand(c, c.file, node)) |place| {
+        const path = try Facts.accesses.pathOf(c.facts, c.file, place);
+        if (path.steps[0].kind != .index) return null;
+        return borrow(c, tree, namespaces, path.steps[1].node);
     }
+    if (try Facts.accesses.memberRead(c.facts, c.file, node)) |step| {
+        if (!std.mem.eql(u8, step.name orelse return null, "items")) return null;
+        return if (try ofStd(c, namespaces, step.receiver.?)) "items" else null; // unreachable: a member's step has its holder
+    }
+    // A payload, a slice: of what holds it.
+    const path = try Facts.accesses.pathOf(c.facts, c.file, node);
+    switch (path.steps[0].kind) {
+        .unwrap, .slice => return borrow(c, tree, namespaces, path.steps[1].node),
+        else => {},
+    }
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, node) orelse return null;
+    const method = (try Facts.accesses.memberRead(c.facts, c.file, call.ast.fn_expr)) orelse return null;
+    const spelled = method.name orelse return null;
+    for ([_][]const u8{ "getPtr", "getEntry", "getKeyPtr", "keys", "values" }) |each| if (std.mem.eql(u8, spelled, each)) {
+        return if (try ofStd(c, namespaces, method.receiver.?)) each else null; // unreachable: a member's step has its holder
+    };
+    return null;
 }
 
 /// Whether the borrowed container is a local nothing grows once the store is made: declared
@@ -4306,24 +4311,33 @@ fn borrow(c: *Context, tree: *const Ast, namespaces: []const ?Facts.Container, n
 fn settled(c: *Context, store: Ast.Node.Index, value: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
+    // Down to the member the borrow is read through: `items`, or the method called.
     var at = value;
-    while (true) at = switch (tree.nodeTag(at)) {
-        .grouped_expression, .unwrap_optional => tree.nodeData(at).node_and_token[0],
-        .address_of => tree.nodeData(at).node,
-        .array_access => tree.nodeData(at).node_and_node[0],
-        .slice_open, .slice, .slice_sentinel => (tree.fullSlice(at) orelse return false).ast.sliced,
-        .field_access => break,
-        else => {
-            var buffer: [1]Ast.Node.Index = undefined;
-            const call = tree.fullCall(&buffer, at) orelse return false;
-            if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
-            at = call.ast.fn_expr;
-            break;
-        },
+    const access = while (true) {
+        if (try addressOperand(c, c.file, at)) |place| {
+            at = place;
+            continue;
+        }
+        if (try Facts.accesses.memberRead(c.facts, c.file, at)) |step| break step;
+        const path = try Facts.accesses.pathOf(c.facts, c.file, at);
+        if (path.steps.len > 1) switch (path.steps[0].kind) {
+            // A payload, an element, a slice: of what holds it.
+            .unwrap, .index, .slice => {
+                at = path.steps[1].node;
+                continue;
+            },
+            else => return false,
+        };
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, Facts.ungrouped(tree, at)) orelse return false;
+        break (try Facts.accesses.memberRead(c.facts, c.file, call.ast.fn_expr)) orelse return false;
     };
-    const receiver = tree.nodeData(at).node_and_token[0];
-    if (tree.nodeTag(receiver) != .identifier) return false;
-    const local = (model.reference(receiver) orelse return false).declaration orelse return false;
+    const receiver = access.receiver.?; // unreachable: a member's step has its holder
+    if (try Facts.accesses.memberRead(c.facts, c.file, receiver) != null) return false;
+    const local = switch (try c.facts.definition(c.file, receiver)) {
+        .decl => |decl| if (decl.file == c.file) decl.index else return false,
+        .none, .unknown => return false,
+    };
     const record = model.declarations[@backingInt(local)];
     if (record.kind != .variable) return false;
     switch (model.scopes[@backingInt(record.scope)].kind) {
@@ -4341,17 +4355,17 @@ fn settled(c: *Context, store: Ast.Node.Index, value: Ast.Node.Index) Context.Er
         }
     }
     const end = tree.lastToken(store);
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .identifier) continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const reference = model.reference(node) orelse continue;
+    for (model.references) |reference| {
         if (reference.declaration != local) continue;
+        const node = reference.node;
         if (tree.nodeMainToken(node) > end) return false;
-        const parent = model.parentOf(node) orelse return false;
-        if (tree.nodeTag(parent) != .field_access) return false;
+        const parent = switch (try Facts.accesses.useOf(c.facts, c.file, node)) {
+            .member => |member| member,
+            else => return false,
+        };
         // A list freed at all, wherever the free is written (a `defer` before the store runs
         // after it), leaves the borrow pointing at freed memory.
-        const member = tree.tokenSlice(tree.nodeData(parent).node_and_token[1]);
+        const member = ((try Facts.accesses.memberRead(c.facts, c.file, parent)) orelse return false).name orelse return false;
         for ([_][]const u8{ "deinit", "clearAndFree", "shrinkAndFree", "toOwnedSlice", "toOwnedSliceSentinel", "moveToUnmanaged", "clearRetainingCapacity" }) |frees| {
             if (std.mem.eql(u8, member, frees)) return false;
         }
