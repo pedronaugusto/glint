@@ -267,19 +267,24 @@ fn roleValue(comptime Roles: type, name: []const u8) ?u32 {
 /// container with a role, seen through pointers, optionals and error unions; of a choice, the
 /// role every part agrees on.
 pub fn role(facts: *Facts, library: anytype, value: Facts.Value) Facts.ResolveError!?@TypeOf(library).Role {
-    const Roles = @TypeOf(library).Role;
-    // A choice: the role every part agrees on, none where they differ or one has none.
+    const raw = (try roleNumber(facts, library, value)) orelse return null;
+    return @as(@TypeOf(library).Role, @fromBackingInt(@intCast(raw)));
+}
+
+/// The number of the role `role` reads, compared as a number (no `Role` a library's `anytype`
+/// makes is compared or copied): of a choice, the one every part agrees on, none where they
+/// differ or one has none.
+fn roleNumber(facts: *Facts, library: anytype, value: Facts.Value) Facts.ResolveError!?@FieldType(Entry, "role") {
     if (value == .alternatives) {
-        var agreed: ?Roles = null;
-        for (value.alternatives, 0..) |part, k| {
-            const one = (try role(facts, library, part)) orelse return null;
-            if (k != 0 and one != agreed.?) return null;
-            agreed = one;
+        if (value.alternatives.len == 0) return null;
+        const first = ((try entryOf(facts, library, value.alternatives[0])) orelse return null).role;
+        for (value.alternatives[1..]) |part| {
+            const other = ((try entryOf(facts, library, part)) orelse return null).role;
+            if (other != first) return null;
         }
-        return agreed;
+        return first;
     }
-    const found = (try entryOf(facts, library, value)) orelse return null;
-    return @as(Roles, @fromBackingInt(@intCast(found.role)));
+    return ((try entryOf(facts, library, value)) orelse return null).role;
 }
 
 /// The fields only `library`'s package touches of a value's type (`.internal`), where its type is
