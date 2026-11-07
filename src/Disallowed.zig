@@ -29,9 +29,10 @@ pub fn check(self: *Context) Context.Error!void {
     }
     const configured = try Governed.resolve(self, .P006, targets.items, indexes.items);
     const declared = try declaredReplacements(self);
-    const governed = try std.mem.concat(self.allocator, Governed.Governed, &.{ configured, declared.governed });
+    // Each entry's index says which list it is of: the configuration's, then the declared.
     var sites: std.ArrayList(Governed.Site) = .empty;
-    try Governed.sites(self, .P006, governed, &sites);
+    try Governed.sites(self, .P006, configured, &sites);
+    try Governed.sites(self, .P006, declared.governed, &sites);
     for (sites.items) |site| {
         if (site.index < self.config.disallowed.len) {
             const entry = self.config.disallowed[site.index];
