@@ -554,7 +554,7 @@ fn kept(c: *Context, resources: []const ?Facts.Container, file: Project.FileId, 
         },
         else => {},
     }
-    const argument = switch (try argumentOf(c, file, node)) {
+    const argument = switch (try argumentOf(c, null, file, node)) {
         .at => |at| at,
         .unknown => return .unknown,
         .none => return .no,
@@ -572,14 +572,14 @@ fn kept(c: *Context, resources: []const ?Facts.Container, file: Project.FileId, 
 /// element); unknown where the call passes it but which parameter takes it is not known.
 const Argument = union(enum) { none, at: struct { call: Facts.calls.Call, position: usize }, unknown };
 
-fn argumentOf(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!Argument {
+fn argumentOf(c: *Context, env: ?*const Facts.Env, file: Project.FileId, node: Ast.Node.Index) Context.Error!Argument {
     const model = &c.project.at(file).model;
     const parent = model.parentOf(node) orelse return .none;
     // A receiver's parent is the callee `x.f`, a tuple element's `@call`'s third operand.
     const use = try Facts.accesses.useOf(c.facts, file, node);
     const tuple = use == .element_of;
     const holder = if (use == .member or tuple) model.parentOf(parent) orelse return .none else parent;
-    const call = (try Facts.calls.at(c.facts, file, holder)) orelse return .none;
+    const call = (try Facts.calls.under(c.facts, env, file, holder)) orelse return .none;
     if (tuple and call.modifier == null) return .none;
     switch (call.args) {
         .known => |args| for (args, 0..) |arg, position| if (arg == node) return .{ .at = .{ .call = call, .position = position } },
@@ -648,7 +648,7 @@ fn ownedField(c: *Context, resources: []const ?Facts.Container, holder: Facts.Co
     for (try fieldUses(c, name)) |use| {
         const receiver = byPointer(try c.facts.resolve(use.file, use.receiver)) orelse continue;
         if (receiver.file != holder.file or receiver.scope != holder.scope) continue;
-        const answer = try released(c, use.file, use.node, 0);
+        const answer = try releasedUnder(c, instanceReading(c, holder, use.file, use.node), use.file, use.node, 0);
         result = join(result, if (use.named) answer else if (answer == .no) .no else .unknown);
         if (result == .yes) return .yes;
     }
@@ -717,11 +717,17 @@ fn writeOf(c: *Context, resources: []const ?Facts.Container, file: Project.FileI
     if (use == .member) switch (try handleOf(c, file, use.member)) {
         .yes => use = try Facts.accesses.useOf(c.facts, file, use.member),
         .no => {},
-        .unknown => return .unknown,
+        // A member whose declaration does not resolve: as std's handle, written as the field
+        // is; as another member, read. None only where both say none.
+        .unknown => return if (try writtenBy(c, resources, file, try Facts.accesses.useOf(c.facts, file, use.member)) == .none) .none else .unknown,
     };
+    return writtenBy(c, resources, file, use);
+}
+
+/// How the use `use` writes what it uses: `=`, or a destructure's target (its element where the
+/// value is a literal, else part of a value that may hold one).
+fn writtenBy(c: *Context, resources: []const ?Facts.Container, file: Project.FileId, use: Facts.accesses.Use) Context.Error!Write {
     switch (use) {
-        // `=`, or a destructure's target: its element where the value is a literal, else part
-        // of a value that may hold one.
         .written => |site| return if (try filled(c, resources, file, site.value orelse return .unknown)) .none else .owner,
         .unknown => return .unknown,
         else => return .none,
@@ -794,7 +800,8 @@ fn addressWrite(c: *Context, resources: []const ?Facts.Container, file: Project.
             .member => |access| switch (try handleOf(c, file, access)) {
                 .yes => try writeOf(c, resources, file, reference.node),
                 .no => .none,
-                .unknown => .unknown,
+                // Judged both ways by `writeOf`.
+                .unknown => if (try writeOf(c, resources, file, reference.node) == .none) .none else .unknown,
             },
             else => .address,
         };
@@ -938,11 +945,17 @@ fn filled(c: *Context, resources: []const ?Facts.Container, file: Project.FileId
 }
 
 /// Whether what `node` in `file` holds (a field read, a capture or local made from it, its
-/// `handle`, its address, a function's return of it) is released where it is read: `close`,
-/// `deinit`, `kill` or `wait` called on it, or passed to a function that releases that
-/// parameter (`releasesParameter`). Passed where nothing resolves, or further than is followed,
-/// it may be.
+/// `handle`, its address, a function's return of it) is released where it is read: a method
+/// called on it that releases its receiver, std's by declaration (`release_paths`), or passed to
+/// a function that releases that parameter (`releasesParameter`). Passed where nothing resolves,
+/// or further than is followed, it may be.
 fn released(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!Stored {
+    return releasedUnder(c, null, file, node, depth);
+}
+
+/// `released`, read under `env`: the bindings of the type function call that made the holder
+/// whose field `node` reads (`instanceReading`), where `node` is in that function.
+fn releasedUnder(c: *Context, env: ?*const Facts.Env, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!Stored {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
     if (depth >= 8) return .unknown;
@@ -952,18 +965,18 @@ fn released(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
     switch (use) {
         // What gives its value on whole: parentheses, `.?`, `try`, `orelse` and `catch`, a
         // branch's or a prong's result, a `break`'s value.
-        .carried => |onward| return released(c, file, onward.into, next),
+        .carried => |onward| return releasedUnder(c, env, file, onward.into, next),
         // Its address, its pointee, its memory sliced or indexed (`(&f)[0..1]`, std's
         // `closeMany` idiom) holds it.
-        .address, .dereferenced, .element, .sliced, .index => |whole| return released(c, file, whole, next),
+        .address, .dereferenced, .element, .sliced, .index => |whole| return releasedUnder(c, env, file, whole, next),
         // Converted (`@as(T, x)`), the value is it.
-        .builtin_argument => |argument| if (argument.position == 1 and Facts.isBuiltin(tree, argument.call, "@as")) return released(c, file, argument.call, next),
+        .builtin_argument => |argument| if (argument.position == 1 and Facts.isBuiltin(tree, argument.call, "@as")) return releasedUnder(c, env, file, argument.call, next),
         // Compared, it is read for its value only.
         .compared => return .no,
         // In arithmetic (a `handle` summed) the result may still be it; given to `x op= v`, the
         // place's reads are followed.
         .operand => |whole| {
-            const update = (try storeAt(c, file, whole)) orelse return released(c, file, whole, next);
+            const update = (try storeAt(c, file, whole)) orelse return releasedUnder(c, env, file, whole, next);
             return placeReleased(c, file, update.target orelse return .unknown, next);
         },
         // A place written, its own value going back into it: not read here.
@@ -972,9 +985,15 @@ fn released(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
         .destructured => return .unknown,
         // Its handle, released as it is; a method called on it, by what the method does with
         // its receiver (`argumentOf`); any other member is read for its value only.
+        // A member whose declaration does not resolve is judged both ways: as std's handle,
+        // followed; as another member, read for its value only. Where both say none, none.
         .member => |access| switch (try handleOf(c, file, access)) {
-            .yes => return released(c, file, access, next),
-            .unknown => return .unknown,
+            .yes => return releasedUnder(c, env, file, access, next),
+            // A method the reading `env` resolves (`b.v.close()` in `Box(T)` read as
+            // `Box(std.Io.File)`) is no handle: by what it does with its receiver.
+            .unknown => if (try Facts.accesses.useOf(c.facts, file, access) == .callee) {
+                if (!try methodUnder(c, env, file, access)) return .unknown;
+            } else return if (try releasedUnder(c, env, file, access, next) == .no) .no else .unknown,
             .no => if (try Facts.accesses.useOf(c.facts, file, access) != .callee) return .no,
         },
         .returned => |ret| return releasedReturn(c, file, ret, next),
@@ -984,7 +1003,7 @@ fn released(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
         .callee => return .no,
         else => {},
     }
-    switch (try argumentOf(c, file, node)) {
+    switch (try argumentOf(c, env, file, node)) {
         .at => |at| return releasesParameter(c, &at.call, at.position, next),
         .unknown => return .unknown,
         .none => {},
@@ -999,21 +1018,21 @@ fn released(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
             var result: Stored = .no;
             for (tree.fullSwitch(chosen).?.ast.cases) |case| for (model.declarations, 0..) |decl, i| { // unreachable: what is switched on is a switch's
                 if (decl.kind != .capture or decl.node != case) continue;
-                result = join(result, try readsReleased(c, file, @fromBackingInt(@intCast(i)), next));
+                result = join(result, try readsReleasedUnder(c, env, file, @fromBackingInt(@intCast(i)), next));
                 if (result == .yes) return .yes;
             };
             return result;
         },
         // A local made from it, by each read of it.
         .initializes => |declaration| for (model.declarations, 0..) |decl, i| {
-            if (decl.kind == .variable and decl.node == declaration) return readsReleased(c, file, @fromBackingInt(@intCast(i)), next);
+            if (decl.kind == .variable and decl.node == declaration) return readsReleasedUnder(c, env, file, @fromBackingInt(@intCast(i)), next);
         },
         // A capture of it, by each read of it; a condition that captures nothing reads it for
         // its value only.
         .tested, .looped => {
             for (model.declarations, 0..) |decl, i| {
                 if (decl.kind != .capture or decl.node != parent or !captures(tree, parent, decl.token, node)) continue;
-                return readsReleased(c, file, @fromBackingInt(@intCast(i)), next);
+                return readsReleasedUnder(c, env, file, @fromBackingInt(@intCast(i)), next);
             }
             if (tree.fullIf(parent)) |branch| if (branch.payload_token == null) return .no;
             if (tree.fullWhile(parent)) |loop| if (loop.payload_token == null) return .no;
@@ -1022,6 +1041,28 @@ fn released(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
     }
     // Any other place it goes is not followed: it may be released there.
     return .unknown;
+}
+
+/// Whether the member read `access` is the callee of a call the reading `env` resolves to a
+/// function or a choice of them (`Facts.calls.under`).
+fn methodUnder(c: *Context, env: ?*const Facts.Env, file: Project.FileId, access: Ast.Node.Index) Context.Error!bool {
+    const reading = env orelse return false;
+    const call = (try Facts.calls.under(c.facts, reading, file, c.project.at(file).model.parentOf(access) orelse return false)) orelse return false;
+    if (call.callee_expr != access) return false;
+    return call.callee != .any;
+}
+
+/// The bindings to read the field read `node` in `file` under: those of the type function call
+/// that made `holder` (`Facts.Made`), where `node` is in that function's body; else none.
+fn instanceReading(c: *Context, holder: Facts.Container, file: Project.FileId, node: Ast.Node.Index) ?*const Facts.Env {
+    const made = holder.made_by orelse return null;
+    const env = made.env orelse return null;
+    if (file != made.function.file) return null;
+    const tree = &c.project.at(file).file.tree;
+    const function = c.project.at(file).model.declarations[@backingInt(made.function.index)].node;
+    const token = tree.firstToken(node);
+    if (token < tree.firstToken(function) or token > tree.lastToken(function)) return null;
+    return env;
 }
 
 /// Whether a copy stored into the place `target` names in `file` is `released`: a local's, by
@@ -1337,7 +1378,7 @@ fn holderReleased(c: *Context, holder: Facts.Container, name: []const u8, depth:
     for (try fieldUses(c, name)) |use| {
         const receiver = byPointer(try c.facts.resolve(use.file, use.receiver)) orelse continue;
         if (receiver.file != holder.file or receiver.scope != holder.scope) continue;
-        const answer = try released(c, use.file, use.node, depth + 1);
+        const answer = try releasedUnder(c, instanceReading(c, holder, use.file, use.node), use.file, use.node, depth + 1);
         result = join(result, if (use.named) answer else if (answer == .no) .no else .unknown);
         if (result == .yes) return .yes;
     }
@@ -1505,10 +1546,13 @@ fn unionProngs(c: *Context) Context.Error!*const UnionProngs {
 
 /// Whether some read of the declaration `id` in `file` is `released`.
 fn readsReleased(c: *Context, file: Project.FileId, id: Model.Declaration.Id, depth: u8) Context.Error!Stored {
+    return readsReleasedUnder(c, null, file, id, depth);
+}
+fn readsReleasedUnder(c: *Context, env: ?*const Facts.Env, file: Project.FileId, id: Model.Declaration.Id, depth: u8) Context.Error!Stored {
     var result: Stored = .no;
     for (c.project.at(file).model.references) |reference| {
         if (reference.declaration != id) continue;
-        result = join(result, try released(c, file, reference.node, depth));
+        result = join(result, try releasedUnder(c, env, file, reference.node, depth));
         if (result == .yes) return .yes;
     }
     return result;
@@ -2464,7 +2508,7 @@ fn releases(c: *Context, file: Project.FileId, node: Ast.Node.Index, decl: Model
         return null;
     }
     if (tree.fullIf(node)) |branch| {
-        if (branch.ast.else_expr != .none or try localOf(c, file, branch.ast.cond_expr) != decl) return null;
+        if (branch.ast.else_expr != .none or !try namesLocal(c, file, branch.ast.cond_expr, decl)) return null;
         const payload = branch.payload_token orelse return null;
         if (tree.tokenTag(payload) != .asterisk) return null;
         for (model.declarations, 0..) |record, i| {
@@ -2503,7 +2547,23 @@ fn releases(c: *Context, file: Project.FileId, node: Ast.Node.Index, decl: Model
             receiver = field.receiver.?; // unreachable: a member's step has its holder
         },
     }
-    return if (try localOf(c, file, receiver) == decl) node else null;
+    return if (try namesLocal(c, file, receiver, decl)) node else null;
+}
+
+/// The declaration of `file` the name `node` refers to (by `Facts.definition`), of any kind; a
+/// member read, a declaration elsewhere and one that does not resolve are none.
+fn declarationOf(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Model.Declaration.Id {
+    if (try Facts.accesses.memberRead(c.facts, file, node) != null) return null;
+    return switch (try c.facts.definition(file, node)) {
+        .decl => |found| if (found.file == file) found.index else null,
+        .none, .unknown => null,
+    };
+}
+
+/// Whether `node` names the declaration `decl` of `file` (by `Facts.definition`): a variable or
+/// a capture (`if (g) |*h| h.deinit()`); a member read is none.
+fn namesLocal(c: *Context, file: Project.FileId, node: Ast.Node.Index, decl: Model.Declaration.Id) Context.Error!bool {
+    return try declarationOf(c, file, node) == decl;
 }
 
 /// The call `value` is, through `try`, that hands on the guard `decl` holds into its value
@@ -2514,7 +2574,7 @@ fn movedBy(c: *Context, file: Project.FileId, value: Ast.Node.Index, decl: Model
     while (tree.nodeTag(at) == .@"try") at = Facts.ungrouped(tree, tree.nodeData(at).node);
     const call = (try Facts.calls.at(c.facts, file, at)) orelse return null;
     if (!try handedOn(c, file, &call)) return null;
-    return if (try localOf(c, file, Facts.ungrouped(tree, call.receiver.bound)) == decl) at else null;
+    return if (try namesLocal(c, file, Facts.ungrouped(tree, call.receiver.bound), decl)) at else null;
 }
 
 /// Whether a call hands the guard its receiver holds on into its value, which takes it from
@@ -3364,7 +3424,7 @@ fn carried(c: *Context, uses: *std.ArrayList(Facts.Key), name: []const u8) Conte
             .initializes => |declaration| local = declaredBy(model, declaration),
             .stored => |site| {
                 if (site.node != node) continue;
-                local = try localOf(c, use.file, site.target orelse continue);
+                local = try declarationOf(c, use.file, site.target orelse continue);
             },
             .returned => |ret| {
                 const function = enclosingFunction(model, tree, ret) orelse continue;
