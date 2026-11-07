@@ -19,6 +19,15 @@ const Ast = std.zig.Ast;
 /// The std resources A015 reads, as `containersOf` finds them.
 const resource_paths = [_][]const u8{ "Io.File", "Io.Dir", "Io.net.Stream", "Io.net.Server", "process.Child" };
 
+/// What releases a std resource, by std's declarations (`Governed.isStd`): its `close`, a
+/// server's `deinit` (it closes the listening socket), a child's `kill` or `wait`, and the
+/// system calls that close a handle. A std function that only shares a name is no release.
+const release_paths = [_][]const u8{ "Io.File.close", "Io.File.closeMany", "Io.Dir.close", "Io.Dir.closeMany", "Io.net.Stream.close", "Io.net.Socket.close", "Io.net.Socket.closeMany", "Io.net.Server.deinit", "process.Child.kill", "process.Child.wait", "os.linux.close", "os.windows.CloseHandle" };
+
+/// The fields that hold a std resource's own handle, by std's declarations: what writes or
+/// releases one writes or releases the resource.
+const handle_paths = [_][]const u8{ "Io.File.handle", "Io.Dir.handle", "Io.net.Stream.socket", "Io.net.Server.socket", "Io.net.Socket.handle" };
+
 /// A015: a std resource held by value in a field the program owns it through, or returned by the
 /// program's own function, outside aegis's `own.Owned`. A field is an owner where the program
 /// releases what it holds (`released`) or writes into it what is no view (`owns`): an owner a
@@ -751,7 +760,7 @@ fn writeOf(c: *Context, resources: []const ?Facts.Container, file: Project.FileI
     var use = try Facts.accesses.useOf(c.facts, file, node);
     if (use == .address) return addressWrite(c, resources, file, use.address);
     if (pointerCapture(tree, model, model.parentOf(node) orelse return .none, node)) return .address;
-    if (use == .member) switch (try handleOf(c, resources, file, use.member)) {
+    if (use == .member) switch (try handleOf(c, file, use.member)) {
         .yes => use = try Facts.accesses.useOf(c.facts, file, use.member),
         .no => {},
         .unknown => return .unknown,
@@ -765,19 +774,36 @@ fn writeOf(c: *Context, resources: []const ?Facts.Container, file: Project.FileI
     }
 }
 
-/// Whether the member read `access` in `file` is a std resource's `handle` field, by the
-/// declaration it names; unknown where it does not resolve.
-fn handleOf(c: *Context, resources: []const ?Facts.Container, file: Project.FileId, access: Ast.Node.Index) Context.Error!Facts.Is {
+/// Whether the member read `access` in `file` is a field holding a std resource's handle
+/// (`handle_paths`), by the declaration it names; unknown where it does not resolve.
+fn handleOf(c: *Context, file: Project.FileId, access: Ast.Node.Index) Context.Error!Facts.Is {
     const decl = switch (try c.facts.definition(file, access)) {
         .decl => |decl| decl,
         .none => return .no,
         .unknown => |why| return .{ .unknown = why },
     };
-    for (resources) |each| {
-        const handle = c.facts.member(each orelse continue, "handle") orelse continue;
-        if (std.meta.eql(handle, decl)) return .yes;
-    }
-    return .no;
+    return stdAmong(c, decl, &handle_paths);
+}
+
+/// Whether `decl` is one of std's declarations at `paths`; unknown where one does not resolve
+/// and none is it.
+fn stdAmong(c: *Context, decl: Facts.Decl, paths: []const []const u8) Context.Error!Facts.Is {
+    var unknown: ?Facts.Unknown = null;
+    for (paths) |path| switch (try Governed.isStd(c, decl, path)) {
+        .yes => return .yes,
+        .no => {},
+        .unknown => |why| unknown = why,
+    };
+    return if (unknown) |why| .{ .unknown = why } else .no;
+}
+
+/// Whether std's function `callee` releases a resource it is given (`release_paths`).
+fn stdReleases(c: *Context, callee: Facts.Decl) Context.Error!Stored {
+    return switch (try stdAmong(c, callee, &release_paths)) {
+        .yes => .yes,
+        .no => .no,
+        .unknown => .unknown,
+    };
 }
 
 /// How the field whose address `address` takes is written through it: by a copy of memory into
@@ -811,7 +837,7 @@ fn addressWrite(c: *Context, resources: []const ?Facts.Container, file: Project.
             // `p.*`: written as the field is.
             .dereferenced => |deref| try writeOf(c, resources, file, deref),
             // `p.handle`: written as the field is; another member is read.
-            .member => |access| switch (try handleOf(c, resources, file, access)) {
+            .member => |access| switch (try handleOf(c, file, access)) {
                 .yes => try writeOf(c, resources, file, reference.node),
                 .no => .none,
                 .unknown => .unknown,
@@ -990,11 +1016,12 @@ fn released(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
         .updated, .written, .discarded => return .no,
         // A destructure's value (a tuple) may hand it on.
         .destructured => return .unknown,
-        .member => |access| {
-            const name = tree.tokenSlice(tree.nodeData(access).node_and_token[1]);
-            if (std.mem.eql(u8, name, "handle")) return released(c, file, access, next);
-            if (!releasing(name)) return .no;
-            return if (try Facts.accesses.useOf(c.facts, file, access) == .callee) .yes else .no;
+        // Its handle, released as it is; a method called on it, by what the method does with
+        // its receiver (`argumentOf`); any other member is read for its value only.
+        .member => |access| switch (try handleOf(c, file, access)) {
+            .yes => return released(c, file, access, next),
+            .unknown => return .unknown,
+            .no => if (try Facts.accesses.useOf(c.facts, file, access) != .callee) return .no,
         },
         .returned => |ret| return releasedReturn(c, file, ret, next),
         // A copy stored: into a local, by each read of it; into another field, by each read of
@@ -1321,8 +1348,7 @@ fn madeHanded(c: *Context, call: *const Facts.calls.Call, position: usize, name:
     const Handed = struct { position: usize, name: []const u8, holder: ?Facts.Container, depth: u8 };
     return eachCallee(c, call, Handed{ .position = position, .name = name, .holder = holder, .depth = depth }, struct {
         fn by(h: Handed, cc: *Context, callee: Facts.Decl) Context.Error!Stored {
-            const record = cc.project.at(callee.file).model.declarations[@backingInt(callee.index)];
-            if (!try cc.facts.program(callee.file)) return if (releasing(record.name)) .yes else .no;
+            if (try cc.facts.standard(callee.file)) return stdReleases(cc, callee);
             const id = switch (parameterAt(cc, callee, h.position)) {
                 .declared => |id| id,
                 .none => return .no,
@@ -1543,11 +1569,6 @@ fn captures(tree: *const Ast, parent: Ast.Node.Index, token: Ast.TokenIndex, nod
     return false;
 }
 
-fn releasing(name: []const u8) bool {
-    for ([_][]const u8{ "close", "closeMany", "deinit", "kill", "wait" }) |each| if (std.mem.eql(u8, name, each)) return true;
-    return false;
-}
-
 /// Whether a call releases its argument at `position`: a program function by a release of that
 /// parameter in its body (`released`), std's by its name (`close`, `deinit`, `kill`, `wait`), a
 /// choice per build by each (`eachCallee`), and one that is no declared function (a function
@@ -1563,8 +1584,7 @@ fn releasesParameter(c: *Context, call: *const Facts.calls.Call, position: usize
 
 /// `releasesParameter` where the call is to `callee`, `position` among its parameters.
 fn releasesBy(c: *Context, callee: Facts.Decl, position: usize, depth: u8) Context.Error!Stored {
-    const record = c.project.at(callee.file).model.declarations[@backingInt(callee.index)];
-    if (!try c.facts.program(callee.file)) return if (releasing(record.name)) .yes else .no;
+    if (try c.facts.standard(callee.file)) return stdReleases(c, callee);
     _ = depth;
     return switch (parameterAt(c, callee, position)) {
         .declared => |id| summarized(c, .{ .of = .parameter, .decl = .{ .file = callee.file, .index = id } }),
@@ -1674,8 +1694,7 @@ fn handedElement(c: *Context, file: Project.FileId, tuple: Ast.Node.Index, posit
             const given: Handed = .{ .file = file, .call = argument.call, .at = std.mem.findScalar(Ast.Node.Index, args, tuple) orelse return .unknown, .position = position, .env = env, .depth = depth, .hops = hops + 1 };
             return eachCallee(c, &call, given, struct {
                 fn by(h: Handed, cc: *Context, callee: Facts.Decl) Context.Error!Stored {
-                    const record = cc.project.at(callee.file).model.declarations[@backingInt(callee.index)];
-                    if (!try cc.facts.program(callee.file)) return if (releasing(record.name)) .yes else .no;
+                    if (try cc.facts.standard(callee.file)) return stdReleases(cc, callee);
                     const id = switch (parameterAt(cc, callee, h.at)) {
                         .declared => |id| id,
                         .none => return .no,
