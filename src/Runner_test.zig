@@ -663,6 +663,100 @@ test "P006 leaves an entry's owning packages alone, and only them" {
     }
 }
 
+/// A run of P006 over a program (`app`), the package that declares the replacements (`airlock`)
+/// and one that does not import it (`lone`), every file selected; std a fixture of its own.
+fn replacedRun(airlock: []const u8) !glint.Report {
+    const P = glint.Project;
+    const inputs = [_]P.Input{
+        .{ .name = "app/main.zig", .package = "app", .fingerprint = 1, .bytes =
+        \\const std = @import("std");
+        \\const airlock = @import("airlock");
+        \\extern "c" fn fsync(fd: c_int) c_int;
+        \\pub fn main() void {
+        \\    std.posix.fdatasync(1);
+        \\    _ = fsync(1);
+        \\    airlock.syncFile(1);
+        \\    std.posix.read(1);
+        \\}
+        },
+        .{ .name = "airlock/root.zig", .package = "airlock", .fingerprint = 2, .bytes = airlock },
+        .{ .name = "lone/root.zig", .package = "lone", .fingerprint = 3, .bytes = "const std = @import(\"std\");\npub fn f() void {\n    std.posix.fdatasync(1);\n}\n" },
+        .{ .name = "std/std.zig", .selected = false, .bytes = "pub const posix = @import(\"posix.zig\");\n" },
+        .{ .name = "std/posix.zig", .selected = false, .bytes = "pub fn fdatasync(fd: i32) void {\n    _ = fd;\n}\npub fn read(fd: i32) void {\n    _ = fd;\n}\n" },
+    };
+    const imports = [_]P.Import{
+        .{ .from = 0, .spelling = "std", .target = 3 },
+        .{ .from = 0, .spelling = "airlock", .target = 1 },
+        .{ .from = 1, .spelling = "std", .target = 3 },
+        .{ .from = 2, .spelling = "std", .target = 3 },
+        .{ .from = 3, .spelling = "posix.zig", .target = 4 },
+    };
+    var project = try P.init(std.testing.allocator, &inputs, &imports, .{});
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.selections = &.{.{ .rule = .P006, .level = .gate }};
+    return glint.run(std.testing.allocator, &project, config);
+}
+
+test "P006 reads what a package declares it replaces: in every package that imports it, its own included, save the replacement and what only the replacement reaches" {
+    var report = try replacedRun(
+        \\const std = @import("std");
+        \\pub fn syncFile(fd: i32) void {
+        \\    std.posix.fdatasync(fd);
+        \\    flush(fd);
+        \\    helper(fd);
+        \\}
+        \\fn flush(fd: i32) void {
+        \\    deeper(fd);
+        \\}
+        \\fn deeper(fd: i32) void {
+        \\    std.posix.fdatasync(fd);
+        \\}
+        \\pub fn other(fd: i32) void {
+        \\    std.posix.fdatasync(fd);
+        \\}
+        \\fn helper(fd: i32) void {
+        \\    std.posix.fdatasync(fd);
+        \\}
+        \\pub const hook: *const fn (i32) void = &helper;
+        \\pub const lint_rules = .{
+        \\    .version = 1,
+        \\    .replaces = .{
+        \\        .{ .std = std.posix.fdatasync, .with = syncFile, .why = "durability belongs to airlock" },
+        \\        .{ .symbol = "fsync", .with = syncFile, .why = "durability belongs to airlock" },
+        \\    },
+        \\};
+    );
+    defer report.deinit();
+    try std.testing.expect(report.complete);
+    // The program's fdatasync and its own fsync; airlock's `other` and its handed-out `helper`.
+    // syncFile, and flush and deeper, which only it reaches, are the replacement's own; `lone`
+    // does not import airlock; `read` is not replaced.
+    // By file (0 the program, 1 airlock) and line.
+    var lines: [8]u32 = undefined;
+    var n: usize = 0;
+    for (report.diagnostics) |d| {
+        try std.testing.expectEqual(glint.Rule.P006, d.rule);
+        try std.testing.expect(std.mem.find(u8, d.message, "replaced by airlock: durability belongs to airlock; use syncFile") != null);
+        lines[n] = d.span.file.raw() * 100 + d.span.line;
+        n += 1;
+    }
+    std.mem.sort(u32, lines[0..n], {}, std.sort.asc(u32));
+    try std.testing.expectEqualSlices(u32, &.{ 5, 6, 114, 117 }, lines[0..n]);
+}
+
+test "P006 leaves a site undecided where its function's callers cannot all be read" {
+    // A chain of private functions deeper than the reading follows, each called once by the next.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    try text.appendSlice(std.testing.allocator, "const std = @import(\"std\");\npub fn syncFile(fd: i32) void {\n    step0(fd);\n}\n");
+    for (0..10) |i| try text.print(std.testing.allocator, "fn step{d}(fd: i32) void {{\n    step{d}(fd);\n}}\n", .{ i, i + 1 });
+    try text.appendSlice(std.testing.allocator, "fn step10(fd: i32) void {\n    std.posix.fdatasync(fd);\n}\npub const lint_rules = .{ .version = 1, .replaces = .{.{ .std = std.posix.fdatasync, .with = syncFile, .why = \"durability belongs to airlock\" }} };\n");
+    var report = try replacedRun(text.items);
+    defer report.deinit();
+    try std.testing.expect(!report.complete);
+}
+
 test "P006 configuration needs a symbol without dots, or a source and a path" {
     var config = glint.Config.none();
     config.disallowed = &.{.{ .declaration = "c.fsync", .reason = "durability", .replacement = "airlock" }};
