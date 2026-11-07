@@ -672,6 +672,7 @@ fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!b
             if (declared == .alternatives) {
                 for (declared.alternatives) |one| switch (one) {
                     .container, .instance => |held| if (c.facts.member(held, read) != null) return false,
+                    .alternatives => unreachable, // unreachable: choose never nests alternatives
                     else => return false,
                 };
                 continue;
@@ -683,8 +684,11 @@ fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!b
                 .pointer => |to| switch (to.child.*) {
                     .container, .instance => |held| held,
                     .array, .primitive, .scalar => if (sequence) return false else continue,
+                    // A pointer to a choice of types: not refuted by one of them.
+                    .alternatives => return false,
                     else => return false,
                 },
+                .alternatives => unreachable, // unreachable: a choice of types is read above
                 else => return false,
             };
             if (c.facts.member(holder, read) != null) return false;
@@ -693,6 +697,8 @@ fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!b
             // atomic, a mutex or a condition used as one is not this field.
             const held = switch (declared) {
                 .container, .instance => |held| held,
+                // A choice of types: not refuted by one of them.
+                .alternatives => return false,
                 else => return false,
             };
             if (!plainStruct(c, held)) return false;
@@ -756,6 +762,8 @@ fn publishedContainer(c: *Context, target: PackageRules.Target) Context.Error!?F
         .function => |function| {
             if (try c.facts.template(function)) |made| switch (made) {
                 .container, .instance => |container| return container,
+                // A choice of made types is no one container: the body's first is read.
+                .alternatives => {},
                 else => {},
             };
             const model = &c.project.at(function.file).model;
@@ -914,10 +922,15 @@ fn fallibleResult(c: *Context, file: Project.FileId, node: Ast.Node.Index) Conte
     const proto = tree.fullFnProto(&buffer, record.node) orelse return false;
     const result = proto.ast.return_type.unwrap() orelse return false;
     if (Model.inferredErrors(tree, result)) return true;
-    return switch (try c.facts.resolve(decl.file, result)) {
-        .optional, .error_union, .unknown => true,
+    const value = try c.facts.resolve(decl.file, result);
+    var each: Facts.Join = .{};
+    // Fallible where any build's result may fail or give null.
+    for (Facts.valueParts(&value)) |part| each.add(part, switch (part) {
+        .optional, .error_union => true,
+        .alternatives => unreachable, // unreachable: valueParts gives no choice as a part
         else => false,
-    };
+    });
+    return each.any() != false;
 }
 
 /// Whether the call at `node` ends a local logical obligation: a release, or a move into storage
@@ -1010,6 +1023,8 @@ fn recordOf(value: Facts.Value) ?Facts.Container {
         .pointer => |inner| inner.child.*,
         .optional, .error_union => |inner| inner.*,
         .instance, .container => |container| return container,
+        // A choice of types is no one container: each caller reads that as unknown.
+        .alternatives => return null,
         else => return null,
     };
 }
@@ -1023,10 +1038,13 @@ fn recordOwned(c: *Context, value: Facts.Value) Context.Error!bool {
     while (true) current = switch (current) {
         .error_union => |inner| inner.*,
         .optional => |inner| inner.*,
+        .alternatives => break,
         else => break,
     };
     const container = switch (current) {
         .instance => |container| container,
+        // A choice of record types is no one record: the caller keeps the value unknown.
+        .alternatives => return false,
         else => return false,
     };
     var paths: std.ArrayList([]const Facts.Decl) = .empty;
@@ -1063,6 +1081,8 @@ fn ownerPaths(c: *Context, container: Facts.Container, prefix: []const Facts.Dec
                 .owner, .unknown => {
                     const record = switch (inner) {
                         .instance => |record| record,
+                        // A field of a choice of types: its owners are not all known.
+                        .alternatives => return false,
                         else => return false,
                     };
                     const path = try std.mem.concat(c.allocator, Facts.Decl, &.{ prefix, &.{field.decl orelse return false} });
@@ -1544,7 +1564,7 @@ fn boundBy(c: *Context, tree: *const Ast, call: Facts.calls.Call, rule: Rule, fu
             try c.undecided(rule, tree.tokenStart(name_token), .unsupported, "a generic of more parameters than are read here copies some: its binding may copy an owner");
             return false;
         }
-        types[count] = if (param.type_expr) |t| try typeKeyword(c, function.file, t) else false;
+        types[count] = if (param.type_expr) |t| try typeKeyword(c, function.file, t) == true else false;
         values[count] = param.anytype_ellipsis3 != null;
     }
     // The generic's casts this binding makes an aegis scalar's: one finding at the binding,
@@ -1602,7 +1622,7 @@ fn boundBy(c: *Context, tree: *const Ast, call: Facts.calls.Call, rule: Rule, fu
             continue;
         }
         // A pointer type: its copies are aliases, which A002 leaves out.
-        if (pointerShaped(value)) continue;
+        if (pointerShaped(value) == true) continue;
         // A type argument stands for its values.
         const bound = switch (value) {
             .container => |container| Facts.Value{ .instance = container },
@@ -1754,7 +1774,7 @@ fn copiedPlace(c: *Context, tree: *const Ast, copy: Ast.Node.Index, init: Ast.No
     if (try plainValue(c, c.file, node, 0)) return;
     // A copied pointer is an alias, which this rule leaves out, whatever it points at.
     const value = try c.facts.resolve(c.file, node);
-    if (pointerShaped(value)) return;
+    if (pointerShaped(value) == true) return;
     // An owner itself, or a struct, union or tuple of the program's holding one in a field.
     const k = (try requiredOwner(c, node, copies, tree.nodeMainToken(node))) orelse switch (try fieldOwner(c, value, 0)) {
         .owner => |held| held,
@@ -1819,7 +1839,7 @@ fn fieldOwner(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed
         // A union's field with no type holds `void`.
         const t = field.ast.type_expr.unwrap() orelse continue;
         const held = try c.facts.resolve(container.file, t);
-        if (pointerShaped(held)) continue;
+        if (pointerShaped(held) == true) continue;
         switch (try fieldOwner(c, held, depth + 1)) {
             .owner => |k| if (copiedOwner(k)) return .{ .owner = k },
             .other => {},
@@ -1912,7 +1932,7 @@ fn checkStoredBorrow(c: *Context, tree: *const Ast, store: Ast.Node.Index, targe
         break :blk decl.kind == .parameter or (decl.kind == .variable and containerLevel(c, tree, decl.node));
     } else true;
     // A local's own storage, unless it holds a pointer the store goes through.
-    if (!outer and (root == target or !pointerShaped(try c.facts.resolve(c.file, root)))) return;
+    if (!outer and (root == target or pointerShaped(try c.facts.resolve(c.file, root)) == false)) return;
     var walk: Exposure = .{ .c = c };
     if (try walk.carries(value, 0)) {
         if (ref.declaration == null) return c.undecided(copies, tree.tokenStart(tree.nodeMainToken(store)), .unresolved, "a secret/guard borrow stored where the place does not resolve may outlive its capability");
@@ -1987,7 +2007,7 @@ const Exposure = struct {
                 const path = try Facts.accesses.pathOf(c.facts, c.file, node);
                 const whole = path.steps[1].node;
                 if (try plainValue(c, c.file, node, 0)) return false;
-                if (scalarShaped(c, try c.facts.resolve(c.file, node))) return false;
+                if (scalarShaped(c, try c.facts.resolve(c.file, node)) == true) return false;
                 return e.carries(whole, depth + 1);
             },
             .identifier => {
@@ -2032,7 +2052,7 @@ const Exposure = struct {
             const callee = try Facts.accesses.pathOf(c.facts, c.file, call.ast.fn_expr);
             if (callee.steps.len >= 2 and callee.steps[0].kind == .field) given = try e.carries(callee.steps[1].node, depth + 1);
             for (call.ast.params) |arg| given = given or try e.carries(arg, depth + 1);
-            if (given and !scalarShaped(c, try c.facts.resolve(c.file, node))) e.unknown = e.unknown orelse node;
+            if (given and scalarShaped(c, try c.facts.resolve(c.file, node)) != true) e.unknown = e.unknown orelse node;
         }
         return false;
     }
@@ -2052,7 +2072,7 @@ const Exposure = struct {
         for (none) |each| if (std.mem.eql(u8, name, each)) return false;
         // Any other builtin given a borrow gives a value this does not follow.
         for (args) |arg| if (try e.carries(arg, depth + 1)) {
-            if (!scalarShaped(c, try c.facts.resolve(c.file, node))) e.unknown = e.unknown orelse node;
+            if (scalarShaped(c, try c.facts.resolve(c.file, node)) != true) e.unknown = e.unknown orelse node;
             return false;
         };
         return false;
@@ -2060,14 +2080,17 @@ const Exposure = struct {
 };
 
 /// Whether a value is a number, a truth value, an enum's tag or nothing: no pointer in it.
-fn scalarShaped(c: *Context, value: Facts.Value) bool {
-    return switch (value) {
+fn scalarShaped(c: *Context, value: Facts.Value) ?bool {
+    var each: Facts.Join = .{};
+    for (Facts.valueParts(&value)) |part| each.add(part, switch (part) {
         .primitive => |name| !std.mem.eql(u8, name, "anyopaque"),
         .error_union => |inner| scalarShaped(c, inner.*),
         // An enum's tag, by the keyword its container is declared with (`Facts.kindOf`).
         .instance => |container| c.facts.kindOf(container) == .keyword_enum,
+        .alternatives => unreachable, // unreachable: valueParts gives no choice as a part
         else => false,
-    };
+    });
+    return each.agreed();
 }
 
 /// Whether an owner of kind `k` may move by assignment: no erasure owed to the bytes left
@@ -2468,12 +2491,15 @@ fn addressed(c: *Context, node: Ast.Node.Index) Context.Error!?Ast.Node.Index {
     return tree.nodeData(operand).node;
 }
 
-fn pointerShaped(value: Facts.Value) bool {
-    return switch (value) {
+fn pointerShaped(value: Facts.Value) ?bool {
+    var each: Facts.Join = .{};
+    for (Facts.valueParts(&value)) |part| each.add(part, switch (part) {
         .pointer => true,
-        .optional => |inner| inner.* == .pointer,
+        .optional => |inner| pointerShaped(inner.*),
+        .alternatives => unreachable, // unreachable: valueParts gives no choice as a part
         else => false,
-    };
+    });
+    return each.agreed();
 }
 fn ownedValue(c: *Context, node: Ast.Node.Index, depth: usize) Context.Error!bool {
     if (depth == 64) return false;
@@ -2484,7 +2510,7 @@ fn ownedValue(c: *Context, node: Ast.Node.Index, depth: usize) Context.Error!boo
     const v = tree.fullVarDecl(decl.node) orelse return false;
     if (v.ast.type_node.unwrap()) |t| {
         if (tree.fullPtrType(t) != null) return false;
-        if (try typeKeyword(c, c.file, t)) return false;
+        if (try typeKeyword(c, c.file, t) == true) return false;
         return try Contract.owner(c, t) != null;
     }
     var init = v.ast.init_node.unwrap() orelse return false;
@@ -5021,11 +5047,15 @@ fn memberNamed(c: *Context, file: Project.FileId, read: Ast.Node.Index) Context.
 }
 
 /// Whether `node` names the type `type`, by what it resolves to.
-fn typeKeyword(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
-    return switch (try c.facts.resolve(file, node)) {
+fn typeKeyword(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?bool {
+    const value = try c.facts.resolve(file, node);
+    var each: Facts.Join = .{};
+    for (Facts.valueParts(&value)) |part| each.add(part, switch (part) {
         .primitive => |primitive| std.mem.eql(u8, primitive, "type"),
+        .alternatives => unreachable, // unreachable: valueParts gives no choice as a part
         else => false,
-    };
+    });
+    return each.agreed();
 }
 
 /// The token declaring the local or global the name `node` reaches, by the model's resolution;
@@ -5785,7 +5815,7 @@ fn allocationUse(c: *Context, file: Project.FileId, use: Ast.Node.Index, depth: 
     const body = &c.project.at(function.file).file.tree;
     const scope = c.project.at(function.file).model.parentOf(c.project.at(function.file).model.declarations[@backingInt(function.index)].node) orelse return .{ .unknown = parent };
     switch (try beforeAdoption(c, function.file, parameter, .root, body.lastToken(scope) + 1, depth + 1)) {
-        .whole => return if (scalarShaped(c, try c.facts.resolve(file, parent))) .whole else .{ .unknown = parent },
+        .whole => return if (scalarShaped(c, try c.facts.resolve(file, parent)) == true) .whole else .{ .unknown = parent },
         .spoiled => |found| return .{ .spoiled = .{ .at = parent, .what = found.what } },
         .unknown => return .{ .unknown = parent },
     }
