@@ -1197,6 +1197,7 @@ fn perBuild(c: *Context, value: Facts.Value) Context.Error!Typed {
         .pointer => |payload| payload.child.*,
         .array, .optional, .error_union => |payload| payload.*,
         .reified => |built| built.fields.*,
+        .alternatives => break,
         else => break,
     };
     if (current != .alternatives) return typed(c.facts, value, 0);
@@ -1294,10 +1295,17 @@ fn heldInRecord(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typ
     var current = value;
     while (true) current = switch (current) {
         .array, .optional, .error_union => |inner| inner.*,
+        .alternatives => break,
         else => break,
     };
     const container = switch (current) {
         .instance => |container| container,
+        // A choice of types holds what any of them does.
+        .alternatives => |each| {
+            var found: Typed = .other;
+            for (each) |one| found = joined(found, try heldInRecord(c, one, depth + 1));
+            return found;
+        },
         else => return .other,
     };
     if (try c.inLibrary(Contract.library, container.file)) return .other;
@@ -1336,10 +1344,17 @@ fn carried(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
     var current = value;
     while (true) current = switch (current) {
         .array, .optional, .error_union => |inner| inner.*,
+        .alternatives => break,
         else => break,
     };
     return switch (current) {
         .instance => |container| heldIn(c, container, .read_here, depth + 1),
+        // A choice of types carries what any of them does.
+        .alternatives => |each| blk: {
+            var found: Typed = .other;
+            for (each) |one| found = joined(found, try carried(c, one, depth + 1));
+            break :blk found;
+        },
         else => .unknown,
     };
 }
@@ -1350,6 +1365,11 @@ fn bindingTyped(value: Facts.Value) bool {
         .pointer => |inner| inner.child.*,
         .array, .optional, .error_union => |inner| inner.*,
         .unknown => |why| return why == .generic,
+        // A choice of types is the binding's only where each of them is.
+        .alternatives => |each| {
+            for (each) |one| if (!bindingTyped(one)) return false;
+            return each.len != 0;
+        },
         else => return false,
     };
 }
@@ -1624,10 +1644,7 @@ fn boundBy(c: *Context, tree: *const Ast, call: Facts.calls.Call, rule: Rule, fu
         // A pointer type: its copies are aliases, which A002 leaves out.
         if (pointerShaped(value) == true) continue;
         // A type argument stands for its values.
-        const bound = switch (value) {
-            .container => |container| Facts.Value{ .instance = container },
-            else => value,
-        };
+        const bound = try instanceOf(c, value);
         if (copy.kind == .made) {
             const site = c.project.at(copy.site.file).file;
             const line = site.line(site.tree.tokenStart(site.tree.firstToken(copy.site.node))) + 1;
@@ -1814,6 +1831,12 @@ fn fieldOwner(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed
     const container = switch (value) {
         .array, .optional, .error_union => |inner| return fieldOwner(c, inner.*, depth + 1),
         .instance, .container => |container| container,
+        // A choice of types holds what any of them does.
+        .alternatives => |each| {
+            var found: Typed = .other;
+            for (each) |one| found = joined(found, try fieldOwner(c, one, depth + 1));
+            return found;
+        },
         else => return .other,
     };
     switch (try typed(c.facts, value, 0)) {
@@ -1878,6 +1901,10 @@ fn sharedReturn(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Err
         // A field or an element read through a pointer dereferences it.
         .field, .index, .slice => switch (try c.facts.resolve(c.file, below.node)) {
             .pointer, .unknown => shared = true,
+            // Through a pointer where any build's operand is one.
+            .alternatives => |each| for (each) |one| {
+                if (one == .pointer or one == .unknown) shared = true;
+            },
             else => {},
         },
         .unwrap, .root => {},
@@ -2224,6 +2251,13 @@ fn capturedMoved(c: *Context, holder: Ast.Node.Index) Context.Error!Is {
         if (tree.fullFor(holder) != null) for (parts.results) |result| switch (try c.facts.resolve(c.file, result)) {
             .pointer => return .no,
             .unknown => |why| unknown = why,
+            // A pointer in some builds: copied in those, moved in the rest.
+            .alternatives => |each| for (each) |one| switch (one) {
+                .pointer => unknown = unknown orelse .unsupported,
+                .unknown => |why| unknown = why,
+                .alternatives => unreachable, // unreachable: choose never nests alternatives
+                else => {},
+            },
             else => {},
         };
         // Any other shape, decided by its value's type.
@@ -3098,10 +3132,13 @@ fn unlisted(c: *Context, call: Ast.Node.Index) Context.Error!bool {
     if (try Contract.owner(c, call) != null) return false;
     const value = switch (try c.facts.resolve(c.file, call)) {
         .error_union => |payload| payload.*,
+        .alternatives => |each| Facts.Value{ .alternatives = each },
         else => |value| value,
     };
     const container = switch (value) {
         .instance => |container| container,
+        // A choice of types is no one type the contract leaves out: the result may owe.
+        .alternatives => return false,
         else => return false,
     };
     if (try c.role(Contract.library, value) != null) return false;
@@ -3165,6 +3202,15 @@ fn pointerResult(c: *Context, function: Facts.Decl) Context.Error!bool {
     var value = try c.facts.resolve(function.file, proto.ast.return_type.unwrap() orelse return false);
     while (true) value = switch (value) {
         .error_union, .optional => |inner| inner.*,
+        // A pointer only where every build's result is one.
+        .alternatives => |each| {
+            for (each) |one| {
+                var part = one;
+                while (part == .error_union or part == .optional) part = if (part == .error_union) part.error_union.* else part.optional.*;
+                if (part != .pointer) return false;
+            }
+            return each.len != 0;
+        },
         else => return value == .pointer,
     };
 }
@@ -4564,6 +4610,11 @@ const Flow = struct {
             .field, .index, .unwrap => switch (try f.c.facts.resolve(f.c.file, below.node)) {
                 .pointer => return true,
                 .unknown => return false,
+                // Through a pointer only where every build's operand is one, as one not known is not.
+                .alternatives => |each| {
+                    for (each) |one| if (one != .pointer) return false;
+                    return each.len != 0;
+                },
                 else => {},
             },
             .slice, .root => return false,
@@ -5371,9 +5422,18 @@ const scalar_arithmetic = [_][]const u8{ "@divTrunc", "@divFloor", "@divExact", 
 
 /// A type's values: a container type stands for its instances.
 fn instanceOf(c: *Context, value: Facts.Value) Context.Error!Facts.Value {
-    _ = c;
     return switch (value) {
         .container => |container| .{ .instance = container },
+        // A choice of types stands for a choice of their values.
+        .alternatives => |each| blk: {
+            const parts = try c.allocator.alloc(Facts.Value, each.len);
+            for (each, parts) |one, *part| part.* = switch (one) {
+                .container => |container| .{ .instance = container },
+                .alternatives => unreachable, // unreachable: choose never nests alternatives
+                else => one,
+            };
+            break :blk .{ .alternatives = parts };
+        },
         else => value,
     };
 }
