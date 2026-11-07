@@ -90,17 +90,51 @@ const depth_limit = 12;
 /// answer that clears nothing.
 const expression_tokens = @as(File.Limits, .{}).expression_tokens;
 
+const accesses = Facts.accesses;
+const Op = @FieldType(accesses.Operator, "op");
+
+/// The form of the syntax `node` is (`Facts.accesses.formOf`).
+fn formAt(tree: *const Ast, node: Ast.Node.Index) accesses.Form {
+    return accesses.formOf(tree.nodeTag(node));
+}
+
+/// The operation `node` makes where it is an operator a past-range value stops (`a + b`, not
+/// `a +% b`, `a +| b` or `a += b`); null for anything else.
+fn checkedOp(tree: *const Ast, node: Ast.Node.Index) ?Op {
+    if (formAt(tree, node) != .operator) return null;
+    const operator = accesses.operatorOf(tree.nodeTag(node)) orelse return null;
+    return if (operator.overflow == .checked) operator.op else null;
+}
+
+/// Whether `node` is the checked compound assignment of `op` (`a += b`, not `a +%= b`).
+fn updates(tree: *const Ast, node: Ast.Node.Index, op: Op) bool {
+    if (formAt(tree, node) != .compound_assign) return false;
+    const operator = accesses.operatorOf(tree.nodeTag(node)) orelse return false;
+    return operator.op == op and operator.overflow == .checked;
+}
+
+/// The reference `node` makes by its name, where it is a name a declaration may stand behind; an
+/// enum literal the model also records is none (`Model.reference`).
+fn nameRef(model: *const Model, node: Ast.Node.Index) ?Model.Reference {
+    const reference = model.reference(node) orelse return null;
+    return if (reference.unknown == .literal_context) null else reference;
+}
+
+/// Whether a store's target is `_`, which discards: only a name can spell it.
+fn discards(tree: *const Ast, target: Ast.Node.Index) bool {
+    return formAt(tree, target) == .leaf and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_");
+}
+
 /// Whether arithmetic `node` (`+`, `*`, `-` and their assignments) cannot overflow its type
 /// whatever its operands' ranges hold, at every pointer width, and an unsigned difference
 /// cannot underflow.
 pub fn fits(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
     // Every path to it shows it within its type.
     const tree = &c.project.at(file).file.tree;
-    const tag = tree.nodeTag(node);
-    const assigns = switch (tag) {
-        .assign_add, .assign_sub, .assign_mul => true,
-        else => false,
-    };
+    const assigns = updates(tree, node, .add) or updates(tree, node, .sub) or updates(tree, node, .mul);
+    const direct = checkedOp(tree, node);
+    const multiplies = direct == .mul or updates(tree, node, .mul);
+    const subtracts = direct == .sub or updates(tree, node, .sub);
     const lhs, const rhs = tree.nodeData(node).node_and_node;
     for (widths(c)) |pointer| {
         const typed = if (assigns) try typeOf(c, file, lhs, pointer, 0) else try typeOf(c, file, node, pointer, 0);
@@ -108,13 +142,12 @@ pub fn fits(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
             .int => |int| int,
             else => return false,
         };
-        const subtracts = tag == .sub or tag == .assign_sub;
         // A midpoint, `a + (b - a) / k`, is at most `b`: it fits where `b` does (the
         // difference's own underflow is judged where it is taken).
-        if (tag == .add and midpoint(tree, lhs, rhs)) continue;
+        if (direct == .add and midpoint(tree, lhs, rhs)) continue;
         // A remainder spelled out (`y - @divFloor(y, k) * k`) is below `k` and never below 0
         // where `y` is not.
-        if (tag == .sub and try remainder(c, file, lhs, rhs) != null) continue;
+        if (direct == .sub and try remainder(c, file, lhs, rhs) != null) continue;
         // An unsigned difference is clear where what it takes away is known to be no more
         // than what it takes from.
         if (subtracts and !int.signed) {
@@ -127,16 +160,13 @@ pub fn fits(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
         if (int.signed and literal(tree, rhs) != null) {
             const k = literal(tree, rhs).?;
             if (subtracts and try ordered(c, file, node, lhs, rhs, pointer)) continue;
-            if (!subtracts and tag != .mul and tag != .assign_mul) {
+            if (!subtracts and !multiplies) {
                 if (try upper(c, file, lhs, node, pointer, 0)) |most| if (atMost(most +| k, int.room())) continue;
             }
         }
         const left = (try bound(c, file, lhs, pointer, 0)) orelse return false;
         const right = (try bound(c, file, rhs, pointer, 0)) orelse return false;
-        const needed = switch (tag) {
-            .mul, .assign_mul => left *| right,
-            else => left +| right,
-        };
+        const needed = if (multiplies) left *| right else left +| right;
         if (!atMost(needed, int.room())) return false;
     }
     return true;
@@ -168,8 +198,8 @@ pub fn converts(c: *Context, file: Project.FileId, node: Ast.Node.Index, operand
 /// peer's number. A `bool` holds no number; a value of the type's whole range, or a type the
 /// reading does not know, shows none.
 pub fn shown(c: *Context, file: Project.FileId, value: Ast.Node.Index, declared_file: Project.FileId, declared: Ast.Node.Index) Context.Error!bool {
-    const types = &c.project.at(declared_file).file.tree;
-    if (types.nodeTag(declared) == .identifier and std.mem.eql(u8, types.tokenSlice(types.nodeMainToken(declared)), "bool")) return true;
+    const declared_value = try c.facts.resolve(declared_file, declared);
+    if (declared_value == .primitive and std.mem.eql(u8, declared_value.primitive, "bool")) return true;
     for (widths(c)) |pointer| {
         const into = (try named(c, declared_file, declared, pointer)) orelse return false;
         const most = (try bound(c, file, value, pointer, 0)) orelse return false;
@@ -188,7 +218,7 @@ pub fn shown(c: *Context, file: Project.FileId, value: Ast.Node.Index, declared_
 /// program's.
 fn upperByConstant(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: Ast.Node.Index, pointer: u16) Context.Error!?Magnitude {
     const tree = &c.project.at(file).file.tree;
-    if (tree.nodeTag(node) != .identifier and tree.nodeTag(node) != .field_access) return null;
+    if (nameRef(&c.project.at(file).model, node) == null and formAt(tree, node) != .member) return null;
     var out: ?Magnitude = null;
     for (try facts(c, file, at)) |fact| {
         const base, const k = offset(tree, fact.small);
@@ -210,20 +240,7 @@ fn upperByConstant(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: 
 
 /// The value a conversion or grouping holds (`@as(u64, n)`, `(n)`), whose comparisons are its.
 fn unwrapped(c: *Context, file: Project.FileId, value: Ast.Node.Index) Ast.Node.Index {
-    const tree = &c.project.at(file).file.tree;
-    var at = value;
-    while (true) {
-        switch (tree.nodeTag(at)) {
-            .grouped_expression => at = tree.nodeData(at).node_and_token[0],
-            .builtin_call_two, .builtin_call_two_comma => {
-                const name = tree.tokenSlice(tree.nodeMainToken(at));
-                var buffer: [2]Ast.Node.Index = undefined;
-                const args = Facts.builtinArgs(tree, at, &buffer);
-                if (std.mem.eql(u8, name, "@as") and args.len == 2) at = args[1] else if (std.mem.eql(u8, name, "@intCast") and args.len == 1) at = args[0] else return at;
-            },
-            else => return at,
-        }
-    }
+    return bare(&c.project.at(file).file.tree, value);
 }
 
 /// Whether a type expression names an integer type.
@@ -259,7 +276,7 @@ fn bound(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16, 
 /// as a value, not a magnitude.
 fn upper(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: Ast.Node.Index, pointer: u16, depth: u8) Context.Error!?Magnitude {
     const tree = &c.project.at(file).file.tree;
-    if (tree.nodeTag(node) != .identifier and tree.nodeTag(node) != .field_access) return null;
+    if (nameRef(&c.project.at(file).model, node) == null and formAt(tree, node) != .member) return null;
     var out: ?Magnitude = null;
     // A position the function indexes or slices memory with is below a length, and so is one
     // read below a length where it is used (a std search's in what it searched).
@@ -313,74 +330,67 @@ fn nonnegativeIn(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: As
     // (its sign is the divisor's), `x & mask` by a literal mask.
     const value = bare(tree, node);
     if (literal(tree, value) != null) return true;
-    switch (tree.nodeTag(value)) {
-        .bit_and => {
-            const lhs, const rhs = tree.nodeData(value).node_and_node;
-            return literal(tree, lhs) != null or literal(tree, rhs) != null;
-        },
-        .add, .mul, .add_sat, .mul_sat => {
-            const lhs, const rhs = tree.nodeData(value).node_and_node;
-            return try nonnegativeIn(c, file, lhs, at, pointer, next, assumed) and try nonnegativeIn(c, file, rhs, at, pointer, next, assumed);
-        },
-        .div => {
-            const lhs, const rhs = tree.nodeData(value).node_and_node;
-            return (literal(tree, rhs) orelse 0) > 0 and try nonnegativeIn(c, file, lhs, at, pointer, next, assumed);
-        },
-        .builtin_call_two, .builtin_call_two_comma => {
-            const name = tree.tokenSlice(tree.nodeMainToken(value));
-            var buffer: [2]Ast.Node.Index = undefined;
-            const args = Facts.builtinArgs(tree, value, &buffer);
-            if (std.mem.eql(u8, name, "@abs")) return true;
-            // A count of bits, or a bool's 0 or 1.
-            for ([_][]const u8{ "@ctz", "@clz", "@popCount", "@intFromBool" }) |count| if (std.mem.eql(u8, name, count)) return true;
-            if (args.len == 1 and std.mem.eql(u8, name, "@intCast")) return nonnegativeIn(c, file, args[0], at, pointer, next, assumed);
-            if (args.len != 2) return false;
-            if (std.mem.eql(u8, name, "@as")) return nonnegativeIn(c, file, args[1], at, pointer, next, assumed);
-            if (std.mem.eql(u8, name, "@max")) return literal(tree, args[0]) != null or literal(tree, args[1]) != null;
-            if (std.mem.eql(u8, name, "@mod")) return (literal(tree, args[1]) orelse 0) > 0;
-            if (std.mem.eql(u8, name, "@rem")) return (literal(tree, args[1]) orelse 0) > 0 and try nonnegativeIn(c, file, args[0], at, pointer, next, assumed);
-            if (std.mem.eql(u8, name, "@divTrunc") or std.mem.eql(u8, name, "@divFloor")) return (literal(tree, args[1]) orelse 0) > 0 and try nonnegativeIn(c, file, args[0], at, pointer, next, assumed);
-        },
-        .identifier => {
-            const model = &c.project.at(file).model;
-            const d = (model.reference(value) orelse return false).declaration orelse return false;
-            if (assumed.local == d) return true;
-            const record = model.declarations[@backingInt(d)];
-            if (record.kind != .variable) return false;
-            const variable = tree.fullVarDecl(record.node) orelse return false;
-            const init = variable.ast.init_node.unwrap() orelse return false;
-            if (tree.tokenTag(variable.ast.mut_token) == .keyword_const or try kept(c, file, value, record.node, at)) return nonnegativeIn(c, file, init, init, pointer, next, assumed);
-            // A variable every value of which is at zero or above: its initializer and what
-            // each assignment gives it, its own reads in them taken as such.
-            if (assumed.local != null) return false;
-            const inductive: Assumed = .{ .local = d, .skip = assumed.skip };
-            if (!try nonnegativeIn(c, file, init, init, pointer, next, inductive)) return false;
-            for (tree.nodes.items(.tag), 0..) |tag, i| {
-                const assignment: Ast.Node.Index = @fromBackingInt(@intCast(i));
-                switch (tag) {
-                    .assign, .assign_add, .assign_mul, .assign_add_sat, .assign_mul_sat => {},
-                    .assign_sub, .assign_sub_wrap, .assign_add_wrap, .assign_mul_wrap, .assign_sub_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor => {
-                        const target = tree.nodeData(assignment).node_and_node[0];
-                        if (tree.nodeTag(target) == .identifier) if (model.reference(target)) |r| if (r.declaration == d) return false;
-                        continue;
-                    },
-                    else => continue,
-                }
-                const target, const given = tree.nodeData(assignment).node_and_node;
-                if (tree.nodeTag(target) != .identifier) continue;
-                const ref = model.reference(target) orelse continue;
-                if (ref.declaration != d) continue;
-                if (assumed.skip == assignment) continue;
-                if (!try nonnegativeIn(c, file, given, given, pointer, next, inductive)) return false;
-            }
-            // Any other write is none the induction reads: its address handed on lets a callee
-            // write it, and a destructuring or an `asm` output writes it directly.
-            if (try written(c, file, d)) return false;
-            return true;
-        },
-        else => {},
+    if (formAt(tree, value) == .operator) if (accesses.operatorOf(tree.nodeTag(value))) |operator| {
+        const lhs, const rhs = tree.nodeData(value).node_and_node;
+        switch (operator.op) {
+            .bit_and => return literal(tree, lhs) != null or literal(tree, rhs) != null,
+            .add, .mul => if (operator.overflow != .wrapping) return try nonnegativeIn(c, file, lhs, at, pointer, next, assumed) and try nonnegativeIn(c, file, rhs, at, pointer, next, assumed),
+            .div => return (literal(tree, rhs) orelse 0) > 0 and try nonnegativeIn(c, file, lhs, at, pointer, next, assumed),
+            else => {},
+        }
+    };
+    if (formAt(tree, value) == .builtin) {
+        const name = tree.tokenSlice(tree.nodeMainToken(value));
+        var buffer: [2]Ast.Node.Index = undefined;
+        const args = Facts.builtinArgs(tree, value, &buffer);
+        // Two operands at most: more is no builtin this reads.
+        if (args.len > 2) return false;
+        if (std.mem.eql(u8, name, "@abs")) return true;
+        // A count of bits, or a bool's 0 or 1.
+        for ([_][]const u8{ "@ctz", "@clz", "@popCount", "@intFromBool" }) |count| if (std.mem.eql(u8, name, count)) return true;
+        if (args.len == 1 and std.mem.eql(u8, name, "@intCast")) return nonnegativeIn(c, file, args[0], at, pointer, next, assumed);
+        if (args.len != 2) return false;
+        if (std.mem.eql(u8, name, "@as")) return nonnegativeIn(c, file, args[1], at, pointer, next, assumed);
+        if (std.mem.eql(u8, name, "@max")) return literal(tree, args[0]) != null or literal(tree, args[1]) != null;
+        if (std.mem.eql(u8, name, "@mod")) return (literal(tree, args[1]) orelse 0) > 0;
+        if (std.mem.eql(u8, name, "@rem")) return (literal(tree, args[1]) orelse 0) > 0 and try nonnegativeIn(c, file, args[0], at, pointer, next, assumed);
+        if (std.mem.eql(u8, name, "@divTrunc") or std.mem.eql(u8, name, "@divFloor")) return (literal(tree, args[1]) orelse 0) > 0 and try nonnegativeIn(c, file, args[0], at, pointer, next, assumed);
+        return false;
     }
-    return false;
+    const model = &c.project.at(file).model;
+    const named_here = nameRef(model, value) orelse return false;
+    const d = named_here.declaration orelse return false;
+    if (assumed.local == d) return true;
+    const record = model.declarations[@backingInt(d)];
+    if (record.kind != .variable) return false;
+    const variable = tree.fullVarDecl(record.node) orelse return false;
+    const init = variable.ast.init_node.unwrap() orelse return false;
+    if (tree.tokenTag(variable.ast.mut_token) == .keyword_const or try kept(c, file, value, record.node, at)) return nonnegativeIn(c, file, init, init, pointer, next, assumed);
+    // A variable every value of which is at zero or above: its initializer and what each
+    // assignment gives it, its own reads in them taken as such.
+    if (assumed.local != null) return false;
+    const inductive: Assumed = .{ .local = d, .skip = assumed.skip };
+    if (!try nonnegativeIn(c, file, init, init, pointer, next, inductive)) return false;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        const assignment: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const form = accesses.formOf(tag);
+        if (form != .assign and form != .compound_assign) continue;
+        const target, const given = tree.nodeData(assignment).node_and_node;
+        if (accesses.operatorOf(tag)) |operator| {
+            // A sum or product of what is at zero or above is; any other update may not be.
+            if ((operator.op != .add and operator.op != .mul) or operator.overflow == .wrapping) {
+                if (nameRef(model, target)) |r| if (r.declaration == d) return false;
+                continue;
+            }
+        }
+        const ref = nameRef(model, target) orelse continue;
+        if (ref.declaration != d) continue;
+        if (assumed.skip == assignment) continue;
+        if (!try nonnegativeIn(c, file, given, given, pointer, next, inductive)) return false;
+    }
+    // Any other write is none the induction reads: its address handed on lets a callee write it,
+    // and a destructuring or an `asm` output writes it directly.
+    return !try written(c, file, d);
 }
 
 /// Whether a local is written other than by an assignment to its name: by another name
@@ -390,7 +400,7 @@ fn written(c: *Context, file: Project.FileId, d: Model.Declaration.Id) Context.E
     const tree = &c.project.at(file).file.tree;
     var in_file: [1]Project.FileId = undefined;
     var found_sites = try declarationWrites(c, file, d, &in_file);
-    while (try found_sites.next()) |site| if (tree.nodeTag(site.node) == .assign_destructure) return true;
+    while (try found_sites.next()) |site| if (formAt(tree, site.node) == .destructure) return true;
     return false;
 }
 
@@ -435,9 +445,9 @@ pub fn movedWithin(c: *Context, file: Project.FileId, node: Ast.Node.Index) Cont
     if (tree.nodeTag(node) != .add) return false;
     const base, const moved = tree.nodeData(node).node_and_node;
     const at = bare(tree, base);
-    if (tree.nodeTag(at) != .field_access) return false;
-    const memory, const name = tree.nodeData(at).node_and_token;
-    if (!std.mem.eql(u8, tree.tokenSlice(name), "ptr")) return false;
+    // A slice's own `ptr`, by the holder's type (`Facts.languageField`).
+    if (try c.facts.languageField(file, at) != .ptr) return false;
+    const memory = tree.nodeData(at).node_and_token[0];
     if (!firstRead(c, file, node)) return false;
     return within(c, file, moved, memory, false);
 }
@@ -448,11 +458,11 @@ fn firstRead(c: *Context, file: Project.FileId, node: Ast.Node.Index) bool {
     const model = &c.project.at(file).model;
     var at = node;
     var parent = model.parentOf(at) orelse return false;
-    while (tree.nodeTag(parent) == .grouped_expression) {
+    while (formAt(tree, parent) == .grouped) {
         at = parent;
         parent = model.parentOf(at) orelse return false;
     }
-    if (tree.nodeTag(parent) == .array_access) {
+    if (formAt(tree, parent) == .array_access) {
         const reached, const index = tree.nodeData(parent).node_and_node;
         return reached == at and literal(tree, index) == 0;
     }
@@ -475,35 +485,37 @@ fn pointerValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: 
         .pointer => return true,
         else => {},
     }
-    switch (tree.nodeTag(at)) {
-        .add, .sub, .add_wrap, .sub_wrap => return pointerValue(c, file, tree.nodeData(at).node_and_node[0], depth + 1),
-        .identifier => {
-            const local = constantOf(c, file, at) orelse return false;
-            return pointerValue(c, file, local.ast.init_node.unwrap() orelse return false, depth + 1);
-        },
-        .builtin_call_two, .builtin_call_two_comma => return std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), "@intFromPtr"),
-        else => return false,
-    }
+    if (formAt(tree, at) == .operator) if (accesses.operatorOf(tree.nodeTag(at))) |operator| {
+        // An address moved: by a sum or a difference that may wrap, never one that saturates.
+        if ((operator.op == .add or operator.op == .sub) and operator.overflow != .saturating) return pointerValue(c, file, tree.nodeData(at).node_and_node[0], depth + 1);
+        return false;
+    };
+    if (Facts.isBuiltin(tree, at, "@intFromPtr")) return true;
+    const local = constantOf(c, file, at) orelse return false;
+    return pointerValue(c, file, local.ast.init_node.unwrap() orelse return false, depth + 1);
 }
 
 /// What an expression's own operation bounds, before its type does.
 fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16, depth: u8) Context.Error!?Magnitude {
     const tree = &c.project.at(file).file.tree;
     const next = depth + 1;
-    switch (tree.nodeTag(node)) {
-        .number_literal => return switch (std.zig.parseNumberLiteral(tree.tokenSlice(tree.nodeMainToken(node)))) {
-            .int => |value| value,
-            else => null,
-        },
-        .char_literal => return literal(tree, node) orelse 0x10ffff,
-        .identifier => {
+    switch (formAt(tree, node)) {
+        .leaf => {
+            if (try c.facts.literalOf(file, node)) |written_here| switch (written_here) {
+                .number => return switch (std.zig.parseNumberLiteral(tree.tokenSlice(tree.nodeMainToken(node)))) {
+                    .int => |value| value,
+                    else => null,
+                },
+                .char => return literal(tree, node) orelse 0x10ffff,
+                else => return null,
+            };
             const model = &c.project.at(file).model;
-            const ref = model.reference(node) orelse return null;
+            const ref = nameRef(model, node) orelse return null;
             const d = ref.declaration orelse return null;
             if (prong(c, .{ .file = file, .index = d })) |range| return range.most;
             return constant(c, .{ .file = file, .index = d }, pointer, next);
         },
-        .field_access => {
+        .member => {
             // A length of memory the program holds: below half the address space where its
             // elements take room.
             switch (try c.facts.memoryField(file, node)) {
@@ -514,76 +526,77 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
             const decl = ((try c.facts.definition(file, node)).orNull()) orelse return chosen(c, file, node, pointer, next);
             return constant(c, decl, pointer, next);
         },
-        .grouped_expression, .unwrap_optional => return bound(c, file, tree.nodeData(node).node_and_token[0], pointer, next),
-        .@"try" => return bound(c, file, tree.nodeData(node).node, pointer, next),
-        .negation => return bound(c, file, tree.nodeData(node).node, pointer, next),
+        .grouped, .unwrap_optional => return bound(c, file, tree.nodeData(node).node_and_token[0], pointer, next),
+        .tried => return bound(c, file, tree.nodeData(node).node, pointer, next),
         .@"orelse", .@"catch" => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             // A fallback that leaves (`orelse return error.Short`) gives no value.
             if (leaves(tree, rhs)) return bound(c, file, lhs, pointer, next);
             return wider(try bound(c, file, lhs, pointer, next), try bound(c, file, rhs, pointer, next));
         },
-        .add, .assign_add => {
+        .compound_assign => {
+            if (!updates(tree, node, .add)) return null;
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             return sum(try bound(c, file, lhs, pointer, next), try bound(c, file, rhs, pointer, next));
         },
-        .sub => {
+        .operator => {
+            if (accesses.unaryOf(tree.nodeTag(node)) == .negation) return bound(c, file, tree.nodeData(node).node, pointer, next);
+            const op = checkedOp(tree, node) orelse return null;
             const lhs, const rhs = tree.nodeData(node).node_and_node;
-            const signed = switch (try typeOf(c, file, node, pointer, next)) {
-                .int => |int| int.signed,
+            switch (op) {
+                .add => return sum(try bound(c, file, lhs, pointer, next), try bound(c, file, rhs, pointer, next)),
+                .sub => {
+                    const signed = switch (try typeOf(c, file, node, pointer, next)) {
+                        .int => |int| int.signed,
+                        else => return null,
+                    };
+                    // What is left of a value once its quotient by `k` is taken away (`y -
+                    // @divFloor(y, k) * k`) is a remainder, below `k`.
+                    if (try remainder(c, file, lhs, rhs)) |k| return ((try bound(c, file, k, pointer, next)) orelse return null) -| 1;
+                    // An unsigned difference that does not underflow is at most what it takes
+                    // from, less a constant it takes (an underflow stops the program: A010's to
+                    // judge).
+                    if (!signed) return ((try bound(c, file, lhs, pointer, next)) orelse return null) -| (literal(tree, rhs) orelse 0);
+                    return sum(try bound(c, file, lhs, pointer, next), try bound(c, file, rhs, pointer, next));
+                },
+                .mul => {
+                    const left = (try bound(c, file, lhs, pointer, next)) orelse return null;
+                    const right = (try bound(c, file, rhs, pointer, next)) orelse return null;
+                    return left *| right;
+                },
+                .div => return quotient(try bound(c, file, lhs, pointer, next), literal(tree, rhs)),
+                .mod => return ((try bound(c, file, rhs, pointer, next)) orelse return null) -| 1,
+                // A shift by at most `k` moves at most as far as one by `k`.
+                .shl => {
+                    const by = literal(tree, rhs) orelse std.math.cast(u64, (try bound(c, file, rhs, pointer, next)) orelse return null) orelse return null;
+                    return shifted(try bound(c, file, lhs, pointer, next), by);
+                },
+                .shr => {
+                    const left = (try bound(c, file, lhs, pointer, next)) orelse return null;
+                    const by = literal(tree, rhs) orelse return left;
+                    return if (by >= @bitSizeOf(Magnitude)) 0 else left >> @intCast(by);
+                },
+                .bit_and => {
+                    const left = try bound(c, file, lhs, pointer, next);
+                    const right = try bound(c, file, rhs, pointer, next);
+                    if (left == null) return right;
+                    if (right == null) return left;
+                    return @min(left.?, right.?);
+                },
+                .bit_or, .bit_xor => {
+                    const most = wider(try bound(c, file, lhs, pointer, next), try bound(c, file, rhs, pointer, next)) orelse return null;
+                    return filled(std.math.sub(u16, @bitSizeOf(Magnitude), @clz(most)) catch return null);
+                },
                 else => return null,
-            };
-            // What is left of a value once its quotient by `k` is taken away (`y - @divFloor(y,
-            // k) * k`) is a remainder, below `k`.
-            if (try remainder(c, file, lhs, rhs)) |k| return ((try bound(c, file, k, pointer, next)) orelse return null) -| 1;
-            // An unsigned difference that does not underflow is at most what it takes from, less
-            // a constant it takes (an underflow stops the program: A010's to judge).
-            if (!signed) return ((try bound(c, file, lhs, pointer, next)) orelse return null) -| (literal(tree, rhs) orelse 0);
-            return sum(try bound(c, file, lhs, pointer, next), try bound(c, file, rhs, pointer, next));
+            }
         },
-        .mul => {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            const left = (try bound(c, file, lhs, pointer, next)) orelse return null;
-            const right = (try bound(c, file, rhs, pointer, next)) orelse return null;
-            return left *| right;
-        },
-        .div => {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            return quotient(try bound(c, file, lhs, pointer, next), literal(tree, rhs));
-        },
-        .mod => return ((try bound(c, file, tree.nodeData(node).node_and_node[1], pointer, next)) orelse return null) -| 1,
-        // A shift by at most `k` moves at most as far as one by `k`.
-        .shl => {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            const by = literal(tree, rhs) orelse std.math.cast(u64, (try bound(c, file, rhs, pointer, next)) orelse return null) orelse return null;
-            return shifted(try bound(c, file, lhs, pointer, next), by);
-        },
-        .shr => {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            const left = (try bound(c, file, lhs, pointer, next)) orelse return null;
-            const by = literal(tree, rhs) orelse return left;
-            return if (by >= @bitSizeOf(Magnitude)) 0 else left >> @intCast(by);
-        },
-        .bit_and => {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            const left = try bound(c, file, lhs, pointer, next);
-            const right = try bound(c, file, rhs, pointer, next);
-            if (left == null) return right;
-            if (right == null) return left;
-            return @min(left.?, right.?);
-        },
-        .bit_or, .bit_xor => {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            const most = wider(try bound(c, file, lhs, pointer, next), try bound(c, file, rhs, pointer, next)) orelse return null;
-            return filled(std.math.sub(u16, @bitSizeOf(Magnitude), @clz(most)) catch return null);
-        },
-        .@"if", .if_simple => {
+        .@"if" => {
             const branch = tree.fullIf(node).?;
             const then = try bound(c, file, branch.ast.then_expr, pointer, next);
             const otherwise = branch.ast.else_expr.unwrap() orelse return then;
             return wider(then, try bound(c, file, otherwise, pointer, next));
         },
-        .@"switch", .switch_comma => {
+        .@"switch" => {
             var out: ?Magnitude = 0;
             for (tree.fullSwitch(node).?.ast.cases) |case| {
                 const full = tree.fullSwitchCase(case) orelse return null;
@@ -591,15 +604,16 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
             }
             return out;
         },
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return builtin(c, file, node, pointer, next),
-        else => {
+        .builtin => return builtin(c, file, node, pointer, next),
+        .call => {
             var buffer: [1]Ast.Node.Index = undefined;
-            const call = tree.fullCall(&buffer, node) orelse return null;
+            const call = tree.fullCall(&buffer, node).?; // unreachable: a call's form holds calls
             return switch (try c.facts.resolve(file, call.ast.fn_expr)) {
                 .function => |decl| (try extreme(c, file, decl, call, pointer)) orelse (try readCount(c, file, decl, call)) orelse returned(c, decl, pointer, next),
                 else => null,
             };
         },
+        else => return null,
     }
 }
 
@@ -624,7 +638,7 @@ fn readCount(c: *Context, file: Project.FileId, decl: Facts.Decl, call: Ast.full
         if (each.file != decl.file or each.index != decl.index) continue;
         const tree = &c.project.at(file).file.tree;
         var buffer = bare(tree, call.ast.params[call.ast.params.len - 1]);
-        if (tree.nodeTag(buffer) == .address_of) buffer = bare(tree, tree.nodeData(buffer).node);
+        if (formAt(tree, buffer) == .address_of) buffer = bare(tree, tree.nodeData(buffer).node);
         return fixedLength(c, file, buffer);
     }
     return null;
@@ -759,42 +773,40 @@ fn madeValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, made: *con
     const tree = &c.project.at(file).file.tree;
     const at = bare(tree, node);
     if (literal(tree, at)) |k| return k;
-    switch (tree.nodeTag(at)) {
-        .add, .sub, .mul, .div => {
-            const lhs, const rhs = tree.nodeData(at).node_and_node;
-            const a = (try madeValue(c, file, lhs, made, depth + 1)) orelse return null;
-            const b = (try madeValue(c, file, rhs, made, depth + 1)) orelse return null;
-            return switch (tree.nodeTag(at)) {
-                .add => std.math.add(u64, a, b) catch null,
-                .sub => std.math.sub(u64, a, b) catch null,
-                .mul => std.math.mul(u64, a, b) catch null,
-                else => if (b == 0) null else a / b,
-            };
+    if (checkedOp(tree, at)) |op| {
+        if (op != .add and op != .sub and op != .mul and op != .div) return null;
+        const lhs, const rhs = tree.nodeData(at).node_and_node;
+        const a = (try madeValue(c, file, lhs, made, depth + 1)) orelse return null;
+        const b = (try madeValue(c, file, rhs, made, depth + 1)) orelse return null;
+        return switch (op) {
+            .add => std.math.add(u64, a, b) catch null,
+            .sub => std.math.sub(u64, a, b) catch null,
+            .mul => std.math.mul(u64, a, b) catch null,
+            else => if (b == 0) null else a / b,
+        };
+    }
+    if (formAt(tree, at) == .builtin) {
+        const name = tree.tokenSlice(tree.nodeMainToken(at));
+        var buffer: [2]Ast.Node.Index = undefined;
+        const args = Facts.builtinArgs(tree, at, &buffer);
+        if (args.len != 2) return null;
+        const a = (try madeValue(c, file, args[0], made, depth + 1)) orelse return null;
+        const b = (try madeValue(c, file, args[1], made, depth + 1)) orelse return null;
+        if (b == 0) return null;
+        if (std.mem.eql(u8, name, "@divFloor") or std.mem.eql(u8, name, "@divTrunc")) return a / b;
+        if (std.mem.eql(u8, name, "@divCeil")) return std.math.divCeil(u64, a, b) catch null;
+        if (std.mem.eql(u8, name, "@divExact")) return if (a % b == 0) a / b else null;
+        return null;
+    }
+    const model = &c.project.at(file).model;
+    const d = (nameRef(model, at) orelse return null).declaration orelse return null;
+    const record = model.declarations[@backingInt(d)];
+    switch (record.kind) {
+        .parameter => {
+            const given = (try madeArgument(c, .{ .file = file, .index = d }, made)) orelse return null;
+            return valueOf(c, made.file, given, depth + 1);
         },
-        .builtin_call_two, .builtin_call_two_comma => {
-            const name = tree.tokenSlice(tree.nodeMainToken(at));
-            const lhs, const rhs = tree.nodeData(at).opt_node_and_opt_node;
-            const a = (try madeValue(c, file, lhs.unwrap() orelse return null, made, depth + 1)) orelse return null;
-            const b = (try madeValue(c, file, rhs.unwrap() orelse return null, made, depth + 1)) orelse return null;
-            if (b == 0) return null;
-            if (std.mem.eql(u8, name, "@divFloor") or std.mem.eql(u8, name, "@divTrunc")) return a / b;
-            if (std.mem.eql(u8, name, "@divCeil")) return std.math.divCeil(u64, a, b) catch null;
-            if (std.mem.eql(u8, name, "@divExact")) return if (a % b == 0) a / b else null;
-            return null;
-        },
-        .identifier => {
-            const model = &c.project.at(file).model;
-            const d = (model.reference(at) orelse return null).declaration orelse return null;
-            const record = model.declarations[@backingInt(d)];
-            switch (record.kind) {
-                .parameter => {
-                    const given = (try madeArgument(c, .{ .file = file, .index = d }, made)) orelse return null;
-                    return valueOf(c, made.file, given, depth + 1);
-                },
-                .variable => return madeConstant(c, .{ .file = file, .index = d }, made),
-                else => return null,
-            }
-        },
+        .variable => return madeConstant(c, .{ .file = file, .index = d }, made),
         else => return null,
     }
 }
@@ -864,7 +876,7 @@ fn assigned(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Erro
                     out = null;
                     continue;
                 };
-                if (!empty(tree, value)) out = wider(out, try bound(c, decl.file, value, pointer, depth));
+                if (!try empty(c, decl.file, value)) out = wider(out, try bound(c, decl.file, value, pointer, depth));
             },
             .update, .covered, .address, .open => out = null,
             .read => {},
@@ -905,10 +917,7 @@ fn givenTypes(c: *Context) Context.Error!*Given {
                 for (call.ast.params, 0..) |arg, k| try typeArgument(c, memo, file, call.ast.fn_expr, k, arg);
                 continue;
             }
-            switch (tag) {
-                .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {},
-                else => continue,
-            }
+            if (accesses.formOf(tag) != .builtin) continue;
             // `@call(modifier, f, .{ … })` calls `f` with the tuple's elements.
             if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@call")) continue;
             var buffer: [2]Ast.Node.Index = undefined;
@@ -944,7 +953,7 @@ fn typeArgument(c: *Context, memo: *Given, file: Project.FileId, callee: Ast.Nod
     // read where they are.
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    if (tree.nodeTag(arg) == .identifier) if (model.reference(arg)) |ref| if (ref.declaration) |d| {
+    if (nameRef(model, arg)) |ref| if (ref.declaration) |d| {
         if (model.declarations[@backingInt(d)].kind == .parameter) return;
     };
     memo.any = true;
@@ -966,7 +975,7 @@ fn takesType(c: *Context, file: Project.FileId, callee: Ast.Node.Index, at: usiz
     }) orelse return true;
     // A method called on a value is given its receiver first: the call is read in its own file.
     const at_call = &c.project.at(file).file.tree;
-    const bound_receiver = at_call.nodeTag(callee) == .field_access and switch (try c.facts.resolve(file, at_call.nodeData(callee).node_and_token[0])) {
+    const bound_receiver = formAt(at_call, callee) == .member and switch (try c.facts.resolve(file, at_call.nodeData(callee).node_and_token[0])) {
         .container => false,
         else => true,
     };
@@ -975,7 +984,7 @@ fn takesType(c: *Context, file: Project.FileId, callee: Ast.Node.Index, at: usiz
     while (params.next()) |param| : (k += 1) {
         if (k != at + @intFromBool(bound_receiver)) continue;
         const kind = param.type_expr orelse return true;
-        return tree.nodeTag(kind) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(kind)), "type");
+        return c.facts.typeIsType(function.file, kind);
     }
     // A variadic `extern`'s or one past the list: nothing known.
     return true;
@@ -1150,10 +1159,9 @@ fn containerName(c: *Context, file: Project.FileId, container_node: Ast.Node.Ind
 }
 
 /// Whether a value is `null` or `undefined`: no number.
-fn empty(tree: *const Ast, node: Ast.Node.Index) bool {
-    if (tree.nodeTag(node) != .identifier) return false;
-    const name = tree.tokenSlice(tree.nodeMainToken(node));
-    return std.mem.eql(u8, name, "null") or std.mem.eql(u8, name, "undefined");
+fn empty(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    const written_here = (try c.facts.literalOf(file, node)) orelse return false;
+    return written_here == .null or written_here == .undefined;
 }
 
 /// The integer type `node` computes in.
@@ -1161,24 +1169,32 @@ fn typeOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16,
     if (depth > depth_limit) return .unknown;
     const tree = &c.project.at(file).file.tree;
     const next = depth + 1;
-    switch (tree.nodeTag(node)) {
-        .number_literal, .char_literal => return .literal,
-        .grouped_expression, .unwrap_optional => return typeOf(c, file, tree.nodeData(node).node_and_token[0], pointer, next),
-        .@"try", .negation, .bit_not => return typeOf(c, file, tree.nodeData(node).node, pointer, next),
-        .add, .add_wrap, .add_sat, .sub, .sub_wrap, .sub_sat, .mul, .mul_wrap, .mul_sat, .div, .mod, .bit_and, .bit_or, .bit_xor, .@"orelse", .@"catch" => {
+    switch (formAt(tree, node)) {
+        .grouped, .unwrap_optional => return typeOf(c, file, tree.nodeData(node).node_and_token[0], pointer, next),
+        .tried => return typeOf(c, file, tree.nodeData(node).node, pointer, next),
+        .operator => {
+            if (accesses.unaryOf(tree.nodeTag(node))) |unary| {
+                if (unary != .negation_wrap) return typeOf(c, file, tree.nodeData(node).node, pointer, next);
+            } else {
+                const lhs, const rhs = tree.nodeData(node).node_and_node;
+                const operator = accesses.operatorOf(tree.nodeTag(node)).?; // unreachable: an operator on two is `operatorOf`'s
+                if (operator.op == .shl or operator.op == .shr) return typeOf(c, file, lhs, pointer, next);
+                return Typed.peer(try typeOf(c, file, lhs, pointer, next), try typeOf(c, file, rhs, pointer, next));
+            }
+        },
+        .@"orelse", .@"catch" => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             // A fallback that leaves gives no value: the type is the unwrapped one's.
-            if ((tree.nodeTag(node) == .@"orelse" or tree.nodeTag(node) == .@"catch") and leaves(tree, rhs)) return typeOf(c, file, lhs, pointer, next);
+            if (leaves(tree, rhs)) return typeOf(c, file, lhs, pointer, next);
             return Typed.peer(try typeOf(c, file, lhs, pointer, next), try typeOf(c, file, rhs, pointer, next));
         },
-        .shl, .shl_sat, .shr => return typeOf(c, file, tree.nodeData(node).node_and_node[0], pointer, next),
-        .@"if", .if_simple => {
+        .@"if" => {
             const branch = tree.fullIf(node).?;
             const then = try typeOf(c, file, branch.ast.then_expr, pointer, next);
             const otherwise = branch.ast.else_expr.unwrap() orelse return then;
             return Typed.peer(then, try typeOf(c, file, otherwise, pointer, next));
         },
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+        .builtin => {
             const name = tree.tokenSlice(tree.nodeMainToken(node));
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, node, &buffer);
@@ -1196,24 +1212,25 @@ fn typeOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16,
                 return Typed.peer(try typeOf(c, file, args[0], pointer, next), try typeOf(c, file, args[1], pointer, next));
             };
         },
-        .identifier, .field_access => {
-            if (try c.facts.memoryField(file, node) != .field) return .{ .int = .{ .bits = pointer, .signed = false } };
-            const decl = ((try c.facts.definition(file, node)).orNull()) orelse if (tree.nodeTag(node) == .identifier) blk: {
-                const ref = c.project.at(file).model.reference(node) orelse break :blk null;
-                break :blk if (ref.declaration) |d| Facts.Decl{ .file = file, .index = d } else null;
-            } else null;
-            // A constant with no type of its own has its initializer's: a number literal's
-            // comptime type, which takes the other operand's.
-            if (decl) |d| {
-                if (try untyped(c, d)) |init| return typeOf(c, d.file, init, pointer, next);
-                // A variable with no type of its own has its initializer's, which no assignment
-                // changes (`var i = at + 1` is a `usize` where `at` is): a runtime one, as Zig
-                // takes no comptime number for a `var`.
-                if (try inferred(c, d)) |init| switch (try typeOf(c, d.file, init, pointer, next)) {
-                    .int => |int| return .{ .int = int },
-                    else => {},
-                };
-                if (try element(c, d, pointer)) |typed| return typed;
+        .leaf, .member => {
+            if (try c.facts.literalOf(file, node)) |written_here| if (written_here == .number or written_here == .char) return .literal;
+            const ref = nameRef(&c.project.at(file).model, node);
+            if (ref != null or formAt(tree, node) == .member) {
+                if (try c.facts.memoryField(file, node) != .field) return .{ .int = .{ .bits = pointer, .signed = false } };
+                const decl = ((try c.facts.definition(file, node)).orNull()) orelse if (ref) |named_ref| (if (named_ref.declaration) |d| Facts.Decl{ .file = file, .index = d } else null) else null;
+                // A constant with no type of its own has its initializer's: a number literal's
+                // comptime type, which takes the other operand's.
+                if (decl) |d| {
+                    if (try untyped(c, d)) |init| return typeOf(c, d.file, init, pointer, next);
+                    // A variable with no type of its own has its initializer's, which no
+                    // assignment changes (`var i = at + 1` is a `usize` where `at` is): a runtime
+                    // one, as Zig takes no comptime number for a `var`.
+                    if (try inferred(c, d)) |init| switch (try typeOf(c, d.file, init, pointer, next)) {
+                        .int => |int| return .{ .int = int },
+                        else => {},
+                    };
+                    if (try element(c, d, pointer)) |typed| return typed;
+                }
             }
         },
         else => {},
@@ -1288,20 +1305,18 @@ fn nonzeroAt(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: Ast.No
     const tree = &c.project.at(file).file.tree;
     const value = bare(tree, node);
     if (literal(tree, value)) |k| return k != 0;
-    switch (tree.nodeTag(value)) {
-        .builtin_call_two, .builtin_call_two_comma => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "@max")) {
-            var buffer: [2]Ast.Node.Index = undefined;
-            for (Facts.builtinArgs(tree, value, &buffer)) |arg| if ((literal(tree, arg) orelse 0) >= 1) return true;
-        },
-        .identifier => {
-            const model = &c.project.at(file).model;
-            if (model.reference(value)) |ref| if (ref.declaration) |d| {
-                if (prong(c, .{ .file = file, .index = d })) |range| if (range.least >= 1) return true;
-            };
-            if (constantOf(c, file, value)) |local| if (local.ast.init_node.unwrap()) |init| {
-                if (try nonzeroAt(c, file, init, at, depth + 1)) return true;
-            };
-        },
+    if (Facts.isBuiltin(tree, value, "@max")) {
+        var buffer: [2]Ast.Node.Index = undefined;
+        for (Facts.builtinArgs(tree, value, &buffer)) |arg| if ((literal(tree, arg) orelse 0) >= 1) return true;
+    }
+    const model = &c.project.at(file).model;
+    if (nameRef(model, value)) |ref| if (ref.declaration) |d| {
+        if (prong(c, .{ .file = file, .index = d })) |range| if (range.least >= 1) return true;
+    };
+    if (constantOf(c, file, value)) |local| if (local.ast.init_node.unwrap()) |init| {
+        if (try nonzeroAt(c, file, init, at, depth + 1)) return true;
+    };
+    if (checkedOp(tree, value)) |op| switch (op) {
         // A shift keeps a set lowest bit within the width (the amount's type is below it).
         .shl => if ((literal(tree, bare(tree, tree.nodeData(value).node_and_node[0])) orelse 0) & 1 == 1) return true,
         .add => {
@@ -1312,7 +1327,7 @@ fn nonzeroAt(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: Ast.No
             if (parts and (try nonzeroAt(c, file, lhs, at, depth + 1) or try nonzeroAt(c, file, rhs, at, depth + 1))) return true;
         },
         else => {},
-    }
+    };
     for (try gather(c, file, at)) |fact| {
         if (fact.read) continue;
         // Other than zero, and not negative: no -1 that overflows a signed minimum.
@@ -1352,7 +1367,7 @@ pub fn negates(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.
     // `x = -x` outside a loop: the value it makes is no value the negation reads.
     var assumed: Assumed = .{};
     if (model.parentOf(node)) |negation| if (model.parentOf(negation)) |parent| {
-        if (tree.nodeTag(parent) == .assign and same(tree, tree.nodeData(parent).node_and_node[0], node) and !looped(tree, model, parent)) assumed.skip = parent;
+        if (formAt(tree, parent) == .assign and same(tree, tree.nodeData(parent).node_and_node[0], node) and !looped(tree, model, parent)) assumed.skip = parent;
     };
     for (widths(c)) |pointer| {
         if (try nonnegativeIn(c, file, node, node, pointer, 0, assumed)) continue;
@@ -1367,11 +1382,7 @@ pub fn negates(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.
 fn widened(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
     const at = Facts.ungrouped(tree, node);
-    switch (tree.nodeTag(at)) {
-        .builtin_call_two, .builtin_call_two_comma => {},
-        else => return false,
-    }
-    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), "@as")) return false;
+    if (!Facts.isBuiltin(tree, at, "@as")) return false;
     var buffer: [2]Ast.Node.Index = undefined;
     const args = Facts.builtinArgs(tree, at, &buffer);
     if (args.len != 2) return false;
@@ -1401,15 +1412,15 @@ fn looped(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
 pub fn floating(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
     const at = bare(tree, node);
-    switch (tree.nodeTag(at)) {
-        .number_literal => return std.zig.parseNumberLiteral(tree.tokenSlice(tree.nodeMainToken(at))) == .float,
-        .add, .sub, .mul, .div, .mod, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => {
+    if (try c.facts.literalOf(file, at) == .number) return std.zig.parseNumberLiteral(tree.tokenSlice(tree.nodeMainToken(at))) == .float;
+    if (accesses.unaryOf(tree.nodeTag(at)) == .negation) return floating(c, file, tree.nodeData(at).node);
+    if (accesses.operatorOf(tree.nodeTag(at))) |operator| if (operator.overflow == .checked) switch (operator.op) {
+        .add, .sub, .mul, .div, .mod => {
             const lhs, const rhs = tree.nodeData(at).node_and_node;
             return try floating(c, file, lhs) or try floating(c, file, rhs);
         },
-        .negation => return floating(c, file, tree.nodeData(at).node),
         else => {},
-    }
+    };
     var value = try c.facts.resolve(file, at);
     while (true) value = switch (value) {
         .optional, .error_union => |inner| inner.*,
@@ -1466,15 +1477,15 @@ fn destined(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
     const model = &c.project.at(file).model;
     var at = node;
     while (model.parentOf(at)) |parent| : (at = parent) {
-        switch (tree.nodeTag(parent)) {
-            .grouped_expression, .@"try" => continue,
+        switch (formAt(tree, parent)) {
+            .grouped, .tried => continue,
             // A branch's value is the `if`'s: its destination is the `if`'s.
-            .@"if", .if_simple => {
+            .@"if" => {
                 const branch = tree.fullIf(parent).?;
                 if (branch.ast.then_expr != at and branch.ast.else_expr.unwrap() != at) return null;
                 continue;
             },
-            .builtin_call_two, .builtin_call_two_comma => {
+            .builtin => {
                 const name = tree.tokenSlice(tree.nodeMainToken(parent));
                 var buffer: [2]Ast.Node.Index = undefined;
                 const args = Facts.builtinArgs(tree, parent, &buffer);
@@ -1483,12 +1494,21 @@ fn destined(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
                 if (args.len != 2 or args[1] != at) return null;
                 return .{ .named = .{ .file = file, .node = args[0] } };
             },
-            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_bit_and, .assign_bit_or, .assign_bit_xor => {
+            .assign => {
                 const lhs, const rhs = tree.nodeData(parent).node_and_node;
                 if (rhs != at) return null;
                 return .{ .assigned = lhs };
             },
-            .shl, .shr, .assign_shl, .assign_shr => {
+            .compound_assign => {
+                const operator = accesses.operatorOf(tree.nodeTag(parent)).?; // unreachable: a compound assignment is `operatorOf`'s
+                if (operator.overflow != .checked) return null;
+                const lhs, const rhs = tree.nodeData(parent).node_and_node;
+                if (rhs != at) return null;
+                return if (operator.op == .shl or operator.op == .shr) .{ .shifted = lhs } else .{ .assigned = lhs };
+            },
+            .operator => {
+                const op = checkedOp(tree, parent) orelse return null;
+                if (op != .shl and op != .shr) return null;
                 const lhs, const rhs = tree.nodeData(parent).node_and_node;
                 if (rhs != at) return null;
                 return .{ .shifted = lhs };
@@ -1625,7 +1645,7 @@ fn argument(c: *Context, file: Project.FileId, call: Ast.full.Call, arg: Ast.Nod
     };
     // A method called on a value takes it as its first parameter.
     var skip: usize = 0;
-    if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
+    if (formAt(tree, call.ast.fn_expr) == .member) {
         var receiver = try c.facts.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0]);
         if (receiver == .pointer) receiver = receiver.pointer.child.*;
         if (receiver == .instance) skip = 1;
@@ -1672,21 +1692,27 @@ fn named(c: *Context, file: Project.FileId, type_node: Ast.Node.Index, pointer: 
 /// A constant's value: an integer or character literal, or a sum, difference or product of
 /// them (`255 * 4`, `'0'`).
 fn literal(tree: *const Ast, node: Ast.Node.Index) ?u64 {
-    switch (tree.nodeTag(node)) {
-        .number_literal => return switch (std.zig.parseNumberLiteral(tree.tokenSlice(tree.nodeMainToken(node)))) {
-            .int => |value| value,
-            else => null,
+    switch (formAt(tree, node)) {
+        // A number's or a character's token is its own kind.
+        .leaf => switch (tree.tokenTag(tree.nodeMainToken(node))) {
+            .number_literal => return switch (std.zig.parseNumberLiteral(tree.tokenSlice(tree.nodeMainToken(node)))) {
+                .int => |value| value,
+                else => null,
+            },
+            .char_literal => return switch (std.zig.string_literal.parseCharLiteral(tree.tokenSlice(tree.nodeMainToken(node)))) {
+                .success => |code| code,
+                .failure => null,
+            },
+            else => return null,
         },
-        .char_literal => return switch (std.zig.string_literal.parseCharLiteral(tree.tokenSlice(tree.nodeMainToken(node)))) {
-            .success => |code| code,
-            .failure => null,
-        },
-        .grouped_expression => return literal(tree, tree.nodeData(node).node_and_token[0]),
-        .add, .sub, .mul => {
+        .grouped => return literal(tree, tree.nodeData(node).node_and_token[0]),
+        .operator => {
+            const op = checkedOp(tree, node) orelse return null;
+            if (op != .add and op != .sub and op != .mul) return null;
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             const a = literal(tree, lhs) orelse return null;
             const b = literal(tree, rhs) orelse return null;
-            return switch (tree.nodeTag(node)) {
+            return switch (op) {
                 .add => std.math.add(u64, a, b) catch null,
                 .sub => std.math.sub(u64, a, b) catch null,
                 else => std.math.mul(u64, a, b) catch null,
@@ -1769,12 +1795,9 @@ fn operandRange(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer
     const tree = &c.project.at(file).file.tree;
     const at = Facts.ungrouped(tree, node);
     if (try valueOf(c, file, at, 0)) |value| return .{ .lo = value, .hi = value, .known = true };
-    if (tree.nodeTag(at) == .negation) if (try valueOf(c, file, tree.nodeData(at).node, 0)) |value| return .{ .lo = -@as(Wide, value), .hi = -@as(Wide, value), .known = true };
+    if (accesses.unaryOf(tree.nodeTag(at)) == .negation) if (try valueOf(c, file, tree.nodeData(at).node, 0)) |value| return .{ .lo = -@as(Wide, value), .hi = -@as(Wide, value), .known = true };
     // An array's length is its type's, known as the program compiles.
-    if (tree.nodeTag(at) == .field_access) {
-        const memory, const name = tree.nodeData(at).node_and_token;
-        if (std.mem.eql(u8, tree.tokenSlice(name), "len")) if (try fixedLength(c, file, memory)) |fixed| return .{ .lo = fixed, .hi = fixed, .known = true };
-    }
+    if (try c.facts.lengthOf(file, at)) |memory| if (try fixedLength(c, file, memory)) |fixed| return .{ .lo = fixed, .hi = fixed, .known = true };
     const int = switch (try typeOf(c, file, at, pointer, depth)) {
         .int => |int| int,
         else => return null,
@@ -1802,34 +1825,45 @@ fn atRuntime(c: *Context, file: Project.FileId, node: Ast.Node.Index, given: ?*c
     if (depth > runtime_depth) return false;
     const tree = &c.project.at(file).file.tree;
     const next = depth + 1;
-    switch (tree.nodeTag(node)) {
-        .grouped_expression, .unwrap_optional => return atRuntime(c, file, tree.nodeData(node).node_and_token[0], given, next),
-        .@"try", .deref, .negation, .negation_wrap, .bit_not => return atRuntime(c, file, tree.nodeData(node).node, given, next),
+    switch (formAt(tree, node)) {
+        .grouped, .unwrap_optional => return atRuntime(c, file, tree.nodeData(node).node_and_token[0], given, next),
+        .tried, .deref => return atRuntime(c, file, tree.nodeData(node).node, given, next),
         .@"orelse", .@"catch" => return atRuntime(c, file, tree.nodeData(node).node_and_node[0], given, next),
-        .add, .sub, .mul, .div, .mod, .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor, .array_access => {
+        .operator => {
+            if (accesses.unaryOf(tree.nodeTag(node)) != null) return atRuntime(c, file, tree.nodeData(node).node, given, next);
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             return try atRuntime(c, file, lhs, given, next) or try atRuntime(c, file, rhs, given, next);
         },
-        .@"if", .if_simple => {
+        .array_access => {
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            return try atRuntime(c, file, lhs, given, next) or try atRuntime(c, file, rhs, given, next);
+        },
+        .@"if" => {
             const branch = tree.fullIf(node).?;
             const otherwise = branch.ast.else_expr.unwrap() orelse return false;
             return try atRuntime(c, file, branch.ast.then_expr, given, next) and try atRuntime(c, file, otherwise, given, next);
         },
-        .@"switch", .switch_comma => {
+        .@"switch" => {
             const choice = tree.fullSwitch(node).?;
             for (choice.ast.cases) |case| if (!try atRuntime(c, file, tree.fullSwitchCase(case).?.ast.target_expr, given, next)) return false;
             return choice.ast.cases.len != 0;
         },
-        .field_access => {
-            const receiver, const name = tree.nodeData(node).node_and_token;
+        .member => {
+            const receiver = tree.nodeData(node).node_and_token[0];
             if (!try atRuntime(c, file, receiver, given, next)) return false;
-            if (!std.mem.eql(u8, tree.tokenSlice(name), "len")) return c.facts.runtime(file, node);
-            // An array's length is its type's; a slice's is the slice's.
-            var memory = try c.facts.resolve(file, receiver);
-            if (memory == .pointer and memory.pointer.size == .one) memory = memory.pointer.child.*;
-            return memory == .pointer and memory.pointer.size == .slice;
+            switch (try c.facts.languageField(file, node)) {
+                // An array's length is its type's; a slice's is the slice's.
+                .len => {
+                    var memory = try c.facts.resolve(file, receiver);
+                    if (memory == .pointer and memory.pointer.size == .one) memory = memory.pointer.child.*;
+                    return memory == .pointer and memory.pointer.size == .slice;
+                },
+                .ptr, .none => return c.facts.runtime(file, node),
+                // May be an array's, known as the program compiles.
+                .unknown => return false,
+            }
         },
-        .call_one, .call_one_comma, .call, .call_comma => {
+        .call => {
             const call = (try Facts.calls.at(c.facts, file, node)) orelse return false;
             const callees: []const Facts.Decl = switch (call.callee) {
                 .function => |decl| &.{decl},
@@ -1839,7 +1873,7 @@ fn atRuntime(c: *Context, file: Project.FileId, node: Ast.Node.Index, given: ?*c
             for (callees) |callee| if (!try returnsRuntime(c, call, callee, given, next)) return false;
             return true;
         },
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+        .builtin => {
             const value_builtins = [_][]const u8{ "@as", "@intCast", "@truncate", "@bitCast", "@intFromEnum", "@intFromBool", "@intFromFloat", "@intFromPtr", "@min", "@max", "@abs", "@popCount", "@ctz", "@clz", "@byteSwap", "@bitReverse", "@divFloor", "@divTrunc", "@divExact", "@mod", "@rem", "@shlExact", "@shrExact" };
             const name = tree.tokenSlice(tree.nodeMainToken(node));
             for (value_builtins) |each| if (std.mem.eql(u8, name, each)) {
@@ -1849,9 +1883,9 @@ fn atRuntime(c: *Context, file: Project.FileId, node: Ast.Node.Index, given: ?*c
             };
             return false;
         },
-        .identifier => {
+        .leaf => {
             const model = &c.project.at(file).model;
-            const index = (model.reference(node) orelse return false).declaration orelse return false;
+            const index = (nameRef(model, node) orelse return false).declaration orelse return false;
             const record = model.declarations[@backingInt(index)];
             switch (record.kind) {
                 .parameter => {
@@ -2002,17 +2036,17 @@ fn gatherAt(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
     var out: std.ArrayList(Fact) = .empty;
     var at = node;
     while (model.parentOf(at)) |parent| : (at = parent) {
-        switch (tree.nodeTag(parent)) {
+        switch (formAt(tree, parent)) {
             .fn_decl => break,
             // The right side of `a and b` is read where `a` is true, of `a or b` where it is false.
-            .bool_and, .bool_or => switch (Facts.conditionOf(tree, parent)) {
+            .logic => switch (Facts.conditionOf(tree, parent)) {
                 .both => |sides| if (sides[1] == at) try held(c, file, &out, sides[0], true, node),
                 .either => |sides| if (sides[1] == at) try held(c, file, &out, sides[0], false, node),
                 .not, .compare, .other => {},
             },
-            .block, .block_semicolon, .block_two, .block_two_semicolon => {
+            .body => {
                 var buffer: [2]Ast.Node.Index = undefined;
-                for (tree.blockStatements(&buffer, parent).?) |statement| {
+                for (tree.blockStatements(&buffer, parent) orelse &.{}) |statement| {
                     if (statement == at) break;
                     try limited(c, file, &out, statement, node);
                     try subtracted(c, file, &out, statement, node);
@@ -2031,7 +2065,7 @@ fn gatherAt(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
                     } else try clamped(c, file, &out, branch, statement, node);
                 }
             },
-            .@"switch", .switch_comma => {
+            .@"switch" => {
                 const operand = tree.nodeData(parent).node_and_extra[0];
                 if (operand != at) {
                     try read(c, file, &out, operand, node, null);
@@ -2064,7 +2098,7 @@ fn gatherAt(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
 fn read(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), access: Ast.Node.Index, use: Ast.Node.Index, since: ?Ast.Node.Index) Context.Error!void {
     const tree = &c.project.at(file).file.tree;
     const at = bare(tree, access);
-    if (tree.nodeTag(at) != .array_access) return;
+    if (formAt(tree, at) != .array_access) return;
     const memory, const index = tree.nodeData(at).node_and_node;
     if (!try kept(c, file, memory, since orelse access, use) or !try kept(c, file, index, since orelse access, use)) return;
     try out.append(c.allocator, .{ .small = index, .large = memory, .strict = true, .read = true });
@@ -3532,9 +3566,8 @@ fn captured(c: *Context, file: Project.FileId, node: Ast.Node.Index) ?Ast.Node.I
 /// The constant local an identifier names.
 fn constantOf(c: *Context, file: Project.FileId, node: Ast.Node.Index) ?Ast.full.VarDecl {
     const tree = &c.project.at(file).file.tree;
-    if (tree.nodeTag(node) != .identifier) return null;
     const model = &c.project.at(file).model;
-    const d = (model.reference(node) orelse return null).declaration orelse return null;
+    const d = (nameRef(model, node) orelse return null).declaration orelse return null;
     const record = model.declarations[@backingInt(d)];
     if (record.kind != .variable) return null;
     const variable = tree.fullVarDecl(record.node) orelse return null;
@@ -3549,21 +3582,13 @@ fn same(tree: *const Ast, a: Ast.Node.Index, b: Ast.Node.Index) bool {
 }
 
 fn bare(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
-    var at = node;
-    while (true) switch (tree.nodeTag(at)) {
-        .grouped_expression => at = tree.nodeData(at).node_and_token[0],
-        .builtin_call_two, .builtin_call_two_comma => {
-            const name = tree.tokenSlice(tree.nodeMainToken(at));
-            var buffer: [2]Ast.Node.Index = undefined;
-            const args = Facts.builtinArgs(tree, at, &buffer);
-            if (std.mem.eql(u8, name, "@as") and args.len == 2) {
-                at = args[1];
-            } else if (std.mem.eql(u8, name, "@intCast") and args.len == 1) {
-                at = args[0];
-            } else return at;
-        },
-        else => return at,
-    };
+    var at = Facts.ungrouped(tree, node);
+    while (true) {
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (formAt(tree, at) != .builtin) return at;
+        const args = Facts.builtinArgs(tree, at, &buffer);
+        at = Facts.ungrouped(tree, if (Facts.isBuiltin(tree, at, "@as") and args.len == 2) args[1] else if (Facts.isBuiltin(tree, at, "@intCast") and args.len == 1) args[0] else return at);
+    }
 }
 
 /// Whether the comparisons holding where `index` is read keep it within `memory`: below its

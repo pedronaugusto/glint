@@ -12544,27 +12544,43 @@ pub const accesses = struct {
         overflow: enum { checked, wrapping, saturating } = .checked,
     };
 
-    /// The operation of a compound assignment's tag.
-    fn compound(tag: Ast.Node.Tag) Operator {
+    /// The operation a binary operator or a compound assignment performs, by its tag (`a + b`'s
+    /// and `a += b`'s alike). Null for any other tag: it is no arithmetic, which says nothing of
+    /// whether an operation overflows.
+    pub fn operatorOf(tag: Ast.Node.Tag) ?Operator {
         return switch (tag) {
-            .assign_mul => .{ .op = .mul },
-            .assign_div => .{ .op = .div },
-            .assign_mod => .{ .op = .mod },
-            .assign_add => .{ .op = .add },
-            .assign_sub => .{ .op = .sub },
-            .assign_shl => .{ .op = .shl },
-            .assign_shl_sat => .{ .op = .shl, .overflow = .saturating },
-            .assign_shr => .{ .op = .shr },
-            .assign_bit_and => .{ .op = .bit_and },
-            .assign_bit_xor => .{ .op = .bit_xor },
-            .assign_bit_or => .{ .op = .bit_or },
-            .assign_mul_wrap => .{ .op = .mul, .overflow = .wrapping },
-            .assign_add_wrap => .{ .op = .add, .overflow = .wrapping },
-            .assign_sub_wrap => .{ .op = .sub, .overflow = .wrapping },
-            .assign_mul_sat => .{ .op = .mul, .overflow = .saturating },
-            .assign_add_sat => .{ .op = .add, .overflow = .saturating },
-            .assign_sub_sat => .{ .op = .sub, .overflow = .saturating },
-            else => unreachable, // the caller's prong holds the compound assignments alone
+            .mul, .assign_mul => .{ .op = .mul },
+            .div, .assign_div => .{ .op = .div },
+            .mod, .assign_mod => .{ .op = .mod },
+            .add, .assign_add => .{ .op = .add },
+            .sub, .assign_sub => .{ .op = .sub },
+            .shl, .assign_shl => .{ .op = .shl },
+            .shl_sat, .assign_shl_sat => .{ .op = .shl, .overflow = .saturating },
+            .shr, .assign_shr => .{ .op = .shr },
+            .bit_and, .assign_bit_and => .{ .op = .bit_and },
+            .bit_xor, .assign_bit_xor => .{ .op = .bit_xor },
+            .bit_or, .assign_bit_or => .{ .op = .bit_or },
+            .mul_wrap, .assign_mul_wrap => .{ .op = .mul, .overflow = .wrapping },
+            .add_wrap, .assign_add_wrap => .{ .op = .add, .overflow = .wrapping },
+            .sub_wrap, .assign_sub_wrap => .{ .op = .sub, .overflow = .wrapping },
+            .mul_sat, .assign_mul_sat => .{ .op = .mul, .overflow = .saturating },
+            .add_sat, .assign_add_sat => .{ .op = .add, .overflow = .saturating },
+            .sub_sat, .assign_sub_sat => .{ .op = .sub, .overflow = .saturating },
+            else => null,
+        };
+    }
+
+    /// An operator on one number.
+    pub const Unary = enum { negation, negation_wrap, bit_not };
+
+    /// The operator on one number a tag writes. Null for any other tag, `!` among them (a
+    /// condition's, `conditionOf`): it is no arithmetic, which says nothing of overflow.
+    pub fn unaryOf(tag: Ast.Node.Tag) ?Unary {
+        return switch (tag) {
+            .negation => .negation,
+            .negation_wrap => .negation_wrap,
+            .bit_not => .bit_not,
+            else => null,
         };
     }
 
@@ -13615,7 +13631,7 @@ pub const accesses = struct {
                     .assign_mul, .assign_div, .assign_mod, .assign_add, .assign_sub, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_xor, .assign_bit_or, .assign_mul_wrap, .assign_add_wrap, .assign_sub_wrap, .assign_mul_sat, .assign_add_sat, .assign_sub_sat => {
                         const target, const value = tree.nodeData(node).node_and_node;
                         var site = w.make(node, target, .update, value);
-                        site.operator = .{ .op = compound(tag) };
+                        site.operator = .{ .op = operatorOf(tag).? }; // unreachable: this prong holds the compound assignments alone
                         if (try w.wants(target)) try w.store(site);
                     },
                     .assign_destructure => {

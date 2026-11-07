@@ -249,6 +249,56 @@ test "accesses: each syntax form that holds an expression is in a construct matr
     try std.testing.expect(!failed);
 }
 
+test "accesses: an operator's operation by its tag, each form's overflow, and null for what is no arithmetic" {
+    const Tag = std.zig.Ast.Node.Tag;
+    // Both directions against `formOf`: a tag of the operator forms maps to exactly one of the two
+    // readers, a compound assignment to the binary one's; every other tag to neither.
+    for (std.meta.tags(Tag)) |tag| {
+        const binary = accesses.operatorOf(tag) != null;
+        const unary = accesses.unaryOf(tag) != null;
+        switch (accesses.formOf(tag)) {
+            .operator => try std.testing.expect(binary != unary),
+            .compound_assign => try std.testing.expect(binary and !unary),
+            else => try std.testing.expect(!binary and !unary),
+        }
+    }
+    // A form and its assignment are one operation, whose overflow each carries.
+    const Row2 = struct { Tag, Tag, @TypeOf(@as(accesses.Operator, undefined).op), @TypeOf(@as(accesses.Operator, undefined).overflow) };
+    const operators = [_]Row2{
+        .{ .add, .assign_add, .add, .checked },
+        .{ .sub, .assign_sub, .sub, .checked },
+        .{ .mul, .assign_mul, .mul, .checked },
+        .{ .div, .assign_div, .div, .checked },
+        .{ .mod, .assign_mod, .mod, .checked },
+        .{ .shl, .assign_shl, .shl, .checked },
+        .{ .shr, .assign_shr, .shr, .checked },
+        .{ .bit_and, .assign_bit_and, .bit_and, .checked },
+        .{ .bit_or, .assign_bit_or, .bit_or, .checked },
+        .{ .bit_xor, .assign_bit_xor, .bit_xor, .checked },
+        .{ .add_wrap, .assign_add_wrap, .add, .wrapping },
+        .{ .sub_wrap, .assign_sub_wrap, .sub, .wrapping },
+        .{ .mul_wrap, .assign_mul_wrap, .mul, .wrapping },
+        .{ .add_sat, .assign_add_sat, .add, .saturating },
+        .{ .sub_sat, .assign_sub_sat, .sub, .saturating },
+        .{ .mul_sat, .assign_mul_sat, .mul, .saturating },
+        .{ .shl_sat, .assign_shl_sat, .shl, .saturating },
+    };
+    for (operators) |row| for ([_]Tag{ row[0], row[1] }) |tag| {
+        const read = accesses.operatorOf(tag).?; // unreachable: the first loop holds these to one
+        try std.testing.expectEqual(row[2], read.op);
+        try std.testing.expectEqual(row[3], read.overflow);
+    };
+    try std.testing.expectEqual(accesses.Unary.negation, accesses.unaryOf(.negation).?);
+    try std.testing.expectEqual(accesses.Unary.negation_wrap, accesses.unaryOf(.negation_wrap).?);
+    try std.testing.expectEqual(accesses.Unary.bit_not, accesses.unaryOf(.bit_not).?);
+    // What is no arithmetic, however an operator it looks: a condition's, a comparison's, a
+    // pointer's and a type's.
+    for ([_]Tag{ .bool_not, .bool_and, .bool_or, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .address_of, .deref, .optional_type, .assign, .assign_destructure }) |tag| {
+        try std.testing.expectEqual(@as(?accesses.Operator, null), accesses.operatorOf(tag));
+        try std.testing.expectEqual(@as(?accesses.Unary, null), accesses.unaryOf(tag));
+    }
+}
+
 test "accesses: what an expression's value does where it stands" {
     // Each row: a source, the first expression spelled as `needle`, its use (a carried one with how).
     const rows_of_use = [_]struct { []const u8, []const u8, []const u8 }{
