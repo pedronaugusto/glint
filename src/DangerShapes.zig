@@ -3338,7 +3338,7 @@ fn literalState(c: *Context, hold: StateHold, name: []const u8, type_expr: Facts
     // The field's default, what a literal of its holder that names it not gives it.
     const model = &c.project.at(type_expr.file).model;
     const tree_of_field = &c.project.at(type_expr.file).file.tree;
-    const default: ?Ast.Node.Index = if (model.parentOf(type_expr.node)) |field| if (tree_of_field.fullContainerField(field)) |full| full.ast.value_expr.unwrap() else null else null;
+    const default: ?Ast.Node.Index = if (model.parentOf(type_expr.node)) |field| if (model.containerField(tree_of_field, field)) |full| full.ast.value_expr.unwrap() else null else null;
     var literal = false;
     var unknown = false;
     for (writes) |write| {
