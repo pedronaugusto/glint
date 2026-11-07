@@ -1003,8 +1003,8 @@ test "A014 finds a pointer into the frame carried out of the call" {
     // given, and nowhere in the frame where it is made from an integer, its type unresolved (a
     // generic's `@TypeOf(slice.ptr)`, relic-b's warp c.zig:774).
     try expect(pack.lifetimes, "pub fn f(n: u8) []u8 { var buf: [4]u8 = .{ n, n, n, n }; buf[0] = 1; const p: [*]u8 = &buf; return p[0..2]; }", 1);
-    try expect(pack.lifetimes, "fn m(s: anytype, at: usize) @TypeOf(s) { const p: @TypeOf(s.ptr) = @ptrFromInt(at); return p[0..s.len]; } pub fn f(x: anytype) void { _ = m(x, 8); }", 0);
-    try expect(pack.lifetimes, "fn m(s: anytype, at: usize) @TypeOf(s) { const p: @TypeOf(s.ptr) = @ptrCast(@alignCast(@as(*u8, @ptrFromInt(at)))); return p[0..s.len]; } pub fn f(x: anytype) void { _ = m(x, 8); }", 0);
+    try expectNoted(pack.lifetimes, "fn m(s: anytype, at: usize) @TypeOf(s) { const p: @TypeOf(s.ptr) = @ptrFromInt(at); return p[0..s.len]; } pub fn f(x: anytype) void { _ = m(x, 8); }", 1, 0);
+    try expectNoted(pack.lifetimes, "fn m(s: anytype, at: usize) @TypeOf(s) { const p: @TypeOf(s.ptr) = @ptrCast(@alignCast(@as(*u8, @ptrFromInt(at)))); return p[0..s.len]; } pub fn f(x: anytype) void { _ = m(x, 8); }", 1, 0);
 }
 
 test "A014 leaves static storage, pointers, copies and a store a defer clears on every exit alone" {
