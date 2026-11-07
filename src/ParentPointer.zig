@@ -2245,5 +2245,3 @@ fn typeFunction(c: *Context, file: Project.FileId, callee: Ast.Node.Index) Conte
     const proto = tree.fullFnProto(&buffer, function.node) orelse return false;
     return typeKeyword(tree, proto.ast.return_type.unwrap() orelse return false);
 }
-
-
