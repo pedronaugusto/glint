@@ -1725,7 +1725,7 @@ test "an aegis with one name each for its ring and ring buffer, as 0.3 has, is r
         try std.testing.expect(!report.complete);
         var drifted = false;
         for (report.coverage) |entry| if (entry.rule != null) {
-            drifted = drifted or std.mem.eql(u8, entry.detail, "aegis's lint_rules at src/root.zig:116: a reference that does not resolve; the roles it declares are not all read in this file");
+            drifted = drifted or std.mem.eql(u8, entry.detail, "aegis's lint_rules at src/root.zig:126: a reference that does not resolve; the roles it declares are not all read in this file");
         };
         try std.testing.expect(drifted);
     }

@@ -67,6 +67,18 @@ pub const Kind = enum {
     /// aegis's: released by a call of its own that releases each of them on every exit, read by
     /// releases.zig (A003).
     record,
+    /// `Budget.reserve`: a reservation of an amount against the budget, the amount at most what
+    /// the budget has left (Range's bound where it passed).
+    charge,
+    /// `int.Checked`'s `add` and `mul`: a checked step that only grows its value, its operand at
+    /// most its result, as overflow is an error.
+    checked_growth,
+    /// `int.Checked.raw`: the integer a checked value holds, read out.
+    raw,
+    /// `Untrusted.parse`: hands the peer's value to the program's parser.
+    parse,
+    /// `Untrusted.readForParse`: the peer's value itself, as a parser reads it.
+    peer_value,
 };
 
 /// Aegis's roles, as aegis declares them in its root's `lint_rules` (glint-design §12): each
@@ -132,7 +144,9 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
                 .function => |function| function,
                 .choice, .any => return null,
             };
-            if (try c.role(library, .{ .function = origin })) |k| return k;
+            // A type function's role is what its call makes; an operation's (`Budget.reserve`'s
+            // charge) says what the call does, not what it gives: its declared result does.
+            if (try c.role(library, .{ .function = origin })) |k| if (!isOperation(k)) return k;
             const record = c.project.at(origin.file).model.declarations[@backingInt(origin.index)];
             if (record.kind != .function) return null;
             const written = &c.project.at(origin.file).file.tree;
@@ -144,6 +158,15 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
         else => return null,
     }
 }
+/// Whether a role is an operation's, declared on a function for what calling it does (`charge`,
+/// `checked_growth`, `raw`, `parse`, `peer_value`), never the kind of a value.
+pub fn isOperation(k: Kind) bool {
+    return switch (k) {
+        .charge, .checked_growth, .raw, .parse, .peer_value => true,
+        else => false,
+    };
+}
+
 /// Whether a role is a guard's: an owner's guard, or an Order's ranked capability. Every guard
 /// check asks this, so none forgets the ranked one.
 pub fn isGuard(k: ?Kind) bool {

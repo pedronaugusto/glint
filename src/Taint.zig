@@ -1813,10 +1813,7 @@ fn parsed(c: *Context, flow: *Flow, file: Project.FileId, params: []const Ast.No
 /// The program's function an `Untrusted.parse(context, parser)` call hands its value to.
 fn parserOf(c: *Context, flow: *Flow, file: Project.FileId, params: []const Ast.Node.Index, decl: Facts.Decl) Context.Error!?Function.Id {
     const origin = ((try c.facts.origin(decl)).orNull()) orelse decl;
-    const record = c.project.at(origin.file).model.declarations[@backingInt(origin.index)];
-    if (!std.mem.eql(u8, record.name, "parse") or params.len == 0) return null;
-    const container: Facts.Value = .{ .container = .{ .file = origin.file, .scope = record.scope } };
-    if (try c.role(Contract.library, container) != .untrusted) return null;
+    if (params.len == 0 or try c.role(Contract.library, .{ .function = origin }) != .parse) return null;
     const parser = switch (try c.facts.resolve(file, params[params.len - 1])) {
         .function => |function| function,
         .alternatives => return null,
@@ -2031,7 +2028,7 @@ fn into(c: *Context, flow: *Flow, decl: Facts.Decl, out: *Callee) Context.Error!
         const role = try c.role(Contract.library, container);
         // What an `input.Untrusted` hands its parser is the peer's value itself: only what the
         // parser makes of it is the answer to input.
-        if (role == .untrusted and std.mem.eql(u8, c.project.at(origin.file).model.declarations[@backingInt(origin.index)].name, "readForParse")) {
+        if (try c.role(Contract.library, .{ .function = origin }) == .peer_value) {
             out.kind = .source;
             return;
         }

@@ -89,6 +89,19 @@ test "a declared role is recognized across any layout, by the declaration it nam
         try expectMessages(run.report, &.{ "widget", "widget", "gauge", "gauge", "none", "none" });
     }
 }
+test "a replacement or deprecation that does not resolve leaves the declared roles read, with no drift: it is the declarer's to fix where its own lint reports it" {
+    const unresolved = [_]Layout{
+        .{ .name = "gadgets.zig", .bytes = "const std = @import(\"std\");\npub const Widget = @import(\"widget.zig\").Widget;\npub const kit = @import(\"kit.zig\");\n" ++
+            "pub const lint_rules = .{ .version = 1, .replaces = .{.{ .std = std.Io.Dir.gone, .with = Widget, .why = \"r\" }}, .deprecated = .{.{ .decl = kit.gone, .with = null, .why = \"d\" }}, .roles = .{ .{ .type = Widget, .role = .widget }, .{ .type = kit.Gauge, .role = .gauge } } };\n" },
+        flat[1],
+        flat[2],
+    };
+    var run = try probeAll(consumer, &unresolved);
+    defer run.project.deinit();
+    defer run.report.deinit();
+    try std.testing.expect(run.report.complete);
+    try expectMessages(run.report, &.{ "widget", "widget", "gauge", "gauge", "none", "none" });
+}
 test "the same declarations under another package are not the library's" {
     var built = try P.init(std.testing.allocator, &.{
         .{ .name = "consumer", .bytes = "const lookalike = @import(\"lookalike\");\npub const A = lookalike.Widget;\npub const B = lookalike.Widget(u8);" },

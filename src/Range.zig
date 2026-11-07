@@ -2668,12 +2668,11 @@ fn reserved(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), statem
     var value = statement;
     if (tree.fullVarDecl(statement)) |local| value = local.ast.init_node.unwrap() orelse return;
     const reservation = passed(tree, value) orelse return;
+    // A charge by its callee's declared role (`Budget.reserve`), on the budget it is called on.
+    const receiver = (try roleCall(c, file, reservation, .charge)) orelse return;
     var buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&buffer, reservation) orelse return;
-    if (call.ast.params.len != 1 or formAt(tree, call.ast.fn_expr) != .member) return;
-    const receiver, const name = tree.nodeData(call.ast.fn_expr).node_and_token;
-    if (!std.mem.eql(u8, tree.tokenSlice(name), "reserve")) return;
-    if (try c.role(Contract.library, try c.facts.resolve(file, receiver)) != .budget) return;
+    const call = tree.fullCall(&buffer, reservation).?; // unreachable: roleCall found a call
+    if (call.ast.params.len != 1) return;
     const count = (try charged(c, file, call.ast.params[0])) orelse return;
     if (!try kept(c, file, count, statement, use) or !try kept(c, file, receiver, statement, use)) return;
     try out.append(c.allocator, .{ .small = count, .large = receiver, .strict = false });
@@ -2696,22 +2695,33 @@ fn passed(tree: *const Ast, value: Ast.Node.Index) ?Ast.Node.Index {
 fn charged(c: *Context, file: Project.FileId, amount: Ast.Node.Index) Context.Error!?Ast.Node.Index {
     const tree = &c.project.at(file).file.tree;
     var at = bare(tree, amount);
-    var buffer: [1]Ast.Node.Index = undefined;
-    if (tree.fullCall(&buffer, at)) |raw| {
-        if (raw.ast.params.len != 0 or formAt(tree, raw.ast.fn_expr) != .member) return at;
-        const holder, const name = tree.nodeData(raw.ast.fn_expr).node_and_token;
-        if (!std.mem.eql(u8, tree.tokenSlice(name), "raw")) return at;
-        at = bare(tree, holder);
-    }
+    // A checked value's integer (`.raw()`, by its declared role): the value it is read from.
+    if (try roleCall(c, file, at, .raw)) |holder| at = bare(tree, holder);
     if (constantOf(c, file, at)) |variable| at = bare(tree, variable.ast.init_node.unwrap() orelse return null);
     if (passed(tree, at)) |inner| at = bare(tree, inner);
+    var buffer: [1]Ast.Node.Index = undefined;
     const step = tree.fullCall(&buffer, at) orelse return at;
-    if (step.ast.params.len != 1 or formAt(tree, step.ast.fn_expr) != .member) return null;
-    const checked, const op = tree.nodeData(step.ast.fn_expr).node_and_token;
-    const name = tree.tokenSlice(op);
-    if (!std.mem.eql(u8, name, "mul") and !std.mem.eql(u8, name, "add")) return null;
-    if (try c.role(Contract.library, try c.facts.resolve(file, checked)) != .scalar) return null;
+    // A checked step that only grows (`.mul(n)`, `.add(n)`, by its declared role): `n` is at
+    // most its result.
+    _ = (try roleCall(c, file, at, .checked_growth)) orelse return null;
+    if (step.ast.params.len != 1) return null;
     return step.ast.params[0];
+}
+
+/// The receiver of the method call `node`, where its callee is the one function aegis declares
+/// with `role` (`Facts.calls`, PackageRules.role): null for any other call, a choice of callees,
+/// or one called other than on a value.
+fn roleCall(c: *Context, file: Project.FileId, node: Ast.Node.Index, role: Contract.Kind) Context.Error!?Ast.Node.Index {
+    const call = (try Facts.calls.at(c.facts, file, node)) orelse return null;
+    const function = switch (call.callee) {
+        .function => |function| function,
+        .choice, .any => return null,
+    };
+    if (try c.role(Contract.library, .{ .function = function }) != role) return null;
+    return switch (call.receiver) {
+        .bound => |receiver| receiver,
+        else => null,
+    };
 }
 
 /// The comparison a clamp leaves where it is done: `if (x > y) x = y;` puts `x` at most `y`

@@ -96,6 +96,11 @@ pub const Problem = struct {
     file: Project.FileId,
     node: Ast.Node.Index,
     why: Why,
+    /// The part of the rules it is in: one in a replacement or a deprecation leaves the roles and
+    /// pairs read (`publication`), the declarer's to fix where its own lint reports it.
+    part: Part = .roles,
+
+    pub const Part = enum { roles, replaces, deprecated };
 
     pub const Why = enum {
         /// `.version` is not this reader's (`version`): the rules are not read.
@@ -206,7 +211,9 @@ pub fn publication(facts: *Facts, library: anytype) Facts.ResolveError!*const Pu
     for (try facts.packageRoots(library.package)) |root| {
         const rules = try of(facts, root);
         if (rules.declared == null) try gaps.append(facts.gpa, .{ .root = root, .problem = null });
-        for (rules.problems) |problem| try gaps.append(facts.gpa, .{ .root = root, .problem = problem });
+        // A replacement or a deprecation that does not resolve leaves the roles read: the
+        // declarer's own lint reports it, and P006 skips the entry.
+        for (rules.problems) |problem| if (problem.part == .roles) try gaps.append(facts.gpa, .{ .root = root, .problem = problem });
         try pairs.appendSlice(facts.gpa, rules.pairs);
         for (rules.roles) |declared| {
             const role_value = roleValue(Roles, declared.role) orelse continue;
@@ -325,6 +332,8 @@ const Reader = struct {
     seen: std.AutoHashMapUnmanaged(Facts.Decl, void) = .empty,
     replaces: std.ArrayList(Replace) = .empty,
     deprecated: std.ArrayList(Deprecated) = .empty,
+    /// The part of the rules being read, which a problem found there records.
+    part: Problem.Part = .roles,
     roles: std.ArrayList(Role) = .empty,
     pairs: std.ArrayList(Pair) = .empty,
     problems: std.ArrayList(Problem) = .empty,
@@ -336,7 +345,7 @@ const Reader = struct {
     }
 
     fn problem(r: *Reader, file: Project.FileId, node: Ast.Node.Index, why: Problem.Why) Error!void {
-        try r.problems.append(r.facts.gpa, .{ .file = file, .node = node, .why = why });
+        try r.problems.append(r.facts.gpa, .{ .file = file, .node = node, .why = why, .part = r.part });
     }
 
     /// Reads one `lint_rules` declaration, once.
@@ -360,8 +369,12 @@ const Reader = struct {
             if (std.mem.eql(u8, name, "include")) {
                 try r.includes(decl.file, field);
             } else if (std.mem.eql(u8, name, "replaces")) {
+                r.part = .replaces;
+                defer r.part = .roles;
                 for (try r.list(decl.file, field) orelse continue) |entry| try r.replace(decl.file, entry);
             } else if (std.mem.eql(u8, name, "deprecated")) {
+                r.part = .deprecated;
+                defer r.part = .roles;
                 for (try r.list(decl.file, field) orelse continue) |entry| try r.deprecation(decl.file, entry);
             } else if (std.mem.eql(u8, name, "roles")) {
                 for (try r.list(decl.file, field) orelse continue) |entry| try r.role(decl.file, entry);
