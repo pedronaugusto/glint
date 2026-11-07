@@ -563,57 +563,7 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             return sum(try bound(c, file, lhs, pointer, next), try bound(c, file, rhs, pointer, next));
         },
-        .operator => {
-            if (accesses.unaryOf(tree.nodeTag(node)) == .negation) return bound(c, file, tree.nodeData(node).node, pointer, next);
-            const op = checkedOp(tree, node) orelse return null;
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            switch (op) {
-                .add => return sum(try bound(c, file, lhs, pointer, next), try bound(c, file, rhs, pointer, next)),
-                .sub => {
-                    const signed = switch (try typeOf(c, file, node, pointer, next)) {
-                        .int => |int| int.signed,
-                        else => return null,
-                    };
-                    // What is left of a value once its quotient by `k` is taken away (`y -
-                    // @divFloor(y, k) * k`) is a remainder, below `k`.
-                    if (try remainder(c, file, lhs, rhs)) |k| return ((try bound(c, file, k, pointer, next)) orelse return null) -| 1;
-                    // An unsigned difference that does not underflow is at most what it takes
-                    // from, less a constant it takes (an underflow stops the program: A010's to
-                    // judge).
-                    if (!signed) return ((try bound(c, file, lhs, pointer, next)) orelse return null) -| (literal(tree, rhs) orelse 0);
-                    return sum(try bound(c, file, lhs, pointer, next), try bound(c, file, rhs, pointer, next));
-                },
-                .mul => {
-                    const left = (try bound(c, file, lhs, pointer, next)) orelse return null;
-                    const right = (try bound(c, file, rhs, pointer, next)) orelse return null;
-                    return left *| right;
-                },
-                .div => return quotient(try bound(c, file, lhs, pointer, next), literal(tree, rhs)),
-                .mod => return ((try bound(c, file, rhs, pointer, next)) orelse return null) -| 1,
-                // A shift by at most `k` moves at most as far as one by `k`.
-                .shl => {
-                    const by = literal(tree, rhs) orelse std.math.cast(u64, (try bound(c, file, rhs, pointer, next)) orelse return null) orelse return null;
-                    return shifted(try bound(c, file, lhs, pointer, next), by);
-                },
-                .shr => {
-                    const left = (try bound(c, file, lhs, pointer, next)) orelse return null;
-                    const by = literal(tree, rhs) orelse return left;
-                    return if (by >= @bitSizeOf(Magnitude)) 0 else left >> @intCast(by);
-                },
-                .bit_and => {
-                    const left = try bound(c, file, lhs, pointer, next);
-                    const right = try bound(c, file, rhs, pointer, next);
-                    if (left == null) return right;
-                    if (right == null) return left;
-                    return @min(left.?, right.?);
-                },
-                .bit_or, .bit_xor => {
-                    const most = wider(try bound(c, file, lhs, pointer, next), try bound(c, file, rhs, pointer, next)) orelse return null;
-                    return filled(std.math.sub(u16, @bitSizeOf(Magnitude), @clz(most)) catch return null);
-                },
-                else => return null,
-            }
-        },
+        .operator => return operatorBound(c, file, node, pointer, next),
         .@"if" => {
             const branch = tree.fullIf(node).?;
             const then = try bound(c, file, branch.ast.then_expr, pointer, next);
@@ -638,6 +588,61 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
                 .alternatives => null,
                 else => null,
             };
+        },
+        else => return null,
+    }
+}
+
+/// What an operator bounds: a negation its operand's magnitude, checked arithmetic by what it
+/// does to its operands' bounds. Wrapping, saturating or `~` read as nothing shown here.
+fn operatorBound(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16, next: u8) Context.Error!?Magnitude {
+    const tree = &c.project.at(file).file.tree;
+    if (accesses.unaryOf(tree.nodeTag(node)) == .negation) return bound(c, file, tree.nodeData(node).node, pointer, next);
+    const op = checkedOp(tree, node) orelse return null;
+    const lhs, const rhs = tree.nodeData(node).node_and_node;
+    switch (op) {
+        .add => return sum(try bound(c, file, lhs, pointer, next), try bound(c, file, rhs, pointer, next)),
+        .sub => {
+            const signed = switch (try typeOf(c, file, node, pointer, next)) {
+                .int => |int| int.signed,
+                else => return null,
+            };
+            // What is left of a value once its quotient by `k` is taken away (`y -
+            // @divFloor(y, k) * k`) is a remainder, below `k`.
+            if (try remainder(c, file, lhs, rhs)) |k| return ((try bound(c, file, k, pointer, next)) orelse return null) -| 1;
+            // An unsigned difference that does not underflow is at most what it takes
+            // from, less a constant it takes (an underflow stops the program: A010's to
+            // judge).
+            if (!signed) return ((try bound(c, file, lhs, pointer, next)) orelse return null) -| (literal(tree, rhs) orelse 0);
+            return sum(try bound(c, file, lhs, pointer, next), try bound(c, file, rhs, pointer, next));
+        },
+        .mul => {
+            const left = (try bound(c, file, lhs, pointer, next)) orelse return null;
+            const right = (try bound(c, file, rhs, pointer, next)) orelse return null;
+            return left *| right;
+        },
+        .div => return quotient(try bound(c, file, lhs, pointer, next), literal(tree, rhs)),
+        .mod => return ((try bound(c, file, rhs, pointer, next)) orelse return null) -| 1,
+        // A shift by at most `k` moves at most as far as one by `k`.
+        .shl => {
+            const by = literal(tree, rhs) orelse std.math.cast(u64, (try bound(c, file, rhs, pointer, next)) orelse return null) orelse return null;
+            return shifted(try bound(c, file, lhs, pointer, next), by);
+        },
+        .shr => {
+            const left = (try bound(c, file, lhs, pointer, next)) orelse return null;
+            const by = literal(tree, rhs) orelse return left;
+            return if (by >= @bitSizeOf(Magnitude)) 0 else left >> @intCast(by);
+        },
+        .bit_and => {
+            const left = try bound(c, file, lhs, pointer, next);
+            const right = try bound(c, file, rhs, pointer, next);
+            if (left == null) return right;
+            if (right == null) return left;
+            return @min(left.?, right.?);
+        },
+        .bit_or, .bit_xor => {
+            const most = wider(try bound(c, file, lhs, pointer, next), try bound(c, file, rhs, pointer, next)) orelse return null;
+            return filled(std.math.sub(u16, @bitSizeOf(Magnitude), @clz(most)) catch return null);
         },
         else => return null,
     }
@@ -2325,7 +2330,7 @@ fn ownLocal(tree: *const Ast, model: *const Model, target: Ast.Node.Index, funct
 /// parameter, `self_token`): what it says of the receiver is what the caller's receiver holds.
 /// Another parameter, a local or a capture of the callee read in the caller would be whatever
 /// the caller's code spells that way.
-fn receiverOnly(tree: *const Ast, model: anytype, condition: Ast.Node.Index, function: Ast.Node.Index, self_token: Ast.TokenIndex) bool {
+fn receiverOnly(tree: *const Ast, model: *const Model, condition: Ast.Node.Index, function: Ast.Node.Index, self_token: Ast.TokenIndex) bool {
     const first = tree.firstToken(condition);
     const last = tree.lastToken(condition);
     for (0..tree.nodes.len) |i| {
