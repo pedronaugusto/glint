@@ -8944,16 +8944,17 @@ pub fn valueParts(value: *const Value) []const Value {
 
 /// The answers a reader gives each part of a value (`valueParts`), joined as one: whether any part is
 /// so (`any`, `anyOf`'s join), every part (`all`, `bothOf`'s), or what every part agrees on
-/// (`agreed`). An `.unknown` part, a part the reader cannot decide (null: a tag it does not name)
-/// and a choice of none decide neither yes nor no: the caller turns null into its conservative
-/// answer. `for (Facts.valueParts(&v)) |part| join.add(part, answer(part));`
+/// (`agreed`). An `.unknown` part, a part that is itself a choice (`.alternatives`, which
+/// `valueParts` never gives: a reader's answer to it is of no one part), a part the reader cannot
+/// decide (null: a tag it does not name) and a choice of none decide neither yes nor no: the
+/// caller turns null into its conservative answer. `for (Facts.valueParts(&v)) |part| join.add(part, answer(part));`
 pub const Join = struct {
     some: ?bool = false,
     every: ?bool = true,
     parts: usize = 0,
 
     pub fn add(self: *Join, part: Value, answer: ?bool) void {
-        const given: ?bool = if (part == .unknown) null else answer;
+        const given: ?bool = if (part == .unknown or part == .alternatives) null else answer;
         self.some = anyOf(self.some, given);
         self.every = bothOf(self.every, given);
         self.parts += 1;
@@ -15035,6 +15036,13 @@ test "a value read part by part: any part, every part, or what every part agrees
     try std.testing.expectEqual(@as(usize, 1), valueParts(&scalar).len);
     try std.testing.expectEqual(true, PartReader.join(&scalar).any());
     try std.testing.expectEqual(null, PartReader.join(&unknown).any());
+    // A part that is itself a choice decides nothing, whatever a reader answers of it.
+    var nested: Join = .{};
+    nested.add(.{ .alternatives = &.{ scalar, errors } }, true);
+    nested.add(errors, false);
+    try std.testing.expectEqual(null, nested.any());
+    try std.testing.expectEqual(false, nested.all());
+    try std.testing.expectEqual(null, nested.agreed());
 }
 
 test "an import only a test of std or a known library makes shares no compilation with the program: a function-pointer field keeps its stores; outside a test, or in a test of the program's own, it erases" {
