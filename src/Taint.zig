@@ -2608,8 +2608,9 @@ fn reachedUnnamed(c: *Context, flow: *Flow, decl: Facts.Decl) Context.Error!bool
     const files = flow.own_files orelse files: {
         var own: std.ArrayList(Project.FileId) = .empty;
         for (c.project.sources) |*each| if (flow.own(each.id)) try own.append(c.allocator, each.id);
-        flow.own_files = own.items;
-        break :files own.items;
+        const listed = try own.toOwnedSlice(c.allocator);
+        flow.own_files = listed;
+        break :files listed;
     };
     var sites = Facts.accesses.writes(c.facts, place, files);
     const through = while (try sites.next()) |site| {
@@ -3730,7 +3731,9 @@ fn rootDecl(model: *const Model, tree: *const Ast, node: Ast.Node.Index) ?Model.
 }
 
 /// Each node's children, by file, built once from the parent table.
-const Children = struct { map: std.AutoHashMapUnmanaged(Project.FileId, []const []const Ast.Node.Index) = .empty };
+/// Each node's children, in node order, in one list for the file: `starts[n]` up to `starts[n + 1]`.
+const FileChildren = struct { starts: []const u32, nodes: []const Ast.Node.Index };
+const Children = struct { map: std.AutoHashMapUnmanaged(Project.FileId, FileChildren) = .empty };
 
 fn children(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error![]const Ast.Node.Index {
     // What it keeps in its memo stays for the run.
@@ -3738,17 +3741,34 @@ fn children(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
     defer c.allocator = rule_memory;
     const memo = try c.facts.memo(Children);
     const all = memo.map.get(file) orelse blk: {
-        const model = &c.project.at(file).model;
-        const lists = try c.allocator.alloc(std.ArrayList(Ast.Node.Index), model.node_parents.len);
-        @memset(lists, .empty);
-        for (model.node_parents, 0..) |parent, i| if (parent) |p| try lists[@backingInt(p)].append(c.allocator, @fromBackingInt(@intCast(i)));
-        const out = try c.allocator.alloc([]const Ast.Node.Index, lists.len);
-        for (lists, out) |list, *each| each.* = list.items;
-        try memo.map.put(c.allocator, file, out);
-        break :blk out;
+        const parents = c.project.at(file).model.node_parents;
+        const starts = try c.allocator.alloc(u32, parents.len + 1);
+        @memset(starts, 0);
+        var total: u32 = 0;
+        for (parents) |parent| if (parent) |p| {
+            starts[@backingInt(p)] += 1;
+            total += 1;
+        };
+        // Each node's count, made its start; each child then placed in node order.
+        var sum: u32 = 0;
+        for (starts) |*start| {
+            const count = start.*;
+            start.* = sum;
+            sum += count;
+        }
+        const nodes = try c.allocator.alloc(Ast.Node.Index, total);
+        const next = try c.allocator.dupe(u32, starts);
+        for (parents, 0..) |parent, i| if (parent) |p| {
+            nodes[next[@backingInt(p)]] = @fromBackingInt(@intCast(i));
+            next[@backingInt(p)] += 1;
+        };
+        const made: FileChildren = .{ .starts = starts, .nodes = nodes };
+        try memo.map.put(c.allocator, file, made);
+        break :blk made;
     };
     const index = @backingInt(node);
-    return if (index < all.len) all[index] else &.{};
+    if (index + 1 >= all.starts.len) return &.{};
+    return all.nodes[all.starts[index]..all.starts[index + 1]];
 }
 
 /// The program's calls of each of its functions, by callee, built once per flow.

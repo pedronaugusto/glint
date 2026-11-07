@@ -430,8 +430,8 @@ const Walk = struct {
             // that one.
             const function = ownFunction(w.tree, w.model, w.model.declarations[@backingInt(w.local)].node);
             if (index.exits.get(function)) |own| {
-                w.returns = own.returns.items;
-                w.tries = own.tries.items;
+                w.returns = own.returns;
+                w.tries = own.tries;
             }
         }
         for (index.outputs.items) |node| {
@@ -3004,7 +3004,8 @@ const FileIndex = struct {
     bindings: std.ArrayList(Binding) = .empty,
 
     const Binding = struct { id: Model.Declaration.Id, of: Model.Declaration.Id, address: bool };
-    const Exits = struct { returns: std.ArrayList(Ast.Node.Index) = .empty, tries: std.ArrayList(Ast.Node.Index) = .empty };
+    const Exits = struct { returns: []const Ast.Node.Index, tries: []const Ast.Node.Index };
+    const Growing = struct { returns: std.ArrayList(Ast.Node.Index) = .empty, tries: std.ArrayList(Ast.Node.Index) = .empty };
 };
 
 /// The function declaration `node` is in, nearest first: `.root` outside any.
@@ -3024,11 +3025,13 @@ fn indexOf(facts: *Facts, file: Project.FileId) Context.Error!*const FileIndex {
     const model = &facts.project.at(file).model;
     const index = try gpa.create(FileIndex);
     index.* = .{};
+    var growing: std.AutoHashMapUnmanaged(Ast.Node.Index, FileIndex.Growing) = .empty;
+    defer growing.deinit(gpa);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         switch (tag) {
             .@"return", .@"try" => {
-                const entry = try index.exits.getOrPut(gpa, ownFunction(tree, model, node));
+                const entry = try growing.getOrPut(gpa, ownFunction(tree, model, node));
                 if (!entry.found_existing) entry.value_ptr.* = .{};
                 try (if (tag == .@"return") &entry.value_ptr.returns else &entry.value_ptr.tries).append(gpa, node);
             },
@@ -3050,6 +3053,8 @@ fn indexOf(facts: *Facts, file: Project.FileId) Context.Error!*const FileIndex {
         const of = (try nameOf(facts, file, spelled)) orelse continue;
         try index.bindings.append(gpa, .{ .id = @fromBackingInt(@intCast(d)), .of = of, .address = address });
     }
+    var each = growing.iterator();
+    while (each.next()) |entry| try index.exits.put(gpa, entry.key_ptr.*, .{ .returns = try entry.value_ptr.returns.toOwnedSlice(gpa), .tries = try entry.value_ptr.tries.toOwnedSlice(gpa) });
     try memo.files.put(gpa, file, index);
     return index;
 }

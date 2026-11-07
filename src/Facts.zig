@@ -3441,6 +3441,11 @@ fn mergedNames(self: *Facts, a: ErrorNames, b: ErrorNames) ResolveError!ErrorNam
     if (a == .unknown) return a;
     if (b == .unknown) return b;
     if (a == .any or b == .any) return .any;
+    // Most merges add nothing: nothing is copied for them.
+    const adds = for (b.names) |each| {
+        if (a.holds(each.name) == .no) break true;
+    } else false;
+    if (!adds) return a;
     var names: std.ArrayList(ErrorName) = .empty;
     try names.appendSlice(self.gpa, a.names);
     for (b.names) |each| if ((ErrorNames{ .names = names.items }).holds(each.name) == .no) try names.append(self.gpa, each);
@@ -3530,18 +3535,29 @@ fn inferredEntry(self: *Facts, callee: Decl) ResolveError!*InferredErrors.Inferr
     return &slot.*.?[@backingInt(callee.index)];
 }
 
+const ExitsIn = struct { files: std.AutoHashMapUnmanaged(Project.FileId, []const Ast.Node.Index) = .empty };
+
+/// Each `try` and `return` of `file`, in node order: listed once for the run, not once per body.
+fn exitsIn(self: *Facts, file: Project.FileId) ResolveError![]const Ast.Node.Index {
+    if ((try self.memo(ExitsIn)).files.get(file)) |known| return known;
+    var found: std.ArrayList(Ast.Node.Index) = .empty;
+    for (self.project.at(file).file.tree.nodes.items(.tag), 0..) |tag, i| switch (tag) {
+        .@"try", .@"return" => try found.append(self.gpa, @fromBackingInt(@intCast(i))),
+        else => {},
+    };
+    const listed = try found.toOwnedSlice(self.gpa);
+    try (try self.memo(ExitsIn)).files.put(self.gpa, file, listed);
+    return listed;
+}
+
 fn bodyErrors(self: *Facts, file: Project.FileId, body: Ast.Node.Index) ResolveError!ErrorNames {
     const tree = &self.project.at(file).file.tree;
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
     const model = &self.project.at(file).model;
     var found: ErrorNames = .{ .names = &.{} };
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        switch (tag) {
-            .@"try", .@"return" => {},
-            else => continue,
-        }
+    for (try self.exitsIn(file)) |node| {
+        const tag = tree.nodeTag(node);
         const token = tree.nodeMainToken(node);
         if (token < first or token > last) continue;
         // A function or container written inside returns its own errors, not this body's: by
@@ -8947,30 +8963,39 @@ pub fn origin(self: *Facts, start: Decl) ResolveError!Named {
 /// A value of the type `value` names: an instance of a container, and through a pointer,
 /// optional, error union or array type, the same wrapper around an instance of its payload
 /// (`E!Self` gives an error union whose payload is a `Self`).
-const InstanceKey = struct { parts: usize, len: usize };
+const InstanceKey = struct { parts: usize, shape: usize };
 const Instances = struct { of: std.AutoHashMapUnmanaged(InstanceKey, Value) = .empty };
 
+/// A value of the type `value` names. What holds another value is mapped once, by the box or the
+/// choice that holds it: it is kept for the run, and read as a value again and again.
 fn instance(self: *Facts, value: Value) ResolveError!Value {
-    return switch (value) {
-        .container => |c| .{ .instance = c },
-        .reified => |built| .{ .reified = .{ .fields = built.fields, .value = true } },
+    const key: InstanceKey = switch (value) {
+        .container => |c| return .{ .instance = c },
+        .reified => |built| return .{ .reified = .{ .fields = built.fields, .value = true } },
+        // By the box and the pointer's size: one box may be held by two sizes of pointer.
+        .pointer => |inner| .{ .parts = @intFromPtr(inner.child), .shape = 8 + if (inner.size) |size| @as(usize, @backingInt(size)) else 7 },
+        .optional => |inner| .{ .parts = @intFromPtr(inner), .shape = 1 },
+        .error_union => |inner| .{ .parts = @intFromPtr(inner), .shape = 2 },
+        .array => |inner| .{ .parts = @intFromPtr(inner), .shape = 3 },
+        .alternatives => |each| .{ .parts = @intFromPtr(each.ptr), .shape = 16 + each.len },
+        else => return value,
+    };
+    if ((try self.memo(Instances)).of.get(key)) |known| return known;
+    const made: Value = switch (value) {
         .pointer => |inner| try self.pointerTo(try self.instance(inner.child.*), inner.size),
         .optional => |inner| .{ .optional = try self.boxed(try self.instance(inner.*)) },
         .error_union => |inner| .{ .error_union = try self.boxed(try self.instance(inner.*)) },
         .array => |inner| .{ .array = try self.boxed(try self.instance(inner.*)) },
         // No value has type `noreturn`: a choice of types gives values of the others.
         .alternatives => |each| blk: {
-            // A choice is kept for the run: mapped once, however often it is read as a value.
-            const key: InstanceKey = .{ .parts = @intFromPtr(each.ptr), .len = each.len };
-            if ((try self.memo(Instances)).of.get(key)) |known| break :blk known;
             var mapped: std.ArrayList(Value) = .empty;
             for (each) |one| if (one != .primitive or !std.mem.eql(u8, one.primitive, "noreturn")) try mapped.append(self.gpa, try self.instance(one));
-            const made: Value = if (mapped.items.len == 1) mapped.items[0] else .{ .alternatives = mapped.items };
-            try (try self.memo(Instances)).of.put(self.gpa, key, made);
-            break :blk made;
+            break :blk if (mapped.items.len == 1) mapped.items[0] else .{ .alternatives = mapped.items };
         },
-        else => value,
+        else => unreachable, // unreachable: the key is made for these alone
     };
+    try (try self.memo(Instances)).of.put(self.gpa, key, made);
+    return made;
 }
 
 /// The parts of a value, each read alone: a choice's alternatives, or the value itself (`value`
@@ -12445,70 +12470,84 @@ pub const accesses = struct {
     pub const Values = union(enum) { leaves: []const Ast.Node.Index, unknown: Facts.Unknown };
 
     pub fn valuesOf(facts: *Facts, file: Project.FileId, node: Ast.Node.Index) Error!Values {
+        // Of the syntax alone: read once for the run.
+        const key: Facts.Key = .{ .file = file, .node = node };
+        if ((try facts.memo(ValuesRead)).of.get(key)) |known| return known;
+        const made = try valuesRead(facts, file, node);
+        try (try facts.memo(ValuesRead)).of.put(facts.gpa, key, made);
+        return made;
+    }
+
+    const ValuesRead = struct { of: std.AutoHashMapUnmanaged(Facts.Key, Values) = .empty };
+
+    fn valuesRead(facts: *Facts, file: Project.FileId, node: Ast.Node.Index) Error!Values {
         const tree = &facts.project.at(file).file.tree;
         if (givesItself(tree, node)) return .{ .leaves = try facts.gpa.dupe(Ast.Node.Index, &.{node}) };
+        const lists = std.heap.smp_allocator;
         var leaves: std.ArrayList(Ast.Node.Index) = .empty;
+        defer leaves.deinit(lists);
         var work: std.ArrayList(Ast.Node.Index) = .empty;
-        try work.append(facts.gpa, node);
+        defer work.deinit(lists);
+        try work.append(lists, node);
         var steps: usize = 0;
         while (work.pop()) |at| {
             steps += 1;
             if (steps > 4096) return .{ .unknown = .budget };
             if (givesItself(tree, at)) {
-                try leaves.append(facts.gpa, at);
+                try leaves.append(lists, at);
                 continue;
             }
             switch (formOf(tree.nodeTag(at))) {
-                .grouped, .unwrap_optional => try work.append(facts.gpa, tree.nodeData(at).node_and_token[0]),
-                .tried, .@"comptime", .@"nosuspend" => try work.append(facts.gpa, tree.nodeData(at).node),
-                .@"catch", .@"orelse" => try work.appendSlice(facts.gpa, &tree.nodeData(at).node_and_node),
+                .grouped, .unwrap_optional => try work.append(lists, tree.nodeData(at).node_and_token[0]),
+                .tried, .@"comptime", .@"nosuspend" => try work.append(lists, tree.nodeData(at).node),
+                .@"catch", .@"orelse" => try work.appendSlice(lists, &tree.nodeData(at).node_and_node),
                 .@"if" => {
                     const branch = tree.fullIf(at).?; // unreachable: the form is an if's
                     // One with no `else` gives `void`.
                     const otherwise = branch.ast.else_expr.unwrap() orelse continue;
-                    try work.append(facts.gpa, branch.ast.then_expr);
-                    try work.append(facts.gpa, otherwise);
+                    try work.append(lists, branch.ast.then_expr);
+                    try work.append(lists, otherwise);
                 },
                 // A switch gives each prong's result, and a labeled one each `break` out of it.
                 .@"switch" => {
-                    for (tree.fullSwitch(at).?.ast.cases) |case| try work.append(facts.gpa, tree.fullSwitchCase(case).?.ast.target_expr); // unreachable: the form is a switch's, its cases are prongs
-                    try work.appendSlice(facts.gpa, try facts.breaksOut(file, at));
+                    for (tree.fullSwitch(at).?.ast.cases) |case| try work.append(lists, tree.fullSwitchCase(case).?.ast.target_expr); // unreachable: the form is a switch's, its cases are prongs
+                    try work.appendSlice(lists, try facts.breaksOut(file, at));
                 },
                 .builtin => {
                     if (!Facts.isBuiltin(tree, at, "@as")) {
-                        try leaves.append(facts.gpa, at);
+                        try leaves.append(lists, at);
                         continue;
                     }
                     var buffer: [2]Ast.Node.Index = undefined;
                     const args = Facts.builtinArgs(tree, at, &buffer);
                     if (args.len != 2) return .{ .unknown = .invalid_front_end };
-                    try work.append(facts.gpa, args[1]);
+                    try work.append(lists, args[1]);
                 },
                 .body => {
                     // A container's declaration is a type, given whole.
                     var container_buffer: [2]Ast.Node.Index = undefined;
                     if (tree.fullContainerDecl(&container_buffer, at) != null) {
-                        try leaves.append(facts.gpa, at);
+                        try leaves.append(lists, at);
                         continue;
                     }
                     // A labelled block gives what each `break` that leaves it gives; one with no
                     // label gives `void`.
-                    try work.appendSlice(facts.gpa, try facts.breaksOut(file, at));
+                    try work.appendSlice(lists, try facts.breaksOut(file, at));
                 },
                 .@"return", .@"continue", .@"break" => {},
                 // `unreachable` gives none.
                 .leaf => {},
                 // A loop gives what each `break` out of it gives, and its `else`.
                 .@"while", .@"for" => {
-                    try work.appendSlice(facts.gpa, try facts.breaksOut(file, at));
+                    try work.appendSlice(lists, try facts.breaksOut(file, at));
                     const otherwise = if (tree.fullFor(at)) |loop| loop.ast.else_expr else tree.fullWhile(at).?.ast.else_expr; // unreachable: the form is a loop's
-                    if (otherwise.unwrap()) |value| try work.append(facts.gpa, value);
+                    if (otherwise.unwrap()) |value| try work.append(lists, value);
                 },
                 .deferred, .variable, .field_declaration, .assign, .compound_assign, .destructure, .prong, .prong_range, .for_range, .fn_decl, .frame, .@"asm" => return .{ .unknown = .unsupported },
                 .member, .comparison, .operator, .logic, .concatenation, .address_of, .slice, .deref, .array_access, .array_literal, .struct_literal, .call, .optional_type, .array_type, .pointer_type, .anyframe_type, .error_union, .merged_errors, .prototype => unreachable, // `givesItself`
             }
         }
-        return .{ .leaves = leaves.items };
+        return .{ .leaves = try facts.gpa.dupe(Ast.Node.Index, leaves.items) };
     }
 
     /// Whether `node` is of no form that chooses or carries a value: its own one value.
