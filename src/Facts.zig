@@ -9044,6 +9044,9 @@ pub fn origin(self: *Facts, start: Decl) ResolveError!Named {
 /// A value of the type `value` names: an instance of a container, and through a pointer,
 /// optional, error union or array type, the same wrapper around an instance of its payload
 /// (`E!Self` gives an error union whose payload is a `Self`).
+const InstanceKey = struct { parts: usize, len: usize };
+const Instances = struct { of: std.AutoHashMapUnmanaged(InstanceKey, Value) = .empty };
+
 fn instance(self: *Facts, value: Value) ResolveError!Value {
     return switch (value) {
         .container => |c| .{ .instance = c },
@@ -9054,10 +9057,14 @@ fn instance(self: *Facts, value: Value) ResolveError!Value {
         .array => |inner| .{ .array = try self.boxed(try self.instance(inner.*)) },
         // No value has type `noreturn`: a choice of types gives values of the others.
         .alternatives => |each| blk: {
+            // A choice is kept for the run: mapped once, however often it is read as a value.
+            const key: InstanceKey = .{ .parts = @intFromPtr(each.ptr), .len = each.len };
+            if ((try self.memo(Instances)).of.get(key)) |known| break :blk known;
             var mapped: std.ArrayList(Value) = .empty;
             for (each) |one| if (one != .primitive or !std.mem.eql(u8, one.primitive, "noreturn")) try mapped.append(self.gpa, try self.instance(one));
-            if (mapped.items.len == 1) break :blk mapped.items[0];
-            break :blk .{ .alternatives = mapped.items };
+            const made: Value = if (mapped.items.len == 1) mapped.items[0] else .{ .alternatives = mapped.items };
+            try (try self.memo(Instances)).of.put(self.gpa, key, made);
+            break :blk made;
         },
         else => value,
     };
@@ -12318,6 +12325,21 @@ pub const accesses = struct {
     /// The path of the place `node` names, through parentheses, member reads, `@field`, elements,
     /// slices, `.?` and `.*`, to the expression it starts at.
     pub fn pathOf(facts: *Facts, file: Project.FileId, node: Ast.Node.Index) Error!Path {
+        const key: PathKey = .{ .file = file, .node = node, .assumed = facts.assumed };
+        if ((try facts.memo(Paths)).of.get(key)) |known| return known;
+        const wide = facts.wide;
+        const met = facts.open_met;
+        const was_short = facts.short;
+        const path = try pathRead(facts, file, node);
+        // By the core's one memo rule: nothing a budget or an open query cut short.
+        if (facts.remaining != 0 and !facts.wideSince(wide) and facts.open_met == met and facts.short == was_short) try (try facts.memo(Paths)).of.put(facts.gpa, key, path);
+        return path;
+    }
+
+    const PathKey = struct { file: Project.FileId, node: Ast.Node.Index, assumed: @FieldType(Facts, "assumed") };
+    const Paths = struct { of: std.AutoHashMapUnmanaged(PathKey, Path) = .empty };
+
+    fn pathRead(facts: *Facts, file: Project.FileId, node: Ast.Node.Index) Error!Path {
         const tree = &facts.project.at(file).file.tree;
         var steps: std.ArrayList(Step) = .empty;
         var at = node;
@@ -14769,26 +14791,28 @@ pub const calls = struct {
     /// it names (a function, a pointer to one, a choice of them), none of an optional's `null`;
     /// any where it names a function's type alone or does not resolve.
     fn calleeOf(facts: *Facts, env: ?*const Facts.Env, file: Project.FileId, node: Ast.Node.Index) Error!Callee {
+        // Most calls call one function: the list goes with the answer, kept only for a choice.
         var found: std.ArrayList(Facts.Decl) = .empty;
-        if (try functionsIn(facts, try facts.resolveIn(env, file, node), &found)) |why| return .{ .any = why };
+        defer found.deinit(std.heap.smp_allocator);
+        if (try functionsIn(try facts.resolveIn(env, file, node), &found)) |why| return .{ .any = why };
         return switch (found.items.len) {
             // No source gives it a function: nothing it calls is known.
             0 => .{ .any = .unresolved },
             1 => .{ .function = found.items[0] },
-            else => .{ .choice = found.items },
+            else => .{ .choice = try facts.gpa.dupe(Facts.Decl, found.items) },
         };
     }
 
     /// Adds each function `value` names to `found`; why not, where it may be any.
-    fn functionsIn(facts: *Facts, value: Facts.Value, found: *std.ArrayList(Facts.Decl)) Error!?Facts.Unknown {
+    fn functionsIn(value: Facts.Value, found: *std.ArrayList(Facts.Decl)) Error!?Facts.Unknown {
         switch (value) {
-            .function => |decl| try add(facts, found, decl),
-            .pointer => |inner| return functionsIn(facts, inner.child.*, found),
-            .optional => |inner| return functionsIn(facts, inner.*, found),
+            .function => |decl| try add(found, decl),
+            .pointer => |inner| return functionsIn(inner.child.*, found),
+            .optional => |inner| return functionsIn(inner.*, found),
             .alternatives => |each| for (each) |one| {
                 // `null`, which no call reaches.
                 if (one == .scalar) continue;
-                if (try functionsIn(facts, one, found)) |why| return why;
+                if (try functionsIn(one, found)) |why| return why;
             },
             .unknown => |why| return why,
             else => return .unresolved,
@@ -14796,9 +14820,9 @@ pub const calls = struct {
         return null;
     }
 
-    fn add(facts: *Facts, found: *std.ArrayList(Facts.Decl), one: Facts.Decl) Error!void {
+    fn add(found: *std.ArrayList(Facts.Decl), one: Facts.Decl) Error!void {
         for (found.items) |seen| if (std.meta.eql(seen, one)) return;
-        try found.append(facts.gpa, one);
+        try found.append(std.heap.smp_allocator, one);
     }
 };
 

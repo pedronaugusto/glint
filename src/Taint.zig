@@ -439,6 +439,8 @@ pub const Flow = struct {
     /// Per field and container-level variable, whether a store through memory no place names may
     /// reach it (`reachedUnnamed`).
     unnamed_reach: std.AutoHashMapUnmanaged(Facts.Decl, bool) = .empty,
+    /// The files the solve holds as its own (`own`), listed once (`reachedUnnamed`).
+    own_files: ?[]const Project.FileId = null,
     /// What a function of a file the run does not select may read of input other than through
     /// its parameters (`besideParameters`), found once the solve is done.
     beside: ?Levels = null,
@@ -2466,9 +2468,13 @@ fn reachedUnnamed(c: *Context, flow: *Flow, decl: Facts.Decl) Context.Error!bool
     if (flow.unnamed_reach.get(decl)) |found| return found;
     const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
     const place: Facts.accesses.Place = if (record.kind == .field) .{ .field = decl } else .{ .declaration = decl };
-    var files: std.ArrayList(Project.FileId) = .empty;
-    for (c.project.sources) |*each| if (flow.own(each.id)) try files.append(c.allocator, each.id);
-    var sites = Facts.accesses.writes(c.facts, place, files.items);
+    const files = flow.own_files orelse files: {
+        var own: std.ArrayList(Project.FileId) = .empty;
+        for (c.project.sources) |*each| if (flow.own(each.id)) try own.append(c.allocator, each.id);
+        flow.own_files = own.items;
+        break :files own.items;
+    };
+    var sites = Facts.accesses.writes(c.facts, place, files);
     const through = while (try sites.next()) |site| {
         if (site.kind == .read or site.kind == .init) continue;
         if (site.reach == .named or site.reach == .unresolved) break true;
