@@ -2400,7 +2400,7 @@ fn releaseOf(c: *Context, file: Project.FileId, bound: Bound) Context.Error!?Rel
     const model = &c.project.at(file).model;
     const statement = bound.statement;
     const decl = bound.declaration.?; // unreachable: heldSpan asks only of a bound guard.
-    if (!onlyHeld(tree, model, decl, statement)) return null;
+    if (!try onlyHeld(c, file, decl, statement)) return null;
     const member: Member = if (bound.member) |name| .{ .named = name } else if (bound.any_member) .any else .none;
     const declared = model.declarations[@backingInt(decl)].node;
     var loop: ?Ast.Node.Index = null;
@@ -2444,9 +2444,7 @@ fn releases(c: *Context, file: Project.FileId, node: Ast.Node.Index, decl: Model
         return null;
     }
     if (tree.fullIf(node)) |branch| {
-        if (branch.ast.else_expr != .none or tree.nodeTag(branch.ast.cond_expr) != .identifier) return null;
-        const reference = model.reference(branch.ast.cond_expr) orelse return null;
-        if (reference.declaration != decl) return null;
+        if (branch.ast.else_expr != .none or try localOf(c, file, branch.ast.cond_expr) != decl) return null;
         const payload = branch.payload_token orelse return null;
         if (tree.tokenTag(payload) != .asterisk) return null;
         for (model.declarations, 0..) |record, i| {
@@ -2458,49 +2456,45 @@ fn releases(c: *Context, file: Project.FileId, node: Ast.Node.Index, decl: Model
     // A declaration, a store or a return given what the guard is handed on to
     // (`var ga = fa.await(io)`).
     if (tree.fullVarDecl(node)) |variable| return if (variable.ast.init_node.unwrap()) |value| movedBy(c, file, value, decl) else null;
-    if (tree.nodeTag(node) == .assign) return movedBy(c, file, tree.nodeData(node).node_and_node[1], decl);
+    for (try Facts.accesses.storesIn(c.facts, file)) |site| {
+        if (site.node != node or site.kind != .set) continue;
+        if (try movedBy(c, file, site.value orelse continue, decl)) |moved| return moved;
+    }
     if (tree.nodeTag(node) == .@"return") return if (tree.nodeData(node).opt_node.unwrap()) |value| movedBy(c, file, value, decl) else null;
     const call = (try Facts.calls.at(c.facts, file, node)) orelse return null;
-    if (tree.nodeTag(call.callee_expr) != .field_access) return null;
-    var receiver, const method = tree.nodeData(call.callee_expr).node_and_token;
+    const method = (try Facts.accesses.memberOf(c.facts, file, call.callee_expr)) orelse return null;
+    var receiver = method.receiver.?; // unreachable: a member's step has its holder
     if (call.receiver == .none) return null;
     if (!try guardRelease(c, call.callee)) {
         // A guard whose type does not resolve, as its acquisition does not, is judged as one:
         // its own `deinit` or `release`, which does not resolve with it, releases it.
-        if (call.callee != .any or member == .named or tree.nodeTag(receiver) != .identifier) return null;
-        const spelled = tree.tokenSlice(method);
+        if (call.callee != .any or member == .named or try Facts.accesses.memberOf(c.facts, file, receiver) != null) return null;
+        const spelled = method.name orelse return null;
         if (!std.mem.eql(u8, spelled, "deinit") and !std.mem.eql(u8, spelled, "release")) return null;
     }
     switch (member) {
         .none => {},
         .named => |name| {
-            if (tree.nodeTag(receiver) != .field_access) return null;
-            const holder, const field = tree.nodeData(receiver).node_and_token;
-            if (!std.mem.eql(u8, tree.tokenSlice(field), name)) return null;
-            receiver = holder;
+            const field = (try Facts.accesses.memberOf(c.facts, file, receiver)) orelse return null;
+            if (!std.mem.eql(u8, field.name orelse return null, name)) return null;
+            receiver = field.receiver.?; // unreachable: a member's step has its holder
         },
-        .any => if (tree.nodeTag(receiver) == .field_access) {
-            receiver = tree.nodeData(receiver).node_and_token[0];
+        .any => if (try Facts.accesses.memberOf(c.facts, file, receiver)) |field| {
+            receiver = field.receiver.?; // unreachable: a member's step has its holder
         },
     }
-    if (tree.nodeTag(receiver) != .identifier) return null;
-    const reference = model.reference(receiver) orelse return null;
-    return if (reference.declaration == decl) node else null;
+    return if (try localOf(c, file, receiver) == decl) node else null;
 }
 
 /// The call `value` is, through `try`, that hands on the guard `decl` holds into its value
 /// (`handedOn`), which binds it anew.
 fn movedBy(c: *Context, file: Project.FileId, value: Ast.Node.Index, decl: Model.Declaration.Id) Context.Error!?Ast.Node.Index {
     const tree = &c.project.at(file).file.tree;
-    const model = &c.project.at(file).model;
     var at = Facts.ungrouped(tree, value);
     while (tree.nodeTag(at) == .@"try") at = Facts.ungrouped(tree, tree.nodeData(at).node);
     const call = (try Facts.calls.at(c.facts, file, at)) orelse return null;
     if (!try handedOn(c, file, &call)) return null;
-    const holder = Facts.ungrouped(tree, call.receiver.bound);
-    if (tree.nodeTag(holder) != .identifier) return null;
-    const reference = model.reference(holder) orelse return null;
-    return if (reference.declaration == decl) at else null;
+    return if (try localOf(c, file, Facts.ungrouped(tree, call.receiver.bound)) == decl) at else null;
 }
 
 /// Whether a call hands the guard its receiver holds on into its value, which takes it from
@@ -2516,10 +2510,7 @@ fn handedOn(c: *Context, file: Project.FileId, call: *const Facts.calls.Call) Co
         .choice => |all| all,
         .any => return false,
     };
-    for (each) |choice| {
-        const name = c.project.at(choice.file).model.declarations[@backingInt(choice.index)].name;
-        if (!std.mem.eql(u8, name, "await") and !std.mem.eql(u8, name, "cancel")) return false;
-    }
+    for (each) |choice| if (try stdAmong(c, choice, &.{ "Io.Future.await", "Io.Future.cancel" }) != .yes) return false;
     const value = switch (try c.facts.resolve(file, holder)) {
         .pointer => |inner| inner.child.*,
         else => |other| other,
@@ -2554,16 +2545,19 @@ fn guardRelease(c: *Context, callee: Facts.calls.Callee) Context.Error!bool {
 /// Whether the guard local `decl` is only held: each use of it a member's (`g.value()`,
 /// `g.deinit()`), the statement that binds it, or an `if (g) |*h|`, which copies
 /// nothing. A copy, a store, its address taken may keep it past its release.
-fn onlyHeld(tree: *const Ast, model: *const Model, decl: Model.Declaration.Id, statement: Ast.Node.Index) bool {
+fn onlyHeld(c: *Context, file: Project.FileId, decl: Model.Declaration.Id, statement: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
     for (model.references) |reference| {
         if (reference.declaration != decl) continue;
         const parent = model.parentOf(reference.node) orelse return false;
         if (parent == statement) continue;
-        // Its address given to the call that binds it (`lockInto(a, &g)`).
-        if (tree.nodeTag(parent) == .address_of and reference.token >= tree.firstToken(statement) and reference.token <= tree.lastToken(statement)) continue;
-        if (tree.nodeTag(parent) == .field_access and tree.nodeData(parent).node_and_token[0] == reference.node) continue;
-        if (tree.fullIf(parent)) |branch| {
-            if (branch.ast.cond_expr == reference.node) if (branch.payload_token) |payload| if (tree.tokenTag(payload) == .asterisk) continue;
+        switch (try Facts.accesses.useOf(c.facts, file, reference.node)) {
+            // Its address given to the call that binds it (`lockInto(a, &g)`).
+            .address => if (reference.token >= tree.firstToken(statement) and reference.token <= tree.lastToken(statement)) continue,
+            .member => continue,
+            .tested => |branch| if (tree.fullIf(branch)) |full| if (full.payload_token) |payload| if (tree.tokenTag(payload) == .asterisk) continue,
+            else => {},
         }
         return false;
     }
@@ -2574,11 +2568,8 @@ fn onlyHeld(tree: *const Ast, model: *const Model, decl: Model.Declaration.Id, s
 fn typeOnly(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
     var at = node;
     while (model.parentOf(at)) |parent| : (at = parent) {
-        switch (tree.nodeTag(parent)) {
-            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@TypeOf")) return true,
-            .fn_decl => return false,
-            else => {},
-        }
+        if (Facts.isBuiltin(tree, parent, "@TypeOf")) return true;
+        if (tree.nodeTag(parent) == .fn_decl) return false;
     }
     return false;
 }
