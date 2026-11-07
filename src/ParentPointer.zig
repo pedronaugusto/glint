@@ -1335,13 +1335,20 @@ fn spawnArguments(c: *Context, decl: Facts.Decl, index: usize) Context.Error!boo
         var args_buffer: [2]Ast.Node.Index = undefined;
         const typed = Facts.builtinArgs(tree, tuple.ast.params[0], &args_buffer);
         if (typed.len != 1) return false;
-        // The `function` parameter itself, by the declaration `@TypeOf`'s operand names.
-        const named = switch (try c.facts.definition(decl.file, typed[0])) {
-            .decl => |named| named,
-            .none, .unknown => return false,
-        };
-        const record = c.project.at(named.file).model.declarations[@backingInt(named.index)];
-        return named.file == decl.file and record.kind == .parameter and record.token == (function orelse return false);
+        // The `function` parameter itself, by the declaration `@TypeOf`'s operand names; where
+        // the model indexes no reference in a prototype's own parameter types, the one token
+        // the parameter is named by.
+        const given = function orelse return false;
+        switch (try c.facts.definition(decl.file, typed[0])) {
+            .decl => |named| {
+                const record = c.project.at(named.file).model.declarations[@backingInt(named.index)];
+                return named.file == decl.file and record.kind == .parameter and record.token == given;
+            },
+            .none, .unknown => {
+                const token = tree.firstToken(typed[0]);
+                return token == tree.lastToken(typed[0]) and std.mem.eql(u8, tree.tokenSlice(token), tree.tokenSlice(given));
+            },
+        }
     }
     return false;
 }
