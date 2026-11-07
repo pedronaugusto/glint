@@ -951,3 +951,71 @@ test "accesses: a ZON file's literal writes the fields it initializes, whatever 
     try std.testing.expectEqual(accesses.Reach.named, site.reach);
     try std.testing.expectEqualStrings("200", project.sources[1].file.tree.getNodeSource(site.value.?));
 }
+
+test "consolidate: a member read's step, which language field it is, the program's @fields, a primitive integer's width" {
+    const source =
+        \\const S = struct { len: u32, ptr: u32, f: u8, g: u8 };
+        \\fn f(s: *S, b: []const u8, a: [3]u8, x: anytype, comptime n: []const u8) usize {
+        \\    @field(s, "f") = 1;
+        \\    @field(s, n) = 2;
+        \\    inline for (.{ "f", "g" }) |each| @field(s, each) = 3;
+        \\    _ = @field(s, "g");
+        \\    _ = b.ptr;
+        \\    return s.len + b.len + a.len + x.len + s.ptr;
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const file = project.sources[0].id;
+    const tree = &project.sources[0].file.tree;
+
+    // Q1: `s.len` and `@field(s, "f")` are member reads on `s`, by name; `@field(s, n)`'s name
+    // is computed; `s` itself is none.
+    const dotted = (try accesses.memberRead(&facts, file, spelledNode(tree, "s.len", 0).?)).?;
+    try std.testing.expectEqualStrings("len", dotted.name.?);
+    try std.testing.expectEqualStrings("s", tree.getNodeSource(dotted.receiver.?));
+    try std.testing.expect(dotted.crosses);
+    const spelled = (try accesses.memberRead(&facts, file, spelledNode(tree, "@field(s, \"f\")", 0).?)).?;
+    try std.testing.expectEqualStrings("f", spelled.name.?);
+    try std.testing.expectEqualStrings("s", tree.getNodeSource(spelled.receiver.?));
+    const computed = (try accesses.memberRead(&facts, file, spelledNode(tree, "@field(s, n)", 0).?)).?;
+    try std.testing.expect(computed.name == null);
+    try std.testing.expect(try accesses.memberRead(&facts, file, spelledNode(tree, "s", 0).?) == null);
+
+    // Q2: a slice's and an array's own `len`, a slice's `ptr`; a struct's fields so named are
+    // none; a holder whose type does not resolve may be either.
+    try std.testing.expect(try facts.languageField(file, spelledNode(tree, "b.len", 0).?) == .len);
+    try std.testing.expect(try facts.languageField(file, spelledNode(tree, "a.len", 0).?) == .len);
+    try std.testing.expect(try facts.languageField(file, spelledNode(tree, "b.ptr", 0).?) == .ptr);
+    try std.testing.expect(try facts.languageField(file, spelledNode(tree, "s.len", 0).?) == .none);
+    try std.testing.expect(try facts.languageField(file, spelledNode(tree, "s.ptr", 0).?) == .none);
+    try std.testing.expect(try facts.languageField(file, spelledNode(tree, "x.len", 0).?) == .unknown);
+
+    // Q3: `f` is named by its literal and by the inline loop's list, and may be the computed
+    // one; `g` by its literal and the list; a name no `@field` may be gets the computed one only.
+    const for_f = try facts.fieldUses(arena.allocator(), "f");
+    try std.testing.expectEqual(@as(usize, 3), for_f.len);
+    var computed_seen: usize = 0;
+    for (for_f) |use| computed_seen += @intFromBool(use.computed);
+    try std.testing.expectEqual(@as(usize, 1), computed_seen);
+    try std.testing.expectEqual(@as(usize, 3), (try facts.fieldUses(arena.allocator(), "g")).len);
+    const other = try facts.fieldUses(arena.allocator(), "h");
+    try std.testing.expectEqual(@as(usize, 1), other.len);
+    try std.testing.expect(other[0].computed);
+
+    // Q4: Zig's and C's integers at a pointer width; comptime_int is a literal; others none.
+    const Int = Facts.IntegerType;
+    try std.testing.expectEqual(Int{ .int = .{ .bits = 32, .signed = true } }, Facts.integerType(.{ .primitive = "c_int" }, 64));
+    try std.testing.expectEqual(Int{ .int = .{ .bits = 16, .signed = false } }, Facts.integerType(.{ .primitive = "c_uint" }, 16));
+    try std.testing.expectEqual(Int{ .int = .{ .bits = 32, .signed = true, .wide = 64 } }, Facts.integerType(.{ .primitive = "c_long" }, 64));
+    try std.testing.expectEqual(Int{ .int = .{ .bits = 8, .signed = true, .either = true } }, Facts.integerType(.{ .primitive = "c_char" }, 32));
+    try std.testing.expectEqual(Int{ .int = .{ .bits = 64, .signed = false } }, Facts.integerType(.{ .primitive = "usize" }, 64));
+    try std.testing.expectEqual(Int{ .int = .{ .bits = 7, .signed = true } }, Facts.integerType(.{ .primitive = "i7" }, 64));
+    try std.testing.expect(Facts.integerType(.{ .primitive = "comptime_int" }, 64) == .literal);
+    try std.testing.expect(Facts.integerType(.{ .primitive = "c_longdouble" }, 64) == .unknown);
+    try std.testing.expect(Facts.integerType(.{ .primitive = "bool" }, 64) == .unknown);
+}

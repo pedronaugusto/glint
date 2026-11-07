@@ -1438,36 +1438,14 @@ fn inferred(c: *Context, decl: Facts.Decl) Context.Error!?Ast.Node.Index {
     return variable.ast.init_node.unwrap();
 }
 
-/// A C integer type across the targets of one pointer width, as Zig's C ABI gives them:
-/// `char` 8 bits of either sign, `short` 16, `int` 16 on 16-bit targets (AVR, MSP430) and 32
-/// elsewhere, `long` 32 on Windows and on 16- and 32-bit targets and the pointer's width
-/// elsewhere, `long long` 64.
-fn cType(name: []const u8, pointer: u16) Typed {
-    const unsigned = name.len > 1 and name[0] == 'u';
-    const base = if (unsigned) name[1..] else name;
-    if (std.mem.eql(u8, name, "char")) return .{ .int = .{ .bits = 8, .signed = true, .either = true } };
-    if (std.mem.eql(u8, base, "short")) return .{ .int = .{ .bits = 16, .signed = !unsigned } };
-    if (std.mem.eql(u8, base, "int")) return .{ .int = .{ .bits = if (pointer == 16) 16 else 32, .signed = !unsigned } };
-    if (std.mem.eql(u8, base, "long")) return .{ .int = .{ .bits = 32, .signed = !unsigned, .wide = @max(pointer, 32) } };
-    if (std.mem.eql(u8, base, "longlong")) return .{ .int = .{ .bits = 64, .signed = !unsigned } };
-    return .unknown;
-}
-
-/// The integer type a resolved value is, seen through an optional or an error union.
+/// The integer type a resolved value is, seen through an optional or an error union
+/// (`Facts.integerType`).
 fn integer(value: Facts.Value, pointer: u16) Typed {
-    switch (value) {
-        .optional, .error_union => |inner| return integer(inner.*, pointer),
-        .primitive => |name| {
-            if (std.mem.eql(u8, name, "comptime_int")) return .literal;
-            if (std.mem.eql(u8, name, "usize")) return .{ .int = .{ .bits = pointer, .signed = false } };
-            if (std.mem.eql(u8, name, "isize")) return .{ .int = .{ .bits = pointer, .signed = true } };
-            if (std.mem.startsWith(u8, name, "c_")) return cType(name[2..], pointer);
-            if (name.len < 2 or (name[0] != 'u' and name[0] != 'i')) return .unknown;
-            const bits = std.fmt.parseUnsigned(u16, name[1..], 10) catch return .unknown;
-            return .{ .int = .{ .bits = bits, .signed = name[0] == 'i' } };
-        },
-        else => return .unknown,
-    }
+    return switch (Facts.integerType(value, pointer)) {
+        .int => |int| .{ .int = .{ .bits = int.bits, .signed = int.signed, .wide = int.wide, .either = int.either } },
+        .literal => .literal,
+        .unknown => .unknown,
+    };
 }
 
 /// Where a conversion's result is read into: a type expression naming its type (what `@as`

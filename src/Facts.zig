@@ -3216,6 +3216,49 @@ pub fn typeIsType(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Reso
     return value == .primitive and std.mem.eql(u8, value.primitive, "type");
 }
 
+/// An integer type's width and sign across the targets of one pointer width (`integerType`):
+/// `bits` on every target, `wide` the most on some (a C `long`), `either` where the sign is the
+/// target's (a C `char`); `literal` for `comptime_int`; `unknown` for any other value.
+pub const IntegerType = union(enum) {
+    int: struct { bits: u16, signed: bool, wide: ?u16 = null, either: bool = false },
+    literal,
+    unknown,
+};
+
+/// The integer type `value` is, through an optional or an error union, at pointer width
+/// `pointer`: `uN`, `iN`, `usize`, `isize`, and C's integers as Zig's C ABI gives them (`c_char`
+/// 8 bits of either sign, `c_short` 16, `c_int` 16 on 16-bit targets such as AVR and MSP430 and
+/// 32 elsewhere, `c_long` 32 on Windows and on 16- and 32-bit targets and the pointer's width
+/// elsewhere, `c_longlong` 64). The one reading of a primitive integer's width.
+pub fn integerType(value: Value, pointer: u16) IntegerType {
+    switch (value) {
+        .optional, .error_union => |inner| return integerType(inner.*, pointer),
+        .primitive => |name| {
+            const C = enum { c_char, c_short, c_ushort, c_int, c_uint, c_long, c_ulong, c_longlong, c_ulonglong, comptime_int, usize, isize };
+            const named = std.StaticStringMap(C).initComptime(.{
+                .{ "c_char", .c_char },             .{ "c_short", .c_short },       .{ "c_ushort", .c_ushort },
+                .{ "c_int", .c_int },               .{ "c_uint", .c_uint },         .{ "c_long", .c_long },
+                .{ "c_ulong", .c_ulong },           .{ "c_longlong", .c_longlong }, .{ "c_ulonglong", .c_ulonglong },
+                .{ "comptime_int", .comptime_int }, .{ "usize", .usize },           .{ "isize", .isize },
+            });
+            if (named.get(name)) |known| return switch (known) {
+                .comptime_int => .literal,
+                .usize => .{ .int = .{ .bits = pointer, .signed = false } },
+                .isize => .{ .int = .{ .bits = pointer, .signed = true } },
+                .c_char => .{ .int = .{ .bits = 8, .signed = true, .either = true } },
+                .c_short, .c_ushort => .{ .int = .{ .bits = 16, .signed = known == .c_short } },
+                .c_int, .c_uint => .{ .int = .{ .bits = if (pointer == 16) 16 else 32, .signed = known == .c_int } },
+                .c_long, .c_ulong => .{ .int = .{ .bits = 32, .signed = known == .c_long, .wide = @max(pointer, 32) } },
+                .c_longlong, .c_ulonglong => .{ .int = .{ .bits = 64, .signed = known == .c_longlong } },
+            };
+            if (name.len < 2 or (name[0] != 'u' and name[0] != 'i')) return .unknown;
+            const bits = std.fmt.parseUnsigned(u16, name[1..], 10) catch return .unknown;
+            return .{ .int = .{ .bits = bits, .signed = name[0] == 'i' } };
+        },
+        else => return .unknown,
+    }
+}
+
 /// Whether a declared type holds types as values: `type`, `[N]type`, `[]const type`, `?type`.
 fn holdsTypes(value: Value) bool {
     return switch (value) {
@@ -7582,6 +7625,43 @@ pub fn memberUses(self: *Facts, name: []const u8) ResolveError![]const Key {
     return if (self.member_uses.?.get(name)) |list| list.items else &.{};
 }
 
+/// A `@field` in the program's files (`fieldUses`): the call, its holder (the first argument),
+/// and whether its name is one it computes, which may be any field.
+pub const FieldUse = struct { key: Key, holder: Ast.Node.Index, computed: bool };
+
+/// The program's `@field`s, each with what its name may be (`fieldName`), found once.
+const FieldBuiltins = struct {
+    built: bool = false,
+    each: std.ArrayList(struct { use: FieldUse, name: FieldName }) = .empty,
+};
+
+/// The `@field` reads and writes in the program's files (`program`) that may name a field
+/// `name`: each whose name `fieldName` spells as `name`, or ranges over a list or a struct that
+/// names it (`mayName`), and each whose name it computes, answered as `computed`, never left
+/// out. Beside `memberUses`, which gives `x.name`. In `allocator`.
+pub fn fieldUses(self: *Facts, allocator: std.mem.Allocator, name: []const u8) ResolveError![]const FieldUse {
+    const index = try self.memo(FieldBuiltins);
+    if (!index.built) {
+        index.built = true;
+        for (self.project.sources) |*source| {
+            if (!try self.program(source.id)) continue;
+            const tree = &source.file.tree;
+            for (0..tree.nodes.len) |i| {
+                const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (!isBuiltin(tree, node, "@field")) continue;
+                var buffer: [2]Ast.Node.Index = undefined;
+                const args = builtinArgs(tree, node, &buffer);
+                if (args.len != 2) continue;
+                const spelled = try self.fieldName(source.id, args[1]);
+                try index.each.append(self.gpa, .{ .use = .{ .key = .{ .file = source.id, .node = node }, .holder = args[0], .computed = spelled == .computed }, .name = spelled });
+            }
+        }
+    }
+    var out: std.ArrayList(FieldUse) = .empty;
+    for (index.each.items) |each| if (self.mayName(each.name, name)) try out.append(allocator, each.use);
+    return out.items;
+}
+
 /// A file's own container: the struct the file is.
 pub fn rootOf(self: *const Facts, file: Project.FileId) Container {
     return .{ .file = file, .scope = self.project.at(file).model.root() };
@@ -7707,6 +7787,25 @@ pub fn memoryField(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Res
     const receiver, const name = tree.nodeData(node).node_and_token;
     if (!std.mem.eql(u8, tree.tokenSlice(name), "len") and !std.mem.eql(u8, tree.tokenSlice(name), "ptr")) return .field;
     return self.lengthOfValue(try self.resolve(file, receiver), tree.tokenSlice(name));
+}
+
+/// A language field a member read is (`languageField`): a slice's, an array's or a string's
+/// `len`, a slice's `ptr`, which no declaration stands behind; `none` for a container's field so
+/// named or any other node; `unknown` where the holder's type does not resolve, which may be
+/// either.
+pub const LanguageField = union(enum) { len, ptr, none, unknown: Unknown };
+
+/// Which language field `node` reads (`LanguageField`), by its holder's type as `memoryField`
+/// reads it, so a rule never tells `len` and `ptr` apart by spelling them.
+pub fn languageField(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!LanguageField {
+    const tree = &self.project.at(file).file.tree;
+    if (tree.nodeTag(node) != .field_access) return .none;
+    const receiver, const name = tree.nodeData(node).node_and_token;
+    const spelled = tree.tokenSlice(name);
+    const which: LanguageField = if (std.mem.eql(u8, spelled, "len")) .len else if (std.mem.eql(u8, spelled, "ptr")) .ptr else return .none;
+    const value = try self.resolve(file, receiver);
+    if (value == .unknown) return .{ .unknown = value.unknown };
+    return if (try self.lengthOfValue(value, spelled) == .field) .none else which;
 }
 
 /// Whether the memory a value of `value`'s type holds (a function's result through its error
@@ -11192,6 +11291,9 @@ pub const accesses = struct {
         kind: enum { field, index, slice, unwrap, deref, root },
         /// A member's holder's value (`field`).
         holder: ?Facts.Value = null,
+        /// A member's holder, the expression it is read on (`field`): `x` of `x.f` and of
+        /// `@field(x, "f")`.
+        receiver: ?Ast.Node.Index = null,
         /// A member's name (`field`); null for `@field` with a name it computes, any field of the
         /// holder's type.
         name: ?[]const u8 = null,
@@ -11211,6 +11313,35 @@ pub const accesses = struct {
         root: Facts.Named,
     };
 
+    /// The member read `node` is, as `pathOf` reads its step: `x.f`, `@field(x, "f")` with the
+    /// name `fieldName` spells, and `@field` with a name it computes (`name` null: any field of
+    /// the holder's type). Only the holder's value is read, not the path below it. Null for any
+    /// other node, and for `@field` given other than two arguments.
+    pub fn memberRead(facts: *Facts, file: Project.FileId, node: Ast.Node.Index) Error!?Step {
+        const tree = &facts.project.at(file).file.tree;
+        switch (formOf(tree.nodeTag(node))) {
+            .member => {
+                const holder = tree.nodeData(node).node_and_token[0];
+                const value = try facts.resolve(file, holder);
+                const name = try Model.identifier(facts.gpa, tree.tokenSlice(tree.nodeData(node).node_and_token[1]));
+                return .{ .node = node, .kind = .field, .holder = value, .receiver = holder, .name = name, .crosses = pointing(value) and !try header(facts, name, value) };
+            },
+            .builtin => {
+                if (!isField(tree, node)) return null;
+                var buffer: [2]Ast.Node.Index = undefined;
+                const args = Facts.builtinArgs(tree, node, &buffer);
+                if (args.len != 2) return null;
+                const value = try facts.resolve(file, args[0]);
+                const name: ?[]const u8 = switch (try facts.fieldName(file, args[1])) {
+                    .name => |spelled| spelled,
+                    .each_of, .names, .computed => null,
+                };
+                return .{ .node = node, .kind = .field, .holder = value, .receiver = args[0], .name = name, .crosses = pointing(value) and !try header(facts, name orelse "", value) };
+            },
+            else => return null,
+        }
+    }
+
     /// The path of the place `node` names, through parentheses, member reads, `@field`, elements,
     /// slices, `.?` and `.*`, to the expression it starts at.
     pub fn pathOf(facts: *Facts, file: Project.FileId, node: Ast.Node.Index) Error!Path {
@@ -11220,11 +11351,9 @@ pub const accesses = struct {
         while (true) switch (tree.nodeTag(at)) {
             .grouped_expression => at = tree.nodeData(at).node_and_token[0],
             .field_access => {
-                const holder = tree.nodeData(at).node_and_token[0];
-                const value = try facts.resolve(file, holder);
-                const name = try Model.identifier(facts.gpa, tree.tokenSlice(tree.nodeData(at).node_and_token[1]));
-                try steps.append(facts.gpa, .{ .node = at, .kind = .field, .holder = value, .name = name, .crosses = pointing(value) and !try header(facts, name, value) });
-                at = holder;
+                const step = (try memberRead(facts, file, at)).?; // unreachable: a member read is one
+                try steps.append(facts.gpa, step);
+                at = step.receiver.?; // unreachable: a member's step has its holder
             },
             .array_access => {
                 const holder, const index = tree.nodeData(at).node_and_node;
@@ -11245,19 +11374,10 @@ pub const accesses = struct {
                 at = tree.nodeData(at).node;
             },
             else => {
-                if (isField(tree, at)) {
-                    var buffer: [2]Ast.Node.Index = undefined;
-                    const args = Facts.builtinArgs(tree, at, &buffer);
-                    if (args.len == 2) {
-                        const value = try facts.resolve(file, args[0]);
-                        const name: ?[]const u8 = switch (try facts.fieldName(file, args[1])) {
-                            .name => |spelled| spelled,
-                            .each_of, .names, .computed => null,
-                        };
-                        try steps.append(facts.gpa, .{ .node = at, .kind = .field, .holder = value, .name = name, .crosses = pointing(value) and !try header(facts, name orelse "", value) });
-                        at = args[0];
-                        continue;
-                    }
+                if (try memberRead(facts, file, at)) |step| {
+                    try steps.append(facts.gpa, step);
+                    at = step.receiver.?; // unreachable: a member's step has its holder
+                    continue;
                 }
                 try steps.append(facts.gpa, .{ .node = at, .kind = .root });
                 const root: Facts.Named = if (tree.nodeTag(at) == .identifier and discard(tree, at)) .none else switch (tree.nodeTag(at)) {
