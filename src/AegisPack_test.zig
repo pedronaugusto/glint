@@ -329,7 +329,19 @@ const flat_root_tail =
     \\pub const id = @import("id.zig");
     \\pub const units = @import("units.zig");
 ;
-const flat_root = flat_root_head ++ "pub const Guarded = @import(\"Guarded.zig\").Guarded;\n" ++ flat_root_tail;
+/// The flat aegis's roles, as aegis declares its own (`lint_rules`); `guard_member` names the
+/// guard inside `Guarded`'s container.
+fn flatRules(comptime guard_member: []const u8) []const u8 {
+    return "pub const lint_rules = .{ .version = 1, .roles = .{\n" ++
+        "    .{ .type = Secret, .role = .secret, .internal = .{.material} }, .{ .type = SecretBytes, .role = .bytes, .internal = .{ .allocation, .used_len } },\n" ++
+        "    .{ .type = Guarded, .role = .guarded, .internal = .{ .lock, .data } }, .{ .type = .{ .generic = Guarded, .member = ." ++ guard_member ++ " }, .role = .guard, .internal = .{.owner} },\n" ++
+        "    .{ .type = int.Checked, .role = .scalar }, .{ .type = int.Saturating, .role = .scalar }, .{ .type = int.Ranged, .role = .scalar },\n" ++
+        "    .{ .type = id.Id, .role = .scalar }, .{ .type = id.NonZero, .role = .scalar }, .{ .type = id.Counter, .role = .issuer },\n" ++
+        "    .{ .type = units.Count, .role = .scalar }, .{ .type = units.Bytes, .role = .scalar }, .{ .type = units.Bits, .role = .scalar }, .{ .type = units.Duration, .role = .scalar }, .{ .type = units.Instant, .role = .scalar },\n" ++
+        "},\n    .pairs = .{.{ .type = .{ .generic = Guarded, .member = ." ++ guard_member ++ " }, .release = .{.deinit} }},\n};\n";
+}
+const flat_declared = flat_root_head ++ "pub const Guarded = @import(\"Guarded.zig\").Guarded;\n" ++ flat_root_tail;
+const flat_root = flat_declared ++ "\n" ++ flatRules("Guard");
 const flat_secret =
     \\pub fn Secret(comptime T: type) type {
     \\    comptime validate(T);
@@ -495,9 +507,10 @@ test "identical source under another module is not aegis" {
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: the vault module's Secret is not aegis's.
 }
-test "a published member that disappears is reported where aegis is imported, never a quiet gate" {
-    const dropped = flat_root_head ++ flat_root_tail;
-    var project = try flatFixture("const S = @import(\"aegis\").Secret; pub fn f(s: *S(u32)) void { _ = s.material; }", .{ .root = dropped });
+test "a role aegis declares that does not resolve is reported where aegis is imported, never a quiet gate" {
+    // `Guarded`'s container declares no `Gaurd`: a misspelt member compiles (an enum literal), so
+    // only the reader sees it.
+    var project = try flatFixture("const S = @import(\"aegis\").Secret; pub fn f(s: *S(u32)) void { _ = s.material; }", .{ .root = comptime flat_declared ++ "\n" ++ flatRules("Gaurd") });
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
@@ -508,7 +521,19 @@ test "a published member that disappears is reported where aegis is imported, ne
     for (report.coverage) |entry| if (entry.rule != null) {
         detail = entry.detail;
     };
-    try std.testing.expectEqualStrings("published member Guarded of aegis does not resolve (unresolved); its operations are not recognized in this file", detail.?);
+    try std.testing.expectEqualStrings("aegis's lint_rules at root.zig:9: a reference that does not resolve; the roles it declares are not all read in this file", detail.?);
+}
+test "an aegis that declares no lint_rules is undecided where it is imported, never plain" {
+    var project = try flatFixture("const S = @import(\"aegis\").Secret; pub fn f(s: *S(u32)) void { _ = s.material; }", .{ .root = flat_declared });
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try std.testing.expect(!report.complete);
+    var detail: ?[]const u8 = null;
+    for (report.coverage) |entry| if (entry.rule != null) {
+        detail = entry.detail;
+    };
+    try std.testing.expectEqualStrings("aegis's root root.zig declares no lint_rules; the roles of its types are not read in this file", detail.?);
 }
 test "a build script's import of aegis's name is aegis's build script, never its module: the program's aegis does not drift" {
     const consumer = "const S = @import(\"aegis\").Secret; pub fn f(s: *S(u32)) void { _ = s.material; }";
@@ -1557,6 +1582,91 @@ test "receivers through a list's items, an if or switch expression's capture and
     try expectJudged(head ++ "const T = struct { mutex: u32 };\npub fn f(t: *T, ok: bool) void { const maybe = if (ok) t else null; _ = maybe.?.mutex; }", pack.access, true, 0);
 }
 
+/// Reports, for each public constant of the checked file, the aegis role of what it names.
+fn roleProbe(context: *glint.RuleContext) glint.RuleContext.Error!void {
+    const tree = try context.project.syntax(try context.source());
+    for (try context.project.declarations(try context.source())) |decl| {
+        if (!decl.public) continue;
+        const init = (tree.fullVarDecl(decl.node) orelse continue).ast.init_node.unwrap() orelse continue;
+        const found = try context.role(pack.library, try context.facts.resolve(context.file, init));
+        try context.at(role_probe_id, decl.token, if (found) |role| @tagName(role) else "none");
+    }
+}
+const role_probe_id: glint.Rule = @fromBackingInt(1001); // safe: this test owns its validated extension identity.
+const role_probe: glint.ProjectRule = .{ .definition = .{ .id = role_probe_id, .name = "AEGIS_ROLE_PROBE", .group = .family_policy, .purpose = "reports the aegis role of each public constant", .version = 1 }, .check = roleProbe };
+// Every type the tables glint kept before aegis declared its roles named (AegisContract's, through
+// glint 0.7), each as the pinned aegis names it; this list goes once aegis 0.3.0 has shipped its
+// lint_rules once (glint-design §12).
+const tabled =
+    \\const aegis = @import("aegis");
+    \\const Tag = struct {};
+    \\const S = enum { open, done };
+    \\const E = enum { finish };
+    \\const M = aegis.state.Machine(S, E, .{ .initial = .open, .terminal = &.{.done}, .edges = &.{.{ .from = .open, .on = .finish, .to = .done }} });
+    \\const O = aegis.Order(&.{.{ .name = "a" }});
+    \\pub const a = aegis.Secret;
+    \\pub const b = aegis.SecretBytes;
+    \\pub const c = aegis.SecretBytes.Writer;
+    \\pub const d = aegis.Guarded;
+    \\pub const e = aegis.BlockingGuarded;
+    \\pub const f = aegis.RwGuarded;
+    \\pub const g = aegis.SpinRwGuarded;
+    \\pub const h = aegis.Condition;
+    \\pub const i = aegis.Once;
+    \\pub const j = aegis.Lazy;
+    \\pub const k = aegis.Confined;
+    \\pub const l = aegis.int.Checked;
+    \\pub const m = aegis.int.Saturating;
+    \\pub const n = aegis.int.Ranged;
+    \\pub const o = aegis.id.Id;
+    \\pub const p = aegis.id.NonZero;
+    \\pub const q = aegis.id.Counter;
+    \\pub const r = aegis.units.Count;
+    \\pub const s = aegis.units.Bytes;
+    \\pub const t = aegis.units.Bits;
+    \\pub const u = aegis.units.Duration;
+    \\pub const v = aegis.units.Instant;
+    \\pub const w = aegis.secret.Choice;
+    \\pub const x = aegis.Shared;
+    \\pub const y = aegis.Atomic;
+    \\pub const z = aegis.InitContext;
+    \\pub const aa = O.Context;
+    \\pub const ab = O.Ordered;
+    \\pub const ac = aegis.bounded.Array;
+    \\pub const ad = aegis.bounded.Ring;
+    \\pub const ae = aegis.bounded.Buffer;
+    \\pub const af = aegis.bounded.RingBuffer;
+    \\pub const ag = aegis.bounded.Limit;
+    \\pub const ah = aegis.bounded.Budget;
+    \\pub const ai = aegis.bounded.Budget(u32).Reservation;
+    \\pub const aj = aegis.own.Owned;
+    \\pub const ak = aegis.own.OwnedIo;
+    \\pub const al = aegis.own.MustUse;
+    \\pub const am = aegis.handle.SlotPool;
+    \\pub const an = aegis.handle.RunPool;
+    \\pub const ao = aegis.handle.DenseSlotMap;
+    \\pub const ap = aegis.handle.SecondaryMap;
+    \\pub const aq = aegis.handle.Domain;
+    \\pub const ar = aegis.handle.Index;
+    \\pub const as = M.At;
+    \\pub const at = M.Runtime;
+    \\pub const au = aegis.scope.Table;
+    \\pub const av = aegis.scope.Table(Tag).Scope;
+    \\pub const aw = aegis.scope.Ref;
+    \\pub const ax = aegis.input.Untrusted;
+    \\pub const ay = aegis.err.PublicSource;
+;
+test "every type glint's tables named before aegis declared its roles has its role in aegis's lint_rules" {
+    var project = try fixture(tabled);
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = role_probe_id, .level = .gate }} }, .{ .project_rules = &.{role_probe} });
+    defer report.deinit();
+    try std.testing.expect(report.complete);
+    const expected = [_][]const u8{ "secret", "bytes", "bytes_writer", "guarded", "guarded", "guarded", "guarded", "condition", "once", "once", "confined", "scalar", "scalar", "scalar", "scalar", "scalar", "issuer", "scalar", "scalar", "scalar", "scalar", "scalar", "choice", "shared", "atomic", "context", "context", "guarded", "inline_store", "inline_store", "buffer", "buffer", "limit", "budget", "reservation", "owned", "owned", "must_use", "slots", "slots", "slots", "slots", "issuer", "scalar", "stage", "machine", "table", "scope", "ref", "untrusted", "public_source" };
+    try std.testing.expectEqual(expected.len, report.diagnostics.len);
+    for (expected, report.diagnostics) |role, diagnostic| try std.testing.expectEqualStrings(role, diagnostic.message);
+}
+
 test "every published type after the guards is recognized where aegis is imported, with no drift" {
     try expectJudged(
         \\const aegis = @import("aegis");
@@ -1566,7 +1676,7 @@ test "every published type after the guards is recognized where aegis is importe
     , pack.access, true, 0);
 }
 
-test "an aegis with one name each for its ring and ring buffer, as 0.3 has, is recognized in full; one without a name every revision publishes drifts" {
+test "an aegis with one name each for its ring and ring buffer, as 0.3 has, is recognized in full; one whose lint_rules names a ring it no longer declares drifts" {
     const gpa = std.testing.allocator;
     const pinned = aegis_sources.pinned("src/bounded.zig").?;
     try std.testing.expect(std.mem.find(u8, pinned, "pub const Queue") == null);
@@ -1592,7 +1702,7 @@ test "an aegis with one name each for its ring and ring buffer, as 0.3 has, is r
         try std.testing.expect(!report.complete);
         var drifted = false;
         for (report.coverage) |entry| if (entry.rule != null) {
-            drifted = drifted or std.mem.eql(u8, entry.detail, "published member bounded.Ring of aegis does not resolve (unresolved); its operations are not recognized in this file");
+            drifted = drifted or std.mem.eql(u8, entry.detail, "aegis's lint_rules at src/root.zig:116: a reference that does not resolve; the roles it declares are not all read in this file");
         };
         try std.testing.expect(drifted);
     }
@@ -2368,4 +2478,133 @@ test "A019 leaves a use after cleanup of a local A003 follows to A003 where it r
     const own_alias = try cleanupAndUndefined(alias, false);
     try std.testing.expectEqual(@as(usize, 1), own_alias.undefined_read);
     try std.testing.expectEqual(@as(usize, 0), own_alias.undefined_undecided);
+}
+
+/// An aegis whose acquisitions return their guard wrapped in `MustUse`, and one whose wrapped
+/// payload names nothing: each acquisition read by its declared result, through the wrapper.
+const wrapped_root =
+    \\pub fn MustUse(comptime T: type, comptime why: []const u8) type {
+    \\    _ = why;
+    \\    return struct {
+    \\        data: T,
+    \\        pub fn take(m: *@This()) T { return m.data; }
+    \\    };
+    \\}
+    \\pub fn Guarded(comptime T: type) type {
+    \\    return struct {
+    \\        const Self = @This();
+    \\        data: T,
+    \\        lock: bool = false,
+    \\        pub fn acquire(o: *Self) MustUse(Guard, "release it") { return .{ .data = .{ .owner = o } }; }
+    \\        pub fn obtain(o: *Self) MustUse(@import("absent.zig").Missing, "release it") { _ = o; unreachable; }
+    \\        pub const Guard = struct {
+    \\            owner: *Self,
+    \\            pub fn deinit(g: *Guard) void { g.owner.lock = false; }
+    \\        };
+    \\    };
+    \\}
+    \\pub const lint_rules = .{ .version = 1, .roles = .{
+    \\    .{ .type = MustUse, .role = .must_use },
+    \\    .{ .type = Guarded, .role = .guarded },
+    \\    .{ .type = .{ .generic = Guarded, .member = .Guard }, .role = .guard },
+    \\} };
+;
+fn wrappedLocks(program: []const u8) !struct { findings: usize, complete: bool } {
+    const own = glint.AegisPack.package;
+    var project = try P.init(std.testing.allocator, &.{
+        .{ .name = "consumer", .bytes = program },
+        .{ .name = "root.zig", .bytes = wrapped_root, .selected = false, .package = own.name, .fingerprint = own.fingerprint },
+    }, &.{.{ .from = 0, .spelling = "aegis", .target = 1 }}, .{});
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.lock_order, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    return .{ .findings = count(report, pack.lock_order), .complete = report.complete };
+}
+test "an acquisition is read by its declared result through MustUse; one whose wrapped payload does not resolve is undecided, never no acquisition" {
+    const both = try wrappedLocks("const aegis = @import(\"aegis\");\npub fn f(a: *aegis.Guarded(u32), b: *aegis.Guarded(u32)) void {\n    var ga = a.acquire();\n    var gb = b.acquire();\n    _ = &ga;\n    _ = &gb;\n}\n");
+    try std.testing.expectEqual(@as(usize, 1), both.findings);
+    const unknown = try wrappedLocks("const aegis = @import(\"aegis\");\npub fn f(a: *aegis.Guarded(u32), b: *aegis.Guarded(u32)) void {\n    var ga = a.acquire();\n    var gb = b.obtain();\n    _ = &ga;\n    _ = &gb;\n}\n");
+    try std.testing.expectEqual(@as(usize, 0), unknown.findings);
+    try std.testing.expect(!unknown.complete);
+}
+
+test "where only a value's role is known, a field every type of that role keeps is A001's, one only some keep is undecided, one none keeps is not" {
+    const head = "const aegis = @import(\"aegis\");\nconst wide = @import(\"builtin\").cpu.arch == .x86_64;\nconst Tag = struct {};\nfn clean(_: *u32) void {}\nconst Pool = if (wide) aegis.handle.SlotPool(u8, Tag, .{}) else aegis.handle.RunPool(u8, Tag);\nconst O = if (wide) aegis.own.Owned(u32, clean) else aegis.own.OwnedIo(u32, cleanIo);\nfn cleanIo(_: *u32, _: @import(\"std\").Io) void {}\n";
+    // Owned and OwnedIo both keep `data` behind their operations: a finding, whichever it is.
+    try expectJudged(head ++ "pub fn f(o: *O) u32 { return o.data; }", pack.access, true, 1);
+    // SlotPool keeps `used`, RunPool does not: which one it is, glint does not know.
+    try expectJudged(head ++ "pub fn f(p: *Pool) usize { return p.used; }", pack.access, false, 0);
+    // No type of the role keeps `extra`: none of their fields, nothing to report.
+    try expectJudged(head ++ "pub fn f(p: *Pool) usize { return p.extra; }", pack.access, true, 0);
+}
+
+test "a result obligation's teardown after its discharge is clean; before it, the finding is at the teardown; a discharge after it is a use after its end" {
+    const head = "const aegis = @import(\"aegis\");\nconst M = aegis.own.MustUse(u32, \"read the count\");\n";
+    try expectJudged(head ++ "pub fn f(out: *u32) void {\n    var m = M.init(1);\n    m.take(out);\n    m.deinit();\n}", pack.cleanup, true, 0);
+    // One finding, at the teardown, and none again at the block's end.
+    try expectJudged(head ++ "pub fn f() void {\n    var m = M.init(1);\n    m.deinit();\n}", pack.cleanup, true, 1);
+    // The teardown's, and the take after it.
+    try expectJudged(head ++ "pub fn f(out: *u32) void {\n    var m = M.init(1);\n    m.deinit();\n    m.take(out);\n}", pack.cleanup, true, 2);
+}
+
+/// An aegis whose guard hands its release on to an optional hand-off: the move happens only
+/// when the call gives one.
+const handoff_root =
+    \\pub fn Guarded(comptime T: type) type {
+    \\    return struct {
+    \\        const Self = @This();
+    \\        data: T,
+    \\        lock: bool = false,
+    \\        pub fn acquire(o: *Self) Guard { o.lock = true; return .{ .owner = o }; }
+    \\        pub const Guard = struct {
+    \\            owner: *Self,
+    \\            pub fn deinit(g: *Guard) void { g.owner.lock = false; }
+    \\            pub fn handOff(g: *Guard) Handoff { return .{ .owner = g.owner }; }
+    \\            pub fn tryHandOff(g: *Guard) ?Handoff { return .{ .owner = g.owner }; }
+    \\        };
+    \\        pub const Handoff = struct {
+    \\            owner: *Self,
+    \\            pub fn release(h: *Handoff) void { h.owner.lock = false; }
+    \\        };
+    \\    };
+    \\}
+    \\pub const lint_rules = .{
+    \\    .version = 1,
+    \\    .roles = .{
+    \\        .{ .type = Guarded, .role = .guarded, .internal = .{ .lock, .data } },
+    \\        .{ .type = .{ .generic = Guarded, .member = .Guard }, .role = .guard, .internal = .{.owner} },
+    \\        .{ .type = .{ .generic = Guarded, .member = .Handoff }, .role = .handoff, .internal = .{.owner} },
+    \\    },
+    \\    .pairs = .{
+    \\        .{ .type = .{ .generic = Guarded, .member = .Guard }, .release = .{.deinit}, .transfer = .{ .handOff, .tryHandOff } },
+    \\        .{ .type = .{ .generic = Guarded, .member = .Handoff }, .release = .{.release} },
+    \\    },
+    \\};
+;
+fn handedCleanup(program: []const u8) !struct { findings: usize, complete: bool } {
+    const own = glint.AegisPack.package;
+    var project = try P.init(std.testing.allocator, &.{
+        .{ .name = "consumer", .bytes = program },
+        .{ .name = "root.zig", .bytes = handoff_root, .selected = false, .package = own.name, .fingerprint = own.fingerprint },
+    }, &.{.{ .from = 0, .spelling = "aegis", .target = 1 }}, .{});
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.cleanup, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    return .{ .findings = count(report, pack.cleanup), .complete = report.complete };
+}
+test "a guard's release moved to its hand-off by declaration; to an optional hand-off, only when one is given, which is undecided" {
+    const head = "const aegis = @import(\"aegis\");\nconst G = aegis.Guarded(u32);\n";
+    const moved = try handedCleanup(head ++ "pub fn f(b: *G) G.Handoff {\n    var g = b.acquire();\n    return g.handOff();\n}\n");
+    try std.testing.expect(moved.complete);
+    try std.testing.expectEqual(@as(usize, 0), moved.findings);
+    const maybe = try handedCleanup(head ++ "pub fn f(b: *G) ?G.Handoff {\n    var g = b.acquire();\n    return g.tryHandOff();\n}\n");
+    try std.testing.expect(!maybe.complete);
+    try std.testing.expectEqual(@as(usize, 0), maybe.findings);
+}
+
+test "the private fields aegis's first list missed are A001's: a reader-writer owner's admission limit, a dense map's regions and rooms, a secondary map's index and entries" {
+    const head = "const aegis = @import(\"aegis\");\nconst Tag = struct {};\nconst P = aegis.handle.SlotPool(u32, Tag, .{ .generation = u64 });\n";
+    try expectJudged(head ++ "pub fn f(g: *aegis.RwGuarded(u32)) usize { return g.limit; }", pack.access, true, 1);
+    try expectJudged(head ++ "pub fn f(m: *aegis.handle.DenseSlotMap(u32, Tag)) void { _ = m.value_region; _ = m.key_room; }", pack.access, true, 2);
+    try expectJudged(head ++ "pub fn f(m: *aegis.handle.SecondaryMap(P, u8)) void { _ = m.index; _ = m.first; _ = m.room; _ = m.gpa; }", pack.access, true, 3);
 }

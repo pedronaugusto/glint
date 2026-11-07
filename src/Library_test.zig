@@ -1,28 +1,19 @@
-//! A pack finds a library's declarations by where the library publishes them.
+//! A pack finds a library's declarations by the roles the library's package declares for them.
 const std = @import("std");
 const glint = @import("glint");
 const shakedown = @import("shakedown");
 const P = glint.Project;
 const Role = enum(u8) { widget, gauge, legacy };
-const library: glint.Library(Role) = .{ .modules = &.{
-    .{ .name = "gadgets", .members = &.{
-        .{ .path = "Widget", .role = .widget },
-        .{ .path = "kit.Gauge", .role = .gauge },
-        .{ .path = "Legacy", .role = .legacy, .required = false },
-    } },
-    .{ .name = "gadgets.kit", .members = &.{.{ .path = "Gauge", .role = .gauge }} },
-} };
+const gadgets: @FieldType(glint.Library(Role), "package") = .{ .name = "gadgets", .fingerprint = 0x9ad9e75 };
+const library: glint.Library(Role) = .{ .package = gadgets };
 const own: glint.Rule = @fromBackingInt(1000); // safe: this project owns its validated extension identity.
-const rule: glint.ProjectRule = .{ .definition = .{ .id = own, .name = "ROLE_PROBE", .group = .family_policy, .purpose = "reports the role a library gives each public constant", .version = 1 }, .check = probe };
+const rule: glint.ProjectRule = .{ .definition = .{ .id = own, .name = "ROLE_PROBE", .group = .family_policy, .purpose = "reports the role a library gives each public constant", .version = 1 }, .check = probe, .roles = &.{ "widget", "gauge", "legacy" } };
 
 /// Reports, for each public constant, the role of what it names, or that it names none.
 fn probe(context: *glint.RuleContext) glint.RuleContext.Error!void {
     const tree = try context.project.syntax(try context.source());
     if (try context.inLibrary(library, context.file)) return;
-    if (try context.drift(library)) |gap| {
-        const detail = try context.allocator.print("drift {s} {s} {t}", .{ gap.module, gap.path, gap.why });
-        try context.undecided(own, gap.start, .unresolved, detail);
-    }
+    if (try context.drift(library)) |gap| try context.undecided(own, gap.start, .unresolved, gap.detail);
     for (try context.project.declarations(try context.source())) |decl| {
         if (!decl.public) continue;
         const variable = tree.fullVarDecl(decl.node) orelse continue;
@@ -34,11 +25,12 @@ fn probe(context: *glint.RuleContext) glint.RuleContext.Error!void {
 const config: glint.Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = own, .level = .gate }} };
 
 const Layout = struct { name: []const u8, bytes: []const u8 };
-fn project(bytes: []const u8, layout: []const Layout) !P {
+/// The consumer, then `layout`'s files, each of the gadgets package; entry 0 is its root.
+fn project(a: std.mem.Allocator, bytes: []const u8, layout: []const Layout) !P {
     var inputs: [8]P.Input = undefined;
     inputs[0] = .{ .name = "consumer", .bytes = bytes };
-    for (layout, 1..) |entry, i| inputs[i] = .{ .name = entry.name, .bytes = entry.bytes, .selected = false };
-    // Layout entry 0 is the module root. Files reach each other by their relative names.
+    for (layout, 1..) |entry, i| inputs[i] = .{ .name = entry.name, .bytes = entry.bytes, .selected = false, .package = gadgets.name, .fingerprint = gadgets.fingerprint };
+    // Files reach each other by their relative names.
     var imports: [16]P.Import = undefined;
     imports[0] = .{ .from = 0, .spelling = "gadgets", .target = 1 };
     var count: usize = 1;
@@ -47,10 +39,10 @@ fn project(bytes: []const u8, layout: []const Layout) !P {
         imports[count] = .{ .from = from, .spelling = target.name, .target = to }; // safe: the fixture has a handful of files.
         count += 1;
     };
-    return P.init(std.testing.allocator, inputs[0 .. layout.len + 1], imports[0..count], .{});
+    return P.init(a, inputs[0 .. layout.len + 1], imports[0..count], .{});
 }
 fn probeAll(bytes: []const u8, layout: []const Layout) !struct { project: P, report: glint.Report } {
-    var built = try project(bytes, layout);
+    var built = try project(std.testing.allocator, bytes, layout);
     errdefer built.deinit();
     const report = try glint.runConfigured(std.testing.allocator, &built, config, .{ .project_rules = &.{rule} });
     return .{ .project = built, .report = report };
@@ -58,6 +50,13 @@ fn probeAll(bytes: []const u8, layout: []const Layout) !struct { project: P, rep
 fn expectMessages(report: glint.Report, expected: []const []const u8) !void {
     try std.testing.expectEqual(expected.len, report.diagnostics.len);
     for (expected, report.diagnostics) |message, diagnostic| try std.testing.expectEqualStrings(message, diagnostic.message);
+}
+fn coverage(report: glint.Report) ?[]const u8 {
+    var detail: ?[]const u8 = null;
+    for (report.coverage) |entry| if (entry.rule != null) {
+        detail = entry.detail;
+    };
+    return detail;
 }
 const consumer =
     \\const gadgets = @import("gadgets");
@@ -68,19 +67,20 @@ const consumer =
     \\pub const E = struct {};
     \\pub const F = gadgets.kit;
 ;
+const rules = "pub const lint_rules = .{ .version = 1, .roles = .{ .{ .type = Widget, .role = .widget }, .{ .type = kit.Gauge, .role = .gauge }, .{ .type = kit.Gauge, .role = .secret } } };\n";
 const flat = [_]Layout{
-    .{ .name = "gadgets.zig", .bytes = "pub const Widget = @import(\"widget.zig\").Widget;\npub const kit = @import(\"kit.zig\");" },
+    .{ .name = "gadgets.zig", .bytes = "pub const Widget = @import(\"widget.zig\").Widget;\npub const kit = @import(\"kit.zig\");\n" ++ rules },
     .{ .name = "widget.zig", .bytes = "pub fn Widget(comptime T: type) type { return struct { value: T }; }" },
     .{ .name = "kit.zig", .bytes = "pub fn Gauge(comptime T: type) type { return struct { reading: T }; }" },
 };
-// The same public names, with the declarations moved, rewritten and checked before they return.
+// The same declarations moved, rewritten and checked before they return.
 const moved = [_]Layout{
-    .{ .name = "gadgets.zig", .bytes = "const inner = @import(\"inner.zig\");\npub const Widget = inner.Widget;\npub const kit = inner.kit;\n" },
+    .{ .name = "gadgets.zig", .bytes = "const inner = @import(\"inner.zig\");\npub const Widget = inner.Widget;\npub const kit = inner.kit;\n" ++ rules },
     .{ .name = "inner.zig", .bytes = "pub const kit = @import(\"kit_impl.zig\");\n/// Reworded.\npub fn Widget(comptime T: type) type {\n    comptime check(T);\n    return struct { payload: T, extra: u8 = 0 };\n}\nfn check(comptime T: type) void { _ = T; }" },
     .{ .name = "kit_impl.zig", .bytes = "pub fn Gauge(comptime T: type) type {\n    if (@sizeOf(T) == 0) @compileError(\"zero\");\n    return struct { level: T };\n}" },
 };
 
-test "a published declaration is recognized across any layout that keeps its public names" {
+test "a declared role is recognized across any layout, by the declaration it names; a role the pack does not name is another pack's" {
     for ([_][]const Layout{ &flat, &moved }) |layout| {
         var run = try probeAll(consumer, layout);
         defer run.project.deinit();
@@ -89,11 +89,11 @@ test "a published declaration is recognized across any layout that keeps its pub
         try expectMessages(run.report, &.{ "widget", "widget", "gauge", "gauge", "none", "none" });
     }
 }
-test "a lookalike declaration under another module is not the library's" {
+test "the same declarations under another package are not the library's" {
     var built = try P.init(std.testing.allocator, &.{
         .{ .name = "consumer", .bytes = "const lookalike = @import(\"lookalike\");\npub const A = lookalike.Widget;\npub const B = lookalike.Widget(u8);" },
         .{ .name = "widget.zig", .bytes = "pub fn Widget(comptime T: type) type { return struct { value: T }; }", .selected = false },
-        .{ .name = "gadgets.zig", .bytes = "pub const Widget = @import(\"widget.zig\").Widget;", .selected = false },
+        .{ .name = "gadgets.zig", .bytes = "pub const Widget = @import(\"widget.zig\").Widget;\n" ++ "pub const lint_rules = .{ .version = 1, .roles = .{.{ .type = Widget, .role = .widget }} };\n", .selected = false },
     }, &.{
         .{ .from = 0, .spelling = "lookalike", .target = 2 },
         .{ .from = 2, .spelling = "widget.zig", .target = 1 },
@@ -103,151 +103,82 @@ test "a lookalike declaration under another module is not the library's" {
     defer report.deinit();
     try expectMessages(report, &.{ "none", "none" });
 }
-test "a copy under another name whose member does not resolve far enough to tell is the library, with that member drift" {
-    const vendored = "pub const Widget = @import(\"widget.zig\").Widget;\npub const kit = @import(\"kit.zig\");";
-    const widget = "pub fn Widget(comptime T: type) type { return struct { value: T }; }";
-    const consumer_of = "const vendored = @import(\"vendored\");\npub const A = vendored.Widget;";
-    // The kit it imports is no file of the run: whether it holds `Gauge` is not known.
-    var unknown = try P.init(std.testing.allocator, &.{
-        .{ .name = "consumer", .bytes = consumer_of },
-        .{ .name = "vendored.zig", .bytes = vendored, .selected = false },
-        .{ .name = "widget.zig", .bytes = widget, .selected = false },
-    }, &.{
-        .{ .from = 0, .spelling = "vendored", .target = 1 },
-        .{ .from = 1, .spelling = "widget.zig", .target = 2 },
-    }, .{});
-    defer unknown.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &unknown, config, .{ .project_rules = &.{rule} });
-    defer report.deinit();
-    try std.testing.expect(!report.complete);
-    try expectMessages(report, &.{"widget"});
-    var drift = false;
-    for (report.coverage) |entry| if (std.mem.eql(u8, entry.detail, "drift gadgets kit.Gauge missing_mapping")) {
-        drift = true;
+test "a root of the package that declares no lint_rules is drift where it is imported, and its types read no role" {
+    const bare = [_]Layout{
+        .{ .name = "gadgets.zig", .bytes = "pub const Widget = @import(\"widget.zig\").Widget;\n" },
+        flat[1],
     };
-    try std.testing.expect(drift);
-    // Twin: the kit is there and has no `Gauge`, so the copy is another module.
-    var absent = try P.init(std.testing.allocator, &.{
-        .{ .name = "consumer", .bytes = consumer_of },
-        .{ .name = "vendored.zig", .bytes = vendored, .selected = false },
-        .{ .name = "widget.zig", .bytes = widget, .selected = false },
-        .{ .name = "kit.zig", .bytes = "pub fn Dial(comptime T: type) type { return struct { reading: T }; }", .selected = false },
-    }, &.{
-        .{ .from = 0, .spelling = "vendored", .target = 1 },
-        .{ .from = 1, .spelling = "widget.zig", .target = 2 },
-        .{ .from = 1, .spelling = "kit.zig", .target = 3 },
-    }, .{});
-    defer absent.deinit();
-    var clean = try glint.runConfigured(std.testing.allocator, &absent, config, .{ .project_rules = &.{rule} });
-    defer clean.deinit();
-    try std.testing.expect(clean.complete);
-    try expectMessages(clean, &.{"none"});
+    var run = try probeAll("const gadgets = @import(\"gadgets\");\npub const A = gadgets.Widget;", &bare);
+    defer run.project.deinit();
+    defer run.report.deinit();
+    try std.testing.expect(!run.report.complete);
+    try std.testing.expectEqualStrings("gadgets's root gadgets.zig declares no lint_rules; the roles of its types are not read in this file", coverage(run.report).?);
+    try expectMessages(run.report, &.{"none"});
 }
-test "a dropped required member is drift, an absent optional member is not" {
+test "a reference in lint_rules that does not resolve is drift with where it is written, and the rest is read" {
     const dropped = [_]Layout{
-        .{ .name = "gadgets.zig", .bytes = "pub const Widget = @import(\"widget.zig\").Widget;\npub const kit = @import(\"kit.zig\");" },
-        .{ .name = "widget.zig", .bytes = "pub fn Widget(comptime T: type) type { return struct { value: T }; }" },
-        .{ .name = "kit.zig", .bytes = "pub fn Dial(comptime T: type) type { return struct { reading: T }; }" },
+        .{ .name = "gadgets.zig", .bytes = "pub const Widget = @import(\"widget.zig\").Widget;\npub const kit = @import(\"kit.zig\");\n" ++
+            "pub const lint_rules = .{ .version = 1, .roles = .{\n    .{ .type = Widget, .role = .widget },\n    .{ .type = kit.Meter, .role = .gauge },\n} };\n" },
+        flat[1],
+        flat[2],
     };
     var run = try probeAll(consumer, &dropped);
     defer run.project.deinit();
     defer run.report.deinit();
-    // Gate level: coverage the pack could not resolve makes the run incomplete, not clean.
     try std.testing.expect(!run.report.complete);
-    var drift: usize = 0;
-    for (run.report.coverage) |entry| if (entry.rule != null and std.mem.startsWith(u8, entry.detail, "drift gadgets kit.Gauge")) {
-        drift += 1;
-    };
-    try std.testing.expectEqual(@as(usize, 1), drift); // safe: one coverage entry per importing file.
-    for (run.report.coverage) |entry| try std.testing.expect(std.mem.find(u8, entry.detail, "Legacy") == null);
-    var complete = try probeAll(consumer, &flat);
-    defer complete.project.deinit();
-    defer complete.report.deinit();
-    try std.testing.expect(complete.report.complete);
+    try std.testing.expectEqualStrings("gadgets's lint_rules at gadgets.zig:5: a reference that does not resolve; the roles it declares are not all read in this file", coverage(run.report).?);
+    try expectMessages(run.report, &.{ "widget", "widget", "none", "none", "none", "none" });
 }
-test "an unmapped namespace is drift with its reason" {
-    var built = try P.init(std.testing.allocator, &.{
-        .{ .name = "consumer", .bytes = "const gadgets = @import(\"gadgets\");\npub const A = gadgets.Widget;" },
-        .{ .name = "gadgets.zig", .bytes = "pub const Widget = @import(\"widget.zig\").Widget;\npub const kit = @import(\"kit.zig\");", .selected = false },
-        .{ .name = "widget.zig", .bytes = "pub fn Widget(comptime T: type) type { return struct { value: T }; }", .selected = false },
-    }, &.{
-        .{ .from = 0, .spelling = "gadgets", .target = 1 },
-        .{ .from = 1, .spelling = "widget.zig", .target = 2 },
-    }, .{});
-    defer built.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &built, config, .{ .project_rules = &.{rule} });
-    defer report.deinit();
-    try std.testing.expect(!report.complete);
-    var found = false;
-    for (report.coverage) |entry| if (std.mem.eql(u8, entry.detail, "drift gadgets kit.Gauge missing_mapping")) {
-        found = true;
+test "a version of lint_rules the reader does not know is drift, and none of its roles are read" {
+    const later = [_]Layout{
+        .{ .name = "gadgets.zig", .bytes = "pub const Widget = @import(\"widget.zig\").Widget;\npub const lint_rules = .{ .version = 2, .roles = .{.{ .type = Widget, .role = .widget }} };\n" },
+        flat[1],
     };
-    try std.testing.expect(found);
-}
-test "an import spelled with an escape is the root it names, its drift reported there" {
-    var built = try P.init(std.testing.allocator, &.{
-        .{ .name = "consumer", .bytes = "const gadgets = @import(\"g\\x61dgets\");\npub const A = gadgets.Widget;" },
-        .{ .name = "gadgets.zig", .bytes = "pub const Widget = @import(\"widget.zig\").Widget;\npub const kit = @import(\"kit.zig\");", .selected = false },
-        .{ .name = "widget.zig", .bytes = "pub fn Widget(comptime T: type) type { return struct { value: T }; }", .selected = false },
-    }, &.{
-        .{ .from = 0, .spelling = "gadgets", .target = 1 },
-        .{ .from = 1, .spelling = "widget.zig", .target = 2 },
-    }, .{});
-    defer built.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &built, config, .{ .project_rules = &.{rule} });
-    defer report.deinit();
-    try std.testing.expect(!report.complete);
-    try expectMessages(report, &.{"widget"});
-    var found = false;
-    for (report.coverage) |entry| if (std.mem.eql(u8, entry.detail, "drift gadgets kit.Gauge missing_mapping")) {
-        found = true;
-    };
-    try std.testing.expect(found);
-    // Twin: the same spelling of a library that lacks nothing is complete.
-    var run = try probeAll("const gadgets = @import(\"g\\x61dgets\");\npub const A = gadgets.Widget;", &flat);
+    var run = try probeAll("const gadgets = @import(\"gadgets\");\npub const A = gadgets.Widget;", &later);
     defer run.project.deinit();
     defer run.report.deinit();
-    try std.testing.expect(run.report.complete);
-    try expectMessages(run.report, &.{"widget"});
+    try std.testing.expect(!run.report.complete);
+    try std.testing.expectEqualStrings("gadgets's lint_rules at gadgets.zig:2: a version of the vocabulary this glint does not read; the roles it declares are not all read in this file", coverage(run.report).?);
+    try expectMessages(run.report, &.{"none"});
 }
-test "the library's own files are not checked and two roots are both recognized" {
+test "the library's own files are not checked and two roots of the package are both read" {
+    const stated: P.Input = .{ .name = "", .bytes = "", .package = gadgets.name, .fingerprint = gadgets.fingerprint };
+    var one = stated;
+    one.name = "one.zig";
+    one.bytes = "pub const Widget = @import(\"w1.zig\").Widget;\npub const Unused = 1;\npub const lint_rules = .{ .version = 1, .roles = .{.{ .type = Widget, .role = .widget }} };\n";
+    var w1 = stated;
+    w1.name = "w1.zig";
+    w1.bytes = "pub fn Widget(comptime T: type) type { return struct { value: T }; }\npub const Internal = Widget;";
+    var two = stated;
+    two.name = "two.zig";
+    two.bytes = "pub const Gauge = @import(\"g2.zig\").Gauge;\npub const lint_rules = .{ .version = 1, .roles = .{.{ .type = Gauge, .role = .gauge }} };\n";
+    var g2 = stated;
+    g2.name = "g2.zig";
+    g2.bytes = "pub fn Gauge(comptime T: type) type { return struct { other: T }; }";
     var built = try P.init(std.testing.allocator, &.{
         .{ .name = "first", .bytes = "const g = @import(\"gadgets\");\npub const A = g.Widget;" },
-        .{ .name = "second", .bytes = "const g = @import(\"gadgets\");\npub const B = g.Widget;" },
-        .{ .name = "one.zig", .bytes = "pub const Widget = @import(\"w1.zig\").Widget;\npub const kit = @import(\"k1.zig\");\npub const Unused = 1;" },
-        .{ .name = "w1.zig", .bytes = "pub fn Widget(comptime T: type) type { return struct { value: T }; }\npub const Internal = Widget;" },
-        .{ .name = "k1.zig", .bytes = "pub fn Gauge(comptime T: type) type { return struct { value: T }; }" },
-        .{ .name = "two.zig", .bytes = "pub const Widget = @import(\"w2.zig\").Widget;\npub const kit = @import(\"k2.zig\");" },
-        .{ .name = "w2.zig", .bytes = "pub fn Widget(comptime T: type) type { return struct { other: T }; }" },
-        .{ .name = "k2.zig", .bytes = "pub fn Gauge(comptime T: type) type { return struct { other: T }; }" },
+        .{ .name = "second", .bytes = "const g = @import(\"gadgets.two\");\npub const B = g.Gauge;" },
+        one,
+        w1,
+        two,
+        g2,
     }, &.{
         .{ .from = 0, .spelling = "gadgets", .target = 2 },
-        .{ .from = 1, .spelling = "gadgets", .target = 5 },
+        .{ .from = 1, .spelling = "gadgets.two", .target = 4 },
         .{ .from = 2, .spelling = "w1.zig", .target = 3 },
-        .{ .from = 2, .spelling = "k1.zig", .target = 4 },
-        .{ .from = 5, .spelling = "w2.zig", .target = 6 },
-        .{ .from = 5, .spelling = "k2.zig", .target = 7 },
+        .{ .from = 4, .spelling = "g2.zig", .target = 5 },
     }, .{});
     defer built.deinit();
     // Every source is selected, the library's own files too: they are internals, so the probe skips them.
     var report = try glint.runConfigured(std.testing.allocator, &built, config, .{ .project_rules = &.{rule} });
     defer report.deinit();
     try std.testing.expect(report.complete);
-    try expectMessages(report, &.{ "widget", "widget" });
+    try expectMessages(report, &.{ "widget", "gauge" });
 }
 test "library resolution releases allocation failures" {
     const Case = struct {
         fn run(a: std.mem.Allocator) !void {
-            var built = try P.init(a, &.{
-                .{ .name = "consumer", .bytes = consumer },
-                .{ .name = flat[0].name, .bytes = flat[0].bytes, .selected = false },
-                .{ .name = flat[1].name, .bytes = flat[1].bytes, .selected = false },
-                .{ .name = flat[2].name, .bytes = flat[2].bytes, .selected = false },
-            }, &.{
-                .{ .from = 0, .spelling = "gadgets", .target = 1 },
-                .{ .from = 1, .spelling = flat[1].name, .target = 2 },
-                .{ .from = 1, .spelling = flat[2].name, .target = 3 },
-            }, .{});
+            var built = try project(a, consumer, &flat);
             defer built.deinit();
             var report = try glint.runConfigured(a, &built, config, .{ .project_rules = &.{rule} });
             defer report.deinit();
@@ -267,4 +198,29 @@ test "a type function with several returns has no single template, yet is still 
     defer run.project.deinit();
     defer run.report.deinit();
     try expectMessages(run.report, &.{ "widget", "none", "gauge", "gauge", "none", "none" });
+}
+test "a role no pack of the run reads is drift where the package is imported, and a finding in the package's own lint" {
+    const misspelt = [_]Layout{
+        .{ .name = "gadgets.zig", .bytes = "pub const Widget = @import(\"widget.zig\").Widget;\npub const lint_rules = .{ .version = 1, .roles = .{.{ .type = Widget, .role = .widgte }} };\n" },
+        flat[1],
+    };
+    var run = try probeAll("const gadgets = @import(\"gadgets\");\npub const A = gadgets.Widget;", &misspelt);
+    defer run.project.deinit();
+    defer run.report.deinit();
+    try std.testing.expect(!run.report.complete);
+    try std.testing.expectEqualStrings("gadgets's lint_rules at gadgets.zig:2: a role no pack of this run reads; the roles it declares are not all read in this file", coverage(run.report).?);
+    // The package's own lint: its root is the program's file, and A001 reports the role there.
+    var own_lint = try P.init(std.testing.allocator, &.{.{ .name = "gadgets.zig", .bytes = misspelt[0].bytes, .package = gadgets.name, .fingerprint = gadgets.fingerprint }}, &.{}, .{});
+    defer own_lint.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &own_lint, .{ .enabled = @splat(false), .selections = &.{.{ .rule = glint.AegisPack.access, .level = .gate }} }, .{ .project_rules = &(glint.AegisPack.rules ++ [_]glint.ProjectRule{rule}) });
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len);
+    try std.testing.expectEqualStrings("lint_rules: unknown_role: glint does not read this part, so the programs that import this package do not know what it declares", report.diagnostics[0].message);
+}
+test "two packs that give one role name in different lists are refused, so a package's role names one pack" {
+    var built = try project(std.testing.allocator, consumer, &flat);
+    defer built.deinit();
+    var clashing = rule;
+    clashing.roles = &.{ "widget", "secret" };
+    try std.testing.expectError(error.InvalidSelection, glint.runConfigured(std.testing.allocator, &built, config, .{ .project_rules = &.{clashing} }));
 }

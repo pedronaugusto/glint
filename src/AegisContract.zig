@@ -13,6 +13,9 @@ pub const Kind = enum {
     bytes_writer,
     guarded,
     guard,
+    /// An `Order`'s ranked capability, a guard whose acquisition checks the task's rank order: a
+    /// guard to every check (`isGuard`).
+    ranked_guard,
     /// A guard's release handed past its frame, `Guard.handOff`'s `Handoff`: released once.
     handoff,
     scalar,
@@ -66,123 +69,15 @@ pub const Kind = enum {
     record,
 };
 
-/// Aegis as programs import it. A declaration is aegis's when the path a program writes from the
-/// module root reaches it, so recognition survives any revision that keeps its public names and
-/// reports one that drops them (Context.drift). The same members are listed once per way aegis
-/// is imported: the root, and each namespace module a program may depend on alone.
-pub const library: Lib = .{ .modules = &modules, .package = package };
+/// Aegis's roles, as aegis declares them in its root's `lint_rules` (glint-design §12): each
+/// type's role by its declaration, read through `Facts.publication`. A role a revision of aegis
+/// no longer declares, or one it declares that does not resolve, is a gap that rule reports where
+/// aegis is imported (Context.drift); aegis's own lint reports its problems where they are written.
+pub const library: Library(Kind) = .{ .package = package };
 /// Aegis's package, as its `build.zig.zon` names it (`Facts.known`): its own files are not the
 /// program's, as the analyses know aegis by its declarations, under whatever name it is
 /// imported. Its fingerprint stays the same in every revision.
 pub const package: Facts.Package = .{ .name = "aegis", .fingerprint = 0x5e23831cba68ccae };
-const Lib = Library(Kind);
-const modules = [_]Lib.Module{
-    .{ .name = "aegis", .members = &root_members },
-    .{ .name = "aegis.secret", .members = &secret_members },
-    .{ .name = "aegis.sync", .members = &sync_members },
-    .{ .name = "aegis.int", .members = &int_members },
-    .{ .name = "aegis.id", .members = &id_members },
-    .{ .name = "aegis.units", .members = &units_members },
-};
-const secret_members = [_]Lib.Member{
-    .{ .path = "Secret", .role = .secret },
-    .{ .path = "SecretBytes", .role = .bytes },
-    .{ .path = "SecretBytes.Writer", .role = .bytes_writer, .required = false },
-    .{ .path = "Choice", .role = .choice, .required = false },
-};
-const sync_members = [_]Lib.Member{
-    .{ .path = "Guarded", .role = .guarded },
-    .{ .path = "BlockingGuarded", .role = .guarded },
-    .{ .path = "RwGuarded", .role = .guarded },
-    .{ .path = "SpinRwGuarded", .role = .guarded },
-    .{ .path = "Condition", .role = .condition },
-    .{ .path = "Once", .role = .once },
-    .{ .path = "Lazy", .role = .once },
-    .{ .path = "Confined", .role = .confined },
-    .{ .path = "Shared", .role = .shared, .required = false },
-    .{ .path = "Atomic", .role = .atomic, .required = false },
-    .{ .path = "InitContext", .role = .context, .required = false },
-    .{ .path = "Order.Context", .role = .context, .required = false },
-    .{ .path = "Order.Ordered", .role = .guarded, .required = false },
-};
-const int_members = [_]Lib.Member{
-    .{ .path = "Checked", .role = .scalar },
-    .{ .path = "Saturating", .role = .scalar },
-    .{ .path = "Ranged", .role = .scalar },
-};
-const id_members = [_]Lib.Member{
-    .{ .path = "Id", .role = .scalar },
-    .{ .path = "NonZero", .role = .scalar },
-    .{ .path = "Counter", .role = .issuer },
-};
-const units_members = [_]Lib.Member{
-    .{ .path = "Count", .role = .scalar },
-    .{ .path = "Bytes", .role = .scalar },
-    .{ .path = "Bits", .role = .scalar },
-    .{ .path = "Duration", .role = .scalar },
-    .{ .path = "Instant", .role = .scalar },
-};
-const root_members = [_]Lib.Member{
-    .{ .path = "Secret", .role = .secret },
-    .{ .path = "SecretBytes", .role = .bytes },
-    .{ .path = "SecretBytes.Writer", .role = .bytes_writer, .required = false },
-    .{ .path = "Guarded", .role = .guarded },
-    .{ .path = "BlockingGuarded", .role = .guarded },
-    .{ .path = "RwGuarded", .role = .guarded },
-    .{ .path = "SpinRwGuarded", .role = .guarded },
-    .{ .path = "Condition", .role = .condition },
-    .{ .path = "Once", .role = .once },
-    .{ .path = "Lazy", .role = .once },
-    .{ .path = "Confined", .role = .confined },
-    .{ .path = "int.Checked", .role = .scalar },
-    .{ .path = "int.Saturating", .role = .scalar },
-    .{ .path = "int.Ranged", .role = .scalar },
-    .{ .path = "id.Id", .role = .scalar },
-    .{ .path = "id.NonZero", .role = .scalar },
-    .{ .path = "id.Counter", .role = .issuer },
-    .{ .path = "units.Count", .role = .scalar },
-    .{ .path = "units.Bytes", .role = .scalar },
-    .{ .path = "units.Bits", .role = .scalar },
-    .{ .path = "units.Duration", .role = .scalar },
-    .{ .path = "units.Instant", .role = .scalar },
-    .{ .path = "secret.Choice", .role = .choice },
-    .{ .path = "Shared", .role = .shared },
-    .{ .path = "Atomic", .role = .atomic },
-    .{ .path = "InitContext", .role = .context },
-    .{ .path = "Order.Context", .role = .context },
-    .{ .path = "Order.Ordered", .role = .guarded },
-    .{ .path = "bounded.Array", .role = .inline_store },
-    .{ .path = "bounded.Ring", .role = .inline_store },
-    // `Queue` and `QueueBuffer` name `Ring` and `RingBuffer` through 0.2; 0.3 keeps one name each.
-    .{ .path = "bounded.Queue", .role = .inline_store, .required = false },
-    .{ .path = "bounded.Buffer", .role = .buffer },
-    .{ .path = "bounded.RingBuffer", .role = .buffer },
-    .{ .path = "bounded.QueueBuffer", .role = .buffer, .required = false },
-    .{ .path = "bounded.Limit", .role = .limit },
-    .{ .path = "bounded.Budget", .role = .budget },
-    .{ .path = "bounded.Budget.Reservation", .role = .reservation },
-    .{ .path = "own.Owned", .role = .owned },
-    .{ .path = "own.OwnedIo", .role = .owned },
-    .{ .path = "own.Lent", .role = .lent, .required = false },
-    .{ .path = "own.MustUse", .role = .must_use },
-    // 0.3 folds 0.2's `Pool` and `SlotMap` into `SlotPool`, on a region the pool owns, and adds
-    // `RunPool`; each name is in one revision only.
-    .{ .path = "handle.SlotPool", .role = .slots, .required = false },
-    .{ .path = "handle.RunPool", .role = .slots, .required = false },
-    .{ .path = "handle.Pool", .role = .slots, .required = false },
-    .{ .path = "handle.SlotMap", .role = .slots, .required = false },
-    .{ .path = "handle.DenseSlotMap", .role = .slots },
-    .{ .path = "handle.SecondaryMap", .role = .slots },
-    .{ .path = "handle.Domain", .role = .issuer },
-    .{ .path = "handle.Index", .role = .scalar },
-    .{ .path = "state.Machine.At", .role = .stage },
-    .{ .path = "state.Machine.Runtime", .role = .machine },
-    .{ .path = "scope.Table", .role = .table },
-    .{ .path = "scope.Table.Scope", .role = .scope },
-    .{ .path = "scope.Ref", .role = .ref },
-    .{ .path = "input.Untrusted", .role = .untrusted },
-    .{ .path = "err.PublicSource", .role = .public_source, .required = false },
-};
 
 /// Finds known owners through lexical aliases, declared types and exact constructors.
 /// Generic argument equality, alias effects and control flow are deliberately not inferred.
@@ -214,8 +109,6 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
         .@"orelse", .@"catch" => return kind(c, file, tree.nodeData(node).node_and_node[0], depth + 1),
         .error_union => return kind(c, file, tree.nodeData(node).node_and_node[1], depth + 1),
         .field_access => {
-            const data = tree.nodeData(node).node_and_token;
-            if (guardType(try Model.identifier(c.allocator, tree.tokenSlice(data[1]))) and try kind(c, file, data[0], depth + 1) == .guarded) return .guard;
             if (try typeRole(c, try c.facts.resolve(file, node))) |k| return k;
             // A member reached through a module import or another file's alias names its own
             // declaration: its type expression is read where it is written, which a value
@@ -245,7 +138,6 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
                 const data = tree.nodeData(call.ast.fn_expr).node_and_token;
                 const name = try Model.identifier(c.allocator, tree.tokenSlice(data[1]));
                 if (std.mem.eql(u8, name, "init") or std.mem.eql(u8, name, "fromRaw") or std.mem.eql(u8, name, "adopt")) return kind(c, file, data[0], depth + 1);
-                if (acquisition(name) and try kind(c, file, data[0], depth + 1) == .guarded) return .guard;
             }
             const origin = switch ((try Facts.calls.at(c.facts, file, node) orelse return null).callee) {
                 .function => |function| function,
@@ -262,26 +154,62 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
             const result = proto.ast.return_type.unwrap() orelse return null;
             return kind(c, origin.file, result, depth + 1);
         },
-        else => {},
+        else => {
+            // A container written here (`pub const Guard = struct { ... }`, an acquisition's
+            // declared result): its role, as aegis declares it.
+            var container_buffer: [2]Ast.Node.Index = undefined;
+            if (tree.fullContainerDecl(&container_buffer, node) != null) return typeRole(c, try c.facts.resolve(file, node));
+        },
     }
     return null;
 }
-/// The guard types a guarded owner declares: one guard, or a reader's and a writer's.
-pub fn guardType(name: []const u8) bool {
-    for ([_][]const u8{ "Guard", "ReadGuard", "WriteGuard" }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
-    return false;
+/// Whether a role is a guard's: an owner's guard, or an Order's ranked capability. Every guard
+/// check asks this, so none forgets the ranked one.
+pub fn isGuard(k: ?Kind) bool {
+    return k == .guard or k == .ranked_guard;
 }
 
-/// The hand-off type a guarded owner declares (`Guard.handOff`'s `Handoff`).
-pub fn handoffType(name: []const u8) bool {
-    return std.mem.eql(u8, name, "Handoff");
+/// What calling `decl` acquires (`acquired`): no guard, a guard, a ranked guard, or not known.
+pub const Acquisition = enum { no, plain, ranked, unknown };
+/// Whether `decl` acquires a guard: a function whose declared result, through `!`, `?` and the
+/// wrapper aegis declares (`MustUse(Guard, ...)`, by its role), is a type whose role is a guard's
+/// (aegis's `lint_rules`, never the function's name). A result that does not resolve, or a
+/// wrapper whose payload does not, is unknown, never no guard.
+pub fn acquired(c: *Context, decl: Facts.Decl) Context.Error!Acquisition {
+    const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+    if (record.kind != .function) return .no;
+    const tree = &c.project.at(decl.file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, record.node) orelse return .unknown;
+    return resultGuard(c, decl.file, proto.ast.return_type.unwrap() orelse return .no, 0);
 }
-
-/// The operations by which a guarded owner gives a guard: every acquire, blocking or
-/// spinning, cancelable or not, tried or waited for, and a reader's or a writer's.
-pub fn acquisition(name: []const u8) bool {
-    for ([_][]const u8{ "acquire", "acquireUncancelable", "acquireScheduling", "acquireYielding", "acquireYieldingUncancelable", "tryAcquire", "tryRead", "tryWrite", "read", "write", "readUncancelable", "writeUncancelable", "acquireOrdered", "acquireOrderedUncancelable", "readOrdered", "writeOrdered", "readOrderedUncancelable", "writeOrderedUncancelable" }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
-    return false;
+fn resultGuard(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usize) Context.Error!Acquisition {
+    if (depth == 16) return .unknown;
+    const tree = &c.project.at(file).file.tree;
+    switch (tree.nodeTag(node)) {
+        .optional_type => return resultGuard(c, file, tree.nodeData(node).node, depth + 1),
+        .error_union => return resultGuard(c, file, tree.nodeData(node).node_and_node[1], depth + 1),
+        else => {},
+    }
+    // `MustUse(Guard, "why")`: the wrapper's payload, its first argument.
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    if (tree.fullCall(&call_buffer, node)) |call| if (call.ast.params.len != 0) switch (try c.facts.definition(file, call.ast.fn_expr)) {
+        .decl => |named| switch (try c.facts.origin(named)) {
+            .decl => |function| if (try c.role(library, .{ .function = function }) == .must_use) return resultGuard(c, file, call.ast.params[0], depth + 1),
+            .none, .unknown => {},
+        },
+        .none, .unknown => {},
+    };
+    const value = try c.facts.resolve(file, node);
+    if (value == .unknown) return .unknown;
+    return switch ((try c.role(library, value)) orelse return .no) {
+        .guard => .plain,
+        .ranked_guard => .ranked,
+        // A wrapper reached other than by its call (an alias of `MustUse(Guard, ...)`): its
+        // payload is not read here.
+        .must_use => .unknown,
+        else => .no,
+    };
 }
 
 /// What a name bound by `if (x) |name|` or `while (x) |name|` holds: the payload of `x`, which

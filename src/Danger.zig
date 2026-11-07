@@ -1215,11 +1215,11 @@ fn invariant(c: *Context, node: Ast.Node.Index, edits: *std.ArrayList(Report.Edi
 
 /// The name the file imports aegis by, an edit adding the import (after std's) when it has
 /// none; null where `aegis` names something else. An import is known by its value: a
-/// file-level constant whose declaration is aegis's module root (`Facts.moduleRoots`), or one
+/// file-level constant whose declaration is a root of aegis's package (`Facts.packageRoots`), or one
 /// of std's files, under whatever name either is imported.
 fn aegisName(c: *Context, edits: *std.ArrayList(Report.Edit)) Context.Error!?[]const u8 {
     const model = &c.project.at(c.file).model;
-    const roots = try c.facts.moduleRoots(Contract.library.modules[0]);
+    const roots = try c.facts.packageRoots(Contract.package);
     var std_import: ?Ast.TokenIndex = null;
     for (model.declarations, 0..) |decl, d| {
         if (decl.kind != .variable or model.scopes[@backingInt(decl.scope)].kind != .file) continue;

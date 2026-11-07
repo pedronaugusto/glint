@@ -18,6 +18,7 @@ const Flows = @import("DangerFlow.zig");
 const Program = @import("Program.zig");
 const Rule = @import("Rule.zig").Rule;
 const Report = @import("Report.zig");
+const PackageRules = @import("PackageRules.zig");
 const Ast = std.zig.Ast;
 pub const access = Ids.access;
 pub const copies = Ids.copies;
@@ -44,23 +45,23 @@ pub const cancellation = Ids.cancellation;
 pub const lock_order = Ids.lock_order;
 /// Aegis's package, as its `build.zig.zon` names it: a caller states it for aegis's files.
 pub const package = Contract.package;
+/// The roles the pack reads from what aegis declares, and aegis as a library of them: a project's
+/// own rule reads a role through `RuleContext.role(library, value)`.
+pub const Role = Contract.Kind;
+pub const library = Contract.library;
 /// The danger rules: each finds where a danger exists and aegis's type is the answer.
 pub const danger = [_]Rule{ shared_state, secrets, untrusted_input, integers, units, bounded_work, contracts, lifetimes, ownership, identity, state_machines, diagnostics, unsafe_set, cancellation, lock_order };
-/// The first file outside aegis whose import resolves to an aegis module (`Facts.moduleRoots`):
-/// one, whatever the program names it after and whatever its package, that publishes what the
-/// module does; or one of aegis's name that publishes some of it, does not resolve far enough
-/// to tell, or does not parse, whose missing members the run then reports. A module of aegis's
-/// name that publishes none of it is not aegis.
+/// The first file outside aegis whose import reaches aegis (`Facts.packageRoots`): a file of
+/// aegis's package, by the identity the caller states, whatever the program names it after. A
+/// module of aegis's name that is not of aegis's package is not aegis.
 pub fn importer(gpa: std.mem.Allocator, project: *const Project) Facts.ResolveError!?Project.FileId {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     var facts: Facts = .{ .project = project, .gpa = arena.allocator(), .known = Contract.package };
+    const roots = try facts.packageRoots(Contract.package);
     for (project.imports) |mapping| {
-        if (facts.knownFile(mapping.from)) continue;
-        for (Contract.library.modules) |module| {
-            if (std.mem.findScalar(Project.FileId, try facts.moduleRoots(module), mapping.target) == null) continue;
-            if (project.at(mapping.target).file.status != .parsed or try facts.publishesAny(module, mapping.target) != .no) return mapping.from;
-        }
+        if (!mapping.in.inProgram() or facts.knownFile(mapping.from)) continue;
+        if (std.mem.findScalar(Project.FileId, roots, mapping.target) != null) return mapping.from;
     }
     return null;
 }
@@ -142,16 +143,27 @@ fn checkRecursion(c: *Context) Context.Error!void {
     if (!try begin(c, recursion)) return;
     try @import("AegisRecursion.zig").check(c, recursion);
 }
-/// Starts a check of this file. The library's own files are its safe-type internals, and a
-/// published member that no longer resolves is reported where the library is imported, so a
-/// renamed declaration cannot make a gate quietly stop seeing it.
+/// Starts a check of this file. What a `lint_rules` it declares says that glint cannot read is
+/// reported where it is written, in whatever package (`ownRules`). The library's own files are
+/// its safe-type internals; a root whose roles are not all read is reported where the library is
+/// imported, so a renamed declaration cannot make a gate quietly stop seeing it.
 fn begin(c: *Context, rule: Rule) Context.Error!bool {
+    if (rule == access) try ownRules(c);
     if (try c.inLibrary(Contract.library, c.file)) return false;
-    if (try c.drift(Contract.library)) |gap| {
-        const detail = try c.allocator.print("published member {s} of {s} does not resolve ({t}); its operations are not recognized in this file", .{ gap.path, gap.module, gap.why });
-        try c.undecided(rule, gap.start, .unresolved, detail);
-    }
+    if (try c.drift(Contract.library)) |gap| try c.undecided(rule, gap.start, .unresolved, gap.detail);
     return true;
+}
+/// Once per file (under A001), in any package: each part of a `lint_rules` this file declares
+/// that glint cannot read (PackageRules.Problem: a reference that does not resolve, a role no
+/// pack of the run reads, ...), where it is written, so the package's own lint catches what would
+/// leave its types plain in the programs that import it.
+fn ownRules(c: *Context) Context.Error!void {
+    const declared = try PackageRules.of(c.facts, c.file);
+    if (declared.declared == null) return;
+    const tree = &c.project.at(c.file).file.tree;
+    for (declared.problems) |problem| if (problem.file == c.file) {
+        try c.at(access, tree.firstToken(problem.node), try c.allocator.print("lint_rules: {t}: glint does not read this part, so the programs that import this package do not know what it declares", .{problem.why}));
+    };
 }
 fn checkAccess(c: *Context) Context.Error!void {
     if (!try begin(c, access)) return;
@@ -179,20 +191,31 @@ fn checkAccess(c: *Context) Context.Error!void {
         const step = path.steps[0];
         if (step.kind != .field) continue;
         const name = step.name orelse continue;
-        if (!backingName(name)) continue;
+        if (!try anyInternal(c, name)) continue;
         const holder = path.steps[1].node;
         const token = tree.lastToken(node);
         if (try typeValue(c, holder)) continue;
         if (try refuted(c, node, name)) continue;
         const k = (try requiredOwner(c, holder, access, token)) orelse continue;
-        if (backing(k, name)) try c.at(access, token, "published aegis backing field bypasses exposure/guard/ownership contract; review this access");
+        try reportInternal(c, token, try internalField(c, try c.facts.resolve(c.file, holder), k, name));
+    }
+}
+
+/// A read of a field only aegis touches: a finding where it is one, undecided where only some
+/// of the role's types keep it and the holder's type does not resolve.
+fn reportInternal(c: *Context, token: Ast.TokenIndex, found: Internal) Context.Error!void {
+    const tree = &c.project.at(c.file).file.tree;
+    switch (found) {
+        .yes => try c.at(access, token, "published aegis backing field bypasses exposure/guard/ownership contract; review this access"),
+        .unknown => try c.undecided(access, tree.tokenStart(token), .unresolved, "a field only some aegis types of this role keep behind their operations, on a value glint does not know to be one of them"),
+        .no => {},
     }
 }
 
 /// A backing field named by `@field`, as a member access names it: by a name it spells
 /// (`@field(g, "data")`, `"\x64ata"`, a `const` that holds it), by each field of a struct
 /// whose `field_names` it ranges over that is one; by a name it computes, any field of the
-/// holder, undecided where the holder's kind has a backing field.
+/// holder, undecided where the holder keeps a backing field.
 fn checkFieldBuiltin(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!void {
     if (!Facts.isBuiltin(tree, node, "@field")) return;
     var buffer: [2]Ast.Node.Index = undefined;
@@ -202,31 +225,43 @@ fn checkFieldBuiltin(c: *Context, tree: *const Ast, node: Ast.Node.Index) Contex
     const token = tree.nodeMainToken(node);
     const named = try c.facts.fieldName(c.file, args[1]);
     switch (named) {
-        .name => |name| if (!backingName(name)) return,
-        .each_of, .names => {
-            if (!backingNamed(c, named, null)) return;
-        },
+        .name => |name| if (!try anyInternal(c, name)) return,
+        .each_of, .names => if (!try anyNamedInternal(c, named)) return,
         .computed => {},
     }
     if (try typeValue(c, holder)) return;
     const k = (try requiredOwner(c, holder, access, token)) orelse return;
+    const value = try c.facts.resolve(c.file, holder);
     if (named == .computed) {
-        if (anyBacking(k)) try c.undecided(access, tree.tokenStart(token), .unresolved, "a name @field computes may be a published aegis backing field");
+        if (try keepsInternal(c, value, k) != .no) try c.undecided(access, tree.tokenStart(token), .unresolved, "a name @field computes may be a published aegis backing field");
         return;
     }
-    if (backingNamed(c, named, k)) try c.at(access, token, "published aegis backing field bypasses exposure/guard/ownership contract; review this access");
+    try reportInternal(c, token, try namedInternal(c, named, value, k));
 }
-/// Whether a name `@field` spells or ranges over is a backing field: of kind `k`, or of any.
-fn backingNamed(c: *Context, named: Facts.FieldName, k: ?Contract.Kind) bool {
+/// Whether a name `@field` spells or ranges over may be a field only aegis touches of any type.
+fn anyNamedInternal(c: *Context, named: Facts.FieldName) Context.Error!bool {
+    const found = try PackageRules.publication(c.facts, Contract.library);
+    for (found.entries) |entry| for (entry.internal) |name| if (c.facts.mayName(named, name)) return true;
+    return false;
+}
+/// Whether a name `@field` spells or ranges over is a field only aegis touches of `holder`
+/// (`internalField`): one it is makes the read one, one it may be makes it undecided.
+fn namedInternal(c: *Context, named: Facts.FieldName, holder: Facts.Value, k: Contract.Kind) Context.Error!Internal {
     switch (named) {
-        .name => |name| return if (k) |kind| backing(kind, name) else backingName(name),
-        .computed => return true,
+        .name => |name| return internalField(c, holder, k, name),
+        .computed => return .unknown,
         .each_of, .names => {
-            for (std.enums.values(Contract.Kind)) |each| {
-                if (k) |kind| if (each != kind) continue;
-                for (backingFields(each)) |name| if (c.facts.mayName(named, name)) return true;
-            }
-            return false;
+            var found: Internal = .no;
+            const entries = (try PackageRules.publication(c.facts, Contract.library)).entries;
+            for (entries) |entry| for (entry.internal) |name| {
+                if (!c.facts.mayName(named, name)) continue;
+                switch (try internalField(c, holder, k, name)) {
+                    .yes => return .yes,
+                    .unknown => found = .unknown,
+                    .no => {},
+                }
+            };
+            return found;
         },
     }
 }
@@ -269,22 +304,21 @@ fn checkByteRead(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Er
     if (try typeValue(c, place)) return;
     const token = tree.nodeMainToken(node);
     switch (try ownerKind(c, place, access)) {
-        .owner => |k| if (anyBacking(k)) {
-            if (maybe) |why| return c.unknown(access, node, why);
-            try c.at(access, token, "the bytes of a published aegis owner read whole bypass its exposure/guard/ownership contract; use its operations");
+        .owner => |k| switch (try keepsInternal(c, try c.facts.resolve(c.file, place), k)) {
+            .yes => {
+                if (maybe) |why| return c.unknown(access, node, why);
+                try c.at(access, token, "the bytes of a published aegis owner read whole bypass its exposure/guard/ownership contract; use its operations");
+            },
+            .unknown => try c.undecided(access, tree.tokenStart(token), .unresolved, "the bytes of a value of an aegis role only some of whose types keep fields behind their operations, whose type does not resolve"),
+            .no => {},
         },
         .other, .unknown => {},
     }
 }
-
-/// Whether a kind publishes any backing field (`backing`).
-fn anyBacking(k: Contract.Kind) bool {
-    return backingFields(k).len != 0;
-}
 /// The published types only their own constructor may make: `err.PublicSource`, whose
 /// `classify` takes the reviewed reason that a literal of it skips.
 fn constructed(c: *Context) Context.Error![]const Facts.Container {
-    const found = try c.facts.publication(Contract.library);
+    const found = try PackageRules.publication(c.facts, Contract.library);
     var out: std.ArrayList(Facts.Container) = .empty;
     for (found.entries) |entry| if (entry.target == .container and @as(Contract.Kind, @fromBackingInt(@intCast(entry.role))) == .public_source) try out.append(c.allocator, entry.target.container);
     return out.items;
@@ -461,14 +495,14 @@ fn namesFields(c: *Context, tree: *const Ast, literal: Ast.full.StructInit, cont
 /// `others`: `p.key` read beside `p.value`, and no aegis type whose `value` is backing state
 /// has a `key`.
 fn noLibraryHolder(c: *Context, name: []const u8, others: []const []const u8) Context.Error!bool {
-    const found = try c.facts.publication(Contract.library);
+    const found = try PackageRules.publication(c.facts, Contract.library);
     for (found.files) |file| {
         const model = &c.project.at(file).model;
         for (model.declarations) |decl| {
             if (decl.kind != .field or !std.mem.eql(u8, decl.name, name)) continue;
             const holder: Facts.Container = .{ .file = file, .scope = decl.scope };
             switch (try typed(c.facts, .{ .instance = holder }, 0)) {
-                .owner => |k| if (!backing(k, name)) continue,
+                .owner => |k| if (try internalField(c, .{ .instance = holder }, k, name) == .no) continue,
                 .other => continue,
                 .unknown => {},
             }
@@ -588,11 +622,10 @@ fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!b
     const siblings = try receiverMembers(c, tree, model, receiver, name);
     if (siblings.len != 0 and try noLibraryHolder(c, name, siblings)) return true;
     if (member == null and literal == null and !operand and !called) return false;
-    const found = try c.facts.publication(Contract.library);
+    const found = try PackageRules.publication(c.facts, Contract.library);
     var any = false;
     for (found.entries) |entry| {
-        const k: Contract.Kind = @fromBackingInt(@intCast(entry.role));
-        if (!backing(k, name)) continue;
+        if (!among(entry.internal, name)) continue;
         // A type function whose containers are known: each is an entry of its own (`Facts.publication`).
         if (entry.target == .function) if (try c.facts.template(entry.target.function)) |made| if ((try Facts.returnedContainers(c.allocator, made)).len != 0) continue;
         const container = (try publishedContainer(c, entry.target)) orelse return false;
@@ -709,7 +742,7 @@ fn plainStruct(c: *Context, container: Facts.Container) bool {
 
 /// The container a published target is: the type itself, or the one a type function returns,
 /// the first container declared in its body.
-fn publishedContainer(c: *Context, target: Facts.Target) Context.Error!?Facts.Container {
+fn publishedContainer(c: *Context, target: PackageRules.Target) Context.Error!?Facts.Container {
     switch (target) {
         .container => |container| return container,
         .function => |function| {
@@ -737,60 +770,72 @@ fn publishedContainer(c: *Context, target: Facts.Target) Context.Error!?Facts.Co
     }
 }
 
-/// Whether `name` is a backing field of a published type of kind `k`: the one place the
-/// contract's field catalogue (`backingFields`) is read by name.
-fn backing(k: Contract.Kind, name: []const u8) bool {
-    for (backingFields(k)) |field| if (std.mem.eql(u8, name, field)) return true;
-    return false;
+/// Whether a name is a field only aegis touches (A001's): yes, no, or undecided.
+const Internal = enum { yes, no, unknown };
+/// Whether `name` is a field only aegis touches of `holder`, whose role is `k`: its type's own
+/// `.internal`, as aegis declares it, for each type aegis gives a role that it may be. Where
+/// only the role is known, glint does not know which of that role's types it is: a field every
+/// one of them keeps is one, a field only some keep is undecided, a field none keeps is not.
+fn internalField(c: *Context, holder: Facts.Value, k: Contract.Kind, name: []const u8) Context.Error!Internal {
+    var every = true;
+    var some = false;
+    const types = try holderInternals(c, holder);
+    if (types.len != 0) {
+        for (types) |own| if (among(own, name)) {
+            some = true;
+        } else {
+            every = false;
+        };
+    } else {
+        const found = try PackageRules.publication(c.facts, Contract.library);
+        for (found.entries) |entry| {
+            if (@as(Contract.Kind, @fromBackingInt(@intCast(entry.role))) != k) continue;
+            if (among(entry.internal, name)) some = true else every = false;
+        }
+    }
+    return if (!some) .no else if (every) .yes else .unknown;
 }
-
-/// The private state of the published types: the secret's material, the bytes' allocation, the
-/// guards' value and lock state, and after them what each type's source keeps
-/// behind its operations (the initialized prefix and its cursors, a budget's charge, an owner's
-/// payload and witness, a loan's copy, a staged payload, a machine's state, a scope's record,
-/// the checked pointer, the unparsed value, the decision bit).
-fn backingFields(k: Contract.Kind) []const []const u8 {
-    return switch (k) {
-        .secret => &.{"material"},
-        .bytes => &.{ "allocation", "used_len", "gpa" },
-        // The guarded value and the lock state of every guarded owner: a spin flag, a
-        // blocking mutex, a reader-writer lock and its admission count. An ordered owner's
-        // base lock too.
-        .guarded => &.{ "data", "lock", "mutex", "state", "admitted", "base" },
-        // A guard's owner; an ordered guard's base guard.
-        .guard => &.{ "owner", "base" },
-        // A value initialized once: its publication state, its election lock and waiters, and
-        // the value itself before the state says it is there.
-        .once => &.{ "state", "mutex", "changed", "data" },
-        // A value one logical task owns: the value and the identity that is checked.
-        .confined => &.{ "data", "owner" },
-        .inline_store => &.{ "storage", "used", "head" },
-        .buffer => &.{ "storage", "gpa", "maximum", "used", "head" },
-        .limit => &.{"maximum"},
-        .budget => &.{ "ceiling", "taken", "unsettled" },
-        .reservation => &.{ "budget", "amount", "live" },
-        .owned => &.{ "data", "state" },
-        .lent => &.{"data"},
-        .must_use => &.{ "data", "pending", "live" },
-        .shared => &.{ "block", "live" },
-        // 0.3's `SlotPool` and `RunPool` keep their region and their counts; 0.2's pools, their arrays.
-        .slots => &.{ "slots", "storage", "primary", "values", "keys", "free_head", "entries", "region", "count", "used", "retired", "items", "end", "free_spans", "runs" },
-        .stage => &.{ "live", "payload" },
-        .machine => &.{"state"},
-        .table => &.{ "slots", "free_head", "used_up", "open_count" },
-        .scope => &.{ "table", "generation", "index" },
-        .ref => &.{ "slot", "generation", "pointer" },
-        .untrusted => &.{"value"},
-        .choice => &.{"bit"},
-        .atomic => &.{"cell"},
-        .context => &.{ "stack", "used", "suspended", "owners" },
-        else => &.{},
+/// Whether `holder`, whose role is `k`, keeps any field only aegis touches: by its type's own
+/// `.internal`, or where only the role is known, yes where every type of that role keeps one,
+/// undecided where only some do.
+fn keepsInternal(c: *Context, holder: Facts.Value, k: Contract.Kind) Context.Error!Internal {
+    var every = true;
+    var some = false;
+    const types = try holderInternals(c, holder);
+    if (types.len != 0) {
+        for (types) |own| if (own.len != 0) {
+            some = true;
+        } else {
+            every = false;
+        };
+    } else {
+        const found = try PackageRules.publication(c.facts, Contract.library);
+        for (found.entries) |entry| {
+            if (@as(Contract.Kind, @fromBackingInt(@intCast(entry.role))) != k) continue;
+            if (entry.internal.len != 0) some = true else every = false;
+        }
+    }
+    return if (!some) .no else if (every) .yes else .unknown;
+}
+/// The `.internal` lists of the aegis types `holder` may be (through pointers, optionals and error
+/// unions, each choice of a per-build or comptime choice): empty where none of them is one aegis
+/// gives a role.
+fn holderInternals(c: *Context, holder: Facts.Value) Context.Error![]const []const []const u8 {
+    var found: std.ArrayList([]const []const u8) = .empty;
+    var pending: std.ArrayList(Facts.Value) = .empty;
+    try pending.append(c.allocator, holder);
+    while (pending.pop()) |each| switch (each) {
+        .pointer => |inner| try pending.append(c.allocator, inner.child.*),
+        .optional, .error_union => |inner| try pending.append(c.allocator, inner.*),
+        .alternatives => |choices| try pending.appendSlice(c.allocator, choices),
+        else => if (try PackageRules.internalOf(c.facts, Contract.library, each)) |own| try found.append(c.allocator, own),
     };
+    return found.items;
 }
-
-/// Whether `name` is a backing field of any published type.
-fn backingName(name: []const u8) bool {
-    for (std.enums.values(Contract.Kind)) |k| if (backing(k, name)) return true;
+/// Whether `name` is a field only aegis touches of any type aegis gives a role.
+fn anyInternal(c: *Context, name: []const u8) Context.Error!bool {
+    const found = try PackageRules.publication(c.facts, Contract.library);
+    for (found.entries) |entry| if (among(entry.internal, name)) return true;
     return false;
 }
 
@@ -804,34 +849,104 @@ fn copiedOwner(k: Contract.Kind) bool {
     };
 }
 
-/// What ends a local owner's obligation, by kind: its release, or a declared transfer that
-/// moves it into storage the caller names. Null for kinds with no cleanup to owe.
+/// The kinds whose obligation a pair aegis declares names (`PackageRules.Pair`): a guard, its
+/// hand-off, a reservation, a scope and a result that must be used. What ends, moves or checks one
+/// is read from the callee's declaration, never its name.
+fn logical(k: Contract.Kind) bool {
+    return switch (k) {
+        .guard, .ranked_guard, .handoff, .reservation, .scope, .must_use => true,
+        else => false,
+    };
+}
+/// Whether a local owner of kind `k` owes cleanup: a pair's obligation, or an owner's release.
+fn owes(k: Contract.Kind) bool {
+    return logical(k) or releases(k) != null;
+}
+/// What the call at `node` in `file` does to an obligation a pair aegis declares, by its callee's
+/// declaration (`PackageRules.operation`); null where it does none. A choice of callees that do
+/// different things is unknown; a callee that does not resolve is found as Zig finds it, by its
+/// name in the holder's type where that type has a pair's role, and is unknown otherwise.
+fn pairCall(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?PackageRules.Operation {
+    const call = (try Facts.calls.at(c.facts, file, node)) orelse return null;
+    switch (call.callee) {
+        .function => |decl| return PackageRules.operation(c.facts, Contract.library, decl),
+        .choice => |all| {
+            var found: ?PackageRules.Operation = null;
+            for (all, 0..) |decl, i| {
+                const each = try PackageRules.operation(c.facts, Contract.library, decl);
+                if (i == 0) {
+                    found = each;
+                } else if (!std.meta.eql(found, each)) return .unknown;
+            }
+            return found;
+        },
+        .any => {
+            const path = try Facts.accesses.pathOf(c.facts, file, call.callee_expr);
+            if (path.steps.len < 2 or path.steps[0].kind != .field) return .unknown;
+            const name = path.steps[0].name orelse return .unknown;
+            const holder = recordOf(try c.facts.resolve(file, path.steps[1].node)) orelse return .unknown;
+            const k = (try PackageRules.role(c.facts, Contract.library, .{ .container = holder })) orelse return .unknown;
+            if (!logical(k)) return .unknown;
+            const decl = c.facts.member(holder, name) orelse return null;
+            return PackageRules.operation(c.facts, Contract.library, decl);
+        },
+    }
+}
+/// Whether the function the call at `node` calls declares an optional or error-union result: one
+/// that may give nothing. A result whose type does not resolve may be one.
+fn fallibleResult(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    const call = (try Facts.calls.at(c.facts, file, node)) orelse return false;
+    const decl = switch (call.callee) {
+        .function => |decl| decl,
+        .choice, .any => return false,
+    };
+    const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+    const tree = &c.project.at(decl.file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, record.node) orelse return false;
+    const result = proto.ast.return_type.unwrap() orelse return false;
+    if (Model.inferredErrors(tree, result)) return true;
+    return switch (try c.facts.resolve(decl.file, result)) {
+        .optional, .error_union, .unknown => true,
+        else => false,
+    };
+}
+
+/// Whether the call at `node` ends a local logical obligation: a release, or a move into storage
+/// the caller names; null where its callee is not known.
+fn endsObligation(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?bool {
+    const found = (try pairCall(c, file, node)) orelse return false;
+    return switch (found) {
+        .release => true,
+        .transfer => |to| to == .argument,
+        .teardown => false,
+        .unknown => null,
+    };
+}
+/// `endsObligation` in the checked file: one not known is undecided at the call, never no release.
+fn endsHere(c: *Context, node: Ast.Node.Index) Context.Error!bool {
+    return (try endsObligation(c, c.file, node)) orelse {
+        const tree = &c.project.at(c.file).file.tree;
+        try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a call on an aegis obligation whose callee does not resolve to what its pair declares");
+        return true;
+    };
+}
+
+/// What ends a local owner's obligation, by kind, for the owners whose releases their bodies will
+/// show (glint-b's release summary takes these): its release, or a declared transfer that moves it
+/// into storage the caller names. A pair's obligation is read from the callee's declaration
+/// (`logical`, `endsObligation`). Null for kinds with no cleanup to owe.
 fn releases(k: Contract.Kind) ?[]const []const u8 {
     return switch (k) {
         .secret, .bytes => &.{ "deinit", "moveInto" },
-        .guard, .buffer, .slots, .table => &.{"deinit"},
-        .handoff => &.{"release"},
-        .reservation => &.{ "release", "consume", "moveInto" },
+        .buffer, .slots, .table => &.{"deinit"},
         .owned => &.{ "deinit", "take", "moveInto" },
         // A std resource held raw: `close`, a server's `deinit` (it closes the listening
         // socket), a child's `kill` or `wait`. No other std resource declares a `deinit`.
         .std_handle => &.{ "close", "deinit", "kill", "wait" },
-        // A result obligation is discharged by taking it or acknowledging it with a reason;
-        // its `deinit` checks that it was.
-        .must_use => &.{ "take", "acknowledge" },
         // Its release is whichever call of its releases each owner it holds (`recordReleases`).
         .record => &.{},
         .shared => &.{"release"},
-        .scope => &.{"end"},
-        else => null,
-    };
-}
-
-/// What checks a local owner's obligation once it is discharged, by kind: a result
-/// obligation's `deinit`, which stops the program unless `take` or `acknowledge` came first.
-fn teardown(k: Contract.Kind) ?[]const u8 {
-    return switch (k) {
-        .must_use => "deinit",
         else => null,
     };
 }
@@ -844,6 +959,7 @@ fn releaseName(k: Contract.Kind, name: []const u8) bool {
 /// its kind's release by name, or, of a record of owners, a call that releases each of them.
 fn releasesBy(c: *Context, k: Contract.Kind, call: Ast.Node.Index, name: []const u8) Context.Error!bool {
     if (k == .record) return recordReleases(c, call, null);
+    if (logical(k)) return endsHere(c, call);
     return releaseName(k, name);
 }
 
@@ -868,7 +984,12 @@ fn aegisRelease(facts: *Facts, callee: Facts.Decl, owner: Facts.Value) Facts.Res
         .other, .unknown => return false,
     };
     const record = facts.project.at(callee.file).model.declarations[@backingInt(callee.index)];
-    if (record.kind != .function or !releaseName(k, record.name)) return false;
+    if (record.kind != .function) return false;
+    if (logical(k)) {
+        // By its declaration: a release, or a move into storage the caller names.
+        const found = (try PackageRules.operation(facts, Contract.library, callee)) orelse return false;
+        if (!(found == .release or (found == .transfer and found.transfer == .argument))) return false;
+    } else if (!releaseName(k, record.name)) return false;
     const container = recordOf(owner) orelse return false;
     return callee.file == container.file and record.scope == container.scope;
 }
@@ -920,7 +1041,7 @@ fn ownerPaths(c: *Context, container: Facts.Container, prefix: []const Facts.Dec
         while (inner == .optional) inner = inner.optional.*;
         switch (try typed(c.facts, inner, depth + 1)) {
             .owner => |k| {
-                if (releases(k) == null) {
+                if (!owes(k)) {
                     if (try carried(c, inner, depth + 1) != .other) return false;
                     continue;
                 }
@@ -1097,27 +1218,6 @@ fn recordCopied(c: *Context, container: Facts.Container, depth: usize) Context.E
     }
     return found;
 }
-/// The role of the published aegis type `container` is declared inside, as a guarded value's
-/// guard is: its own operations belong to that type's contract.
-fn enclosingPublished(facts: *Facts, container: Facts.Container) Facts.ResolveError!?Contract.Kind {
-    const found = try facts.publication(Contract.library);
-    const scopes = facts.project.at(container.file).model.scopes;
-    var scope = scopes[@backingInt(container.scope)].parent;
-    while (scope) |s| : (scope = scopes[@backingInt(s)].parent) {
-        for (found.entries) |entry| if (entry.target == .container and entry.target.container.file == container.file and entry.target.container.scope == s) return @fromBackingInt(@intCast(entry.role));
-    }
-    return null;
-}
-/// The name a container is declared under (`pub const Guard = struct { ... }`), if any.
-fn containerName(facts: *Facts, container: Facts.Container) ?[]const u8 {
-    const model = &facts.project.at(container.file).model;
-    const tree = &facts.project.at(container.file).file.tree;
-    const node = model.scopes[@backingInt(container.scope)].node;
-    if (node == .root) return null;
-    const parent = model.parentOf(node) orelse return null;
-    const declared = tree.fullVarDecl(parent) orelse return null;
-    return tree.tokenSlice(declared.ast.mut_token + 1);
-}
 /// What a resolved value's type says: a published aegis type, a type that is not aegis, or
 /// unknown. A guarded owner's guard is the guard. Another type declared inside a published one
 /// and not in the contract is plain data, as an unlisted type at a module's top is: the
@@ -1150,15 +1250,8 @@ fn typed(facts: *Facts, value: Facts.Value, depth: usize) Facts.ResolveError!Typ
             for (try facts.literalParts(literal)) |part| found = joined(found, try typed(facts, part, depth + 1));
             break :blk found;
         },
-        .container, .instance => |container| blk: {
-            if (try facts.role(Contract.library, value)) |k| break :blk .{ .owner = k };
-            const outer = (try enclosingPublished(facts, container)) orelse break :blk .other;
-            // A guarded owner's guard, reached by its resolved type rather than its acquisition.
-            if (outer == .guarded and Contract.guardType(containerName(facts, container) orelse "")) break :blk .{ .owner = .guard };
-            // A guard's release handed past its frame, released once as the guard is.
-            if (outer == .guarded and Contract.handoffType(containerName(facts, container) orelse "")) break :blk .{ .owner = .handoff };
-            break :blk .other;
-        },
+        // A guard and its hand-off among them, by the roles aegis declares (`Guarded(T).Guard`).
+        .container, .instance => if (try PackageRules.role(facts, Contract.library, value)) |k| .{ .owner = k } else .other,
         else => .other,
     };
 }
@@ -1202,7 +1295,7 @@ fn heldIn(c: *Context, container: Facts.Container, bindings: Bindings, depth: us
         };
         switch (try typed(c.facts, field.value, depth + 1)) {
             .other => if (try heldInRecord(c, field.value, depth + 1) != .other) return .unknown,
-            .owner => |k| if (releases(k) != null or try carried(c, field.value, depth + 1) != .other) return .unknown,
+            .owner => |k| if (owes(k) or try carried(c, field.value, depth + 1) != .other) return .unknown,
             .unknown => return .unknown,
         }
     }
@@ -1512,7 +1605,7 @@ fn boundBy(c: *Context, tree: *const Ast, call: Facts.calls.Call, rule: Rule, fu
             const line = site.line(site.tree.tokenStart(site.tree.firstToken(copy.site.node))) + 1;
             const owner = try madeOwner(c, call, function, copy, bound);
             switch (owner) {
-                .owner => |k| if (releases(k) != null) try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unsupported, try c.allocator.print("this binding makes an owner of what {s}:{d} acquires by the generic's type parameter; its cleanup is not walked per binding", .{ c.project.at(copy.site.file).input.name, line })),
+                .owner => |k| if (owes(k)) try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unsupported, try c.allocator.print("this binding makes an owner of what {s}:{d} acquires by the generic's type parameter; its cleanup is not walked per binding", .{ c.project.at(copy.site.file).input.name, line })),
                 .other => {},
                 .unknown => if (!bindingTyped(bound)) try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a generic that acquires by its type parameter is bound to a type that does not resolve"),
             }
@@ -1974,7 +2067,7 @@ fn scalarShaped(c: *Context, value: Facts.Value) bool {
 /// reservations point at, an owner bound to its address in Debug).
 fn movable(k: Contract.Kind) bool {
     return switch (k) {
-        .guard, .handoff, .shared, .reservation, .buffer, .slots, .table, .machine, .must_use, .stage, .issuer, .atomic, .context => true,
+        .guard, .ranked_guard, .handoff, .shared, .reservation, .buffer, .slots, .table, .machine, .must_use, .stage, .issuer, .atomic, .context => true,
         else => false,
     };
 }
@@ -2416,9 +2509,10 @@ fn publishedCall(c: *Context, file: Project.FileId, node: Ast.Node.Index) Contex
     return .{ .name = (try memberNamed(c, file, call.callee_expr)) orelse record.name, .known = true };
 }
 
-/// Whether a published operation's name gives an owner: a constructor or an acquisition.
-fn acquires(name: []const u8) bool {
-    return among(&.{ "init", "adopt" }, name) or Contract.acquisition(name);
+/// Whether a published operation's name gives an owner as its constructor. An acquisition gives
+/// one by its declared result (a guard, by the role aegis declares), which `givesOwner` reads.
+fn constructs(name: []const u8) bool {
+    return among(&.{ "init", "adopt" }, name);
 }
 
 /// Whether `name` is one of a catalogue's `names`.
@@ -2438,7 +2532,7 @@ fn exposure(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     const k = (try requiredOwner(c, path.steps[1].node, copies, tree.lastToken(call.callee_expr))) orelse return false;
     const views: []const []const u8 = switch (k) {
         .secret, .bytes => &.{ "expose", "exposeMut" },
-        .guard => &.{"value"},
+        .guard, .ranked_guard => &.{"value"},
         else => return false,
     };
     return among(views, published.name);
@@ -2598,7 +2692,7 @@ fn heldPart(c: *Context, value: Facts.Value) Context.Error!HeldPart {
     if (value == .pointer) return .none;
     if (bindingTyped(value)) return .unknown;
     return switch (try typed(c.facts, value, 1)) {
-        .owner => |k| if (releases(k) != null) .{ .owner = k } else .unknown,
+        .owner => |k| if (owes(k)) .{ .owner = k } else .unknown,
         .unknown => .unknown,
         .other => if (try heldInRecord(c, value, 1) == .other) .none else .unknown,
     };
@@ -2929,7 +3023,7 @@ fn acquisitionOwner(c: *Context, tree: *const Ast, acquisition: Ast.Node.Index, 
     if (c.facts.madeByParameter(c.file, acquisition) != null) return null;
     // A std handle acquired raw (`dir.openFile`): released by its `close`.
     if (try Shapes.acquiresHandle(c, cleanup, acquisition)) return .std_handle;
-    const named = if (try publishedCall(c, c.file, acquisition)) |published| acquires(published.name) else false;
+    const named = if (try publishedCall(c, c.file, acquisition)) |published| constructs(published.name) else false;
     // One that may give an owner is read by its type below, undecided where that does not resolve.
     if (!named and try givesOwner(c, acquisition) == .no) return null;
     if (try unlisted(c, acquisition)) return null;
@@ -2939,7 +3033,7 @@ fn acquisitionOwner(c: *Context, tree: *const Ast, acquisition: Ast.Node.Index, 
         .owner => |k| k,
         .other, .unknown => return null,
     };
-    if (releases(k) == null) return null;
+    if (!owes(k)) return null;
     return k;
 }
 
@@ -3282,6 +3376,14 @@ const Flow = struct {
             }
             // After the discharge, the check that it came is no use of the owner.
             if (state == .released and try f.tornDown(stmt)) continue;
+            // Before it, the check stops the program: the finding is at the teardown, which ends the
+            // value, so the block's end reports nothing more and a release after it is a use after
+            // its end (cleaned twice).
+            if (state == .live and !f.aggregate and try f.tornDown(stmt)) {
+                try fault(f.c, f.kind, f.firstUse(stmt), "result obligation torn down before its take or acknowledge: its deinit checks a discharge that never came");
+                state = .released;
+                continue;
+            }
             if (state == .released) switch (try f.reacquired(stmt)) {
                 .yes => {
                     state = .live;
@@ -4234,7 +4336,7 @@ const Flow = struct {
         return among(&.{ "await", "cancel", "join" }, name);
     }
 
-    /// `owner = x.init(...)`, `x.adopt(...)` or any acquisition of a guard: live again;
+    /// `owner = x.init(...)`, `x.adopt(...)` or anything giving an owner (a guard's acquisition): live again;
     /// unknown where what the call gives does not resolve.
     fn reacquired(f: Flow, stmt: Ast.Node.Index) Context.Error!Is {
         if (Facts.accesses.formOf(f.tree.nodeTag(stmt)) != .assign) return .no;
@@ -4243,7 +4345,7 @@ const Flow = struct {
         while (Facts.accesses.carriedFrom(f.tree, value)) |inner| value = inner;
         const call = (try Facts.calls.at(f.c.facts, f.c.file, value)) orelse return .no;
         const operation = (try memberNamed(f.c, f.c.file, call.callee_expr)) orelse return .no;
-        if (acquires(operation)) return .yes;
+        if (constructs(operation)) return .yes;
         return givesOwner(f.c, value);
     }
 
@@ -4262,12 +4364,25 @@ const Flow = struct {
         return f.handOffCall(value);
     }
 
-    /// `owner.handOff()`, called on the owner with nothing passed.
+    /// `owner.handOff()`, called on the owner with nothing passed: by its declaration a move of the
+    /// pair's obligation to the call's result. Where that result is `?R` or `!R`, the obligation moves
+    /// only when the call gives one; this walk does not follow that per path, so it is undecided.
     fn handOffCall(f: Flow, value: Ast.Node.Index) Context.Error!bool {
         var buffer: [1]Ast.Node.Index = undefined;
         const call = f.tree.fullCall(&buffer, value) orelse return false;
-        if (call.ast.params.len != 0) return false;
-        return std.mem.eql(u8, (try f.calledOwner(value)) orelse return false, handsOn(.guard).?);
+        if (call.ast.params.len != 0 or !logical(f.kind)) return false;
+        _ = (try f.calledOwner(value)) orelse return false;
+        const found = (try pairCall(f.c, f.c.file, value)) orelse return false;
+        switch (found) {
+            .transfer => |to| if (to != .result) return false,
+            .unknown => {
+                try f.c.undecided(cleanup, f.tree.tokenStart(f.tree.nodeMainToken(value)), .unresolved, "a call on an aegis obligation whose callee does not resolve to what its pair declares");
+                return true;
+            },
+            .release, .teardown => return false,
+        }
+        if (try fallibleResult(f.c, f.c.file, value)) try f.c.undecided(cleanup, f.tree.tokenStart(f.tree.nodeMainToken(value)), .unsupported, "an obligation moved to an optional or error result moves only when the call gives one; that path is not followed");
+        return true;
     }
 
     /// `var h, const m = .{ owner.handOff(), n };`: a destructure of a literal of as many
@@ -4469,8 +4584,11 @@ const Flow = struct {
 
     /// `owner.deinit()` of a result obligation: the check that its discharge came.
     fn tornDown(f: Flow, stmt: Ast.Node.Index) Context.Error!bool {
-        const name = teardown(f.kind) orelse return false;
-        return std.mem.eql(u8, (try f.calledOwner(stmt)) orelse return false, name);
+        // On the owner, and by its declaration a teardown of the pair's (`MustUse.deinit`).
+        if (!logical(f.kind)) return false;
+        _ = (try f.calledOwner(stmt)) orelse return false;
+        const found = (try pairCall(f.c, f.c.file, stmt)) orelse return false;
+        return found == .teardown;
     }
 
     /// `_ = &owner;`
@@ -4690,7 +4808,9 @@ const Loan = struct {
     /// `p.deinit(...)`.
     fn releases(l: Loan, stmt: Ast.Node.Index) Context.Error!bool {
         const called = (try calledOn(l.c, l.file, stmt)) orelse return false;
-        return called.on == l.token and releaseName(l.kind, called.name);
+        if (called.on != l.token) return false;
+        if (logical(l.kind)) return (try endsObligation(l.c, l.file, stmt)) orelse false;
+        return releaseName(l.kind, called.name);
     }
 
     /// `p.* = x.acquire...(...)`.
@@ -4701,7 +4821,15 @@ const Loan = struct {
         if (path.steps.len != 2 or path.steps[0].kind != .deref or declaredAt(l.c, l.file, path.root) != l.token) return false;
         while (Facts.accesses.carriedFrom(l.tree, value)) |inner| value = inner;
         const call = (try Facts.calls.at(l.c.facts, l.file, value)) orelse return false;
-        return Contract.acquisition((try memberNamed(l.c, l.file, call.callee_expr)) orelse return false);
+        // An acquisition by its declared result (`Contract.acquired`): one not known is no reacquisition shown.
+        const function = switch (call.callee) {
+            .function => |function| function,
+            .choice, .any => return false,
+        };
+        return switch (try Contract.acquired(l.c, function)) {
+            .plain, .ranked => true,
+            .no, .unknown => false,
+        };
     }
 
     const Use = enum { none, members, other };
@@ -4713,7 +4841,9 @@ const Loan = struct {
         while (each.next()) |candidate| {
             switch (try Facts.accesses.useOf(l.c.facts, l.file, candidate)) {
                 .member => |read| {
-                    if (releaseName(l.kind, (try memberNamed(l.c, l.file, read)) orelse return .other)) return .other;
+                    if (logical(l.kind)) {
+                        if ((try endsObligation(l.c, l.file, l.model.parentOf(read) orelse return .other)) orelse true) return .other;
+                    } else if (releaseName(l.kind, (try memberNamed(l.c, l.file, read)) orelse return .other)) return .other;
                     found = .members;
                     continue;
                 },
@@ -4962,7 +5092,7 @@ fn adopts(k: Contract.Kind) ?[]const u8 {
 fn handsOn(k: Contract.Kind) ?[]const u8 {
     return switch (k) {
         .owned => "move",
-        .guard => "handOff",
+
         else => null,
     };
 }

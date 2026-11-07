@@ -19,6 +19,10 @@ backing: std.mem.Allocator = std.heap.page_allocator,
 /// std's, are not the program's (`program`), under whatever name a program imports it. Only
 /// files the caller states are that package's: a module republishing it stays the program's.
 known: ?Package = null,
+/// The role names the run's packs read (`RuleContext.Rule.roles` and glint's own packs'), set by
+/// the run: a role a package's `lint_rules` names that none of them is, is a problem where it is
+/// written (PackageRules). Null where no run states them: no name is then judged.
+role_names: ?[]const []const u8 = null,
 cache: std.AutoHashMapUnmanaged(Settled, Value) = .empty,
 /// What a node gives in a reading (`resolveIn`), by the reading's address and the node.
 bound: std.AutoHashMapUnmanaged(Bound, Value) = .empty,
@@ -51,9 +55,8 @@ bound_places: std.AutoHashMapUnmanaged(struct { site: Key, place: Ast.Node.Index
 cast_sites: std.AutoHashMapUnmanaged(Key, Decl) = .empty,
 /// Whether a file declares any `comptime` parameter of type `bool`, found per file once.
 conditional_files: std.AutoHashMapUnmanaged(Project.FileId, bool) = .empty,
-publications: std.AutoHashMapUnmanaged(usize, *const Publication) = .empty,
-/// Each module's roots, by the address of its members.
-module_roots: std.AutoHashMapUnmanaged(usize, []const Project.FileId) = .empty,
+/// Each package's roots the program reaches (`packageRoots`), by its fingerprint.
+package_roots: std.AutoHashMapUnmanaged(u64, []const Project.FileId) = .empty,
 templates: std.AutoHashMapUnmanaged(Decl, ?Value) = .empty,
 /// What each declaration known only as the program compiles reads as with each call's
 /// bindings, found once (`atBindings`).
@@ -234,23 +237,6 @@ pub const Spelled = union(enum) { name: []const u8, number: usize };
 /// Type information read off a type (`of`) at a part of it: the whole (`info`), a kind's own
 /// (`pointer`, ...), a pointer's size (`size`), a function's parameters, any other part.
 pub const Reflected = struct { of: *const Value, at: enum { info, pointer, size, optional, array, error_union, function, params, structure, tagged, enumeration, part } };
-/// A library's declarations in this project, found through its modules' roots. Roles are the
-/// caller's enum values; the resolver never interprets them.
-pub const Publication = struct {
-    entries: []const Entry,
-    /// Required members that did not resolve: drift or a missing module mapping, never silence.
-    gaps: []const Gap,
-    /// The library's own files. A library with a package (aegis's) has the files of that
-    /// identity: a file publishing its API, a program's re-export or a copy without its
-    /// manifest, stays the program's, whatever it turns on. One without is known by its import
-    /// alone: every file its roots reach, std and builtin aside.
-    files: []const Project.FileId,
-};
-pub const Entry = struct { role: u32, target: Target };
-pub const Target = union(enum) { function: Decl, container: Container };
-/// A required member `module`'s root `root` does not publish: reported where a file imports
-/// that root, under whatever name.
-pub const Gap = struct { module: []const u8, path: []const u8, why: Unknown, root: Project.FileId };
 /// Why a value is unknown. `absent`: it comes from a module the build does not have for this
 /// file (Project.Input.absent), or it is a parameter no function of a reflected choice has
 /// (`param_types[6]` of a table whose functions take at most six), so the code that needs it
@@ -366,8 +352,7 @@ pub fn deinit(self: *Facts) void {
     self.bound_places.deinit(self.gpa);
     self.cast_sites.deinit(self.gpa);
     self.conditional_files.deinit(self.gpa);
-    self.publications.deinit(self.gpa);
-    self.module_roots.deinit(self.gpa);
+    self.package_roots.deinit(self.gpa);
     self.templates.deinit(self.gpa);
     self.type_returns.deinit(self.gpa);
     self.at_bindings.deinit(self.gpa);
@@ -388,101 +373,26 @@ pub fn knownFile(self: *const Facts, file: Project.FileId) bool {
 }
 
 /// Whether the caller states `file` to be of `package`, by name and fingerprint.
-fn ofPackage(self: *const Facts, file: Project.FileId, package: Package) bool {
+pub fn ofPackage(self: *const Facts, file: Project.FileId, package: Package) bool {
     const input = self.project.at(file).input;
     return input.fingerprint == package.fingerprint and std.mem.eql(u8, input.package, package.name);
 }
 
-/// The files a module's root is: each file a file outside the known library imports by the
-/// module's name, or the library's own file under any name, where it is the library's own or
-/// its package is not stated, or where it
-/// publishes any member the module requires or does not parse (the members it lacks are
-/// gaps the run reports); and each, under any name and of any package, that publishes every
-/// member the module requires: the library's own file, its sources vendored into another
-/// package's tree, a manifest that names nothing, a module republishing it. Which files leave
-/// the program is the library's identity alone (`outside`): a module republishing it stays
-/// the program's. A file whose members do not resolve far enough to tell is a root, as one
-/// that does not parse is: the members it may lack are gaps the run reports, never a module
-/// it is not. Found once per run.
-pub fn moduleRoots(self: *Facts, module: anytype) ResolveError![]const Project.FileId {
-    const key = @intFromPtr(module.members.ptr);
-    if (self.module_roots.get(key)) |found| return found;
-    var required = false;
-    for (module.members) |listed| required = required or listed.required;
+/// The roots of `package` the program reaches: each file of that package, as the caller states
+/// it, that a file of another package imports, under any name or path. A build script's import
+/// counts, as the build runner names the package's modules. Found once per run.
+pub fn packageRoots(self: *Facts, package: Package) ResolveError![]const Project.FileId {
+    const key = package.fingerprint;
+    if (self.package_roots.get(key)) |found| return found;
     var roots: std.ArrayList(Project.FileId) = .empty;
-    var other: FileSet = .empty;
     for (self.project.imports) |mapping| {
-        if (std.mem.findScalar(Project.FileId, roots.items, mapping.target) != null) continue;
-        // A library's modules are the program's: a build script's import of the library's name
-        // is the library's build script, as the build runner names it.
         if (!mapping.in.inProgram()) continue;
-        // The library's own import of its parts is no program's import of a module.
-        if (self.knownFile(mapping.from) and self.knownFile(mapping.target)) continue;
-        // The library's own file is it under any name (a second revision imported as
-        // `aegis_old`): by identity, as its files leave the program. Under another module's
-        // name it is that module where it publishes some of it (aegis's root is not
-        // `aegis.int`, whose members it publishes under `int`).
-        const spelled = std.mem.eql(u8, mapping.spelling, module.name);
-        const named = spelled or self.knownFile(mapping.target);
-        const stated = !self.knownFile(mapping.target) and self.project.at(mapping.target).input.fingerprint != null;
-        const parsed = self.project.at(mapping.target).file.status == .parsed;
-        if (!spelled and named and parsed and try self.publishesAny(module, mapping.target) == .no) continue;
-        if (!named or stated) {
-            // Under its name, a module publishing some of it is it with members missing, and
-            // one that does not parse may be; publishing none, it is another.
-            if (!(named and (!parsed or try self.publishesAny(module, mapping.target) != .no))) {
-                if (other.contains(@backingInt(mapping.target))) continue;
-                if (!(required and parsed and try self.publishes(module, mapping.target) != .no)) {
-                    try other.put(self.gpa, @backingInt(mapping.target), {});
-                    continue;
-                }
-            }
-        }
+        if (!self.ofPackage(mapping.target, package) or self.ofPackage(mapping.from, package)) continue;
+        if (std.mem.findScalar(Project.FileId, roots.items, mapping.target) != null) continue;
         try roots.append(self.gpa, mapping.target);
     }
-    try self.module_roots.put(self.gpa, key, roots.items);
+    try self.package_roots.put(self.gpa, key, roots.items);
     return roots.items;
-}
-
-/// Finds what `library` publishes: each module's roots (`moduleRoots`), and each member the
-/// declaration its path names from a root. Found once per run and shared by every rule.
-pub fn publication(self: *Facts, library: anytype) ResolveError!*const Publication {
-    const key = @intFromPtr(library.modules.ptr);
-    if (self.publications.get(key)) |found| return found;
-    var entries: std.ArrayList(Entry) = .empty;
-    var gaps: std.ArrayList(Gap) = .empty;
-    var reached: FileSet = .empty;
-    for (library.modules) |module| {
-        for (try self.moduleRoots(module)) |root| {
-            try reached.put(self.gpa, @backingInt(root), {});
-            for (module.members) |listed| switch (try self.published(root, listed.path)) {
-                .found => |target| {
-                    const role_value: u32 = @intCast(@backingInt(listed.role));
-                    try entries.append(self.gpa, .{ .role = role_value, .target = target });
-                    // The container a type function returns is also its type: instances declared with it are the role's,
-                    // each container it may return where it chooses one by a comptime option (aegis 0.3's
-                    // `SlotPool(T, Tag, options)`: `Keyed` or `Indexed`).
-                    if (target == .function) if (try self.template(target.function)) |returned| for (try returnedContainers(self.gpa, returned)) |made| {
-                        try entries.append(self.gpa, .{ .role = role_value, .target = .{ .container = .{ .file = made.file, .scope = made.scope } } });
-                    };
-                },
-                .absent => if (listed.required) try gaps.append(self.gpa, .{ .module = module.name, .path = listed.path, .why = .unresolved, .root = root }),
-                .unknown => |why| if (listed.required) try gaps.append(self.gpa, .{ .module = module.name, .path = listed.path, .why = why, .root = root }),
-            };
-        }
-    }
-    var files: std.ArrayList(Project.FileId) = .empty;
-    if (library.package) |package| {
-        for (self.project.sources) |*source| if (self.ofPackage(source.id, package)) try files.append(self.gpa, source.id);
-    } else {
-        try self.reach(&reached, .library);
-        var each = reached.keyIterator();
-        while (each.next()) |file| try files.append(self.gpa, @fromBackingInt(file.*));
-    }
-    const result = try self.gpa.create(Publication);
-    result.* = .{ .entries = entries.items, .gaps = gaps.items, .files = files.items };
-    try self.publications.put(self.gpa, key, result);
-    return result;
 }
 
 /// The containers a type function's template is (`template`): the one it returns, or each it
@@ -524,106 +434,6 @@ fn declarationLiteral(self: *Facts, file: Project.FileId, node: Ast.Node.Index) 
     };
 }
 
-/// Whether a file publishes a module's members: `unknown` where one does not resolve far enough
-/// to tell and none decides the answer.
-pub const Publishes = enum { yes, no, unknown };
-
-/// Whether the file `root` publishes every member `module` requires: that module, not another
-/// of its name. One member it lacks says no; one that does not resolve, with none lacking, is
-/// unknown.
-pub fn publishes(self: *Facts, module: anytype, root: Project.FileId) ResolveError!Publishes {
-    var answer: Publishes = .yes;
-    for (module.members) |listed| if (listed.required) switch (try self.published(root, listed.path)) {
-        .found => {},
-        .absent => return .no,
-        .unknown => answer = .unknown,
-    };
-    return answer;
-}
-
-/// Whether the file `root` publishes any member `module` requires. One it has says yes; one
-/// that does not resolve, with none found, is unknown.
-pub fn publishesAny(self: *Facts, module: anytype, root: Project.FileId) ResolveError!Publishes {
-    var answer: Publishes = .no;
-    for (module.members) |listed| if (listed.required) switch (try self.published(root, listed.path)) {
-        .found => return .yes,
-        .absent => {},
-        .unknown => answer = .unknown,
-    };
-    return answer;
-}
-
-/// A member a root publishes; one it does not (no public declaration of that name on the
-/// path); or why the path does not resolve far enough to tell.
-const Found = union(enum) { found: Target, absent, unknown: Unknown };
-/// Walks public namespaces from a module root, the way a program names the declaration.
-fn published(self: *Facts, root: Project.FileId, path: []const u8) ResolveError!Found {
-    var current: Value = .{ .container = self.rootOf(root) };
-    var names = std.mem.splitScalar(u8, path, '.');
-    while (names.next()) |name| {
-        const container = switch (current) {
-            .container, .instance => |c| c,
-            // A member of a type function's container, as `Budget.Reservation` names the
-            // reservation every budget declares. A function whose container this does not
-            // find may still make one.
-            .function => |function| switch ((try self.template(function)) orelse return .{ .unknown = .unsupported }) {
-                .container, .instance => |c| c,
-                // A choice of templates, as any other: not one container.
-                .alternatives => return .{ .unknown = .unsupported },
-                else => return .{ .unknown = .unsupported },
-            },
-            // A type that declares nothing, or a value of one, names no member.
-            .primitive, .scalar, .error_set, .pointer, .array, .optional, .error_union => return .absent,
-            .unknown => |why| return .{ .unknown = why },
-            .alternatives, .reflected, .literal, .reified, .fn_type => return .{ .unknown = .unsupported },
-        };
-        const decl = self.member(container, name) orelse return .absent;
-        if (!self.project.at(decl.file).model.declarations[@backingInt(decl.index)].public) return .absent;
-        current = try self.declaration(decl);
-    }
-    return switch (current) {
-        .function => |decl| .{ .found = .{ .function = decl } },
-        .container => |c| .{ .found = .{ .container = .{ .file = c.file, .scope = c.scope } } },
-        .unknown => |why| .{ .unknown = why },
-        // A choice of declarations: not one the library publishes.
-        .alternatives => .{ .unknown = .unsupported },
-        // A declaration of the name the library's is, of a kind no role names: there, but
-        // not what the library publishes there.
-        else => .{ .unknown = .unsupported },
-    };
-}
-
-/// The role `library` publishes for a function declaration, or a type or instance of a
-/// published container, seen through pointers, optionals and error unions.
-pub fn role(self: *Facts, library: anytype, value: Value) ResolveError!?@TypeOf(library).Role {
-    const Role = @TypeOf(library).Role;
-    const found = try self.publication(library);
-    var current = value;
-    while (true) switch (current) {
-        .pointer => |inner| current = inner.child.*,
-        .array, .optional, .error_union => |inner| current = inner.*,
-        .function => |decl| {
-            for (found.entries) |entry| if (entry.target == .function and std.meta.eql(entry.target.function, decl)) return @as(Role, @fromBackingInt(@intCast(entry.role)));
-            return null;
-        },
-        .container, .instance => |c| {
-            for (found.entries) |entry| if (entry.target == .container and entry.target.container.file == c.file and entry.target.container.scope == c.scope) return @as(Role, @fromBackingInt(@intCast(entry.role)));
-            return null;
-        },
-        // A choice: the role every part agrees on, none where they differ or one has none.
-        .alternatives => |parts| {
-            var agreed: ?Role = null;
-            for (parts, 0..) |part, k| {
-                const one = (try self.role(library, part)) orelse return null;
-                if (k != 0 and one != agreed.?) return null;
-                agreed = one;
-            }
-            return agreed;
-        },
-        else => return null,
-    };
-}
-
 /// What was built since a query answered unknown(budget) for want of budget (`short`), dropped:
 /// its memos and indexes may have been built short of it, which would answer a later query as
 /// if complete (C1). What `resolve` keeps stays: it keeps only what was read with budget left,
@@ -632,7 +442,7 @@ pub fn role(self: *Facts, library: anytype, value: Value) ResolveError!?@TypeOf(
 /// nothing built short (the program's solve, `Taint.get`), or the mark that it ran short. What
 /// one keeps is the run's (`gpa`), never a part of an index dropped here.
 pub fn forget(self: *Facts) void {
-    var fresh: Facts = .{ .project = self.project, .gpa = self.gpa, .known = self.known, .remaining = self.remaining, .cache = self.cache, .bound = self.bound, .readings = self.readings, .settled = self.settled, .lasting = self.lasting };
+    var fresh: Facts = .{ .project = self.project, .gpa = self.gpa, .known = self.known, .role_names = self.role_names, .remaining = self.remaining, .cache = self.cache, .bound = self.bound, .readings = self.readings, .settled = self.settled, .lasting = self.lasting };
     self.cache = .empty;
     self.bound = .empty;
     self.readings = .empty;
