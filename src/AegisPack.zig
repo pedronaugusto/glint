@@ -2858,7 +2858,7 @@ fn storedField(c: *Context, tree: *const Ast, model: *const Model, store: Ast.No
         if (step.crosses) return false;
         fields[fields.len - 1 - i] = switch (step.kind) {
             .field => step.name orelse return false,
-            .index => try c.allocator.print("[{d}]", .{literalIndex(tree, step.node) orelse return false}),
+            .index => try c.allocator.print("[{d}]", .{(try literalIndex(c, c.file, step.node)) orelse return false}),
             else => return false,
         };
     }
@@ -2895,9 +2895,9 @@ fn resultLength(c: *Context, call: Ast.Node.Index) Context.Error!?usize {
     const proto = written.fullFnProto(&buffer, record.node) orelse return null;
     const array = (try c.facts.arrayType(function.file, proto.ast.return_type.unwrap() orelse return null)) orelse return null;
     const length = array.length orelse return null;
-    const typed_in = &c.project.at(array.file).file.tree;
-    if (typed_in.nodeTag(length) != .number_literal) return null;
-    return std.fmt.parseInt(usize, typed_in.tokenSlice(typed_in.nodeMainToken(length)), 0) catch null;
+    // The count the program fixes (`[2]T`, `[n]T` of a constant), by Facts.comptimeValue.
+    const fixed = (try c.facts.comptimeValue(null, array.file, length)) orelse return null;
+    return if (fixed == .integer) std.math.cast(usize, fixed.integer) else null;
 }
 
 /// The element a step of an owner's path names (`"[1]"`: 1); null for a field's name.
@@ -2907,10 +2907,12 @@ fn pathIndex(step: []const u8) ?u64 {
 }
 
 /// The index the element access `element` reads where it is an integer literal (`gs[1]`).
-fn literalIndex(tree: *const Ast, element: Ast.Node.Index) ?u64 {
-    const index = tree.nodeData(element).node_and_node[1];
-    if (tree.nodeTag(index) != .number_literal) return null;
-    return std.fmt.parseInt(u64, tree.tokenSlice(tree.nodeMainToken(index)), 0) catch null;
+fn literalIndex(c: *Context, file: Project.FileId, element: Ast.Node.Index) Context.Error!?u64 {
+    const step = (try Facts.accesses.pathOf(c.facts, file, element)).steps[0];
+    if (step.kind != .index) return null;
+    // The index the program fixes (`t[1]`, `t[i]` of a constant), by Facts.comptimeValue.
+    const fixed = (try c.facts.comptimeValue(null, file, step.index orelse return null)) orelse return null;
+    return if (fixed == .integer) std.math.cast(u64, fixed.integer) else null;
 }
 
 /// Whether the place `parent` gives what `at` holds is a local A003 follows: a declaration's,
@@ -3516,7 +3518,7 @@ const Flow = struct {
                 // field of a returned literal, an argument of the call that makes it), or a
                 // holder of it by value (`return held;` of `held.guard`): its release is the
                 // caller's.
-                if (f.mine(value) or f.carriesOwner(value)) return ends;
+                if (try f.mine(value) or try f.carriesOwner(value)) return ends;
                 switch (try f.carried(value)) {
                     .yes => return ends,
                     .unknown => return .uncertain,
@@ -3527,7 +3529,7 @@ const Flow = struct {
             else => {},
         }
         // `_ = owner` discards it: no release, no transfer, so the owner goes on as it was.
-        if (try Facts.accesses.discardedBy(f.c.facts, f.c.file, stmt)) |value| if (f.mine(value)) return .{ .paths = .{ .falls = state } };
+        if (try Facts.accesses.discardedBy(f.c.facts, f.c.file, stmt)) |value| if (try f.mine(value)) return .{ .paths = .{ .falls = state } };
         // `x = a catch |e| handler` and `const x = a orelse handler`: the handler is a branch
         // taken when `a` fails, the statement goes on in the state `a` leaves otherwise.
         if (f.handled(stmt)) |parts| {
@@ -3930,7 +3932,7 @@ const Flow = struct {
         if (try f.moveCall(node, null)) return true;
         const branch = f.tree.fullIf(node) orelse return false;
         const payload = branch.payload_token orelse return false;
-        if (branch.error_token != null or !f.mine(branch.ast.cond_expr)) return false;
+        if (branch.error_token != null or !try f.mine(branch.ast.cond_expr)) return false;
         const other = branch.ast.else_expr.unwrap() orelse return false;
         if (f.tree.nodeTag(other) != .identifier or !std.mem.eql(u8, f.tree.tokenSlice(f.tree.nodeMainToken(other)), "null")) return false;
         return f.moveCall(branch.ast.then_expr, payload);
@@ -4077,7 +4079,7 @@ const Flow = struct {
                 at = each.node;
                 if (each.kind != .index and each.kind != .unwrap) break;
             }
-            if (f.mine(at)) return .yes;
+            if (try f.mine(at)) return .yes;
         }
         var out: Is = .no;
         for (parts.results) |result| {
@@ -4153,7 +4155,7 @@ const Flow = struct {
             },
             else => return null,
         };
-        if (!f.mine(value) or copy == f.token) return null;
+        if (!try f.mine(value) or copy == f.token) return null;
         // The owner named nowhere after: the copy is its one holder.
         var later: Mentions = .{ .model = f.model, .token = f.token, .first = f.tree.lastToken(stmt) + 1, .last = std.math.maxInt(Ast.TokenIndex) };
         if (later.next() != null) return null;
@@ -4170,36 +4172,35 @@ const Flow = struct {
     }
 
     /// Whether `node` is a name of the owner, by the model's resolution of it.
-    fn mine(f: Flow, node: Ast.Node.Index) bool {
-        return declaringToken(f.model, f.readBelow(node, f.path) orelse return false) == f.token;
+    fn mine(f: Flow, node: Ast.Node.Index) Context.Error!bool {
+        return declaringToken(f.model, (try f.readBelow(node, f.path)) orelse return false) == f.token;
     }
 
     /// The holder `node` reads the fields `fields` from (`box.g` of `.{"g"}`: `box`), each a
     /// member read by that name; null where it is no such read. A field and a declaration of
     /// one container are never named alike, so the name is the field.
-    fn readBelow(f: Flow, node: Ast.Node.Index, fields: []const []const u8) ?Ast.Node.Index {
-        var at = node;
-        var left = fields.len;
-        while (left != 0) : (left -= 1) {
-            if (pathIndex(fields[left - 1])) |index| {
-                if (f.tree.nodeTag(at) != .array_access or literalIndex(f.tree, at) != index) return null;
-                at = f.tree.nodeData(at).node_and_node[0];
+    fn readBelow(f: Flow, node: Ast.Node.Index, fields: []const []const u8) Context.Error!?Ast.Node.Index {
+        // The place's path, from `node` in to its root (Facts.accesses.pathOf): its outermost
+        // steps are the fields, the step below them the holder.
+        const path = try Facts.accesses.pathOf(f.c.facts, f.c.file, node);
+        if (path.steps.len <= fields.len) return null;
+        for (fields, 0..) |field, i| {
+            const place = path.steps[fields.len - 1 - i];
+            if (pathIndex(field)) |index| {
+                if ((try literalIndex(f.c, f.c.file, place.node)) != index) return null;
                 continue;
             }
-            if (f.tree.nodeTag(at) != .field_access) return null;
-            const holder, const name = f.tree.nodeData(at).node_and_token;
-            if (!std.mem.eql(u8, f.tree.tokenSlice(name), fields[left - 1])) return null;
-            at = holder;
+            if (place.kind != .field or !std.mem.eql(u8, place.name orelse return null, field)) return null;
         }
-        return at;
+        return path.steps[fields.len].node;
     }
 
     /// Whether `node` is a holder of the owner by value: the local, or a field of it on the
     /// owner's path short of the owner (`box` of `box.g`). Given or returned whole, it carries
     /// the owner.
-    fn carriesOwner(f: Flow, node: Ast.Node.Index) bool {
+    fn carriesOwner(f: Flow, node: Ast.Node.Index) Context.Error!bool {
         for (0..f.path.len) |short| {
-            if (declaringToken(f.model, f.readBelow(node, f.path[0..short]) orelse continue) == f.token) return true;
+            if (declaringToken(f.model, (try f.readBelow(node, f.path[0..short])) orelse continue) == f.token) return true;
         }
         return false;
     }
@@ -4219,8 +4220,7 @@ const Flow = struct {
                     .element => |element| element,
                     else => return .holder,
                 };
-                if (f.tree.nodeTag(element) != .array_access) return .holder;
-                if ((literalIndex(f.tree, element) orelse return .holder) != index) return .apart;
+                if ((try literalIndex(f.c, f.c.file, element) orelse return .holder) != index) return .apart;
                 at = element;
                 continue;
             }
@@ -4250,7 +4250,7 @@ const Flow = struct {
         if (f.path.len == 0) return ownerCall(f.c, node, f.token);
         const call = (try Facts.calls.at(f.c.facts, f.c.file, node)) orelse return null;
         if (f.tree.nodeTag(call.callee_expr) != .field_access) return null;
-        if (!f.mine(f.tree.nodeData(call.callee_expr).node_and_token[0])) return null;
+        if (!try f.mine(f.tree.nodeData(call.callee_expr).node_and_token[0])) return null;
         return memberNamed(f.c, f.c.file, call.callee_expr);
     }
 
@@ -4424,7 +4424,7 @@ const Flow = struct {
     fn reacquired(f: Flow, stmt: Ast.Node.Index) Context.Error!Is {
         if (Facts.accesses.formOf(f.tree.nodeTag(stmt)) != .assign) return .no;
         const place, var value = f.tree.nodeData(stmt).node_and_node;
-        if (!f.mine(place)) return .no;
+        if (!try f.mine(place)) return .no;
         while (Facts.accesses.carriedFrom(f.tree, value)) |inner| value = inner;
         const call = (try Facts.calls.at(f.c.facts, f.c.file, value)) orelse return .no;
         const operation = (try memberNamed(f.c, f.c.file, call.callee_expr)) orelse return .no;
@@ -4501,7 +4501,7 @@ const Flow = struct {
         const call = f.tree.fullCall(&buffer, value) orelse return false;
         var given: usize = 0;
         for (call.ast.params) |param| {
-            if (f.mine(param)) given += 1;
+            if (try f.mine(param)) given += 1;
         }
         if (given != 1) return false;
         // One that may call another function is read as the program's: undecided.
@@ -4531,7 +4531,7 @@ const Flow = struct {
         const call = f.tree.fullCall(&buffer, value) orelse return null;
         // The owner's address: `&owner`, or the pointer itself where the walk has one.
         const position = for (call.ast.params, 0..) |param, i| {
-            if (if (f.pointer) f.mine(param) else Facts.accesses.formOf(f.tree.nodeTag(param)) == .address_of and f.mine(f.tree.nodeData(param).node)) break i;
+            if (if (f.pointer) try f.mine(param) else Facts.accesses.formOf(f.tree.nodeTag(param)) == .address_of and try f.mine(f.tree.nodeData(param).node)) break i;
         } else return null;
         const first = f.tree.firstToken(value);
         const last = f.tree.lastToken(value);
@@ -4539,7 +4539,7 @@ const Flow = struct {
         for (0..f.tree.nodes.len) |i| {
             const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i));
             const main = f.tree.nodeMainToken(candidate);
-            if (main >= first and main <= last and f.mine(candidate)) named += 1;
+            if (main >= first and main <= last and try f.mine(candidate)) named += 1;
         }
         if (named != 1) return null;
         // One that may call another function does not take it: the address handed on is
@@ -4598,7 +4598,7 @@ const Flow = struct {
     fn stored(f: Flow, stmt: Ast.Node.Index) Context.Error!bool {
         if (Facts.accesses.formOf(f.tree.nodeTag(stmt)) != .assign) return false;
         const data = f.tree.nodeData(stmt).node_and_node;
-        if (!f.mine(data[1])) return false;
+        if (!try f.mine(data[1])) return false;
         return f.unheld(data[0]);
     }
 
@@ -4683,7 +4683,7 @@ const Flow = struct {
     fn discardedAddress(f: Flow, stmt: Ast.Node.Index) Context.Error!bool {
         const value = (try Facts.accesses.discardedBy(f.c.facts, f.c.file, stmt)) orelse return false;
         if (Facts.accesses.formOf(f.tree.nodeTag(value)) != .address_of) return false;
-        return f.mine(f.tree.nodeData(value).node);
+        return try f.mine(f.tree.nodeData(value).node);
     }
 };
 
@@ -5327,7 +5327,8 @@ fn rawValue(c: *Context, node: Ast.Node.Index, seen: []const Model.Declaration.I
         // pointer points at (`.len` of an array is its own length).
         .field_access => {
             const data = tree.nodeData(node).node_and_token;
-            if (std.mem.eql(u8, tree.tokenSlice(data[1]), "len")) return false;
+            // A slice's or array's own length (or address) is none of a scalar's raw value.
+            if (try c.facts.memoryField(c.file, node) != .field) return false;
             return rawValue(c, data[0], seen);
         },
         .unwrap_optional => return rawValue(c, tree.nodeData(node).node_and_token[0], seen),
