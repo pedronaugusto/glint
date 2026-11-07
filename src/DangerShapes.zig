@@ -2100,7 +2100,7 @@ fn contextKept(c: *Context, file: Project.FileId, function: Ast.Node.Index, decl
         // Through its address and parentheses, to what takes it.
         var at = reference.node;
         while (true) switch (try Facts.accesses.useOf(c.facts, file, at)) {
-            .address => |up| at = up,
+            .address => |address| at = address,
             .carried => |onward| if (onward.how == .grouped) {
                 at = onward.into;
             } else break,
@@ -2287,7 +2287,6 @@ fn pointsAtGuard(c: *Context, file: Project.FileId, node: Ast.Node.Index) Contex
 /// call is given (`lockInto(a, &g)`).
 fn throughBound(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!Bound {
     const tree = &c.project.at(file).file.tree;
-    const model = &c.project.at(file).model;
     var bound = try boundBy(c, file, node);
     if (bound.declaration != null and (try guardValue(c, file, node) != .no or try pointsAtGuard(c, file, node))) {
         if (bound.member == null) bound.any_member = true;
@@ -2458,7 +2457,7 @@ fn releases(c: *Context, file: Project.FileId, node: Ast.Node.Index, decl: Model
     if (tree.fullVarDecl(node)) |variable| return if (variable.ast.init_node.unwrap()) |value| movedBy(c, file, value, decl) else null;
     for (try Facts.accesses.storesIn(c.facts, file)) |site| {
         if (site.node != node or site.kind != .set) continue;
-        if (try movedBy(c, file, site.value orelse continue, decl)) |moved| return moved;
+        if (try movedBy(c, file, site.value orelse continue, decl)) |call| return call;
     }
     if (tree.nodeTag(node) == .@"return") return if (tree.nodeData(node).opt_node.unwrap()) |value| movedBy(c, file, value, decl) else null;
     const call = (try Facts.calls.at(c.facts, file, node)) orelse return null;
