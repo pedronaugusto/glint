@@ -666,6 +666,11 @@ test "P006 leaves an entry's owning packages alone, and only them" {
 /// A run of P006 over a program (`app`), the package that declares the replacements (`airlock`)
 /// and one that does not import it (`lone`), every file selected; std a fixture of its own.
 fn replacedRun(airlock: []const u8) !glint.Report {
+    return replacedRunOn(airlock, glint.Config.none().fact_budget);
+}
+
+/// `replacedRun` on a budget of `budget` resolutions.
+fn replacedRunOn(airlock: []const u8, budget: usize) !glint.Report {
     const P = glint.Project;
     const inputs = [_]P.Input{
         .{ .name = "app/main.zig", .package = "app", .fingerprint = 1, .bytes =
@@ -695,6 +700,7 @@ fn replacedRun(airlock: []const u8) !glint.Report {
     defer project.deinit();
     var config = glint.Config.none();
     config.selections = &.{.{ .rule = .P006, .level = .gate }};
+    config.fact_budget = budget;
     return glint.run(std.testing.allocator, &project, config);
 }
 
@@ -745,16 +751,37 @@ test "P006 reads what a package declares it replaces: in every package that impo
     try std.testing.expectEqualSlices(u32, &.{ 5, 6, 114, 117 }, lines[0..n]);
 }
 
-test "P006 leaves a site undecided where its function's callers cannot all be read" {
-    // A chain of private functions deeper than the reading follows, each called once by the next.
+/// airlock's replacement reached through a chain of `steps` private functions, each called once by
+/// the next: every one of them only the replacement reaches.
+fn chained(steps: usize) ![]u8 {
     var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(std.testing.allocator);
+    errdefer text.deinit(std.testing.allocator);
     try text.appendSlice(std.testing.allocator, "const std = @import(\"std\");\npub fn syncFile(fd: i32) void {\n    step0(fd);\n}\n");
-    for (0..10) |i| try text.print(std.testing.allocator, "fn step{d}(fd: i32) void {{\n    step{d}(fd);\n}}\n", .{ i, i + 1 });
-    try text.appendSlice(std.testing.allocator, "fn step10(fd: i32) void {\n    std.posix.fdatasync(fd);\n}\npub const lint_rules = .{ .version = 1, .replaces = .{.{ .std = std.posix.fdatasync, .with = syncFile, .why = \"durability belongs to airlock\" }} };\n");
-    var report = try replacedRun(text.items);
-    defer report.deinit();
-    try std.testing.expect(!report.complete);
+    for (0..steps) |i| try text.print(std.testing.allocator, "fn step{d}(fd: i32) void {{\n    step{d}(fd);\n}}\n", .{ i, i + 1 });
+    try text.print(std.testing.allocator, "fn step{d}(fd: i32) void {{\n    std.posix.fdatasync(fd);\n}}\npub const lint_rules = .{{ .version = 1, .replaces = .{{.{{ .std = std.posix.fdatasync, .with = syncFile, .why = \"durability belongs to airlock\" }}}} }};\n", .{steps});
+    return text.toOwnedSlice(std.testing.allocator);
+}
+
+test "P006 follows a function's callers to their end: a chain only the replacement reaches is its own, and one the budget does not read to its end is undecided" {
+    const long = try chained(10);
+    defer std.testing.allocator.free(long);
+    // Read to its end: the chain is the replacement's; only the program's two sites are judged.
+    var whole = try replacedRun(long);
+    defer whole.deinit();
+    try std.testing.expect(whole.complete);
+    for (whole.diagnostics) |d| try std.testing.expectEqual(@as(u32, 0), @backingInt(d.span.file));
+    try std.testing.expectEqual(@as(usize, 2), whole.diagnostics.len);
+    // Past the budget: the site in the chain is undecided, for want of budget, never exempt.
+    const longer = try chained(200);
+    defer std.testing.allocator.free(longer);
+    var short = try replacedRunOn(longer, 150);
+    defer short.deinit();
+    try std.testing.expect(!short.complete);
+    var noted = false;
+    for (short.coverage) |note| if (note.rule != null and note.rule.? == .P006 and std.mem.find(u8, note.detail, "may be reached only from the replacement") != null) {
+        noted = true;
+    };
+    try std.testing.expect(noted);
 }
 
 test "P006 configuration needs a symbol without dots, or a source and a path" {
