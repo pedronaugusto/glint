@@ -608,6 +608,16 @@ pub fn role(self: *Facts, library: anytype, value: Value) ResolveError!?@TypeOf(
             for (found.entries) |entry| if (entry.target == .container and entry.target.container.file == c.file and entry.target.container.scope == c.scope) return @as(Role, @fromBackingInt(@intCast(entry.role)));
             return null;
         },
+        // A choice: the role every part agrees on, none where they differ or one has none.
+        .alternatives => |parts| {
+            var agreed: ?Role = null;
+            for (parts, 0..) |part, k| {
+                const one = (try self.role(library, part)) orelse return null;
+                if (k != 0 and one != agreed.?) return null;
+                agreed = one;
+            }
+            return agreed;
+        },
         else => return null,
     };
 }
@@ -3802,8 +3812,10 @@ fn memberOfChoice(self: *Facts, choices: []const Value, name: []const u8) Resolv
         .container, .instance => |c| if (self.lacks(c, name)) continue else try kept.append(self.gpa, try self.memberValue(choice, name)),
         .pointer => |to| switch (to.child.*) {
             .container, .instance => |c| if (self.lacks(c, name)) continue else try kept.append(self.gpa, try self.memberValue(choice, name)),
+            .alternatives => try kept.append(self.gpa, try self.memberValue(choice, name)),
             else => try kept.append(self.gpa, try self.memberValue(choice, name)),
         },
+        .alternatives => try kept.append(self.gpa, try self.memberValue(choice, name)),
         else => try kept.append(self.gpa, try self.memberValue(choice, name)),
     };
     if (kept.items.len == 0) return .{ .unknown = .unresolved };
@@ -4067,6 +4079,7 @@ fn holderMisses(self: *Facts, file: Project.FileId, node: Ast.Node.Index, holder
         switch (accesses.held(try self.resolveIn(reading, file, holder))) {
             .container, .instance => |k| if (k.symbolic or (k.file == field.file and k.scope == scope)) return false,
             .primitive, .scalar, .array, .function, .fn_type, .error_set => {},
+            .alternatives => return false,
             else => return false,
         }
     }
@@ -4545,6 +4558,7 @@ fn reachReflected(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead)
     if (try self.fieldGuarded(file, holder, name_node)) return;
     const fields: ?Container = if (over) |names| switch (try self.resolveIn(env, file, names.subject)) {
         .container => |k| k,
+        .alternatives => null,
         else => null,
     } else try self.tagNamesOf(env, file, name_node);
     const resolved = try self.resolveIn(env, file, holder);
@@ -4552,6 +4566,7 @@ fn reachReflected(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead)
     const typed: Value = if (through_call) switch (resolved) {
         .instance => |k| .{ .container = k },
         .pointer => |p| if (p.child.* == .instance) .{ .container = p.child.instance } else resolved,
+        .alternatives => resolved,
         else => resolved,
     } else resolved;
     switch (typed) {
@@ -4570,6 +4585,14 @@ fn reachReflected(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead)
         },
         // Zig's own per-build values hold none of the program's declarations.
         .unknown => |why| if (why == .zig_own) {} else if (name) |known| try self.reachNamed(found, next, known) else if (fields) |of| {
+            for (self.fieldNames(of)) |field| try self.reachNamed(found, next, field);
+        } else {
+            try found.limits.append(self.gpa, .{ .file = file, .node = holder, .why = .reflected });
+            found.everything = true;
+        },
+        // A choice of holders: each may be the one, read as a holder not known (by its name,
+        // the names of the fields it ranges over, or anything).
+        .alternatives => if (name) |known| try self.reachNamed(found, next, known) else if (fields) |of| {
             for (self.fieldNames(of)) |field| try self.reachNamed(found, next, field);
         } else {
             try found.limits.append(self.gpa, .{ .file = file, .node = holder, .why = .reflected });
@@ -4868,10 +4891,12 @@ fn refusesUnlessField(self: *Facts, file: Project.FileId, statement: Ast.Node.In
     if (call.ast.params.len != 2) return false;
     const callee = switch (try self.resolve(file, call.ast.fn_expr)) {
         .function => |decl| decl,
+        .alternatives => return false,
         else => return false,
     };
     const field_index = switch (try self.stdMember(&.{ "meta", "fieldIndex" })) {
         .function => |decl| decl,
+        .alternatives => return false,
         else => return false,
     };
     if (!std.meta.eql(callee, field_index)) return false;
@@ -4933,6 +4958,7 @@ fn fieldTypeNode(self: *Facts, file: Project.FileId, of: Ast.Node.Index, name: [
     };
     const container = switch (self.resolve(file, writtenPointee(tree, declared_as)) catch return null) {
         .container => |k| k,
+        .alternatives => return null,
         else => return null,
     };
     const field = self.member(container, name) orelse return null;
@@ -5354,6 +5380,7 @@ fn importsRead(self: *Facts, file: Project.FileId) ResolveError!bool {
                     .absent, .zig_own => {},
                     else => break false,
                 },
+                .alternatives => {},
                 else => {},
             }
         },
@@ -5534,6 +5561,12 @@ fn madeWithin(self: *Facts, value: Value, outer: Container, made: *const Made) R
         .optional => |to| .{ .optional = try self.boxed(try self.madeWithin(to.*, outer, made)) },
         .error_union => |to| .{ .error_union = try self.boxed(try self.madeWithin(to.*, outer, made)) },
         .array => |to| .{ .array = try self.boxed(try self.madeWithin(to.*, outer, made)) },
+        // A choice: each part as it is made within `outer`.
+        .alternatives => |parts| blk: {
+            const each = try self.gpa.alloc(Value, parts.len);
+            for (parts, each) |part, *out| out.* = try self.madeWithin(part, outer, made);
+            break :blk try self.choose(each);
+        },
         else => value,
     };
 }
@@ -5719,6 +5752,7 @@ fn unwrapped(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
         .error_union => .{ .error_union = try self.boxed(inner) },
         .optional => .{ .optional = try self.boxed(inner) },
         // A function or a pointer to one: either side's.
+        .alternatives => if (!callable(inner)) inner else self.identity(try self.erased(inner), &.{ inner, other }),
         else => if (!callable(inner)) inner else self.identity(try self.erased(inner), &.{ inner, other }),
     };
 }
@@ -5840,6 +5874,7 @@ fn takenProng(self: *Facts, env: ?*const Env, file: Project.FileId, whole: Ast.f
     if (subject.reflected.at == .size) {
         const size = switch (subject.reflected.of.*) {
             .pointer => |p| p.size orelse return null,
+            .alternatives => return null,
             else => return null,
         };
         return .{ .one = (try self.prongOf(tree, whole, @tagName(size))) orelse return null };
@@ -5981,6 +6016,7 @@ fn peered(self: *Facts, chosen: Value, peers: Peers) ResolveError!Value {
         .optional => chosen,
         // `E!T` and `null`: `E!?T`.
         .error_union => |held| if (held.* == .optional) chosen else .{ .error_union = try self.boxed(.{ .optional = held }) },
+        .alternatives => .{ .optional = try self.boxed(chosen) },
         else => .{ .optional = try self.boxed(chosen) },
     };
     if (!peers.fallible or optional == .error_union) return optional;
@@ -6217,6 +6253,7 @@ fn switchPayload(self: *Facts, env: ?*const Env, file: Project.FileId, case_node
         .unknown => return subject,
         // A number, a boolean or an error: the capture is the subject's value.
         .scalar, .primitive, .error_set => return subject,
+        .alternatives => return .{ .unknown = .unsupported },
         else => return .{ .unknown = .unsupported },
     };
     if (!self.isUnion(container)) return .{ .instance = container };
@@ -6361,6 +6398,7 @@ pub fn sameValue(a: Value, b: Value) bool {
         // each is kept (`sameMaking`).
         .container, .instance => |k| switch (b) {
             .container, .instance => |other| k.file == other.file and k.scope == other.scope and sameMaking(k.made_by, other.made_by, 0),
+            .alternatives => false,
             else => false,
         },
         else => std.meta.eql(a, b),
@@ -6428,10 +6466,12 @@ fn same(a: Value, b: Value, depth: usize) bool {
         .pointer => |inner| inner.size == b.pointer.size and same(inner.child.*, b.pointer.child.*, depth + 1),
         .array, .optional, .error_union => |inner| switch (b) {
             .array, .optional, .error_union => |other| same(inner.*, other.*, depth + 1),
+            .alternatives => false,
             else => false,
         },
         .container, .instance => |c| switch (b) {
             .container, .instance => |other| c.file == other.file and c.scope == other.scope and sameMaking(c.made_by, other.made_by, depth + 1),
+            .alternatives => false,
             else => false,
         },
         .primitive => |p| std.mem.eql(u8, p, b.primitive),
@@ -6461,12 +6501,14 @@ fn identical(a: Value, b: Value, depth: usize) bool {
         .primitive => |p| std.mem.eql(u8, p, b.primitive),
         .container, .instance => |c| switch (b) {
             .container, .instance => |other| c.file == other.file and c.scope == other.scope and c.symbolic == other.symbolic and c.made_by == other.made_by,
+            .alternatives => false,
             else => false,
         },
         .function => |f| std.meta.eql(f, b.function),
         .pointer => |inner| inner.size == b.pointer.size and identical(inner.child.*, b.pointer.child.*, depth + 1),
         .array, .optional, .error_union => |inner| switch (b) {
             .array, .optional, .error_union => |other| identical(inner.*, other.*, depth + 1),
+            .alternatives => false,
             else => false,
         },
         .error_set, .scalar => true,
@@ -6789,9 +6831,11 @@ fn sameContainer(value: Value, typed: Value) bool {
     return switch (value) {
         .container, .instance => |k| switch (typed) {
             .container, .instance => |other| k.file == other.file and k.scope == other.scope,
+            .alternatives => false,
             else => false,
         },
         .pointer => |inner| typed == .pointer and inner.size == typed.pointer.size and sameContainer(inner.child.*, typed.pointer.child.*),
+        .alternatives => false,
         else => false,
     };
 }
@@ -7876,6 +7920,7 @@ pub fn languageField(self: *Facts, file: Project.FileId, node: Ast.Node.Index) R
 pub fn sizedMemory(self: *Facts, value: Value) ResolveError!bool {
     return switch (value) {
         .error_union, .optional => |inner| self.sizedMemory(inner.*),
+        .alternatives => try self.lengthOfValue(value, "len") == .memory,
         else => try self.lengthOfValue(value, "len") == .memory,
     };
 }
@@ -7945,6 +7990,11 @@ fn sized(self: *Facts, value: Value, depth: usize) ResolveError!bool {
                 if (try self.sized(try self.instance(try self.resolve(k.file, t)), depth + 1)) return true;
             }
             return is_enum and fields > 1;
+        },
+        // A choice: sized where any part is.
+        .alternatives => |parts| {
+            for (parts) |part| if (try self.sized(part, depth + 1)) return true;
+            return false;
         },
         else => return false,
     }
@@ -8162,6 +8212,7 @@ pub fn literalDeclaration(self: *Facts, file: Project.FileId, node: Ast.Node.Ind
     while (true) holder = switch (holder) {
         .pointer => |inner| inner.child.*,
         .optional, .error_union => |inner| inner.*,
+        .alternatives => break,
         else => break,
     };
     const container = switch (holder) {
@@ -8313,6 +8364,7 @@ fn emptyLiteralValue(self: *const Facts, value: Value) bool {
     const literal = switch (value) {
         .literal => |literal| literal,
         .pointer => |inner| if (inner.child.* == .literal) inner.child.literal else return false,
+        .alternatives => return false,
         else => return false,
     };
     return emptyLiteral(&self.project.at(literal.file).file.tree, literal.node);
@@ -8334,6 +8386,8 @@ fn typeOf(self: *Facts, value: Value, _: void) ResolveError!Value {
         .reified => |built| .{ .reified = .{ .fields = built.fields } },
         // A pointer's size is a `std.builtin.Type.Pointer.Size`.
         .reflected => |r| if (r.at == .size) self.stdMember(&.{ "builtin", "Type", "Pointer", "Size" }) else value,
+        // A choice: each part's type (`map` gives each part alone).
+        .alternatives => self.map(value, {}, typeOf),
         else => value,
     };
 }
@@ -8724,6 +8778,7 @@ fn prototype(self: *const Facts, value: Value) ?Key {
     return switch (value) {
         .function => |decl| .{ .file = decl.file, .node = self.project.at(decl.file).model.declarations[@backingInt(decl.index)].node },
         .fn_type => |key| key,
+        .alternatives => null,
         else => null,
     };
 }
@@ -8805,8 +8860,10 @@ fn evaluateCall(self: *Facts, env: ?*const Env, file: Project.FileId, call: Ast.
             .instance, .container => |c| c,
             .pointer => |p| switch (p.child.*) {
                 .instance, .container => |c| c,
+                .alternatives => null,
                 else => null,
             },
+            .alternatives => null,
             else => null,
         };
         if (holder) |h| if (h.made_by) |made| {
@@ -8854,6 +8911,7 @@ fn valueOf(self: *Facts, value: Value) ResolveError!Value {
     return switch (value) {
         .error_union => |inner| .{ .error_union = try self.boxed(try self.valueOf(inner.*)) },
         .optional => |inner| .{ .optional = try self.boxed(try self.valueOf(inner.*)) },
+        .alternatives => self.instance(value),
         else => self.instance(value),
     };
 }
@@ -9040,6 +9098,7 @@ pub fn bindTo(self: *Facts, file: Project.FileId, fn_expr: Ast.Node.Index, param
         const holder: ?Container = switch (receiver) {
             .instance => |c| c,
             .pointer => |p| if (p.child.* == .instance) p.child.instance else null,
+            .alternatives => null,
             else => null,
         };
         if (holder) |h| {
@@ -9620,6 +9679,10 @@ fn absent(value: Value) bool {
         .unknown => |why| why == .absent,
         .pointer => |inner| absent(inner.child.*),
         .array, .optional, .error_union => |inner| absent(inner.*),
+        // A choice: absent only where every part is.
+        .alternatives => |parts| parts.len != 0 and for (parts) |part| {
+            if (!absent(part)) break false;
+        } else true,
         else => false,
     };
 }
@@ -9894,12 +9957,14 @@ fn scanCallSites(self: *Facts, function: Decl, callers: enum { consumers, progra
                         .pointer => |pointed| switch (pointed.child.*) {
                             .instance, .container => |c| .{ c, true },
                             .unknown => if (!callee or try self.cannotBe(tree, parent, node, function)) continue else return null,
+                            .alternatives => continue,
                             else => continue,
                         },
                         // A path of declarations from a module's root reaches only what the
                         // module exports by name, which this function's container is not.
                         .unknown => if (try self.cannotBe(tree, parent, node, function) or self.throughModule(id, tree.nodeData(node).node_and_token[0]) or (!callee and try self.runtimeValue(id, tree.nodeData(node).node_and_token[0], 0))) continue else return null,
                         // `void`, a number or an error has no member to call.
+                        .alternatives => continue,
                         else => continue,
                     };
                     const found = self.member(container, name) orelse continue;
@@ -12431,11 +12496,14 @@ pub const accesses = struct {
             .address_of => try facts.resolve(file, tree.nodeData(memory).node),
             else => switch (try facts.resolve(file, memory)) {
                 .pointer => |inner| inner.child.*,
+                // A choice of memories, read as it is, as any other value.
+                .alternatives => |parts| .{ .alternatives = parts },
                 else => |other| other,
             },
         };
         const seen: Facts.Value = switch (given) {
             .pointer => |inner| inner.child.*,
+            .alternatives => return true,
             else => return true,
         };
         if (!seen.known() or !own.known()) return true;
@@ -13093,6 +13161,12 @@ pub const accesses = struct {
                 .optional => |inner| .{ .optional = try wrap.boxed(w.facts, try w.valued(inner.*)) },
                 .array => |inner| .{ .array = try wrap.boxed(w.facts, try w.valued(inner.*)) },
                 .error_union => |inner| .{ .error_union = try wrap.boxed(w.facts, try w.valued(inner.*)) },
+                // A choice: each part's value.
+                .alternatives => |parts| {
+                    const each = try w.facts.gpa.alloc(Facts.Value, parts.len);
+                    for (parts, each) |part, *out| out.* = try w.valued(part);
+                    return w.facts.choose(each);
+                },
                 else => value,
             };
         }
@@ -13193,6 +13267,7 @@ pub const accesses = struct {
             }
             if (w.holders()) switch (try w.facts.resolve(w.file, pointer)) {
                 .pointer => |inner| try w.shapes(through, inner.child.*, false),
+                .alternatives => try w.unresolved(through),
                 else => try w.unresolved(through),
             };
         }
@@ -13212,7 +13287,8 @@ pub const accesses = struct {
                 const receiver = try w.facts.resolve(w.file, h);
                 if (receiving) switch (receiver) {
                     // A method of a value takes its address where its first parameter is a pointer.
-                    .instance, .unknown, .reified, .literal => if (try w.takesPointer(callee)) {
+                    // A choice of receivers may be a value, as one not known.
+                    .instance, .unknown, .reified, .literal, .alternatives => if (try w.takesPointer(callee)) {
                         _ = try w.path(w.make(node, h, .address, null));
                     },
                     else => {},
@@ -13270,6 +13346,7 @@ pub const accesses = struct {
         fn holdsBody(w: *Walk, callee: Facts.Value) Error!bool {
             const function = switch (callee) {
                 .function => |f| f,
+                .alternatives => return false,
                 else => return false,
             };
             if (!try w.facts.program(function.file)) return false;
@@ -13284,6 +13361,7 @@ pub const accesses = struct {
         fn takesPointer(w: *Walk, callee: Facts.Value) Error!bool {
             const function = switch (callee) {
                 .function => |f| f,
+                .alternatives => return true,
                 else => return true,
             };
             const record = w.facts.project.at(function.file).model.declarations[@backingInt(function.index)];
@@ -13423,6 +13501,7 @@ pub const accesses = struct {
         return switch (value) {
             .pointer => |inner| held(inner.child.*),
             .optional => |inner| held(inner.*),
+            .alternatives => value,
             else => value,
         };
     }
@@ -13850,12 +13929,15 @@ pub const calls = struct {
                 .instance, .container => |c| c,
                 .pointer => |inner| switch (inner.child.*) {
                     .instance, .container => |c| c,
+                    .alternatives => null,
                     else => null,
                 },
                 .optional => |inner| switch (inner.*) {
                     .instance, .container => |c| c,
+                    .alternatives => null,
                     else => null,
                 },
+                .alternatives => null,
                 else => null,
             };
             if (container) |c| if (facts.member(c, try facts.memberName(tree.tokenSlice(tree.nodeData(node).node_and_token[1])))) |found| return .{ .decl = found };
@@ -14182,6 +14264,7 @@ fn literalFieldType(self: *Facts, whole: Value, name: []const u8) ResolveError!V
     var holder = whole;
     while (true) holder = switch (holder) {
         .optional, .error_union => |inner| inner.*,
+        .alternatives => break,
         else => break,
     };
     const container = switch (holder) {
@@ -14211,6 +14294,7 @@ fn lacksMember(self: *const Facts, value: Value, name: []const u8) bool {
     while (true) holder = switch (holder) {
         .optional, .error_union => |inner| inner.*,
         .container, .instance => |c| return self.member(c, name) == null,
+        .alternatives => return false,
         else => return false,
     };
 }
@@ -14248,6 +14332,7 @@ fn placeType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
         return switch (whole) {
             .array => |each| each.*,
             .unknown => whole,
+            .alternatives => .{ .unknown = .unsupported },
             else => .{ .unknown = .unsupported },
         };
     }
@@ -14345,6 +14430,7 @@ fn parameterType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
         while (true) typed = switch (typed) {
             .pointer => |inner| inner.child.*,
             .optional => |inner| inner.*,
+            .alternatives => break,
             else => break,
         };
         return if (typed == .fn_type) self.fnTypeParameter(typed.fn_type, position) else .{ .unknown = .unsupported };
@@ -14358,8 +14444,10 @@ fn parameterType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
             .instance => |c| c,
             .pointer => |p| switch (p.child.*) {
                 .instance => |c| c,
+                .alternatives => null,
                 else => null,
             },
+            .alternatives => null,
             else => null,
         };
         if (container) |c| {
@@ -14379,12 +14467,14 @@ fn parameterType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
         while (true) place = switch (place) {
             .pointer => |inner| inner.child.*,
             .optional, .error_union => |inner| inner.*,
+            .alternatives => break,
             else => break,
         };
         switch (place) {
             .container, .instance => |c| if (c.made_by) |m| if (decl.file == c.file and self.project.at(decl.file).model.declarations[@backingInt(decl.index)].scope == c.scope) {
                 made = m;
             },
+            .alternatives => {},
             else => {},
         }
     }

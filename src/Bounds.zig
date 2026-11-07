@@ -633,6 +633,7 @@ fn callersIndex(c: *Context) Error!*Callers {
             // A declaration's own name is no use of it.
             const decl = switch (try c.facts.resolve(file, node)) {
                 .function => |d| d,
+                .alternatives => continue,
                 else => continue,
             };
             const callee = calleeOf(c, decl) orelse continue;
@@ -998,6 +999,7 @@ const Frame = struct {
         try f.reached.put(f.a, node, {});
         const decl = switch (try f.c.facts.resolve(f.file, fn_expr)) {
             .function => |d| d,
+            .alternatives => return,
             else => return,
         };
         if (!try Program.owns(f.c, decl.file)) return;
@@ -1649,6 +1651,7 @@ const Frame = struct {
             // its type's name (`k.*` of a capture's pointer), writes no place.
             // A field's store is recorded as its field's above, or as any.
             .unknown, .primitive => if (f.tree.nodeTag(target) != .field_access and try f.intOf(target) != null) s else f.wrote(s, null, null),
+            .alternatives => f.wrote(s, null, null),
             else => f.wrote(s, null, null),
         };
     }
@@ -1657,6 +1660,7 @@ const Frame = struct {
     fn flatOptional(_: *Frame, value: Facts.Value) Error!bool {
         return switch (value) {
             .optional => |child| child.* == .scalar or child.* == .pointer,
+            .alternatives => false,
             else => false,
         };
     }
@@ -2544,6 +2548,7 @@ const Frame = struct {
         if (f.tree.nodeTag(at) == .number_literal or f.tree.nodeTag(at) == .char_literal) return true;
         switch (try f.c.facts.resolve(f.file, at)) {
             .instance, .pointer, .array, .function => return true,
+            .alternatives => {},
             else => {},
         }
         const t = (try exprType(f.c, f.file, at, 0)) orelse return false;
@@ -3315,6 +3320,7 @@ const Frame = struct {
                     holder_node = holder;
                     out = try f.heldAtCall(out, node, 1, &receiver.?, f.assignsAny(full.ast.params));
                 },
+                .alternatives => {},
                 else => {},
             }
         }
@@ -3489,6 +3495,7 @@ const Frame = struct {
     fn summaryOf(f: *Frame, node: Ast.Node.Index, callee: Ast.Node.Index) Error!?struct { rows: []const Lin, failing: []const Lin, params: usize, places: []const SlotPlace, written: ?[]const Facts.Decl, fails: bool, own: bool } {
         const decl = switch (try f.c.facts.resolve(f.file, callee)) {
             .function => |d| d,
+            .alternatives => return null,
             else => return null,
         };
         // std's functions are read only where the program calls them, and give only their
@@ -3645,6 +3652,7 @@ fn exprType(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
             const call = tree.fullCall(&buffer, node).?; // unreachable: the tag is a call's
             const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
                 .function => |d| d,
+                .alternatives => return null,
                 else => return null,
             };
             const callee_tree = &c.project.at(decl.file).file.tree;
