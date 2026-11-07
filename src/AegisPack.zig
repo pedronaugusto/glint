@@ -988,13 +988,12 @@ fn releasesBy(c: *Context, k: Contract.Kind, call: Ast.Node.Index, name: []const
 /// summary (releases.zig) holds on every exit of what it calls, its errors' too, so it
 /// releases whether the call fails or not.
 fn unfailing(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
-    var at = node;
-    while (true) at = switch (tree.nodeTag(at)) {
+    var at = Facts.ungrouped(tree, node);
+    while (true) at = Facts.ungrouped(tree, switch (tree.nodeTag(at)) {
         .@"try" => tree.nodeData(at).node,
         .@"catch" => tree.nodeData(at).node_and_node[0],
-        .grouped_expression => tree.nodeData(at).node_and_token[0],
         else => return at,
-    };
+    });
 }
 
 /// What releases an aegis owner by its type alone, for releases.zig: a release its kind names
@@ -1112,9 +1111,8 @@ fn recordReading(c: *Context, call_node: Ast.Node.Index, token: ?Ast.TokenIndex)
     };
     if (token) |local| {
         const tree = try c.project.syntax(try c.source());
-        const named = Facts.ungrouped(tree, receiver);
-        if (tree.nodeTag(named) != .identifier) return .unknown;
-        const on = declaringToken(&c.project.at(c.file).model, named) orelse return .unknown;
+        // A name's declaring token (the model's resolution); none for any other expression.
+        const on = declaringToken(&c.project.at(c.file).model, Facts.ungrouped(tree, receiver)) orelse return .unknown;
         if (on != local and !capturesOwner(c, on, local)) return .unknown;
     }
     const container = recordOf(try c.facts.resolve(c.file, receiver)) orelse return .unknown;
@@ -2685,12 +2683,8 @@ fn heldOwners(c: *Context, tree: *const Ast, model: *const Model, decl: Model.De
         position = std.mem.findScalar(Ast.Node.Index, destructure.?.ast.variables, decl.node) orelse return null;
     }
     // The call's own result, or what `try` gives of it.
-    var call = value;
-    while (true) switch (tree.nodeTag(call)) {
-        .@"try" => call = tree.nodeData(call).node,
-        .grouped_expression => call = tree.nodeData(call).node_and_token[0],
-        else => break,
-    };
+    var call = Facts.ungrouped(tree, value);
+    while (tree.nodeTag(call) == .@"try") call = Facts.ungrouped(tree, tree.nodeData(call).node);
     var call_buffer: [1]Ast.Node.Index = undefined;
     _ = tree.fullCall(&call_buffer, call) orelse return null;
     if (c.facts.madeByParameter(c.file, call) != null) return null;
