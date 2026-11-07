@@ -86,43 +86,36 @@ pub const package: Facts.Package = .{ .name = "aegis", .fingerprint = 0x5e23831c
 pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usize) Context.Error!?Kind {
     if (depth == 64) return null;
     const tree = &c.project.at(file).file.tree;
-    const model = &c.project.at(file).model;
-    if (tree.fullPtrType(node)) |ptr| return kind(c, file, ptr.ast.child_type, depth + 1);
-    switch (tree.nodeTag(node)) {
-        .identifier => {
-            const ref = model.reference(node) orelse return null;
-            const index = ref.declaration orelse return null;
-            const decl = model.declarations[@backingInt(index)];
-            if (decl.kind == .parameter) return kind(c, file, decl.node, depth + 1);
-            if (decl.kind == .capture) return captured(c, file, decl.node, decl.token, depth + 1);
-            if (decl.kind == .field) {
-                const field = model.containerField(tree, decl.node).?;
-                if (field.ast.type_expr.unwrap()) |t| return kind(c, file, t, depth + 1);
-            }
-            if (tree.fullVarDecl(decl.node)) |v| {
-                if (v.ast.type_node.unwrap()) |t| if (try kind(c, file, t, depth + 1)) |k| return k;
-                if (v.ast.init_node.unwrap()) |init| return kind(c, file, init, depth + 1);
-            }
-        },
-        .@"try", .address_of, .deref, .optional_type => return kind(c, file, tree.nodeData(node).node, depth + 1),
+    // What the expression is, or is a type of, by the value it resolves to (through `?`, `!`, a
+    // pointer, an array: PackageRules.role).
+    if (try typeRole(c, try c.facts.resolve(file, node))) |k| return k;
+    // What resolve cannot always read: the declaration a name stands for, read where it is
+    // written, and what a call's callee says it makes.
+    switch (Facts.accesses.formOf(tree.nodeTag(node))) {
+        .pointer_type => return kind(c, file, tree.fullPtrType(node).?.ast.child_type, depth + 1), // unreachable: the form is a pointer type's
+        .tried, .address_of, .deref, .optional_type => return kind(c, file, tree.nodeData(node).node, depth + 1),
         .unwrap_optional => return kind(c, file, tree.nodeData(node).node_and_token[0], depth + 1),
         .@"orelse", .@"catch" => return kind(c, file, tree.nodeData(node).node_and_node[0], depth + 1),
         .error_union => return kind(c, file, tree.nodeData(node).node_and_node[1], depth + 1),
-        .field_access => {
-            if (try typeRole(c, try c.facts.resolve(file, node))) |k| return k;
-            // A member reached through a module import or another file's alias names its own
-            // declaration: its type expression is read where it is written, which a value
-            // resolved through a type function's call cannot always be.
+        // A name, or a member reached through a module import or another file's alias: its own
+        // declaration, its type expression read where it is written, which a value resolved
+        // through a type function's call cannot always be.
+        .leaf, .member => {
             const decl = switch (try c.facts.definition(file, node)) {
                 .decl => |found| found,
                 .none, .unknown => return null,
             };
             const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
             const written = &c.project.at(decl.file).file.tree;
-            if (record.kind == .field) {
-                const field = c.project.at(decl.file).model.containerField(written, record.node).?;
-                if (field.ast.type_expr.unwrap()) |t| return kind(c, decl.file, t, depth + 1);
-                return null;
+            switch (record.kind) {
+                .parameter => return kind(c, decl.file, record.node, depth + 1),
+                .capture => return captured(c, decl.file, record.node, record.token, depth + 1),
+                .field => {
+                    const field = c.project.at(decl.file).model.containerField(written, record.node).?; // unreachable: a field's declaration is a container's field
+                    if (field.ast.type_expr.unwrap()) |t| return kind(c, decl.file, t, depth + 1);
+                    return null;
+                },
+                else => {},
             }
             if (written.fullVarDecl(record.node)) |v| {
                 if (v.ast.type_node.unwrap()) |t| if (try kind(c, decl.file, t, depth + 1)) |k| return k;
@@ -130,18 +123,16 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
             }
             return null;
         },
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return typeRole(c, try c.facts.resolve(file, node)),
-        .call_one, .call_one_comma, .call, .call_comma => {
-            // What the call makes, by the type its value resolves to (`T.init(...)`, `T.fromRaw`,
-            // `T.adopt`, an alias of either): never the callee's spelling.
-            if (try typeRole(c, try c.facts.resolve(file, node))) |k| return k;
+        .call => {
+            // What the call makes, by its callee: one aegis declares a role for, or a function of
+            // the program's own, which is what its declared result says, whether it is an
+            // ordinary function or a method of a type a type function returns. Never the
+            // callee's spelling.
             const origin = switch ((try Facts.calls.at(c.facts, file, node) orelse return null).callee) {
                 .function => |function| function,
                 .choice, .any => return null,
             };
             if (try c.role(library, .{ .function = origin })) |k| return k;
-            // A function of the program's own is what its declared result says, whether it is
-            // an ordinary function or a method of a type a type function returns.
             const record = c.project.at(origin.file).model.declarations[@backingInt(origin.index)];
             if (record.kind != .function) return null;
             const written = &c.project.at(origin.file).file.tree;
@@ -150,14 +141,8 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
             const result = proto.ast.return_type.unwrap() orelse return null;
             return kind(c, origin.file, result, depth + 1);
         },
-        else => {
-            // A container written here (`pub const Guard = struct { ... }`, an acquisition's
-            // declared result): its role, as aegis declares it.
-            var container_buffer: [2]Ast.Node.Index = undefined;
-            if (tree.fullContainerDecl(&container_buffer, node) != null) return typeRole(c, try c.facts.resolve(file, node));
-        },
+        else => return null,
     }
-    return null;
 }
 /// Whether a role is a guard's: an owner's guard, or an Order's ranked capability. Every guard
 /// check asks this, so none forgets the ranked one.
@@ -177,33 +162,45 @@ pub fn acquired(c: *Context, decl: Facts.Decl) Context.Error!Acquisition {
     const tree = &c.project.at(decl.file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
     const proto = tree.fullFnProto(&buffer, record.node) orelse return .unknown;
-    return resultGuard(c, decl.file, proto.ast.return_type.unwrap() orelse return .no, 0);
+    return resultGuard(c, try c.facts.resolve(decl.file, proto.ast.return_type.unwrap() orelse return .no), 0);
 }
-fn resultGuard(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usize) Context.Error!Acquisition {
+/// What a result of type `value` acquires: through `!` and `?`, a guard or a ranked guard by its
+/// role, and the wrapper aegis declares (`MustUse(Guard, ...)`, by its role) by what it holds: a
+/// guard if a field of it holds one, unknown if one does not resolve. A choice is what each of
+/// its parts acquires, unknown where they differ.
+fn resultGuard(c: *Context, value: Facts.Value, depth: usize) Context.Error!Acquisition {
     if (depth == 16) return .unknown;
-    const tree = &c.project.at(file).file.tree;
-    switch (tree.nodeTag(node)) {
-        .optional_type => return resultGuard(c, file, tree.nodeData(node).node, depth + 1),
-        .error_union => return resultGuard(c, file, tree.nodeData(node).node_and_node[1], depth + 1),
+    switch (value) {
+        .unknown => return .unknown,
+        .optional, .error_union => |inner| return resultGuard(c, inner.*, depth + 1),
+        .alternatives => |each| {
+            var found: ?Acquisition = null;
+            for (each) |one| {
+                const part = try resultGuard(c, one, depth + 1);
+                if (found != null and found.? != part) return .unknown;
+                found = part;
+            }
+            return found orelse .unknown;
+        },
         else => {},
     }
-    // `MustUse(Guard, "why")`: the wrapper's payload, its first argument.
-    var call_buffer: [1]Ast.Node.Index = undefined;
-    if (tree.fullCall(&call_buffer, node)) |call| if (call.ast.params.len != 0) switch (try c.facts.definition(file, call.ast.fn_expr)) {
-        .decl => |named| switch (try c.facts.origin(named)) {
-            .decl => |function| if (try c.role(library, .{ .function = function }) == .must_use) return resultGuard(c, file, call.ast.params[0], depth + 1),
-            .none, .unknown => {},
-        },
-        .none, .unknown => {},
-    };
-    const value = try c.facts.resolve(file, node);
-    if (value == .unknown) return .unknown;
     return switch ((try c.role(library, value)) orelse return .no) {
         .guard => .plain,
         .ranked_guard => .ranked,
-        // A wrapper reached other than by its call (an alias of `MustUse(Guard, ...)`): its
-        // payload is not read here.
-        .must_use => .unknown,
+        .must_use => switch (value) {
+            .container, .instance => |wrapper| held: {
+                var unknown = false;
+                for (try c.facts.heldFields(wrapper)) |field| switch (try resultGuard(c, field.value, depth + 1)) {
+                    .no => {},
+                    .unknown => unknown = true,
+                    .plain, .ranked => |guard| break :held guard,
+                };
+                break :held if (unknown) .unknown else .no;
+            },
+            .alternatives => unreachable, // unreachable: a choice is read part by part above
+            // A wrapper reached as a pointer to it: what it holds is not read here.
+            else => .unknown,
+        },
         else => .no,
     };
 }

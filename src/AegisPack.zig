@@ -1982,37 +1982,28 @@ const Exposure = struct {
             e.cut = true;
             return false;
         }
+        // What the value may be, through the forms that carry or choose it: parentheses, `try`,
+        // `.?`, `@as`, `comptime`, `nosuspend`, both sides of `orelse` and `catch`, a branch or a
+        // prong, a `break` or a loop's `else` (Facts.accesses.valuesOf). One it does not read to
+        // its end is cut short.
+        const leaves = switch (try Facts.accesses.valuesOf(c.facts, c.file, node)) {
+            .leaves => |leaves| leaves,
+            .unknown => {
+                e.cut = true;
+                return false;
+            },
+        };
+        for (leaves) |leaf| if (try e.carriesLeaf(leaf, depth + 1)) return true;
+        return false;
+    }
+    /// Whether a value of a form that neither carries nor chooses another carries a borrow.
+    fn carriesLeaf(e: *Exposure, node: Ast.Node.Index, depth: usize) Context.Error!bool {
+        const c = e.c;
         const tree = try c.project.syntax(try c.source());
         const model = &c.project.at(c.file).model;
-        switch (tree.nodeTag(node)) {
-            .grouped_expression => return e.carries(tree.nodeData(node).node_and_token[0], depth + 1),
-            .@"try", .@"comptime", .@"nosuspend" => return e.carries(tree.nodeData(node).node, depth + 1),
-            .@"orelse", .@"catch" => {
-                const sides = tree.nodeData(node).node_and_node;
-                return try e.carries(sides[0], depth + 1) or try e.carries(sides[1], depth + 1);
-            },
-            .@"if", .if_simple => {
-                const branch = tree.fullIf(node).?; // unreachable: the tag is an `if`'s
-                if (try e.carries(branch.ast.then_expr, depth + 1)) return true;
-                const otherwise = branch.ast.else_expr.unwrap() orelse return false;
-                return e.carries(otherwise, depth + 1);
-            },
-            .@"switch", .switch_comma => {
-                for (tree.fullSwitch(node).?.ast.cases) |case| if (try e.carries(tree.fullSwitchCase(case).?.ast.target_expr, depth + 1)) return true; // unreachable: the tag is a switch's, its cases are cases
-                return false;
-            },
-            .block, .block_semicolon, .block_two, .block_two_semicolon => {
-                // A block with no label gives `void`; one with a label, what each `break` out of it does.
-                for (try c.facts.breaksOut(c.file, node)) |value| if (try e.carries(value, depth + 1)) return true;
-                return false;
-            },
-            .@"for", .for_simple, .@"while", .while_simple, .while_cont => {
-                for (try c.facts.breaksOut(c.file, node)) |value| if (try e.carries(value, depth + 1)) return true;
-                const otherwise = if (tree.fullFor(node)) |loop| loop.ast.else_expr else tree.fullWhile(node).?.ast.else_expr; // unreachable: the tag is a loop's
-                return if (otherwise.unwrap()) |value| e.carries(value, depth + 1) else false;
-            },
+        switch (Facts.accesses.formOf(tree.nodeTag(node))) {
             // A slice of a borrow borrows the same memory.
-            .slice, .slice_open, .slice_sentinel => return e.carries(tree.fullSlice(node).?.ast.sliced, depth + 1), // unreachable: the tag is a slice's
+            .slice => return e.carries(tree.fullSlice(node).?.ast.sliced, depth + 1), // unreachable: the form is a slice's
             // An address of a part read through a borrow points into what it borrows.
             .address_of => {
                 const path = try Facts.accesses.pathOf(c.facts, c.file, tree.nodeData(node).node);
@@ -2020,14 +2011,15 @@ const Exposure = struct {
             },
             // A part of what carries a borrow carries it where the part may be a pointer, or a
             // value holding one; a number, a truth value or an enum's tag holds none.
-            .field_access, .unwrap_optional, .deref, .array_access => {
+            .member, .unwrap_optional, .deref, .array_access => {
                 const path = try Facts.accesses.pathOf(c.facts, c.file, node);
                 const whole = path.steps[1].node;
                 if (try plainValue(c, c.file, node, 0)) return false;
                 if (scalarShaped(c, try c.facts.resolve(c.file, node)) == true) return false;
                 return e.carries(whole, depth + 1);
             },
-            .identifier => {
+            // A name: a local's or a capture's value; a literal is no borrow.
+            .leaf => {
                 const index = Contract.local(c, node) orelse return false;
                 const decl = model.declarations[@backingInt(index)];
                 if ((try e.seen.getOrPut(c.allocator, index)).found_existing) return false;
@@ -2049,29 +2041,32 @@ const Exposure = struct {
                 }
                 return false;
             },
-            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return e.builtin(node, depth),
-            else => {},
+            .builtin => return e.builtin(node, depth),
+            // A field or an element of a literal.
+            .struct_literal => {
+                var buffer: [2]Ast.Node.Index = undefined;
+                for (tree.fullStructInit(&buffer, node).?.ast.fields) |field| if (try e.carries(field, depth + 1)) return true; // unreachable: the form is a struct literal's
+                return false;
+            },
+            .array_literal => {
+                var buffer: [2]Ast.Node.Index = undefined;
+                for (tree.fullArrayInit(&buffer, node).?.ast.elements) |element| if (try e.carries(element, depth + 1)) return true; // unreachable: the form is an array literal's
+                return false;
+            },
+            .call => {
+                if (try exposure(c, node)) return true;
+                // A call given a borrow may return it, where what it returns may be a pointer.
+                var call_buffer: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&call_buffer, node).?; // unreachable: the form is a call's
+                var given = false;
+                const callee = try Facts.accesses.pathOf(c.facts, c.file, call.ast.fn_expr);
+                if (callee.steps.len >= 2 and callee.steps[0].kind == .field) given = try e.carries(callee.steps[1].node, depth + 1);
+                for (call.ast.params) |arg| given = given or try e.carries(arg, depth + 1);
+                if (given and scalarShaped(c, try c.facts.resolve(c.file, node)) != true) e.unknown = e.unknown orelse node;
+                return false;
+            },
+            else => return false,
         }
-        var buffer: [2]Ast.Node.Index = undefined;
-        if (tree.fullStructInit(&buffer, node)) |literal| {
-            for (literal.ast.fields) |field| if (try e.carries(field, depth + 1)) return true;
-            return false;
-        }
-        if (tree.fullArrayInit(&buffer, node)) |literal| {
-            for (literal.ast.elements) |element| if (try e.carries(element, depth + 1)) return true;
-            return false;
-        }
-        if (try exposure(c, node)) return true;
-        // A call given a borrow may return it, where what it returns may be a pointer.
-        var call_buffer: [1]Ast.Node.Index = undefined;
-        if (tree.fullCall(&call_buffer, node)) |call| {
-            var given = false;
-            const callee = try Facts.accesses.pathOf(c.facts, c.file, call.ast.fn_expr);
-            if (callee.steps.len >= 2 and callee.steps[0].kind == .field) given = try e.carries(callee.steps[1].node, depth + 1);
-            for (call.ast.params) |arg| given = given or try e.carries(arg, depth + 1);
-            if (given and scalarShaped(c, try c.facts.resolve(c.file, node)) != true) e.unknown = e.unknown orelse node;
-        }
-        return false;
     }
     /// A builtin's value: what keeps its operand's address carries what the operand does.
     fn builtin(e: *Exposure, node: Ast.Node.Index, depth: usize) Context.Error!bool {
@@ -2337,39 +2332,41 @@ fn calledFunction(c: *Context, file: Project.FileId, node: Ast.Node.Index) Conte
     };
 }
 
-/// Whether a type expression is plain data: a primitive type (`usize`, `bool`, `type`), or an array,
-/// slice, pointer, optional or error union of plain data. No aegis owner or capability is such a value.
+/// Whether a type expression is plain data, by the type it resolves to (`plainTyped`).
 fn plainType(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usize) Context.Error!bool {
     if (depth == 64) return false;
-    const tree = &c.project.at(file).file.tree;
-    if (tree.fullPtrType(node)) |ptr| return plainType(c, file, ptr.ast.child_type, depth + 1);
-    if (tree.fullArrayType(node)) |array| return plainType(c, file, array.ast.elem_type, depth + 1);
-    return switch (tree.nodeTag(node)) {
-        .optional_type => plainType(c, file, tree.nodeData(node).node, depth + 1),
-        .error_union => plainType(c, file, tree.nodeData(node).node_and_node[1], depth + 1),
-        .identifier => try c.facts.resolve(file, node) == .primitive,
-        // A struct or tuple type written in place, every field plain: never a published aegis
-        // type, which has a name.
-        .container_decl, .container_decl_trailing, .container_decl_two, .container_decl_two_trailing => blk: {
-            var buffer: [2]Ast.Node.Index = undefined;
-            const decl = tree.fullContainerDecl(&buffer, node).?; // unreachable: the tag is a container's
-            if (tree.tokenTag(decl.ast.main_token) != .keyword_struct) break :blk false;
-            for (decl.ast.members) |member| {
-                const field = c.project.at(file).model.containerField(tree, member) orelse continue;
-                const t = field.ast.type_expr.unwrap() orelse break :blk false;
-                if (!try plainType(c, file, t, depth + 1)) break :blk false;
+    return plainTyped(c, try c.facts.resolve(file, node), &.{});
+}
+
+/// Whether a type, or a value of it, is plain data: a primitive type (`usize`, `bool`, `type`),
+/// an array or a vector, a pointer or slice, an optional or an error union of plain data, an enum
+/// or a struct (a tuple included) every field of which is plain, of no role aegis declares. No
+/// aegis owner or capability is such a value. A type not known, or one of a choice that is not
+/// plain, is not; a struct already being read (`within`, a field that holds its own type through
+/// a pointer) is not either.
+fn plainTyped(c: *Context, value: Facts.Value, within: []const Facts.Container) Context.Error!bool {
+    if (within.len == 16) return false;
+    var each: Facts.Join = .{};
+    for (Facts.valueParts(&value)) |part| each.add(part, switch (part) {
+        .primitive => true,
+        .pointer => |pointer| try plainTyped(c, pointer.child.*, within),
+        .array, .optional, .error_union => |inner| try plainTyped(c, inner.*, within),
+        .container, .instance => |container| blk: {
+            if (try c.role(Contract.library, part) != null) break :blk false;
+            for (within) |held| if (held.file == container.file and held.scope == container.scope) break :blk false;
+            switch (c.facts.kindOf(container) orelse break :blk false) {
+                .keyword_enum => break :blk true,
+                .keyword_struct => {},
+                else => break :blk false,
             }
+            const deeper = try std.mem.concat(c.allocator, Facts.Container, &.{ within, &.{container} });
+            for (try c.facts.heldFields(container)) |field| if (!try plainTyped(c, field.value, deeper)) break :blk false;
             break :blk true;
         },
-        // `@Vector(n, T)`: lanes of plain data.
-        .builtin_call_two, .builtin_call_two_comma => blk: {
-            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@Vector")) break :blk false;
-            var buffer: [2]Ast.Node.Index = undefined;
-            const args = Facts.builtinArgs(tree, node, &buffer);
-            break :blk args.len == 2 and try plainType(c, file, args[1], depth + 1);
-        },
+        .alternatives => unreachable, // unreachable: valueParts gives no choice as a part
         else => false,
-    };
+    });
+    return each.all() == true;
 }
 
 /// Whether a value is plain data by what is written where it comes from: a literal, a local or
@@ -5224,33 +5221,26 @@ fn rawBytes(c: *Context, node: Ast.Node.Index, seen: []const Model.Declaration.I
 /// What an operator makes of it is reported at the operator, not carried further. `seen` holds
 /// the locals the value is already being followed through.
 fn rawValue(c: *Context, node: Ast.Node.Index, seen: []const Model.Declaration.Id) Context.Error!bool {
+    // What the value may be, through the forms that carry or choose it (Facts.accesses.valuesOf):
+    // each one read whole.
+    const leaves = switch (try Facts.accesses.valuesOf(c.facts, c.file, node)) {
+        .leaves => |leaves| leaves,
+        .unknown => return false,
+    };
+    for (leaves) |leaf| if (try rawLeaf(c, leaf, seen)) return true;
+    return false;
+}
+/// Whether a value of a form that neither carries nor chooses another is what a scalar's `raw()`
+/// returned, or holds it.
+fn rawLeaf(c: *Context, node: Ast.Node.Index, seen: []const Model.Declaration.Id) Context.Error!bool {
     const tree = try c.project.syntax(try c.source());
-    switch (tree.nodeTag(node)) {
-        .call_one, .call_one_comma, .call, .call_comma => return try raw(c, node) or try rawBytes(c, node, seen),
-        .@"try", .@"comptime" => return rawValue(c, tree.nodeData(node).node, seen),
-        .grouped_expression => return rawValue(c, tree.nodeData(node).node_and_token[0], seen),
-        .@"orelse", .@"catch" => {
-            const sides = tree.nodeData(node).node_and_node;
-            return try rawValue(c, sides[0], seen) or try rawValue(c, sides[1], seen);
-        },
-        .@"if", .if_simple => {
-            const branch = tree.fullIf(node).?; // unreachable: the tag is an if's
-            if (try rawValue(c, branch.ast.then_expr, seen)) return true;
-            const otherwise = branch.ast.else_expr.unwrap() orelse return false;
-            return rawValue(c, otherwise, seen);
-        },
-        .@"switch", .switch_comma => {
-            const choice = tree.fullSwitch(node).?; // unreachable: the tag is a switch's
-            for (choice.ast.cases) |case| if (try rawValue(c, tree.fullSwitchCase(case).?.ast.target_expr, seen)) return true; // unreachable: a switch's cases are cases
-            return false;
-        },
-        .block, .block_semicolon, .block_two, .block_two_semicolon => return rawBreaks(c, node, seen),
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+    switch (Facts.accesses.formOf(tree.nodeTag(node))) {
+        .call => return try raw(c, node) or try rawBytes(c, node, seen),
+        .builtin => {
             const name = tree.tokenSlice(tree.nodeMainToken(node));
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, node, &buffer);
-            // The value unchanged, or in each lane.
-            if (std.mem.eql(u8, name, "@as")) return args.len == 2 and try rawValue(c, args[1], seen);
+            // The value in each lane (`@as` gives it unchanged: valuesOf reads through it).
             if (std.mem.eql(u8, name, "@splat")) return args.len == 1 and try rawValue(c, args[0], seen);
             // A scalar's integer read out by the language.
             if (std.mem.eql(u8, name, "@backingInt") or std.mem.eql(u8, name, "@intFromEnum")) {
@@ -5277,16 +5267,16 @@ fn rawValue(c: *Context, node: Ast.Node.Index, seen: []const Model.Declaration.I
         },
         // A part of what holds it, or a pointer to it: a field, an element, a payload, what a
         // pointer points at (`.len` of an array is its own length).
-        .field_access => {
+        .member => {
             const data = tree.nodeData(node).node_and_token;
             // A slice's or array's own length (or address) is none of a scalar's raw value.
             if (try c.facts.memoryField(c.file, node) != .field) return false;
             return rawValue(c, data[0], seen);
         },
-        .unwrap_optional => return rawValue(c, tree.nodeData(node).node_and_token[0], seen),
         .deref, .address_of => return rawValue(c, tree.nodeData(node).node, seen),
         .array_access => return rawValue(c, tree.nodeData(node).node_and_node[0], seen),
-        .identifier => {
+        // A name: a local's or a capture's value; a literal holds none.
+        .leaf => {
             const index = Contract.local(c, node) orelse return false;
             for (seen) |s| if (s == index) return false;
             const model = &c.project.at(c.file).model;
@@ -5326,41 +5316,19 @@ fn rawValue(c: *Context, node: Ast.Node.Index, seen: []const Model.Declaration.I
             }
             return false;
         },
-        else => {
-            // A literal holding it in a field or an element.
+        // A literal holding it in a field or an element.
+        .struct_literal => {
             var buffer: [2]Ast.Node.Index = undefined;
-            if (tree.fullStructInit(&buffer, node)) |literal| {
-                for (literal.ast.fields) |field| if (try rawValue(c, field, seen)) return true;
-                return false;
-            }
-            if (tree.fullArrayInit(&buffer, node)) |literal| {
-                for (literal.ast.elements) |element| if (try rawValue(c, element, seen)) return true;
-                return false;
-            }
+            for (tree.fullStructInit(&buffer, node).?.ast.fields) |field| if (try rawValue(c, field, seen)) return true; // unreachable: the form is a struct literal's
             return false;
         },
+        .array_literal => {
+            var buffer: [2]Ast.Node.Index = undefined;
+            for (tree.fullArrayInit(&buffer, node).?.ast.elements) |element| if (try rawValue(c, element, seen)) return true; // unreachable: the form is an array literal's
+            return false;
+        },
+        else => return false,
     }
-}
-
-/// Whether a `break` out of the labeled block `node` may give a raw value.
-fn rawBreaks(c: *Context, node: Ast.Node.Index, seen: []const Model.Declaration.Id) Context.Error!bool {
-    const tree = try c.project.syntax(try c.source());
-    const lbrace = tree.nodeMainToken(node);
-    if (lbrace < 2 or tree.tokenTag(lbrace - 1) != .colon or tree.tokenTag(lbrace - 2) != .identifier) return false;
-    const label = tree.tokenSlice(lbrace - 2);
-    const first = tree.firstToken(node);
-    const last = tree.lastToken(node);
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .@"break") continue;
-        const brk: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const at = tree.nodeMainToken(brk);
-        if (at < first or at > last) continue;
-        const data = tree.nodeData(brk).opt_token_and_opt_node;
-        const target = data[0].unwrap() orelse continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(target), label)) continue;
-        if (try rawValue(c, data[1].unwrap() orelse continue, seen)) return true;
-    }
-    return false;
 }
 
 /// An assignment, plain or compound: each writes its left side from its right.
