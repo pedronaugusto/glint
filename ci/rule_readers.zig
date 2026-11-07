@@ -169,7 +169,6 @@ const switches = [_]Allowed{
     .{ .file = "src/Facts.zig", .function = "fieldOwner", .reason = "pending: glint-c" },
     .{ .file = "src/Facts.zig", .function = "fieldType", .reason = "pending: glint-c" },
     .{ .file = "src/Facts.zig", .function = "fieldTypeNode", .reason = "pending: glint-c" },
-    .{ .file = "src/Facts.zig", .function = "hasFieldTruth", .reason = "pending: glint-c" },
     .{ .file = "src/Facts.zig", .function = "heldContainer", .reason = "pending: glint-c" },
     .{ .file = "src/Facts.zig", .function = "holderMisses", .reason = "pending: glint-c" },
     .{ .file = "src/Facts.zig", .function = "holdsTypes", .reason = "pending: glint-c" },
