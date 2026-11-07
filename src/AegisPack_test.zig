@@ -2137,6 +2137,10 @@ test "a generic's copies of its anytype parameter are decided where the argument
     try expectJudged(head ++ "pub fn f(s: aegis.Secret(u32)) void { on(s); }", pack.copies, true, 1);
     // A pointer's copies are aliases.
     try expectJudged(head ++ "pub fn f(s: *aegis.Secret(u32)) void { keep(s); }", pack.copies, true, 0);
+}
+
+test "what a generic passes on of its anytype parameter (what calling it returns, what it points to) is read where the parameter is bound" {
+    const head = "const aegis = @import(\"aegis\");\npub fn keep(value: anytype) void { var copy = value; _ = &copy; }\npub fn on(value: anytype) void { keep(value); }\nconst P = struct { n: u8 };\n";
     // What a generic passes on of its parameter other than the parameter itself (what calling
     // it returns, what it points to) is read where the parameter is bound, also from a function
     // declared in the generic and through a generic passing the parameter on (parley's typed
@@ -2148,11 +2152,19 @@ test "a generic's copies of its anytype parameter are decided where the argument
     try expectJudged(handlers ++ "fn secret() !aegis.Secret(u32) { return undefined; }\npub fn f() void { _ = typed(secret); }", pack.copies, true, 1);
     try expectJudged(handlers ++ "fn secret() !aegis.Secret(u32) { return undefined; }\npub fn f() void { add(secret); }", pack.copies, true, 1);
     try expectJudged(handlers ++ "pub fn f(s: *aegis.Secret(u32), p: *P) void { through(s); through(p); }", pack.copies, true, 1);
+}
+
+test "a generic's copy of an argument that does not resolve is undecided, and a comptime parameter's copies are no owner's" {
+    const head = "const aegis = @import(\"aegis\");\npub fn keep(value: anytype) void { var copy = value; _ = &copy; }\npub fn on(value: anytype) void { keep(value); }\nconst P = struct { n: u8 };\n";
     // An argument that does not resolve leaves the call undecided.
     try expectJudged(head ++ "pub fn f(g: fn () @import(\"missing\").T) void { keep(g()); }", pack.copies, false, 0);
     // A `comptime` parameter's value holds nothing at run time: its copies are no owner's.
     const fixed = "const aegis = @import(\"aegis\");\nfn digits(comptime value: anytype) usize { var rest = value; _ = &rest; return 1; }\nfn width(comptime T: type, comptime value: T) usize { const copy = value; _ = copy; return 1; }\n";
     try expectJudged(fixed ++ "pub fn f(g: fn () @import(\"missing\").T) usize { return digits(g()) + width(u8, 1); }", pack.copies, true, 0);
+}
+
+test "a generic's copies of arguments plain as written are clean, of a tuple holding an owner a finding, of a choice of alias types clean" {
+    const head = "const aegis = @import(\"aegis\");\npub fn keep(value: anytype) void { var copy = value; _ = &copy; }\npub fn on(value: anytype) void { keep(value); }\nconst P = struct { n: u8 };\n";
     // Arguments plain as written: a vector, an enum's or a union's tag, `{}`, a tuple of plain
     // values, an element of a typed array of plain tuples.
     const shapes = head ++ "const Color = enum { red, @\"with space\" };\nconst Shape = union(enum) { circle: f32, empty };\n";
@@ -2164,6 +2176,10 @@ test "a generic's copies of its anytype parameter are decided where the argument
     try expectJudged(shapes ++ "pub fn f(s: aegis.Secret(u32), g: fn () @import(\"missing\").T) void { keep(.{ s, g() }); }", pack.copies, false, 0);
     // A choice of types whose pointers, and arrays of them, are aliases.
     try expectJudged(head ++ "pub fn f(comptime n: u8) void { const T = switch (n) { 0 => [*]const u8, 1 => [0]*const u8, else => P }; const v: T = undefined; keep(v); }", pack.copies, true, 0);
+}
+
+test "a generic's copies of a tuple's element, and of a type built from field types, hold what those types hold" {
+    const head = "const aegis = @import(\"aegis\");\npub fn keep(value: anytype) void { var copy = value; _ = &copy; }\npub fn on(value: anytype) void { keep(value); }\nconst P = struct { n: u8 };\n";
     // A tuple's element, by its number, also where an `inline for` gives the tuple.
     const typed = head ++ "fn take(comptime T: type, value: T) void { var copy = value; _ = &copy; }\n";
     try expectJudged(typed ++ "pub fn f() void { inline for (.{ .{ P, 1 }, .{ u8, 2 } }) |case| take(case[0], undefined); }", pack.copies, true, 0);
@@ -2174,6 +2190,10 @@ test "a generic's copies of its anytype parameter are decided where the argument
     try expectJudged(head ++ "const Built = @Struct(.auto, null, &.{\"a\"}, &.{aegis.Secret(u32)}, &@splat(.{}));\npub fn f(b: Built) void { keep(b); }", pack.copies, true, 1);
     try expectJudged(head ++ "fn Made() type { var types: [1]type = @splat(P); _ = &types; return @Struct(.auto, null, &.{\"a\"}, &types, &@splat(.{})); }\npub fn f(m: Made()) void { keep(m); }", pack.copies, true, 0);
     try expectJudged(head ++ "fn Made() type { var types: [1]type = @splat(aegis.Secret(u32)); _ = &types; return @Struct(.auto, null, &.{\"a\"}, &types, &@splat(.{})); }\npub fn f(m: Made()) void { keep(m); }", pack.copies, true, 1);
+}
+
+test "a generic's copies through @Pointer, a function type written in place and a made container's @FieldType are read as Zig makes them" {
+    const head = "const aegis = @import(\"aegis\");\npub fn keep(value: anytype) void { var copy = value; _ = &copy; }\npub fn on(value: anytype) void { keep(value); }\nconst P = struct { n: u8 };\n";
     // `@Pointer(...)` makes a pointer: a copy of what `Untrusted.readForParse` gives is an
     // alias (relic's credential answer read a line at a time).
     try expectJudged("const aegis = @import(\"aegis\");\npub fn f(answer: aegis.input.Untrusted([]const u8)) usize { var rest = answer.readForParse(); var line = rest; rest = rest[1..]; line = line[0..1]; return line.len + rest.len; }", pack.copies, true, 0);
