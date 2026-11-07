@@ -258,7 +258,8 @@ test "Z034 finds operators Zig 0.18 refuses to order without parentheses, and le
 }
 
 test "Z026 a test's refusal assertion is no discard, the same shape in production code is" {
-    const parse = "fn parse(b: []const u8) error{Bad}!u8 { return if (b.len == 1) b[0] else error.Bad; }\n";
+    // A set with OutOfMemory: no refusal alone (Discards), so only the assertion's form is read here.
+    const parse = "fn parse(b: []const u8) error{ OutOfMemory, Bad }!u8 { return if (b.len == 1) b[0] else error.Bad; }\n";
     // In a test, the success branch leaves by an error: the error branch is the assertion's pass.
     try check(.Z026, parse ++ "test \"refused\" { if (parse(\"ab\")) |_| return error.TestUnexpectedResult else |_| {} }", 0);
     try check(.Z026, parse ++ "test \"refused\" { if (parse(\"ab\")) |_| { @panic(\"read\"); } else |_| {} }", 0);
@@ -273,7 +274,7 @@ test "Z026 a test's refusal assertion is no discard, the same shape in productio
 }
 
 test "Z026 a refusal assertion in a file only tests reach is no discard" {
-    const helper = "fn parse(b: []const u8) error{Bad}!u8 { return if (b.len == 1) b[0] else error.Bad; }\npub fn refused() !void { if (parse(\"ab\")) |_| return error.TestUnexpectedResult else |_| {} }\n";
+    const helper = "fn parse(b: []const u8) error{ OutOfMemory, Bad }!u8 { return if (b.len == 1) b[0] else error.Bad; }\npub fn refused() !void { if (parse(\"ab\")) |_| return error.TestUnexpectedResult else |_| {} }\n";
     const cases = [_]struct { root: []const u8, expected: usize }{
         // Imported only from a test block: test code.
         .{ .root = "test { _ = @import(\"helper.zig\"); }", .expected = 0 },

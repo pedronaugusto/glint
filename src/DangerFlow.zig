@@ -817,9 +817,13 @@ fn callCancels(c: *Context, callee: Facts.Decl, depth: u8, ending: Ends) Context
     // A dependency's function with no body here (`extern`, a declaration only) says nothing of
     // what it does: none.
     if (!Taint.inStd((try Taint.get(c, Danger.peer_input)).flow, callee)) return false;
-    var proto_buffer: [1]Ast.Node.Index = undefined;
-    const proto = callee_tree.fullFnProto(&proto_buffer, callee_model.declarations[@backingInt(callee.index)].node) orelse return false;
-    return canceling(c, callee.file, proto.ast.return_type.unwrap() orelse return false, 0);
+    // std's by the set its result declares (Facts.declaredErrors, the one reader of a call's
+    // errors): a set this does not read, or `anyerror`, is read as not holding error.Canceled, so
+    // the loop the call is in stays judged.
+    return switch (try c.facts.declaredErrors(callee)) {
+        .names => |names| (Facts.ErrorNames{ .names = names }).holds("Canceled") == .yes,
+        .any, .unknown => false,
+    };
 }
 
 /// Whether a call passes on the `error.Canceled` it returns: under a `try`, returned, or caught
@@ -1459,39 +1463,6 @@ fn namesCanceled(tree: *const Ast, node: Ast.Node.Index) bool {
         if (tree.tokenTag(@intCast(token)) == .identifier and std.mem.eql(u8, tree.tokenSlice(@intCast(token)), "Canceled")) return true;
     }
     return false;
-}
-
-/// Whether a result type's error set holds `error.Canceled`: a set literal naming it, a merge
-/// with one that does, or a declaration whose value is such a set (`Io.Cancelable`).
-fn canceling(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!bool {
-    if (depth > 8) return false;
-    const tree = &c.project.at(file).file.tree;
-    switch (tree.nodeTag(node)) {
-        .error_union => return canceling(c, file, tree.nodeData(node).node_and_node[0], depth + 1),
-        .merge_error_sets => {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            return try canceling(c, file, lhs, depth + 1) or try canceling(c, file, rhs, depth + 1);
-        },
-        .grouped_expression => return canceling(c, file, tree.nodeData(node).node_and_token[0], depth + 1),
-        .error_set_decl => {
-            for (tree.firstToken(node)..tree.lastToken(node) + 1) |token| {
-                if (tree.tokenTag(@intCast(token)) == .identifier and std.mem.eql(u8, tree.tokenSlice(@intCast(token)), "Canceled")) return true;
-            }
-            return false;
-        },
-        .identifier, .field_access => {
-            // A set this does not name is read as not holding error.Canceled: its call is no
-            // cancellation point, so the loop it is in stays judged.
-            const decl: Facts.Decl = if (tree.nodeTag(node) == .identifier) .{ .file = file, .index = ((c.project.at(file).model.reference(node) orelse return false).declaration orelse return false) } else switch (try c.facts.definition(file, node)) {
-                .decl => |found| found,
-                .none, .unknown => return false,
-            };
-            const declared = &c.project.at(decl.file).file.tree;
-            const variable = declared.fullVarDecl(c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return false;
-            return canceling(c, decl.file, variable.ast.init_node.unwrap() orelse return false, depth + 1);
-        },
-        else => return false,
-    }
 }
 
 /// The `fn_decl` holding `node`.

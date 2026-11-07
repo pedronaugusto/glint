@@ -10776,3 +10776,128 @@ test "A019 reads a call through a function field's captured payload as one throu
     try std.testing.expectEqual(unwrapped.undecided, captured.undecided);
     try std.testing.expectEqual(unwrapped.findings, captured.findings);
 }
+
+/// A std for Z026's forms: `Io.Future`, std's standard streams and writers, and system error
+/// sets in the namespaces Z026 reads as the system's (`Io`, `fs`, `posix`, `os`, `process`,
+/// `Thread`).
+const z026_std = [_]sources.Extra{
+    .{ .name = "std/std.zig", .bytes =
+    \\pub const Io = @import("Io.zig");
+    \\pub const posix = @import("posix.zig");
+    \\pub const fs = @import("fs.zig");
+    \\pub const os = @import("os.zig");
+    \\pub const process = @import("process.zig");
+    \\pub const Thread = @import("Thread.zig");
+    \\pub const debug = @import("debug.zig");
+    },
+    .{ .name = "std/Io.zig", .bytes =
+    \\userdata: ?*anyopaque = null,
+    \\const Io = @This();
+    \\pub const File = @import("Io/File.zig");
+    \\pub const Cancelable = error{Canceled};
+    \\pub const Writer = struct { end: usize = 0, pub fn writeAll(w: *Writer, bytes: []const u8) error{WriteFailed}!void { _ = w; _ = bytes; } pub fn flush(w: *Writer) error{WriteFailed}!void { _ = w; } };
+    \\pub fn Future(Result: type) type { return struct { result: Result, pub fn cancel(f: *@This(), io: Io) Result { _ = io; return f.result; } pub fn await(f: *@This(), io: Io) Result { _ = io; return f.result; } }; }
+    \\pub const net = struct { pub const Stream = struct { handle: i32 }; pub const Server = struct { stream: Stream }; };
+    \\pub const Dir = struct { handle: i32 };
+    },
+    .{ .name = "std/Io/File.zig", .bytes =
+    \\handle: i32,
+    \\const File = @This();
+    \\const Io = @import("../Io.zig");
+    \\pub const OpenError = error{ AccessDenied, FileNotFound, SystemResources };
+    \\pub fn stderr() File { return .{ .handle = 2 }; }
+    \\pub fn stdout() File { return .{ .handle = 1 }; }
+    \\pub const Writer = struct { file: File, interface: Io.Writer };
+    \\pub fn writer(f: File, io: Io, buffer: []u8) Writer { _ = io; _ = buffer; return .{ .file = f, .interface = .{} }; }
+    \\pub fn open(io: Io, path: []const u8) OpenError!File { _ = io; _ = path; return .{ .handle = 3 }; }
+    },
+    .{ .name = "std/posix.zig", .bytes = "pub const ReadError = error{ InputOutput, BrokenPipe };\n" },
+    .{ .name = "std/fs.zig", .bytes = "pub const max_path_bytes = 1024;\n" },
+    .{ .name = "std/os.zig", .bytes = "pub const windows = struct {};\n" },
+    .{ .name = "std/process.zig", .bytes = "pub const Child = struct { id: i32 };\n" },
+    .{ .name = "std/Thread.zig", .bytes = "id: u32,\n" },
+    .{ .name = "std/debug.zig", .bytes = "pub fn assert(ok: bool) void { if (!ok) unreachable; }\n" },
+};
+const z026_imports = [_]sources.ExtraImport{
+    .{ .spelling = "std", .target = 0 },
+    .{ .from = 0, .spelling = "Io.zig", .target = 1 },
+    .{ .from = 1, .spelling = "Io/File.zig", .target = 2 },
+    .{ .from = 2, .spelling = "../Io.zig", .target = 1 },
+    .{ .from = 0, .spelling = "posix.zig", .target = 3 },
+    .{ .from = 0, .spelling = "fs.zig", .target = 4 },
+    .{ .from = 0, .spelling = "os.zig", .target = 5 },
+    .{ .from = 0, .spelling = "process.zig", .target = 6 },
+    .{ .from = 0, .spelling = "Thread.zig", .target = 7 },
+    .{ .from = 0, .spelling = "debug.zig", .target = 8 },
+};
+fn expectZ026(comptime program: []const u8, findings: usize) !void {
+    const result = try runWith(.Z026, "const std = @import(\"std\");\n" ++ program, &z026_std, &z026_imports);
+    try std.testing.expectEqual(findings, result.findings);
+}
+
+test "Z026 the error path: a cleanup's error where another is already leaving is no discard" {
+    const cleanup = "fn cleanup() error{Gone}!void {}\nfn step() error{Bad}!void {}\n";
+    try expectZ026(cleanup ++ "pub fn make() error{Full}!void { errdefer cleanup() catch {}; return error.Full; }", 0);
+    try expectZ026(cleanup ++ "pub fn make() error{Full}!void { defer cleanup() catch {}; return error.Full; }", 1);
+    try expectZ026(cleanup ++ "pub fn run() error{Bad}!void { step() catch |e| { cleanup() catch {}; return e; }; }", 0);
+    try expectZ026(cleanup ++ "pub fn run() ?u8 { step() catch { cleanup() catch {}; return null; }; return 1; }", 1);
+    try expectZ026(cleanup ++ "pub fn run(more: bool) error{Bad}!void { step() catch |e| { cleanup() catch {}; if (more) return; return e; }; }", 1);
+}
+
+test "Z026 a cancel whose result owns nothing, and a release, drop nothing" {
+    try expectZ026("pub fn run(io: std.Io, f: *std.Io.Future(std.Io.Cancelable!void)) void { defer f.cancel(io) catch {}; }", 0);
+    try expectZ026("pub fn run(io: std.Io, f: *std.Io.Future(std.Io.Cancelable!std.Io.File)) void { _ = f.cancel(io) catch {}; }", 1);
+    try expectZ026("pub fn run(io: std.Io, f: anytype) void { _ = f.cancel(io) catch {}; }", 1);
+    const thing = "const Thing = struct { n: u8, pub fn deinit(t: *Thing) void { _ = t; } };\nfn use(t: Thing) void { _ = t; }\n";
+    try expectZ026(thing ++ "pub fn run(r: error{Bad}!Thing) void { if (r) |*p| p.deinit() else |_| {} }", 0);
+    try expectZ026(thing ++ "pub fn run(r: error{Bad}!Thing) void { if (r) |p| use(p) else |_| {} }", 1);
+}
+
+test "Z026 a write to standard error drops nothing, standard output and a field's writer do" {
+    try expectZ026("pub fn say(io: std.Io) void { var buffer: [64]u8 = undefined; var w = std.Io.File.stderr().writer(io, &buffer); w.interface.writeAll(\"x\") catch {}; }", 0);
+    try expectZ026("pub fn say(io: std.Io) void { var buffer: [64]u8 = undefined; var w = std.Io.File.stdout().writer(io, &buffer); w.interface.writeAll(\"x\") catch {}; }", 1);
+    try expectZ026("const Out = struct { w: std.Io.File.Writer };\npub fn say(o: *Out) void { o.w.interface.writeAll(\"x\") catch {}; }", 1);
+}
+
+test "Z026 a call whose every error is a refusal: a fallback below in production, any form in test code" {
+    const refusing = "fn parseBool(v: []const u8) error{InvalidValue}!bool { return if (v.len == 1) v[0] == 't' else error.InvalidValue; }\n";
+    const allocating = "fn parseBool(v: []const u8) error{ OutOfMemory, InvalidValue }!bool { return if (v.len == 1) v[0] == 't' else error.InvalidValue; }\n";
+    try expectZ026(refusing ++ "pub fn read(v: []const u8) bool { if (parseBool(v)) |b| return b else |_| {} return false; }", 0);
+    try expectZ026(allocating ++ "pub fn read(v: []const u8) bool { if (parseBool(v)) |b| return b else |_| {} return false; }", 1);
+    // An inferred set read by its body: error literals alone are refusals; an error variable is not read.
+    try expectZ026("fn parseB(v: []const u8) !bool { if (v.len == 0) return error.Empty; return v[0] == 't'; }\npub fn read(v: []const u8) bool { if (parseB(v)) |b| return b else |_| {} return false; }", 0);
+    try expectZ026("fn parseB(v: []const u8, e: anyerror) !bool { if (v.len == 0) return e; return v[0] == 't'; }\npub fn read(v: []const u8) bool { if (parseB(v, error.X)) |b| return b else |_| {} return false; }", 1);
+    // Functions that reach each other are unknown.
+    try expectZ026("fn a(v: []const u8) !bool { if (v.len == 0) return error.Empty; return b(v[1..]); }\nfn b(v: []const u8) !bool { return try a(v); }\npub fn read(v: []const u8) bool { if (a(v)) |x| return x else |_| {} return false; }", 1);
+    // A system error (a std system namespace's set) is no refusal: a candidate lookup stays.
+    try expectZ026("pub fn find(io: std.Io, p: []const u8) ?std.Io.File { if (std.Io.File.open(io, p)) |f| return f else |_| {} return null; }", 1);
+    // A production `catch`, and a success branch that goes on, are no fallback.
+    try expectZ026(refusing ++ "pub fn read(v: []const u8) void { _ = parseBool(v) catch {}; }", 1);
+    try expectZ026(refusing ++ "pub fn read(v: []const u8) bool { var n = false; if (parseBool(v)) |b| n = b else |_| {} return n; }", 1);
+    // A private helper only a test names is test code: no fallback needed.
+    try expectZ026(refusing ++ "fn fuzzOne(v: []const u8) void { _ = parseBool(v) catch {}; }\ntest \"fuzz\" { fuzzOne(\"x\"); }", 0);
+    try expectZ026(allocating ++ "fn fuzzOne(v: []const u8) void { _ = parseBool(v) catch {}; }\ntest \"fuzz\" { fuzzOne(\"x\"); }", 1);
+    try expectZ026(refusing ++ "pub fn fuzzOne(v: []const u8) void { _ = parseBool(v) catch {}; }\ntest \"fuzz\" { fuzzOne(\"x\"); }", 1);
+    try expectZ026(refusing ++ "fn fuzzOne(v: []const u8) void { _ = parseBool(v) catch {}; }\npub fn run() void { fuzzOne(\"y\"); }\ntest \"fuzz\" { fuzzOne(\"x\"); }", 1);
+    // A `try` whose call takes a container written in place: the call's errors are the body's.
+    try expectZ026("fn pick(comptime T: type, v: []const u8) error{ OutOfMemory, Bad }!T { _ = v; return error.Bad; }\nfn wrap(v: []const u8) !void { _ = try pick(struct { a: u8 }, v); }\npub fn read(v: []const u8) bool { if (wrap(v)) |_| return true else |_| {} return false; }", 1);
+    // A function written inside returns its own errors, not the body's.
+    try expectZ026("fn outer(v: []const u8) !u8 { const S = struct { fn inner() error{OutOfMemory}!void { return error.OutOfMemory; } }; _ = S; if (v.len == 0) return error.Empty; return 1; }\npub fn read(v: []const u8) bool { if (outer(v)) |n| return n == 1 else |_| {} return false; }", 0);
+    // A `var` may be given another value: its first is not read as all it holds.
+    try expectZ026("fn a() error{Bad}!u8 { return error.Bad; }\nfn b() error{OutOfMemory}!u8 { return error.OutOfMemory; }\nfn c() !u8 { var r = a(); r = b(); return r; }\npub fn read() bool { if (c()) |n| return n == 1 else |_| {} return false; }", 1);
+    // A choice returns each branch's error.
+    try expectZ026("fn d(c: bool) !u8 { return if (c) error.OutOfMemory else 1; }\npub fn read(c: bool) bool { if (d(c)) |n| return n == 1 else |_| {} return false; }", 1);
+    try expectZ026("fn e(x: u8) !u8 { return switch (x) { 0 => error.OutOfMemory, else => 0 }; }\npub fn read(x: u8) bool { if (e(x)) |n| return n == 1 else |_| {} return false; }", 1);
+    try expectZ026("fn d(c: bool) !u8 { return if (c) error.Empty else 1; }\npub fn read(c: bool) bool { if (d(c)) |n| return n == 1 else |_| {} return false; }", 0);
+    // `orelse` and `catch` give what their right side does.
+    try expectZ026("fn f(opt: ?u8) !u8 { return opt orelse error.OutOfMemory; }\npub fn read(o: ?u8) bool { if (f(o)) |n| return n == 1 else |_| {} return false; }", 1);
+    try expectZ026("fn f(opt: ?u8) !u8 { return opt orelse error.Missing; }\npub fn read(o: ?u8) bool { if (f(o)) |n| return n == 1 else |_| {} return false; }", 0);
+    try expectZ026("fn g() error{Bad}!u8 { return error.Bad; }\nfn h() !u8 { return g() catch error.OutOfMemory; }\npub fn read() bool { if (h()) |n| return n == 1 else |_| {} return false; }", 1);
+    try expectZ026("fn g() error{OutOfMemory}!u8 { return error.OutOfMemory; }\nfn h() !u8 { return g() catch error.Missing; }\npub fn read() bool { if (h()) |n| return n == 1 else |_| {} return false; }", 0);
+    // An optional whose payload is an error union carries its errors.
+    try expectZ026("fn f(opt: ?(error{OutOfMemory}!u8)) !u8 { return opt orelse 0; }\npub fn read(o: ?(error{OutOfMemory}!u8)) bool { if (f(o)) |n| return n == 1 else |_| {} return false; }", 1);
+    // Production code that computes a `@field` name may reach a private helper unspelled.
+    try expectZ026(refusing ++ "fn fuzzOne(v: []const u8) void { _ = parseBool(v) catch {}; }\npub fn call(comptime name: []const u8) void { @field(@This(), name)(\"y\"); }\ntest \"fuzz\" { fuzzOne(\"x\"); }", 1);
+    // A future's await returns its task's result: never read as the call's own errors.
+    try expectZ026("test \"awaited\" { var f: std.Io.Future(error{Bad}!void) = undefined; if (f.await(.{})) |_| {} else |_| {} }", 1);
+}

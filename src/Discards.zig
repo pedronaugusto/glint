@@ -1,0 +1,363 @@
+//! Z026's empty error handlers that drop nothing, by what the code itself shows (the book's
+//! rulings, 11-07): an error already leaving its function (the error path), a canceled task's
+//! result that owns nothing and a held result whose success branch only releases it (a cancel
+//! or a release), a write to the process's standard error, and a call whose every error is a
+//! refusal of its input (refusals alone). Anything here that does not resolve leaves the handler
+//! a site.
+const std = @import("std");
+const Facts = @import("Facts.zig");
+const Model = @import("Model.zig");
+const Governed = @import("Governed.zig");
+const AegisContract = @import("AegisContract.zig");
+const Context = @import("RuleContext.zig");
+const Ast = std.zig.Ast;
+const Error = Context.Error;
+
+/// Whether the empty handler of `site`, a `catch` or an `if`'s or `while`'s `else |err|`, drops
+/// nothing (the forms this file reads).
+pub fn dropsNothing(c: *Context, site: Ast.Node.Index) Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
+    if (onErrorPath(c, site)) return true;
+    const handled = Facts.ungrouped(tree, handledOf(tree, site) orelse return false);
+    if (try canceledOwningNothing(c, handled)) return true;
+    if (tree.fullIf(site)) |branch| if (try releaseOnly(c, branch)) return true;
+    if (try toStderr(c, handled)) return true;
+    return refusalsOnly(c, site, handled);
+}
+
+/// What a handler handles the errors of: a `catch`'s left side, an `if`'s or `while`'s condition.
+fn handledOf(tree: *const Ast, site: Ast.Node.Index) ?Ast.Node.Index {
+    if (tree.nodeTag(site) == .@"catch") return tree.nodeData(site).node_and_node[0];
+    if (tree.fullIf(site)) |branch| return branch.ast.cond_expr;
+    if (tree.fullWhile(site)) |loop| return loop.ast.cond_expr;
+    return null;
+}
+
+/// The error path: the handler is inside an `errdefer`, which runs only as an error leaves; or
+/// the statements after it, in the block that holds it, go on to return an error (`return
+/// error.X`, or `return e` of an error a `catch |e|` or `else |e|` captured) with no other jump
+/// before it. Zig returns one error: the one leaving is the failure reported, and a cleanup's own
+/// can only be dropped or made a panic.
+fn onErrorPath(c: *Context, site: Ast.Node.Index) bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    var up = site;
+    while (model.parentOf(up)) |parent| : (up = parent) switch (tree.nodeTag(parent)) {
+        .@"errdefer" => return true,
+        .fn_decl, .test_decl => break,
+        else => {},
+    };
+    var at = site;
+    while (model.parentOf(at)) |parent| : (at = parent) {
+        switch (tree.nodeTag(parent)) {
+            // A `defer` runs on every way out, success too: what follows it is no path it is on.
+            .fn_decl, .test_decl, .@"defer" => return false,
+            else => {},
+        }
+        var buffer: [2]Ast.Node.Index = undefined;
+        const statements = tree.blockStatements(&buffer, parent) orelse continue;
+        const position = std.mem.findScalar(Ast.Node.Index, statements, at) orelse continue;
+        for (statements[position + 1 ..]) |statement| {
+            if (tree.nodeTag(statement) == .@"return") return errorReturned(tree, model, statement);
+            if (jumps(tree, statement)) return false;
+        }
+        return false;
+    }
+    return false;
+}
+
+/// Whether a `return` gives its function an error: `error.X`, or an error a `catch |e|` or an
+/// `if`'s or `while`'s `else |e|` captured.
+fn errorReturned(tree: *const Ast, model: *const Model, statement: Ast.Node.Index) bool {
+    const operand = Facts.ungrouped(tree, tree.nodeData(statement).opt_node.unwrap() orelse return false);
+    if (tree.nodeTag(operand) == .error_value) return true;
+    if (tree.nodeTag(operand) != .identifier) return false;
+    const id = (model.reference(operand) orelse return false).declaration orelse return false;
+    const decl = model.declarations[@backingInt(id)];
+    if (decl.kind != .capture) return false;
+    if (tree.nodeTag(decl.node) == .@"catch") return true;
+    if (tree.fullIf(decl.node)) |branch| return branch.error_token == decl.token;
+    if (tree.fullWhile(decl.node)) |loop| return loop.error_token == decl.token;
+    return false;
+}
+
+/// Whether a statement holds a jump anywhere inside it: a `break`, a `continue`, a `return`.
+fn jumps(tree: *const Ast, statement: Ast.Node.Index) bool {
+    const first = tree.firstToken(statement);
+    const last = tree.lastToken(statement);
+    for (tree.nodes.items(.tag), 0..) |tag, i| switch (tag) {
+        .@"break", .@"continue", .@"return" => {
+            const token = tree.nodeMainToken(@fromBackingInt(@intCast(i)));
+            if (token >= first and token <= last) return true;
+        },
+        else => {},
+    };
+    return false;
+}
+
+/// A cancel: `f.cancel(io)` of a task std's `Io.Future` holds, whose result's payload owns
+/// nothing (`ownsNothing`). Cancel is the caller's word that it gives the result up; std writes
+/// `defer future.cancel(io) catch {}` itself. A payload that may own something is dropped with
+/// the error, and stays a site.
+fn canceledOwningNothing(c: *Context, handled: Ast.Node.Index) Error!bool {
+    const call = (try Facts.calls.at(c.facts, c.file, handled)) orelse return false;
+    if (!try futureCancel(c, call)) return false;
+    return switch (try c.facts.resolve(c.file, call.node)) {
+        .error_union => |payload| ownsNothing(c, payload.*),
+        // A result chosen per build: which payload is dropped is not one known here.
+        .alternatives => false,
+        else => false,
+    };
+}
+
+/// Whether a call is `cancel` of a future std's `Io.Future` makes, by its receiver's type.
+fn futureCancel(c: *Context, call: Facts.calls.Call) Error!bool {
+    const callee = switch (call.callee) {
+        .function => |function| function,
+        .choice, .any => return false,
+    };
+    const record = c.project.at(callee.file).model.declarations[@backingInt(callee.index)];
+    if (!std.mem.eql(u8, record.name, "cancel")) return false;
+    const holder = switch (call.receiver) {
+        .bound => |holder| holder,
+        .none, .unknown => return false,
+    };
+    var value = try c.facts.resolve(c.file, holder);
+    while (value == .pointer) value = value.pointer.child.*;
+    const made = switch (value) {
+        .instance, .container => |found| found.made_by orelse return false,
+        // A receiver chosen per build is no one future to read.
+        .alternatives => return false,
+        else => return false,
+    };
+    return try Governed.isStd(c, made.function, "Io.Future") == .yes;
+}
+
+/// The release: `if (r) |p| <one release of p> else |_| {}` on a held result (a name, a field,
+/// a dereference) or a future's cancel. Its success branch only releases what the result owns
+/// (`p.deinit()`, `p.close(io)`, `a.free(p)`, `a.destroy(p)`), and an error owns nothing: the
+/// empty branch drops no failure a fresh call would report.
+fn releaseOnly(c: *Context, branch: Ast.full.If) Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    const payload = branch.payload_token orelse return false;
+    const name = if (tree.tokenTag(payload) == .asterisk) payload + 1 else payload;
+    const held = Facts.ungrouped(tree, branch.ast.cond_expr);
+    if (Facts.calls.written(tree, held)) {
+        const call = (try Facts.calls.at(c.facts, c.file, held)) orelse return false;
+        if (!try futureCancel(c, call)) return false;
+    }
+    var statement = Facts.ungrouped(tree, branch.ast.then_expr);
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.blockStatements(&buffer, statement)) |statements| {
+        if (statements.len != 1) return false;
+        statement = statements[0];
+    }
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&call_buffer, statement) orelse return false;
+    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
+    const receiver, const method_token = tree.nodeData(call.ast.fn_expr).node_and_token;
+    const method = tree.tokenSlice(method_token);
+    const released = if (std.mem.eql(u8, method, "deinit") or std.mem.eql(u8, method, "close"))
+        receiver
+    else if ((std.mem.eql(u8, method, "free") or std.mem.eql(u8, method, "destroy")) and call.ast.params.len == 1)
+        call.ast.params[0]
+    else
+        return false;
+    if (tree.nodeTag(released) != .identifier) return false;
+    const id = (model.reference(released) orelse return false).declaration orelse return false;
+    return model.declarations[@backingInt(id)].token == name;
+}
+
+/// The one reading of an owner here: whether a value owns nothing its drop leaks. It holds no
+/// address anywhere (`Facts.holdsNoAddress`: no memory it may own), no std resource by value
+/// (A015's: `Io.File`, `Io.Dir`, `Io.net.Stream`, `Io.net.Server`, `process.Child`), and no
+/// aegis type, any of which may be an owner. aegis's roles come through PackageRules once its
+/// separation lands; this is the one function that reads them.
+fn ownsNothing(c: *Context, value: Facts.Value) Error!bool {
+    if (!try c.facts.holdsNoAddress(value)) return false;
+    var seen: std.ArrayList(Facts.Container) = .empty;
+    return !try mayOwn(c, value, &seen);
+}
+
+const resource_paths = [_][]const u8{ "Io.File", "Io.Dir", "Io.net.Stream", "Io.net.Server", "process.Child" };
+
+fn mayOwn(c: *Context, value: Facts.Value, seen: *std.ArrayList(Facts.Container)) Error!bool {
+    switch (value) {
+        .primitive, .scalar, .error_set => return false,
+        .array, .optional, .error_union => |inner| return mayOwn(c, inner.*, seen),
+        .alternatives => |each| {
+            for (each) |one| if (try mayOwn(c, one, seen)) return true;
+            return false;
+        },
+        .container, .instance => |container| {
+            for (seen.items) |known| if (known.file == container.file and known.scope == container.scope) return false;
+            try seen.append(c.allocator, container);
+            if (try c.inLibrary(AegisContract.library, container.file)) return true;
+            for (resource_paths) |path| switch (try Governed.declarations(c, "std", path)) {
+                .decls => |decls| for (decls) |decl| switch (try c.facts.declaration(decl)) {
+                    .container => |resource| if (resource.file == container.file and resource.scope == container.scope) return true,
+                    // A resource type chosen per build may be this one.
+                    .alternatives => return true,
+                    else => {},
+                },
+                .none => {},
+                .unknown => return true,
+            };
+            for (try c.facts.heldFields(container)) |field| if (try mayOwn(c, field.value, seen)) return true;
+            return false;
+        },
+        else => return true,
+    }
+}
+
+/// Standard error: the handled call writes through a writer the process's standard error is,
+/// by value: its receiver is a local followed through its value (`.interface`, `&w.interface`,
+/// `.writer`, a method of it), down to a call of std's `Io.File.stderr`, `debug.lockStderr` or
+/// `Io.lockStderr`. std drops these failures itself (`std.debug.print`): standard error is the
+/// channel a failure would be reported on. Standard output, a field and a parameter are not
+/// read so, and stay sites.
+fn toStderr(c: *Context, handled: Ast.Node.Index) Error!bool {
+    const call = (try Facts.calls.at(c.facts, c.file, handled)) orelse return false;
+    return switch (call.receiver) {
+        .bound => |holder| stderrValue(c, holder),
+        .none, .unknown => stderrValue(c, call.callee_expr),
+    };
+}
+
+fn stderrValue(c: *Context, written: Ast.Node.Index) Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    const node = Facts.ungrouped(tree, written);
+    switch (tree.nodeTag(node)) {
+        .field_access => return stderrValue(c, tree.nodeData(node).node_and_token[0]),
+        .address_of, .@"try" => return stderrValue(c, tree.nodeData(node).node),
+        .identifier => {
+            const id = (model.reference(node) orelse return false).declaration orelse return false;
+            const decl = model.declarations[@backingInt(id)];
+            if (decl.kind != .variable) return false;
+            // A local's: a container's variable may be set anywhere.
+            switch (model.scopes[@backingInt(decl.scope)].kind) {
+                .file, .container => return false,
+                else => {},
+            }
+            const variable = tree.fullVarDecl(decl.node) orelse return false;
+            return stderrValue(c, variable.ast.init_node.unwrap() orelse return false);
+        },
+        else => {},
+    }
+    if (!Facts.calls.written(tree, node)) return false;
+    for ([_][]const u8{ "Io.File.stderr", "debug.lockStderr", "Io.lockStderr" }) |path| if (try Governed.stdCall(c, node, path) == .yes) return true;
+    const call = (try Facts.calls.at(c.facts, c.file, node)) orelse return false;
+    return switch (call.receiver) {
+        .bound => |holder| stderrValue(c, holder),
+        .none, .unknown => false,
+    };
+}
+
+/// Refusals alone: every error each callee the handled call may be returns (`Facts.callErrors`)
+/// is a refusal of its input, no failure of the system: none is `OutOfMemory`, `Canceled` or
+/// `Unexpected`, nor spelled by a set std's system namespaces declare (`systemNames`). In test
+/// code (`inTestCode`) that is enough; in production code the handler is an `if`'s whose success
+/// branch leaves on every path (`leaves`), so the failure goes on to the code below, its fallback.
+/// A set that does not resolve, or `anyerror`, is no refusal.
+fn refusalsOnly(c: *Context, site: Ast.Node.Index, handled: Ast.Node.Index) Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const call = (try Facts.calls.at(c.facts, c.file, handled)) orelse return false;
+    const each: []const Facts.Decl = switch (call.callee) {
+        .function => |*one| one[0..1],
+        .choice => |all| all,
+        .any => return false,
+    };
+    const system = try systemNames(c) orelse return false;
+    for (each) |callee| switch (try c.facts.callErrors(callee)) {
+        .names => |errors| for (errors) |one| if (!refusal(system, one.name)) return false,
+        .any, .unknown => return false,
+    };
+    if (try c.inTestCode(tree.nodeMainToken(site))) return true;
+    const branch = tree.fullIf(site) orelse return false;
+    return leaves(tree, branch.ast.then_expr);
+}
+
+/// Whether an error name is a refusal: neither a failure every operation may meet (`OutOfMemory`,
+/// `Canceled`, `Unexpected`) nor one of std's system errors. By its name: Zig's error names are
+/// global identities, one `error.X` program-wide whatever set spells it, so a package's own
+/// `error{EndOfStream}` is std's `EndOfStream` (NAME_TABLES allows a table of them).
+fn refusal(system: *const std.StringHashMapUnmanaged(void), name: []const u8) bool {
+    for ([_][]const u8{ "OutOfMemory", "Canceled", "Unexpected" }) |failure| if (std.mem.eql(u8, name, failure)) return false;
+    return !system.contains(name);
+}
+
+/// Every error name an error set in std's system namespaces spells (`Io`, `fs`, `posix`, `os`,
+/// `process`, `Thread`, each file under the namespace's own), found once for the run. Null where
+/// a namespace does not resolve: no name is then read as a refusal.
+const SystemNames = struct { names: std.StringHashMapUnmanaged(void) = .empty, built: bool = false };
+
+fn systemNames(c: *Context) Error!?*const std.StringHashMapUnmanaged(void) {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
+    const memo = try c.facts.memo(SystemNames);
+    if (memo.built) return &memo.names;
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    for ([_][]const u8{ "Io", "fs", "posix", "os", "process", "Thread" }) |namespace| {
+        const decls = switch (try Governed.declarations(c, "std", namespace)) {
+            .decls => |decls| decls,
+            // No std, or none of this name: no system set of it.
+            .none => continue,
+            .unknown => return null,
+        };
+        for (decls) |decl| {
+            const root = switch (try c.facts.declaration(decl)) {
+                .container => |container| c.project.at(container.file).input.name,
+                // A namespace chosen per build: its files are not one known set.
+                .alternatives => return null,
+                else => return null,
+            };
+            const stem = root[0 .. root.len - (if (std.mem.endsWith(u8, root, ".zig")) @as(usize, 4) else 0)];
+            for (c.project.sources) |*source| {
+                const name = source.input.name;
+                const under = name.len > stem.len and std.mem.startsWith(u8, name, stem) and (name[stem.len] == '/' or name[stem.len] == '\\');
+                if (!std.mem.eql(u8, name, root) and !under) continue;
+                if (!try c.facts.standard(source.id) or source.file.status != .parsed) continue;
+                try setNames(c, &source.file.tree, &names);
+            }
+        }
+    }
+    memo.names = names;
+    memo.built = true;
+    return &memo.names;
+}
+
+fn setNames(c: *Context, tree: *const Ast, names: *std.StringHashMapUnmanaged(void)) Error!void {
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .error_set_decl) continue;
+        const open, const close = tree.nodeData(@fromBackingInt(@intCast(i))).token_and_token;
+        var token = open + 1;
+        while (token < close) : (token += 1) {
+            if (tree.tokenTag(token) != .identifier) continue;
+            try names.put(c.allocator, try Model.identifier(c.allocator, tree.tokenSlice(token)), {});
+        }
+    }
+}
+
+/// Whether every path through `node` leaves: a `return`, `break`, `continue`, `unreachable` or
+/// `@panic` ends it, an `if` with both branches so, a `switch` with every prong so, a block whose
+/// last statement does.
+fn leaves(tree: *const Ast, written: Ast.Node.Index) bool {
+    const node = Facts.ungrouped(tree, written);
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.blockStatements(&buffer, node)) |statements| return statements.len != 0 and leaves(tree, statements[statements.len - 1]);
+    switch (tree.nodeTag(node)) {
+        .@"return", .@"break", .@"continue", .unreachable_literal => return true,
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@panic"),
+        .@"switch", .switch_comma => {
+            const whole = tree.fullSwitch(node).?; // unreachable: tagged a switch
+            for (whole.ast.cases) |case| if (!leaves(tree, tree.fullSwitchCase(case).?.ast.target_expr)) return false; // unreachable: a switch's cases are cases
+            return true;
+        },
+        else => {},
+    }
+    const branch = tree.fullIf(node) orelse return false;
+    return leaves(tree, branch.ast.then_expr) and leaves(tree, branch.ast.else_expr.unwrap() orelse return false);
+}

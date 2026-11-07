@@ -3474,6 +3474,320 @@ pub fn returnedErrors(self: *Facts, file: Project.FileId, proto: Ast.full.FnProt
     };
 }
 
+/// An error a set holds, by its name, and the file whose set literal spells it.
+pub const ErrorName = struct { name: []const u8, file: Project.FileId };
+
+/// The errors a set holds (`errorNames`) or a call may return (`callErrors`): their names; any
+/// error (`anyerror`); or unknown, and why, never read as either.
+pub const ErrorNames = union(enum) {
+    names: []const ErrorName,
+    any,
+    unknown: Unknown,
+
+    /// Whether the set holds the error `name`.
+    pub fn holds(self: ErrorNames, name: []const u8) Is {
+        return switch (self) {
+            .names => |names| for (names) |each| {
+                if (std.mem.eql(u8, each.name, name)) break .yes;
+            } else .no,
+            .any => .yes,
+            .unknown => |why| .{ .unknown = why },
+        };
+    }
+};
+
+/// The errors the set a type names holds: an `error{...}` set, `A || B`, an error union's set,
+/// `anyerror`, or a const given one, followed through each. A set this does not see written (a
+/// function's or `@TypeOf`'s, a type parameter, a name that does not resolve) is unknown; a
+/// const that names itself again is unknown(cycle).
+pub fn errorNames(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!ErrorNames {
+    var trail: std.ArrayList(Key) = .empty;
+    return self.namesIn(file, node, &trail);
+}
+
+fn namesIn(self: *Facts, file: Project.FileId, node: Ast.Node.Index, trail: *std.ArrayList(Key)) ResolveError!ErrorNames {
+    const tree = &self.project.at(file).file.tree;
+    const at = ungrouped(tree, node);
+    for (trail.items) |seen| if (seen.file == file and seen.node == at) return .{ .unknown = .cycle };
+    try trail.append(self.gpa, .{ .file = file, .node = at });
+    defer trail.items.len -= 1;
+    switch (tree.nodeTag(at)) {
+        .error_set_decl => {
+            const open, const close = tree.nodeData(at).token_and_token;
+            var names: std.ArrayList(ErrorName) = .empty;
+            var token = open + 1;
+            while (token < close) : (token += 1) {
+                if (tree.tokenTag(token) != .identifier) continue;
+                try names.append(self.gpa, .{ .name = try Model.identifier(self.gpa, tree.tokenSlice(token)), .file = file });
+            }
+            return .{ .names = names.items };
+        },
+        .merge_error_sets => {
+            const lhs, const rhs = tree.nodeData(at).node_and_node;
+            return self.mergedNames(try self.namesIn(file, lhs, trail), try self.namesIn(file, rhs, trail));
+        },
+        .error_union => return self.namesIn(file, tree.nodeData(at).node_and_node[0], trail),
+        .identifier => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), "anyerror") and try self.definition(file, at) == .none) return .any,
+        else => {},
+    }
+    const given_file, const given = (try self.constantValue(file, at)) orelse return .{ .unknown = .unsupported };
+    return self.namesIn(given_file, given, trail);
+}
+
+/// What either of two sets holds: unknown where either is, any where either is, else the
+/// names of both, each once.
+fn mergedNames(self: *Facts, a: ErrorNames, b: ErrorNames) ResolveError!ErrorNames {
+    if (a == .unknown) return a;
+    if (b == .unknown) return b;
+    if (a == .any or b == .any) return .any;
+    var names: std.ArrayList(ErrorName) = .empty;
+    try names.appendSlice(self.gpa, a.names);
+    for (b.names) |each| if ((ErrorNames{ .names = names.items }).holds(each.name) == .no) try names.append(self.gpa, each);
+    return .{ .names = names.items };
+}
+
+/// The errors a call of `callee` may return, by its declaration: none where its result is no
+/// error union; the set its result names (`E!T`, `errorNames`); for an inferred `!T`, what its
+/// body returns (`inferredErrors`); unknown where the result is read neither way (a type
+/// parameter's, as `Io.Future(T).await`'s `Result`: a task's own result is never the call's).
+pub fn callErrors(self: *Facts, callee: Decl) ResolveError!ErrorNames {
+    return self.errorsOf(callee, .body);
+}
+
+/// The errors `callee`'s declaration names in its result (`callErrors` without reading a body):
+/// an inferred `!T` is unknown. For a reading that takes a declared set as the callee's
+/// contract, as A020 takes std's `Io` operations.
+pub fn declaredErrors(self: *Facts, callee: Decl) ResolveError!ErrorNames {
+    return self.errorsOf(callee, .declared);
+}
+
+fn errorsOf(self: *Facts, callee: Decl, reading: enum { declared, body }) ResolveError!ErrorNames {
+    const source = self.project.at(callee.file);
+    const record = source.model.declarations[@backingInt(callee.index)];
+    if (record.kind != .function) return .{ .unknown = .unsupported };
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = source.file.tree.fullFnProto(&buffer, record.node) orelse return .{ .unknown = .unsupported };
+    return switch (try self.returnedErrors(callee.file, proto)) {
+        .none => .{ .names = &.{} },
+        .set => |set| self.errorNames(set.file, set.node),
+        .inferred => if (reading == .body) self.inferredErrors(callee) else .{ .unknown = .unsupported },
+        .unknown => |why| .{ .unknown = why },
+    };
+}
+
+/// Each function's inferred errors (`inferredErrors`) once read, and those being read.
+const InferredErrors = struct {
+    /// Per file, one entry a declaration by its index, made as the file is first asked.
+    files: []?[]Inferred = &.{},
+    const Inferred = union(enum) { unasked, reading, known: ErrorNames };
+};
+
+/// The errors an inferred `!T`'s body returns: each `return error.X`; each `try` of a call, the
+/// callee's `callErrors`; each `return` of a call, the same; each `return e` of a captured error,
+/// the errors of what its `catch` or `if` caught. A value of the payload's type returns no error.
+/// Any other error returned (a variable not captured so, `@errorCast`, a call whose callee does
+/// not resolve) leaves it unknown. Nested functions and containers are their own. One read of a
+/// function is one resolution of the run's budget: spent, it is unknown(budget). A function its
+/// own reading reaches again is unknown(cycle) there, so every function of the cycle is unknown.
+fn inferredErrors(self: *Facts, callee: Decl) ResolveError!ErrorNames {
+    const entry = try self.inferredEntry(callee);
+    switch (entry.*) {
+        .unasked => {},
+        .reading => return .{ .unknown = .cycle },
+        .known => |known| return known,
+    }
+    if (self.budgetSpent()) return .{ .unknown = .budget };
+    self.remaining -= 1;
+    const source = self.project.at(callee.file);
+    const tree = &source.file.tree;
+    const record = source.model.declarations[@backingInt(callee.index)];
+    const declared = source.model.parentOf(record.node) orelse return .{ .unknown = .unsupported };
+    if (tree.nodeTag(declared) != .fn_decl) return .{ .unknown = .unsupported };
+    entry.* = .reading;
+    const found = self.bodyErrors(callee.file, tree.nodeData(declared).node_and_node[1]) catch |err| {
+        entry.* = .unasked;
+        return err;
+    };
+    // Read with none left, a part of it may have come back unknown(budget): it is not kept.
+    entry.* = if (self.remaining != 0) .{ .known = found } else .unasked;
+    return found;
+}
+
+/// `callee`'s entry in the run's inferred errors, its file's entries made when first asked.
+fn inferredEntry(self: *Facts, callee: Decl) ResolveError!*InferredErrors.Inferred {
+    const inferred = try self.memo(InferredErrors);
+    if (inferred.files.len == 0) {
+        inferred.files = try self.gpa.alloc(?[]InferredErrors.Inferred, self.project.sources.len);
+        @memset(inferred.files, null);
+    }
+    const slot = &inferred.files[@backingInt(callee.file)];
+    if (slot.* == null) {
+        const made = try self.gpa.alloc(InferredErrors.Inferred, self.project.at(callee.file).model.declarations.len);
+        @memset(made, .unasked);
+        slot.* = made;
+    }
+    return &slot.*.?[@backingInt(callee.index)];
+}
+
+fn bodyErrors(self: *Facts, file: Project.FileId, body: Ast.Node.Index) ResolveError!ErrorNames {
+    const tree = &self.project.at(file).file.tree;
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
+    const model = &self.project.at(file).model;
+    var found: ErrorNames = .{ .names = &.{} };
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        switch (tag) {
+            .@"try", .@"return" => {},
+            else => continue,
+        }
+        const token = tree.nodeMainToken(node);
+        if (token < first or token > last) continue;
+        // A function or container written inside returns its own errors, not this body's: by
+        // the node's parents up to the body, as node order is not token order.
+        if (!inBodyItself(tree, model, node, body)) continue;
+        switch (tag) {
+            .@"try" => found = try self.mergedNames(found, try self.carriedErrors(file, tree.nodeData(node).node)),
+            .@"return" => if (tree.nodeData(node).opt_node.unwrap()) |operand| {
+                found = try self.mergedNames(found, try self.returnedValueErrors(file, operand));
+            },
+            else => continue,
+        }
+        if (found == .unknown) return found;
+    }
+    return found;
+}
+
+/// Whether `node` belongs to `body` itself: no function or container lies between them.
+fn inBodyItself(tree: *const Ast, model: *const Model, node: Ast.Node.Index, body: Ast.Node.Index) bool {
+    var at = node;
+    while (model.parentOf(at)) |parent| : (at = parent) {
+        if (parent == body) return true;
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (tree.nodeTag(parent) == .fn_decl or tree.fullContainerDecl(&buffer, parent) != null) return false;
+    }
+    return false;
+}
+
+/// The errors an error union written as `node` may carry: a call's, by its callee's
+/// `callErrors` (each callee it may be); unknown for any other.
+fn carriedErrors(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!ErrorNames {
+    const call = (try calls.at(self, file, ungrouped(&self.project.at(file).file.tree, node))) orelse return .{ .unknown = .unsupported };
+    const each: []const Decl = switch (call.callee) {
+        .function => |*one| one[0..1],
+        .choice => |all| all,
+        .any => |why| return .{ .unknown = why },
+    };
+    var found: ErrorNames = .{ .names = &.{} };
+    for (each) |callee| {
+        found = try self.mergedNames(found, try self.callErrors(callee));
+        if (found == .unknown) return found;
+    }
+    return found;
+}
+
+/// The errors a `return`'s operand gives its function: `error.X`; a call's (`carriedErrors`); a
+/// captured error's, what its `catch` or `if` caught; none for a `try` (read where it stands) or
+/// a value that is no error; unknown for an error that is none of these.
+fn returnedValueErrors(self: *Facts, file: Project.FileId, operand: Ast.Node.Index) ResolveError!ErrorNames {
+    const tree = &self.project.at(file).file.tree;
+    const model = &self.project.at(file).model;
+    const at = ungrouped(tree, operand);
+    switch (tree.nodeTag(at)) {
+        .error_value => return .{ .names = try self.gpa.dupe(ErrorName, &.{.{ .name = try Model.identifier(self.gpa, tree.tokenSlice(tree.nodeMainToken(at) + 2)), .file = file }}) },
+        .@"try" => return .{ .names = &.{} },
+        .identifier => if (model.reference(at)) |ref| if (ref.declaration) |id| {
+            const decl = model.declarations[@backingInt(id)];
+            switch (decl.kind) {
+                .capture => {
+                    if (tree.nodeTag(decl.node) == .@"catch") return self.carriedErrors(file, tree.nodeData(decl.node).node_and_node[0]);
+                    if (tree.fullIf(decl.node)) |branch| if (branch.error_token == decl.token) return self.carriedErrors(file, branch.ast.cond_expr);
+                },
+                // A parameter by the type it declares (its node is that type; `anytype` declares
+                // none), not by what its callers give.
+                .parameter => {
+                    var buffer: [1]Ast.Node.Index = undefined;
+                    if (tree.fullFnProto(&buffer, decl.node) != null) return .{ .unknown = .unsupported };
+                    return self.typedErrors(file, decl.node);
+                },
+                // A local by its written type, else, a `const`, by what it is given: a `var`
+                // may be given another value later.
+                .variable => if (tree.fullVarDecl(decl.node)) |variable| {
+                    if (variable.ast.type_node.unwrap()) |typed| return self.typedErrors(file, typed);
+                    if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return .{ .unknown = .unsupported };
+                    if (variable.ast.init_node.unwrap()) |init| return self.returnedValueErrors(file, init);
+                },
+                .function, .field => {},
+            }
+        },
+        // A choice gives what each of its branches does.
+        .@"if", .if_simple => {
+            const branch = tree.fullIf(at).?; // unreachable: tagged an if
+            const taken = try self.returnedValueErrors(file, branch.ast.then_expr);
+            const other = branch.ast.else_expr.unwrap() orelse return taken;
+            return self.mergedNames(taken, try self.returnedValueErrors(file, other));
+        },
+        .@"switch", .switch_comma => {
+            var found: ErrorNames = .{ .names = &.{} };
+            for (tree.fullSwitch(at).?.ast.cases) |case| { // unreachable: tagged a switch
+                found = try self.mergedNames(found, try self.returnedValueErrors(file, tree.fullSwitchCase(case).?.ast.target_expr)); // unreachable: a switch's cases are cases
+                if (found == .unknown) return found;
+            }
+            return found;
+        },
+        // `a orelse b` is a's payload or b; `a catch b` is a's payload, its errors caught, or b.
+        .@"orelse" => {
+            const lhs, const rhs = tree.nodeData(at).node_and_node;
+            return self.mergedNames(try self.returnedValueErrors(file, lhs), try self.returnedValueErrors(file, rhs));
+        },
+        .@"catch" => return self.returnedValueErrors(file, tree.nodeData(at).node_and_node[1]),
+        else => {},
+    }
+    if (calls.written(tree, at)) return self.carriedErrors(file, at);
+    switch (tree.nodeTag(at)) {
+        // A name may hold an error this does not follow: none only where it resolves to what no
+        // error is (a value of an error type resolves as a scalar).
+        .identifier, .field_access, .unwrap_optional, .deref, .array_access => return switch (try self.resolve(file, at)) {
+            .instance, .literal, .pointer, .array, .function, .container => .{ .names = &.{} },
+            .optional => |child| if (mayBeError(child.*)) .{ .unknown = .unsupported } else .{ .names = &.{} },
+            .primitive => |name| errorPrimitive(name),
+            // A choice of values: one of them may be an error this does not follow.
+            .alternatives => .{ .unknown = .unsupported },
+            else => .{ .unknown = .unsupported },
+        },
+        else => {},
+    }
+    const value = try self.resolve(file, at);
+    return if (mayBeError(value)) .{ .unknown = .unsupported } else .{ .names = &.{} };
+}
+
+/// Whether a value, or a value of a type, may be an error: an error set or union, `anyerror`, an
+/// optional of one (`?(E!T)`'s payload carries E), or one not known.
+fn mayBeError(value: Value) bool {
+    return switch (value) {
+        .error_set, .error_union, .unknown => true,
+        .primitive => |name| errorPrimitive(name) == .unknown,
+        .optional => |child| mayBeError(child.*),
+        .alternatives => |each| for (each) |one| {
+            if (mayBeError(one)) break true;
+        } else false,
+        else => false,
+    };
+}
+
+/// The errors a value of the type `type_node` may be: none for a type that is no error, unknown
+/// for an error set or an error union (which errors it holds is the value's, not followed here).
+fn typedErrors(self: *Facts, file: Project.FileId, type_node: Ast.Node.Index) ResolveError!ErrorNames {
+    return if (mayBeError(try self.resolve(file, type_node))) .{ .unknown = .unsupported } else .{ .names = &.{} };
+}
+
+/// A value of a primitive type gives no error, but one of `anyerror` (a primitive of kind
+/// `error_set`) is an error this does not follow.
+fn errorPrimitive(name: []const u8) ErrorNames {
+    const kind = primitiveKind(name) orelse return .{ .unknown = .unsupported };
+    return if (std.mem.eql(u8, kind, "error_set")) .{ .unknown = .unsupported } else .{ .names = &.{} };
+}
+
 /// The names a capture takes from a list written in place that a `for` ranges over alone, each
 /// element one name spells (`nameIn`); null where one does not.
 fn rangedNames(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?[]const []const u8 {

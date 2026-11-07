@@ -220,10 +220,11 @@ pub fn inTest(self: *const RuleContext, token: std.zig.Ast.TokenIndex) bool {
     return inTestScope(self.project.at(self.file), token);
 }
 /// Whether a token is test code, as a program's files are classified: inside a `test` block or
-/// a test input (`inTest`), or anywhere in a file only tests reach (`testReached`). One answer for
-/// every rule that reads test code so.
+/// a test input (`inTest`), anywhere in a file only tests reach (`testReached`), or inside a
+/// private function only tests reach (`testOnly`: a fuzz target, a property's helper). One answer
+/// for every rule that reads test code so.
 pub fn inTestCode(self: *RuleContext, token: std.zig.Ast.TokenIndex) Error!bool {
-    return self.inTest(token) or try testReached(self, self.file);
+    return self.inTest(token) or try testReached(self, self.file) or try inTestOnlyFunction(self, self.file, token);
 }
 
 /// Which files only tests reach, one entry a file by its id, found as each is asked and kept for
@@ -297,6 +298,127 @@ fn importedOnlyFromTests(self: *RuleContext, memo: *TestReached, file: Project.F
         }
     }
     return imported;
+}
+
+/// Which private functions only tests reach, by declaration, found as each is asked and kept for
+/// the run.
+const TestOnly = struct { files: []?[]Reach = &.{} };
+
+/// Whether `token` of `file` is inside a function only tests reach (`testOnly`): itself or any
+/// function around it.
+fn inTestOnlyFunction(self: *RuleContext, file: Project.FileId, token: Ast.TokenIndex) Error!bool {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = self.keep();
+    defer self.allocator = rule_memory;
+    return inTestOnlyIn(self, try self.facts.memo(TestOnly), file, token);
+}
+
+fn inTestOnlyIn(self: *RuleContext, memo: *TestOnly, file: Project.FileId, token: Ast.TokenIndex) Error!bool {
+    const model = &self.project.at(file).model;
+    var scope: ?Model.Scope.Id = model.scopeOf(token);
+    while (scope) |id| : (scope = model.scopes[@backingInt(id)].parent) {
+        const each = &model.scopes[@backingInt(id)];
+        if (each.kind != .function) continue;
+        const function = functionDeclaration(&self.project.at(file).file.tree, model, each) orelse continue;
+        if (try testOnly(self, memo, .{ .file = file, .index = function })) return true;
+    }
+    return false;
+}
+
+/// The function a `fn_decl` declares: the declaration whose node is its prototype.
+/// Looked up by its name in the scope around the function's, where it is declared.
+fn functionDeclaration(tree: *const Ast, model: *const Model, scope: *const Model.Scope) ?Model.Declaration.Id {
+    if (tree.nodeTag(scope.node) != .fn_decl) return null;
+    const prototype = tree.nodeData(scope.node).node_and_node[0];
+    var buffer: [1]Ast.Node.Index = undefined;
+    const name = (tree.fullFnProto(&buffer, prototype) orelse return null).name_token orelse return null;
+    const around = scope.parent orelse return null;
+    const id = model.scopes[@backingInt(around)].names.get(tree.tokenSlice(name)) orelse return null;
+    const decl = model.declarations[@backingInt(id)];
+    return if (decl.kind == .function and decl.node == prototype) id else null;
+}
+
+/// Whether production code of `held` writes a `@field` whose name is computed: it may name any
+/// declaration of a type, a private function's too, without spelling it.
+fn computedField(held: *const Project.Source) bool {
+    const tree = &held.file.tree;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        switch (tag) {
+            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {},
+            else => continue,
+        }
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) continue;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const args = Facts.builtinArgs(tree, node, &buffer);
+        if (args.len == 2 and tree.nodeTag(args[1]) == .string_literal) continue;
+        if (inTestScope(held, tree.nodeMainToken(node))) continue;
+        return true;
+    }
+    return false;
+}
+
+/// Whether a function only tests reach: private (no `pub`, no `export`), so only its own file
+/// can name it (Zig's visibility, as D001 reads it), named there at least once, and every
+/// spelling of its name in that file, an identifier or a string (`@field`), but its own
+/// declaration's, is test code: in a `test` block, or in another function only tests reach. A
+/// spelling of the same name that means another declaration counts too, so a name shared with
+/// production code is not only tests'. A function asked again while it is read (they name each
+/// other) is not only tests', as nothing shows it.
+fn testOnly(self: *RuleContext, memo: *TestOnly, function: Facts.Decl) Error!bool {
+    const held = self.project.at(function.file);
+    const decl = held.model.declarations[@backingInt(function.index)];
+    if (decl.public or decl.exported) return false;
+    const entry = try testOnlyEntry(self, memo, function);
+    switch (entry.*) {
+        .unasked => {},
+        .asking, .not_only => return false,
+        .only_tests => return true,
+    }
+    if (computedField(held)) {
+        entry.* = .not_only;
+        return false;
+    }
+    entry.* = .asking;
+    const tree = &held.file.tree;
+    var named = false;
+    const only = for (0..tree.tokens.len) |i| {
+        const token: Ast.TokenIndex = @intCast(i);
+        if (token == decl.token) continue;
+        const spelled = switch (tree.tokenTag(token)) {
+            .identifier => blk: {
+                const raw = tree.tokenSlice(token);
+                // `@"name"` is read as its name; any other identifier is its own spelling.
+                break :blk if (raw[0] == '@') std.mem.eql(u8, try Model.identifier(self.allocator, raw), decl.name) else std.mem.eql(u8, raw, decl.name);
+            },
+            .string_literal => blk: {
+                const text = tree.tokenSlice(token);
+                break :blk text.len == decl.name.len + 2 and std.mem.eql(u8, text[1 .. text.len - 1], decl.name);
+            },
+            else => false,
+        };
+        if (!spelled) continue;
+        named = true;
+        if (inTestScope(held, token)) continue;
+        if (!try inTestOnlyIn(self, memo, function.file, token)) break false;
+    } else named;
+    entry.* = if (only) .only_tests else .not_only;
+    return only;
+}
+
+/// `function`'s entry in the run's memo, its file's entries made when first asked.
+fn testOnlyEntry(self: *RuleContext, memo: *TestOnly, function: Facts.Decl) Error!*Reach {
+    if (memo.files.len == 0) {
+        memo.files = try self.allocator.alloc(?[]Reach, self.project.sources.len);
+        @memset(memo.files, null);
+    }
+    const slot = &memo.files[@backingInt(function.file)];
+    if (slot.* == null) {
+        const made = try self.allocator.alloc(Reach, self.project.at(function.file).model.declarations.len);
+        @memset(made, .unasked);
+        slot.* = made;
+    }
+    return &slot.*.?[@backingInt(function.index)];
 }
 
 /// Whether a token of `held` is test code: a test input, or inside a `test` block.

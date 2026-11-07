@@ -11,6 +11,7 @@ const Report = @import("Report.zig");
 const DeadDeclarations = @import("DeadDeclarations.zig");
 const Disallowed = @import("Disallowed.zig");
 const Governed = @import("Governed.zig");
+const Discards = @import("Discards.zig");
 const RunError = Context.Error;
 
 pub fn check(context: *Context) RunError!void {
@@ -335,6 +336,7 @@ fn amendedPolicies(self: *Context) RunError!void {
             continue;
         if (!try discards(self, handler, 0)) continue;
         if (tree.fullIf(node)) |branch| if (try refusalAsserted(self, tree, branch)) continue;
+        if (try Discards.dropsNothing(self, node)) continue;
         try self.at(.Z026, tree.nodeMainToken(node), "an error handler that discards the error; write a reason at this site");
     };
 }
