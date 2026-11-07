@@ -3596,6 +3596,44 @@ test "A009 reads a while condition by what decides it, as A020 does: a variable 
     , 0);
 }
 
+test "Z026 reads a release by what the call does, never its name: a body that releases what it holds and std's own close, not a deinit that does other work" {
+    const make =
+        \\fn make() error{Bad}!Holder { return error.Bad; }
+        \\pub fn f() void { var made = make(); if (made) |*h| h.deinit() else |_| {} }
+    ;
+    const head =
+        \\const std = @import("std");
+        \\var io_held: std.Io = undefined;
+        \\
+    ;
+    // Its body closes the handle it holds on every exit: all it does.
+    const closes = try run(.Z026, head ++ "const Holder = struct { file: std.Io.File, n: u8, fn deinit(h: *Holder) void { h.file.close(io_held); } };\n" ++ make);
+    try std.testing.expectEqual(@as(usize, 0), closes.findings);
+    // Called `deinit`, it releases nothing.
+    const works = try run(.Z026, head ++ "const Holder = struct { file: std.Io.File, n: u8, fn deinit(h: *Holder) void { _ = h; commit(); } };\nfn commit() void {}\n" ++ make);
+    try std.testing.expectEqual(@as(usize, 1), works.findings);
+    // Called `deinit`, it closes the handle and writes a count too.
+    const counts = try run(.Z026, head ++ "const Holder = struct { file: std.Io.File, n: u8, fn deinit(h: *Holder) void { h.n += 1; h.file.close(io_held); } };\n" ++ make);
+    try std.testing.expectEqual(@as(usize, 1), counts.findings);
+    // A receiver's whole value handed on may be anything: real work.
+    const flushes = try run(.Z026, head ++ "const Holder = struct { file: std.Io.File, n: u8, fn deinit(h: *Holder) void { flush(h); h.file.close(io_held); } };\nfn flush(h: *Holder) void { h.n = 0; }\n" ++ make);
+    try std.testing.expectEqual(@as(usize, 1), flushes.findings);
+    // std's own close, by its declaration.
+    const direct = try run(.Z026,
+        \\const std = @import("std");
+        \\fn open() error{Bad}!std.Io.File { return error.Bad; }
+        \\pub fn f(io: std.Io) void { const held = open(); if (held) |file| file.close(io) else |_| {} }
+    );
+    try std.testing.expectEqual(@as(usize, 0), direct.findings);
+    // A callee that does not resolve stays a site.
+    const unknown = try run(.Z026,
+        \\const ext = @import("missing");
+        \\fn open() error{Bad}!ext.Thing { return error.Bad; }
+        \\pub fn f() void { const held = open(); if (held) |t| t.deinit() else |_| {} }
+    );
+    try std.testing.expectEqual(@as(usize, 1), unknown.findings);
+}
+
 test "a function of std's reader no list names is a read of a peer's number, never clean: what a new Zig adds is input until it is named" {
     // Named nowhere: `takeFresh` is only the stub's. What it gives indexes unchecked.
     try expect(pack.untrusted_input,

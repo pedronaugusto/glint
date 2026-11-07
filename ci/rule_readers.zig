@@ -32,6 +32,7 @@ const Allowed = struct { file: []const u8, function: []const u8, reason: []const
 /// The reads that stay syntactic, each with its reason. A session adds an entry for its rule
 /// with the guard's owner.
 const allowed = [_]Allowed{
+    .{ .file = "src/Discards.zig", .function = "refusal", .reason = "Zig's error names are global identities, one `error.X` program-wide whatever set spells it: no declaration stands behind one" },
     .{ .file = "src/Builtins.zig", .function = "unusedImports", .reason = "a member read is written `a.b` or `@field` (read apart by Facts.reflected); Facts.definition decides what each names" },
     .{ .file = "src/Builtins.zig", .function = "priorityRules", .reason = "picks the token a finding is reported at; Facts.calls and Facts.definition decide the callee" },
     .{ .file = "src/Builtins.zig", .function = "inert", .reason = "Zig has no getters or overloading: a name, member, literal or reading builtin as written has no effect" },
@@ -231,6 +232,10 @@ const text_maps = [_]struct { []const u8, usize }{ .{ "StringHashMapUnmanaged", 
 /// The text tables that name no declaration, each with its reason, by the place that makes the
 /// table (`place`). An entry no table of its file's is at is a finding itself.
 const tables = [_]Allowed{
+    .{ .file = "src/Discards.zig", .function = "refusal", .reason = "Zig's error names are global identities, one `error.X` program-wide whatever set spells it: no declaration stands behind one" },
+    .{ .file = "src/Discards.zig", .function = "SystemNames.names", .reason = "Zig's error names are global identities, one `error.X` program-wide whatever set spells it: no declaration stands behind one" },
+    .{ .file = "src/Discards.zig", .function = "systemNames", .reason = "Zig's error names are global identities, one `error.X` program-wide whatever set spells it: no declaration stands behind one" },
+    .{ .file = "src/Discards.zig", .function = "setNames", .reason = "Zig's error names are global identities, one `error.X` program-wide whatever set spells it: no declaration stands behind one" },
     .{ .file = "src/Model.zig", .function = "Scope.names", .reason = "Zig's own scope lookup: the resolver itself finds a declaration by its name in its scope" },
     .{ .file = "src/cli.zig", .function = "Loader.paths", .reason = "file paths: a loaded file's canonical path is its identity" },
     .{ .file = "src/cli.zig", .function = "Loader.manifests", .reason = "directory paths: each package directory's manifest" },

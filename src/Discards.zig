@@ -9,6 +9,7 @@ const Facts = @import("Facts.zig");
 const Model = @import("Model.zig");
 const Governed = @import("Governed.zig");
 const AegisContract = @import("AegisContract.zig");
+const release_summary = @import("releases.zig");
 const Context = @import("RuleContext.zig");
 const Ast = std.zig.Ast;
 const Error = Context.Error;
@@ -149,8 +150,8 @@ fn futureCancel(c: *Context, call: Facts.calls.Call) Error!bool {
 }
 
 /// The release: `if (r) |p| <one release of p> else |_| {}` on a held result (a name, a field,
-/// a dereference) or a future's cancel. Its success branch only releases what the result owns
-/// (`p.deinit()`, `p.close(io)`, `a.free(p)`, `a.destroy(p)`), and an error owns nothing: the
+/// a dereference) or a future's cancel. Its success branch only releases what the result owns, by
+/// what the call does, never what it is called (`releasedBy`), and an error owns nothing: the
 /// empty branch drops no failure a fresh call would report.
 fn releaseOnly(c: *Context, branch: Ast.full.If) Error!bool {
     const tree = &c.project.at(c.file).file.tree;
@@ -167,26 +168,141 @@ fn releaseOnly(c: *Context, branch: Ast.full.If) Error!bool {
         if (statements.len != 1) return false;
         statement = statements[0];
     }
-    var call_buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&call_buffer, statement) orelse return false;
-    if (formAt(tree, call.ast.fn_expr) != .member) return false;
-    const receiver, const method_token = tree.nodeData(call.ast.fn_expr).node_and_token;
-    const released = if (try allocatorRelease(c, statement) and call.ast.params.len == 1) call.ast.params[0] else if (releaseMethod(tree.tokenSlice(method_token))) receiver else return false;
+    const call = (try Facts.calls.at(c.facts, c.file, statement)) orelse return false;
+    const released = (try releasedBy(c, call)) orelse return false;
     const decl = (try ownDeclaration(c, released)) orelse return false;
     return decl.token == name;
 }
 
-/// Whether the call `node` frees what std's `mem.Allocator` gave, by the function it calls.
-fn allocatorRelease(c: *Context, node: Ast.Node.Index) Error!bool {
-    for ([_][]const u8{ "mem.Allocator.free", "mem.Allocator.destroy" }) |path| if (try Governed.stdCall(c, node, path) == .yes) return true;
+/// std's functions that release what they are given, by declaration.
+const allocator_release_paths = [_][]const u8{ "mem.Allocator.free", "mem.Allocator.destroy" };
+const handle_release_paths = [_][]const u8{ "Io.File.close", "Io.File.closeMany", "Io.Dir.close", "Io.Dir.closeMany", "Io.net.Stream.close", "Io.net.Socket.close", "Io.net.Socket.closeMany", "Io.net.Server.deinit", "process.Child.kill", "process.Child.wait" };
+
+/// What a call releases, where that is all it does: what std's allocator is given to free, a
+/// handle std's own contract closes, or the receiver of a function whose body releases what it
+/// holds (`releasesHeld`), each function a choice may be. Null for any other call, and one that
+/// does not resolve.
+fn releasedBy(c: *Context, call: Facts.calls.Call) Error!?Ast.Node.Index {
+    const each: []const Facts.Decl = switch (call.callee) {
+        .function => |*one| one[0..1],
+        .choice => |all| all,
+        .any => return null,
+    };
+    const args = switch (call.args) {
+        .known => |known| known,
+        .unknown => return null,
+    };
+    const holder = switch (call.receiver) {
+        .bound => |bound| bound,
+        .none, .unknown => return null,
+    };
+    if (each.len == 0) return null;
+    var freed = true;
+    var closed = true;
+    for (each) |callee| {
+        if (!try amongStd(c, callee, &allocator_release_paths)) freed = false;
+        if (!try amongStd(c, callee, &handle_release_paths) and !try releasesHeld(c, callee, holder)) closed = false;
+    }
+    // `a.free(p)` hands over its one argument after the allocator it is called on.
+    if (freed) return if (args.len == 2) args[1] else null;
+    return if (closed) holder else null;
+}
+
+fn amongStd(c: *Context, callee: Facts.Decl, paths: []const []const u8) Error!bool {
+    for (paths) |path| if (try Governed.isStd(c, callee, path) == .yes) return true;
     return false;
 }
 
-/// Whether a method's name says it releases its receiver: Zig has no destructor, and a type of
-/// the program's, whatever it is, gives up what it holds by these names alone.
-fn releaseMethod(name: []const u8) bool {
-    return std.mem.eql(u8, name, "deinit") or std.mem.eql(u8, name, "close");
+/// Whether a function only gives up what its receiver `holder` holds, by what its body does
+/// (`releases.zig`): it releases a field on every exit, and leaves each other untouched; or the
+/// type owns nothing and the body does nothing at all (`idle`). A body that uses a field or the
+/// receiver otherwise (real work: a flush, a count, a call handed the whole value), that releases
+/// nothing and does something, or a type that does not resolve, does not.
+fn releasesHeld(c: *Context, callee: Facts.Decl, holder: Ast.Node.Index) Error!bool {
+    try readStdReleases(c);
+    const function = switch (try c.facts.origin(callee)) {
+        .decl => |origin| origin,
+        .none => callee,
+        .unknown => return false,
+    };
+    var value = try c.facts.resolve(c.file, holder);
+    while (value == .pointer) value = value.pointer.child.*;
+    const container = switch (value) {
+        .instance, .container => |found| found,
+        // A receiver chosen per build is no one type to read.
+        .alternatives => return false,
+        else => return false,
+    };
+    var any = false;
+    var settled = true;
+    for (try c.facts.heldFields(container)) |field| {
+        const decl = field.decl orelse {
+            settled = false;
+            continue;
+        };
+        switch (try release_summary.released(c.facts, function, .{ .parameter = 0, .path = &.{decl} }, std_release)) {
+            .every_exit => any = true,
+            .untouched => {},
+            .unknown => settled = false,
+        }
+    }
+    return (any and settled) or (try ownsNothing(c, value) and idle(c, function));
 }
+
+/// Whether a function's body makes no call and no store: nothing it could drop by being skipped.
+fn idle(c: *Context, function: Facts.Decl) bool {
+    const tree = &c.project.at(function.file).file.tree;
+    const model = &c.project.at(function.file).model;
+    const whole = model.parentOf(model.declarations[@backingInt(function.index)].node) orelse return false;
+    if (formAt(tree, whole) != .fn_decl) return false;
+    const first = tree.firstToken(whole);
+    const last = tree.lastToken(whole);
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(node);
+        if (token < first or token > last) continue;
+        switch (accesses.formOf(tag)) {
+            .call, .builtin, .compound_assign, .destructure, .@"asm" => return false,
+            // `_ = x` stores nothing.
+            .assign => {
+                const target = tree.nodeData(node).node_and_node[0];
+                if (formAt(tree, target) != .leaf or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) return false;
+            },
+            else => {},
+        }
+    }
+    return true;
+}
+
+/// std's releases, read once for the summary, whose notion is given no `Context`.
+const StdReleases = struct { read: bool = false, decls: std.ArrayList(Facts.Decl) = .empty };
+
+fn readStdReleases(c: *Context) Error!void {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
+    const memo = try c.facts.memo(StdReleases);
+    if (memo.read) return;
+    memo.read = true;
+    for ([_][]const []const u8{ &handle_release_paths, &allocator_release_paths }) |paths| for (paths) |path| switch (try Governed.declarations(c, "std", path)) {
+        .decls => |decls| try memo.decls.appendSlice(c.allocator, decls),
+        // None known: nothing is read as released through it.
+        .none, .unknown => {},
+    };
+}
+
+fn stdRelease(facts: *Facts, callee: Facts.Decl, owner: Facts.Value) Facts.ResolveError!bool {
+    _ = owner;
+    const memo = try facts.memo(StdReleases);
+    const origin = switch (try facts.origin(callee)) {
+        .decl => |found| found,
+        .none => callee,
+        .unknown => return false,
+    };
+    for (memo.decls.items) |decl| if (std.meta.eql(decl, callee) or std.meta.eql(decl, origin)) return true;
+    return false;
+}
+const std_release: release_summary.Base = .{ .notion = .std_handle, .isRelease = stdRelease };
 
 /// The one reading of an owner here: whether a value owns nothing its drop leaks. It holds no
 /// address anywhere (`Facts.holdsNoAddress`: no memory it may own), no std resource by value
