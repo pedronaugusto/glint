@@ -2771,12 +2771,7 @@ fn argumentContext(c: *Context, file: Project.FileId, call: *const Facts.calls.C
 fn contextNamed(c: *Context, file: Project.FileId, argument: Ast.Node.Index) Context.Error!?Model.Declaration.Id {
     const tree = &c.project.at(file).file.tree;
     var at = Facts.ungrouped(tree, argument);
-    if (try Facts.accesses.pointed(c.facts, file, at)) |place| switch (try Facts.accesses.useOf(c.facts, file, place)) {
-        .address => |address| if (address == at) {
-            at = Facts.ungrouped(tree, place);
-        },
-        else => {},
-    };
+    if (try addressOperand(c, file, at)) |place| at = Facts.ungrouped(tree, place);
     if (try Facts.accesses.memberRead(c.facts, file, at) != null) return null;
     const decl = switch (try c.facts.definition(file, at)) {
         .decl => |decl| decl,
@@ -2794,6 +2789,16 @@ fn contextOf(c: *Context, file: Project.FileId, call: *const Facts.calls.Call) C
     // The receiver, the Io, the context.
     if (args.len != 3) return null;
     return contextNamed(c, file, args[2]);
+}
+
+/// The place `&x` at `node` takes the address of (`Facts.accesses.pointed`, where `node` is that
+/// `&` itself); null for any other node.
+fn addressOperand(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Ast.Node.Index {
+    const place = (try Facts.accesses.pointed(c.facts, file, node)) orelse return null;
+    return switch (try Facts.accesses.useOf(c.facts, file, place)) {
+        .address => |address| if (address == node) place else null,
+        else => null,
+    };
 }
 
 /// Whether a value is a guard (`guardValue`), and an Order's ranked one.
@@ -3791,7 +3796,7 @@ fn switchedOn(c: *Context, file: Project.FileId, node: Ast.Node.Index, hold: Sta
     var at = node;
     var converted = hold != .integral;
     while (true) switch (try Facts.accesses.useOf(c.facts, file, at)) {
-        .switched => |chosen| return converted or literalProngs(tree, tree.fullSwitch(chosen).?), // unreachable: what is switched on is a switch's
+        .switched => |chosen| return converted or try literalProngs(c, file, tree.fullSwitch(chosen).?), // unreachable: what is switched on is a switch's
         .carried => |onward| switch (onward.how) {
             .unwrapped, .grouped, .payload => at = onward.into,
             else => return false,
@@ -3823,16 +3828,15 @@ fn switchedOn(c: *Context, file: Project.FileId, node: Ast.Node.Index, hold: Sta
 
 /// Whether a switch's prongs are literals (`0 =>`, `'a' =>`, `1...3 =>`), as a state coded as
 /// an integer's are.
-fn literalProngs(tree: *const Ast, choice: Ast.full.Switch) bool {
+fn literalProngs(c: *Context, file: Project.FileId, choice: Ast.full.Switch) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
     var any = false;
     for (choice.ast.cases) |case_node| {
         const case = tree.fullSwitchCase(case_node).?; // unreachable: a switch's cases are cases.
         for (case.ast.values) |value| {
-            const literal = switch (tree.nodeTag(value)) {
-                .number_literal, .char_literal => true,
-                .switch_range => tree.nodeTag(tree.nodeData(value).node_and_node[0]) == .number_literal or tree.nodeTag(tree.nodeData(value).node_and_node[0]) == .char_literal,
-                else => false,
-            };
+            // A range's first bound (`1...3`).
+            const item = if (tree.nodeTag(value) == .switch_range) tree.nodeData(value).node_and_node[0] else value;
+            const literal = if (try c.facts.literalOf(file, item)) |known| known == .number or known == .char else false;
             if (!literal) return false;
             any = true;
         }
@@ -3901,13 +3905,18 @@ fn writtenThrough(c: *Context, file: Project.FileId, function: Ast.Node.Index, n
     var at = node;
     var steps: u8 = 0;
     while (steps < 32) : (steps += 1) {
-        switch (tree.nodeTag(at)) {
-            .field_access, .unwrap_optional, .grouped_expression => at = tree.nodeData(at).node_and_token[0],
-            .deref, .address_of => at = tree.nodeData(at).node,
-            .array_access, .slice_open => at = tree.nodeData(at).node_and_node[0],
-            .slice, .slice_sentinel => at = tree.fullSlice(at).?.ast.sliced, // unreachable: the tag is a slice's.
-            .identifier => {
-                const d = (model.reference(at) orelse return .other).declaration orelse return .other;
+        // To its root through members, elements, slices, `.?`, `.*` and parentheses
+        // (`Facts.accesses.pathOf`), then through `&`.
+        const path = try Facts.accesses.pathOf(c.facts, file, at);
+        const root = path.steps[path.steps.len - 1].node;
+        if (try addressOperand(c, file, root)) |place| {
+            at = place;
+            continue;
+        }
+        switch (path.root) {
+            .decl => |decl| {
+                if (decl.file != file) return .other;
+                const d = decl.index;
                 const record = model.declarations[@backingInt(d)];
                 if (enclosingFunction(model, tree, record.node) != function and record.node != function) return .other;
                 switch (record.kind) {
@@ -3915,10 +3924,10 @@ fn writtenThrough(c: *Context, file: Project.FileId, function: Ast.Node.Index, n
                     .capture => at = capturedBy(tree, model, record) orelse return .other,
                     .variable => {
                         const variable = tree.fullVarDecl(record.node) orelse return .other;
-                        const by_value = switch (try c.facts.resolve(file, at)) {
+                        const by_value = switch (try c.facts.resolve(file, root)) {
                             .instance, .array, .optional, .literal, .reified => true,
                             // Its type as written where its value does not resolve.
-                            .unknown => if (variable.ast.type_node.unwrap()) |written| tree.fullPtrType(written) == null and tree.nodeTag(written) != .optional_type else false,
+                            .unknown => if (variable.ast.type_node.unwrap()) |written| tree.fullPtrType(written) == null and Facts.accesses.formOf(tree.nodeTag(written)) != .optional_type else false,
                             else => false,
                         };
                         if (by_value) return if (returnsLocal(tree, model, function, d)) .made else .local;
@@ -3929,12 +3938,13 @@ fn writtenThrough(c: *Context, file: Project.FileId, function: Ast.Node.Index, n
                     else => return .other,
                 }
             },
-            else => {
+            .unknown => return .other,
+            .none => {
                 // A call's result held by pointer (`c.project.at(file)`): what its receiver holds.
                 var buffer: [1]Ast.Node.Index = undefined;
-                const call = tree.fullCall(&buffer, at) orelse return .other;
-                if (tree.nodeTag(call.ast.fn_expr) != .field_access) return .other;
-                at = tree.nodeData(call.ast.fn_expr).node_and_token[0];
+                const call = tree.fullCall(&buffer, root) orelse return .other;
+                const method = (try Facts.accesses.memberRead(c.facts, file, call.ast.fn_expr)) orelse return .other;
+                at = method.receiver.?; // unreachable: a member's step has its holder
             },
         }
     }
