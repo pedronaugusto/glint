@@ -847,8 +847,9 @@ test "P006 reads the replacements a package declares as one door: what only they
     defer stray.deinit();
     try std.testing.expect(stray.complete);
     try std.testing.expectEqualSlices(u32, &.{ 11, 13, 21 }, airlockLines(stray, &buffer));
-    // A call that may be of the helper does not resolve: undecided at its site, never exempt.
-    var unresolved = try replacedRun(door("const gone = @import(\"gone\");\npub fn reach() void {\n    gone.shared(1);\n}\n"));
+    // A method whose one call is on a value whose type does not resolve: that call may be of it, so
+    // its site is undecided, never exempt nor a finding.
+    var unresolved = try replacedRun(door("const Box = struct {\n    fd: i32,\n    fn flush(b: Box) void {\n        std.posix.fdatasync(b.fd);\n    }\n};\npub fn reach(b: anytype) void {\n    b.flush();\n}\n"));
     defer unresolved.deinit();
     try std.testing.expect(!unresolved.complete);
     try std.testing.expectEqualSlices(u32, &.{}, airlockLines(unresolved, &buffer));
