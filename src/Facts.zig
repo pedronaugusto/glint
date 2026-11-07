@@ -2954,8 +2954,10 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
                 .pointer => |to| switch (to.child.*) {
                     .array => to.child.*,
                     .unknown => to.child.*,
+                    .alternatives => .{ .array = to.child },
                     else => .{ .array = to.child },
                 },
+                .alternatives => .{ .unknown = .unsupported },
                 else => .{ .unknown = .unsupported },
             };
         },
@@ -4042,6 +4044,7 @@ fn memberValue(self: *Facts, lhs: Value, name: []const u8) ResolveError!Value {
         // An array's one member is its length, a number.
         .array => return if (std.mem.eql(u8, name, "len")) .scalar else .{ .unknown = .unresolved },
         .unknown => return lhs,
+        .alternatives => return .{ .unknown = .unresolved },
         else => return .{ .unknown = .unresolved },
     };
     // A tag named on an enum or a union type (`Color.red`, `Shape.empty`): a value of it.
@@ -6517,6 +6520,7 @@ fn indexed(self: *Facts, value: Value, _: void) ResolveError!Value {
         .pointer => |inner| switch (inner.child.*) {
             .array => |elements| elements.*,
             .literal => |literal| self.choose(try self.literalParts(literal)),
+            .alternatives => inner.child.*,
             else => inner.child.*,
         },
         // A tuple of no type of its own, named (`inline for (kinds) |kind|`): one of its parts.
@@ -8867,6 +8871,7 @@ pub fn definition(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Reso
             .primitive, .scalar, .error_set => return .none,
             // A choice of holders, each with its own member; any other value a member of which
             // is not read here.
+            .alternatives => return .{ .unknown = .unsupported },
             else => return .{ .unknown = .unsupported },
         };
         return .of(self.member(container, try self.memberName(tree.tokenSlice(data[1]))));
@@ -8893,6 +8898,7 @@ pub fn reflected(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resol
         .container, .instance => |c| c,
         .unknown => |why| return .{ .unknown = why },
         .primitive, .scalar, .error_set => return .none,
+        .alternatives => return .{ .unknown = .unsupported },
         else => return .{ .unknown = .unsupported },
     };
     if (container.symbolic) return .{ .unknown = .comptime_dependent };
@@ -13653,6 +13659,7 @@ pub const accesses = struct {
             const name = try w.spelled(args[1]) orelse return null;
             const container = switch (held(try w.facts.resolve(w.file, args[0]))) {
                 .instance, .container => |c| c,
+                .alternatives => return .{ .unknown = .unsupported },
                 else => return .{ .unknown = .unsupported },
             };
             const d = w.facts.member(container, name) orelse return .{ .unknown = .unsupported };
@@ -14557,13 +14564,16 @@ pub const calls = struct {
                     .instance => |c| c,
                     .pointer => |inner| switch (inner.child.*) {
                         .instance => |c| c,
+                        .alternatives => return .{ .unknown = .unsupported },
                         else => return .{ .unknown = .unsupported },
                     },
                     .optional => |inner| switch (inner.*) {
                         .instance => |c| c,
+                        .alternatives => return .{ .unknown = .unsupported },
                         else => return .{ .unknown = .unsupported },
                     },
                     .unknown => |why| return .{ .unknown = why },
+                    .alternatives => return .{ .unknown = .unsupported },
                     else => return .{ .unknown = .unsupported },
                 };
                 const decl = facts.member(container, name) orelse return .{ .unknown = .unresolved };
@@ -14593,6 +14603,7 @@ pub const calls = struct {
         return switch (value) {
             .instance, .pointer, .optional => .{ .bound = holder },
             .unknown => |why| .{ .unknown = why },
+            .alternatives => .{ .unknown = .unsupported },
             else => .{ .unknown = .unsupported },
         };
     }
@@ -15047,6 +15058,7 @@ fn placeType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
             const target = switch (try self.placeType(env, file, parent, depth + 1)) {
                 .pointer => |inner| inner.child.*,
                 .unknown => |why| return .{ .unknown = why },
+                .alternatives => return .{ .unknown = .unsupported },
                 else => return .{ .unknown = .unsupported },
             };
             var array_buffer: [2]Ast.Node.Index = undefined;
