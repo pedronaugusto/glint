@@ -9709,7 +9709,8 @@ pub fn callSites(self: *Facts, function: Decl) ResolveError!?[]const CallSite {
     const met = self.open_met;
     const found = try self.scanCallSites(function, .consumers, .aliases);
     // An alias's value read while a query of it is in progress may be provisional: asked again.
-    if (self.open_met == met) try read.map.put(self.gpa, function, found);
+    _ = met;
+    try read.map.put(self.gpa, function, found);
     return found;
 }
 
@@ -9724,7 +9725,8 @@ pub fn programCallSites(self: *Facts, function: Decl) ResolveError!?[]const Call
     const met = self.open_met;
     const found = try self.scanCallSites(function, .program, .fields);
     // An alias's value read while a query of it is in progress may be provisional: asked again.
-    if (self.open_met == met) try read.map.put(self.gpa, function, found);
+    _ = met;
+    try read.map.put(self.gpa, function, found);
     return found;
 }
 
@@ -9741,7 +9743,8 @@ fn namedCalls(self: *Facts, function: Decl) ResolveError!?usize {
     if (read.map.get(function)) |known| return known;
     const met = self.open_met;
     const found: ?usize = if (try self.scanCallSites(function, .program, .aliases)) |sites| sites.len else null;
-    if (self.open_met == met) try read.map.put(self.gpa, function, found);
+    _ = met;
+    try read.map.put(self.gpa, function, found);
     return found;
 }
 
