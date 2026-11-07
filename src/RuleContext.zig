@@ -217,11 +217,94 @@ pub fn configOf(self: *const RuleContext, file: Project.FileId) rules.Config {
 }
 /// Whether a token is test code: a test input, or inside a `test` block.
 pub fn inTest(self: *const RuleContext, token: std.zig.Ast.TokenIndex) bool {
-    if (self.project.at(self.file).input.classification == .@"test") return true;
-    const model = &self.project.at(self.file).model;
-    var scope: ?Model.Scope.Id = model.scopeOf(token);
+    return inTestScope(self.project.at(self.file), token);
+}
+/// Whether a token is test code, as a program's files are classified: inside a `test` block or
+/// a test input (`inTest`), or anywhere in a file only tests reach (`testReached`). One answer for
+/// every rule that reads test code so.
+pub fn inTestCode(self: *RuleContext, token: std.zig.Ast.TokenIndex) Error!bool {
+    return self.inTest(token) or try testReached(self, self.file);
+}
+
+/// Which files only tests reach, one entry a file by its id, found as each is asked and kept for
+/// the run.
+const TestReached = struct { known: []Reach = &.{} };
+const Reach = enum { unasked, asking, only_tests, not_only };
+
+/// Whether `file` is reached only from tests: imported somewhere, and every `@import` of it is
+/// in a `test` block or in a file only tests reach. A file nothing imports (a module's root, a
+/// test root the build names) is not: what the build compiles it as is not read here.
+fn testReached(self: *RuleContext, file: Project.FileId) Error!bool {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = self.keep();
+    defer self.allocator = rule_memory;
+    return testReachedIn(self, try self.facts.memo(TestReached), file, 0);
+}
+
+fn testReachedIn(self: *RuleContext, memo: *TestReached, file: Project.FileId, depth: usize) Error!bool {
+    if (memo.known.len == 0) {
+        memo.known = try self.allocator.alloc(Reach, self.project.sources.len);
+        @memset(memo.known, .unasked);
+    }
+    const entry = &memo.known[@backingInt(file)];
+    switch (entry.*) {
+        .unasked => {},
+        // Asked again while it is being read (an import cycle): not only tests', as nothing shows it.
+        .asking, .not_only => return false,
+        .only_tests => return true,
+    }
+    if (depth == 32) return false;
+    entry.* = .asking;
+    const only = try importedOnlyFromTests(self, memo, file, depth);
+    entry.* = if (only) .only_tests else .not_only;
+    return only;
+}
+
+fn importedOnlyFromTests(self: *RuleContext, memo: *TestReached, file: Project.FileId, depth: usize) Error!bool {
+    var imported = false;
+    for (self.project.imports, 0..) |edge, k| {
+        if (edge.target != file or !edge.in.inProgram()) continue;
+        // Each importer once: an earlier edge from it to `file` read its imports already.
+        const read = for (self.project.imports[0..k]) |earlier| {
+            if (earlier.from == edge.from and earlier.target == file and earlier.in.inProgram()) break true;
+        } else false;
+        if (read) continue;
+        const from = self.project.at(edge.from);
+        if (from.file.status != .parsed) return false;
+        const tree = &from.file.tree;
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            switch (tag) {
+                .builtin_call_two, .builtin_call_two_comma => {},
+                else => continue,
+            }
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import")) continue;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, node, &buffer);
+            if (args.len != 1 or tree.nodeTag(args[0]) != .string_literal) continue;
+            // The import as Facts reads it: the literal's value, resolved by the caller's
+            // mapping in the importing file's compilations (`Project.importedAll`).
+            const spelling = std.zig.string_literal.parseAlloc(self.allocator, tree.tokenSlice(tree.nodeMainToken(args[0]))) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidLiteral => continue,
+            };
+            var reached: [2]Project.FileId = undefined;
+            const targets = self.project.importedAll(edge.from, spelling, &reached);
+            if (std.mem.findScalar(Project.FileId, targets, file) == null) continue;
+            imported = true;
+            if (inTestScope(from, tree.nodeMainToken(node))) continue;
+            if (!try testReachedIn(self, memo, edge.from, depth + 1)) return false;
+        }
+    }
+    return imported;
+}
+
+/// Whether a token of `held` is test code: a test input, or inside a `test` block.
+fn inTestScope(held: *const Project.Source, token: Ast.TokenIndex) bool {
+    if (held.input.classification == .@"test") return true;
+    var scope: ?Model.Scope.Id = held.model.scopeOf(token);
     while (scope) |id| {
-        const each = &model.scopes[@backingInt(id)];
+        const each = &held.model.scopes[@backingInt(id)];
         if (each.kind == .@"test") return true;
         scope = each.parent;
     }

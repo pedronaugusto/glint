@@ -333,8 +333,65 @@ fn amendedPolicies(self: *Context) RunError!void {
             (if (loop.error_token != null) loop.ast.else_expr.unwrap() orelse continue else continue)
         else
             continue;
-        if (try discards(self, handler, 0)) try self.at(.Z026, tree.nodeMainToken(node), "an error handler that discards the error; write a reason at this site");
+        if (!try discards(self, handler, 0)) continue;
+        if (tree.fullIf(node)) |branch| if (try refusalAsserted(self, tree, branch)) continue;
+        try self.at(.Z026, tree.nodeMainToken(node), "an error handler that discards the error; write a reason at this site");
     };
+}
+
+/// Whether an `if`'s empty error branch is a test's assertion that the call fails: in test code
+/// (`RuleContext.inTestCode`: a `test` block, or a file only tests reach), its success branch
+/// leaves by an error (`leavesByError`), so the error is the assertion's pass, never discarded.
+/// In production code the same shape is how a real failure reads as an answer (a permission
+/// error read as "no such file"), and it stays a site; so does a `catch`, and a test's success
+/// branch that goes on.
+fn refusalAsserted(self: *Context, tree: *const Ast, branch: Ast.full.If) RunError!bool {
+    if (!leavesByError(tree, branch.ast.then_expr, 0)) return false;
+    return self.inTestCode(branch.payload_token orelse branch.ast.if_token);
+}
+
+/// Whether every path through `node` leaves its function by an error: it ends in `return` of an
+/// error (`return error.TestUnexpectedResult`) or in `@panic`, and nothing before that leaves or
+/// jumps any other way (`break`, `continue`, a `return` of a value). A `try` leaves by an error
+/// too, so it may stand anywhere.
+fn leavesByError(tree: *const Ast, written: Ast.Node.Index, depth: usize) bool {
+    if (depth == 8) return false;
+    const node = Facts.ungrouped(tree, written);
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.blockStatements(&buffer, node)) |statements| {
+        if (statements.len == 0) return false;
+        for (statements[0 .. statements.len - 1]) |statement| if (jumpsBut(tree, statement)) return false;
+        return leavesByError(tree, statements[statements.len - 1], depth + 1);
+    }
+    switch (tree.nodeTag(node)) {
+        .@"return" => {
+            const operand = tree.nodeData(node).opt_node.unwrap() orelse return false;
+            return tree.nodeTag(Facts.ungrouped(tree, operand)) == .error_value;
+        },
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@panic"),
+        else => return false,
+    }
+}
+
+/// Whether a statement holds a jump other than a `return` of an error: a `break`, a `continue`,
+/// or a `return` of anything else, anywhere inside it.
+fn jumpsBut(tree: *const Ast, statement: Ast.Node.Index) bool {
+    const first = tree.firstToken(statement);
+    const last = tree.lastToken(statement);
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        const inner: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(inner);
+        if (token < first or token > last) continue;
+        switch (tag) {
+            .@"break", .@"continue" => return true,
+            .@"return" => {
+                const operand = tree.nodeData(inner).opt_node.unwrap() orelse return true;
+                if (tree.nodeTag(Facts.ungrouped(tree, operand)) != .error_value) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
 }
 
 /// Whether an error's handler does nothing with it: an empty block, or one whose every

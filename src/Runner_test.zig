@@ -257,6 +257,46 @@ test "Z034 finds operators Zig 0.18 refuses to order without parentheses, and le
     , 0);
 }
 
+test "Z026 a test's refusal assertion is no discard, the same shape in production code is" {
+    const parse = "fn parse(b: []const u8) error{Bad}!u8 { return if (b.len == 1) b[0] else error.Bad; }\n";
+    // In a test, the success branch leaves by an error: the error branch is the assertion's pass.
+    try check(.Z026, parse ++ "test \"refused\" { if (parse(\"ab\")) |_| return error.TestUnexpectedResult else |_| {} }", 0);
+    try check(.Z026, parse ++ "test \"refused\" { if (parse(\"ab\")) |_| { @panic(\"read\"); } else |_| {} }", 0);
+    try check(.Z026, parse ++ "test \"refused\" { if (parse(\"ab\")) |v| { _ = v; return error.TestUnexpectedResult; } else |_| {} }", 0);
+    // The same shape in production code: a failure read as an answer, still a site.
+    try check(.Z026, parse ++ "pub fn present(b: []const u8) error{Missing}!void { if (parse(b)) |_| return error.Missing else |_| {} }", 1);
+    // A test's success branch that goes on, or may leave another way, answers nothing.
+    try check(.Z026, parse ++ "test \"used\" { var n: u8 = 0; if (parse(\"ab\")) |v| n = v else |_| {} try @import(\"std\").testing.expect(n == 0); }", 1);
+    try check(.Z026, parse ++ "test \"looped\" { for (0..2) |i| { if (parse(\"ab\")) |_| { if (i == 0) continue; return error.TestUnexpectedResult; } else |_| {} } }", 1);
+    // A `catch`, in a test too, stays a site.
+    try check(.Z026, parse ++ "test \"caught\" { _ = parse(\"ab\") catch {}; }", 1);
+}
+
+test "Z026 a refusal assertion in a file only tests reach is no discard" {
+    const helper = "fn parse(b: []const u8) error{Bad}!u8 { return if (b.len == 1) b[0] else error.Bad; }\npub fn refused() !void { if (parse(\"ab\")) |_| return error.TestUnexpectedResult else |_| {} }\n";
+    const cases = [_]struct { root: []const u8, expected: usize }{
+        // Imported only from a test block: test code.
+        .{ .root = "test { _ = @import(\"helper.zig\"); }", .expected = 0 },
+        // The same import spelled with an escape: read as its value, as Facts reads it.
+        .{ .root = "test { _ = @import(\"helper\\x2ezig\"); }", .expected = 0 },
+        // Imported by the program too: production code.
+        .{ .root = "const helper = @import(\"helper.zig\"); pub fn run() !void { try helper.refused(); } test { _ = helper; }", .expected = 1 },
+    };
+    for (cases) |case| {
+        var project = try glint.Project.init(std.testing.allocator, &.{
+            .{ .name = "root", .bytes = case.root },
+            .{ .name = "helper.zig", .bytes = helper },
+        }, &.{.{ .from = 0, .spelling = "helper.zig", .target = 1 }}, .{});
+        defer project.deinit();
+        var config = glint.Config.none();
+        config.set(.Z026, true);
+        var report = try glint.run(std.testing.allocator, &project, config);
+        defer report.deinit();
+        try std.testing.expectEqual(case.expected, report.diagnostics.len);
+        try std.testing.expect(report.complete);
+    }
+}
+
 test "G2 Z026 family reason policy includes cleanup and distinguishes handled errors" {
     try check(.Z026, "fn fallible() error{Failure}!void {} pub fn f() void { fallible() catch {}; defer fallible() catch {}; }", 2);
     try check(.Z026, "fn fallible() error{Failure}!void {} pub fn f() void { fallible() catch { return; }; }", 0);
