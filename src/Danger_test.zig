@@ -112,6 +112,7 @@ const std_files = [_]sources.Extra{
     \\pub fn takeByte(r: *@This()) !u8 { if (r.seek == r.end) return error.EndOfStream; return 0; }
     \\pub fn takeInt(r: *@This(), comptime T: type, endian: u1) !T { _ = endian; if (r.seek == r.end) return error.EndOfStream; return 0; }
     \\pub fn fill(r: *@This(), n: usize) !void { if (r.seek + n > r.end) return error.EndOfStream; }
+    \\pub fn takeFresh(r: *@This()) !usize { if (r.seek == r.end) return error.EndOfStream; return 0; }
     \\pub fn take(r: *@This(), n: usize) ![]u8 { try r.fill(n); return r.buffer; }
     \\pub fn toss(r: *@This(), n: usize) void { r.seek += n; assert(r.seek <= r.end); }
     \\fn assert(ok: bool) void { if (!ok) unreachable; }
@@ -3592,6 +3593,19 @@ test "A009 reads a while condition by what decides it, as A020 does: a variable 
         \\    }
         \\    return total;
         \\}
+    , 0);
+}
+
+test "a function of std's reader no list names is a read of a peer's number, never clean: what a new Zig adds is input until it is named" {
+    // Named nowhere: `takeFresh` is only the stub's. What it gives indexes unchecked.
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, t: []const u8) !u8 { const n = try r.takeFresh(); return t[n]; }
+    , 1);
+    // `fill`, which the list names as giving nothing, reads nothing.
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !void { try r.fill(1); }
     , 0);
 }
 

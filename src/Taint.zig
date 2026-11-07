@@ -2068,8 +2068,32 @@ fn fnDecl(c: *Context, decl: Facts.Decl) ?Ast.Node.Index {
     return if (tree.nodeTag(parent) == .fn_decl) parent else null;
 }
 
-/// std's `Io.Reader` functions that hand over what a peer sent.
-const reader_reads = [_][]const u8{ "allocRemaining", "allocRemainingAlignedSentinel", "appendExact", "appendRemaining", "appendRemainingAligned", "appendRemainingUnlimited", "buffered", "bufferedLen", "peek", "peekArray", "peekByte", "peekDelimiterExclusive", "peekDelimiterInclusive", "peekGreedy", "peekInt", "peekSentinel", "peekStruct", "peekStructPointer", "readAllocAll", "readAllocShort", "readSliceAll", "readSliceEndian", "readSliceEndianAlloc", "readSliceShort", "readVec", "readVecAll", "take", "takeArray", "takeByte", "takeByteSigned", "takeDelimiter", "takeDelimiterExclusive", "takeDelimiterInclusive", "takeEnum", "takeEnumNonexhaustive", "takeInt", "takeLeb128", "takeSentinel", "takeStruct", "takeStructPointer", "takeVarInt" };
+/// std's `Io.Reader` functions that hand over nothing a peer sent: its plumbing, and what moves
+/// or discards bytes without giving them. Every other function of the type reads as a read, so
+/// one a new Zig adds is input until it is named here, never clean.
+const reader_no_reads = [_][]const u8{ "Hashed", "defaultDiscard", "defaultReadVec", "defaultRebase", "discard", "discardAll", "discardAll64", "discardDelimiterExclusive", "discardDelimiterInclusive", "discardDelimiterLimit", "discardRemaining", "discardShort", "fill", "fillMore", "fixed", "hashed", "limited", "rebase", "stream", "streamDelimiter", "streamDelimiterEnding", "streamDelimiterLimit", "streamExact", "streamExact64", "streamExactPreserve", "streamRemaining", "toss", "tossBuffered", "writableVector", "writableVectorPosix", "writableVectorWsa" };
+
+/// std's `Io.Reader` reads that give bytes, no number decoded from them. Every other read decodes
+/// (`decodes`), so one a new Zig adds is a peer's number until it is named here.
+const reader_byte_reads = [_][]const u8{ "allocRemaining", "allocRemainingAlignedSentinel", "appendExact", "appendRemaining", "appendRemainingAligned", "appendRemainingUnlimited", "buffered", "bufferedLen", "peek", "peekArray", "peekByte", "peekDelimiterExclusive", "peekDelimiterInclusive", "peekGreedy", "peekSentinel", "peekStruct", "peekStructPointer", "readAllocAll", "readAllocShort", "readSliceAll", "readSliceEndian", "readSliceEndianAlloc", "readSliceShort", "readVec", "readVecAll", "take", "takeArray", "takeByte", "takeByteSigned", "takeDelimiter", "takeDelimiterExclusive", "takeDelimiterInclusive", "takeSentinel", "takeStruct", "takeStructPointer" };
+
+/// std's decoders outside `Io.Reader`, by path. A row below holds this list to the std glint is
+/// built with: a new one fails the build's tests rather than reading as no decoder.
+const std_decoders = [_][]const u8{ "fmt.parseInt", "fmt.parseIntSizeSuffix", "fmt.parseIntWithGenericCharacter", "fmt.parseUnsigned", "mem.readInt", "mem.readPackedInt", "mem.readVarInt" };
+
+/// Whether `decl` is a function `holder` declares itself (a nested type's is not).
+fn declaredIn(c: *Context, holder: Facts.Container, decl: Facts.Decl) bool {
+    const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+    return decl.file == holder.file and record.scope == holder.scope and record.kind == .function;
+}
+
+/// Whether `decl` is a read of std's `Io.Reader`: any function of it but `reader_no_reads`.
+fn readerRead(c: *Context, flow: *const Flow, decl: Facts.Decl) bool {
+    const reader = flow.reader orelse return false;
+    if (!declaredIn(c, reader, decl)) return false;
+    for (reader_no_reads) |each| if (memberIs(c, reader, each, decl)) return false;
+    return true;
+}
 
 /// Whether `decl` is the member `name` of the container `holder`, by its declaration.
 fn memberIs(c: *Context, holder: Facts.Container, name: []const u8, decl: Facts.Decl) bool {
@@ -2080,7 +2104,7 @@ fn memberIs(c: *Context, holder: Facts.Container, name: []const u8, decl: Facts.
 /// Whether a function outside the program reads a peer's input.
 fn source(c: *Context, flow: *Flow, decl: Facts.Decl) Context.Error!bool {
     for (flow.reads.items) |read| if (std.meta.eql(read, decl)) return true;
-    if (flow.reader) |reader| if (reader.file == decl.file) for (reader_reads) |read| if (memberIs(c, reader, read, decl)) return true;
+    if (readerRead(c, flow, decl)) return true;
     if (flow.file) |handle| for ([_][]const u8{ "readStreaming", "readPositional", "readPositionalAll" }) |read| if (memberIs(c, handle, read, decl)) return true;
     if (flow.dir) |dir| for ([_][]const u8{ "readFile", "readFileAlloc", "readFileAllocOptions", "readLink" }) |read| if (memberIs(c, dir, read, decl)) return true;
     return false;
@@ -2881,7 +2905,7 @@ fn resultOf(c: *Context, flow: *Flow, function: Function.Id, callee: Callee) Con
             // A read into the caller's buffer returns how much it read: a count the buffer
             // bounds, a peer's within it.
             if (!(try bufferParams(c, decl)).empty() and returnsCount(c, decl)) return .{ .level = .in(lanes, .data) };
-            if (try decodes(c, decl)) return .{ .level = .in(lanes, if (narrow(c, f.file, callee.params)) .data else .number) };
+            if (try decodes(c, flow, decl)) return .{ .level = .in(lanes, if (narrow(c, f.file, callee.params)) .data else .number) };
             return .{ .level = .in(lanes, .data) };
         },
         .outside => {
@@ -2911,7 +2935,7 @@ fn resultOf(c: *Context, flow: *Flow, function: Function.Id, callee: Callee) Con
             // `math`, `base64`), or one of them that decodes an integer, may make any number of
             // what it is given (`std.json` parsing a struct, a hash of the bytes). A decode of 16
             // bits or fewer stays in their range.
-            if (callee.receiver == null and (!flow.data_files.contains(@backingInt(decl.file)) or try decodes(c, decl))) return if (narrow(c, f.file, callee.params)) out else try out.widened(c.allocator);
+            if (callee.receiver == null and (!flow.data_files.contains(@backingInt(decl.file)) or try decodes(c, flow, decl))) return if (narrow(c, f.file, callee.params)) out else try out.widened(c.allocator);
             // A value clamped between the program's own bounds is held to them.
             if (try Governed.isStd(c, decl, "math.clamp") == .yes and callee.params.len == 3) {
                 if ((try dep(c, flow, function, callee.params[1])).clean() and (try dep(c, flow, function, callee.params[2])).clean()) return try out.narrowed(c.allocator);
@@ -2973,10 +2997,13 @@ fn narrow(c: *Context, file: Project.FileId, params: []const Ast.Node.Index) boo
 /// Whether a std function decodes an integer from bytes or text: `readInt` and its forms,
 /// `parseInt`, `parseUnsigned`, a reader's `takeInt`, `peekInt`, `takeVarInt`, `takeLeb128`,
 /// `takeEnum`.
-fn decodes(c: *Context, decl: Facts.Decl) Context.Error!bool {
-    for ([_][]const u8{ "mem.readInt", "mem.readVarInt", "mem.readPackedInt", "fmt.parseInt", "fmt.parseIntSizeSuffix", "fmt.parseUnsigned", "Io.Reader.takeInt", "Io.Reader.peekInt", "Io.Reader.takeVarInt", "Io.Reader.takeLeb128", "Io.Reader.takeEnum", "Io.Reader.takeEnumNonexhaustive" }) |decoder| {
-        if (try Governed.isStd(c, decl, decoder) == .yes) return true;
+fn decodes(c: *Context, flow: *const Flow, decl: Facts.Decl) Context.Error!bool {
+    if (readerRead(c, flow, decl)) {
+        const reader = flow.reader.?; // unreachable: `readerRead` holds it
+        for (reader_byte_reads) |each| if (memberIs(c, reader, each, decl)) return false;
+        return true;
     }
+    for (std_decoders) |decoder| if (try Governed.isStd(c, decl, decoder) == .yes) return true;
     return false;
 }
 
@@ -5424,6 +5451,27 @@ fn scaled(tree: *const Ast, model: *const Model, d: Model.Declaration.Id, value:
         return args.len > 0 and namesDeclaration(tree, model, args[0], d);
     };
     return false;
+}
+
+test "the lists of std's reads and decoders are this std's: a function they do not name fails here, as glint reads it as input until it is named" {
+    @setEvalBranchQuota(100_000);
+    const named = struct {
+        fn among(comptime name: []const u8, comptime list: []const []const u8) bool {
+            for (list) |each| if (std.mem.eql(u8, each, name)) return true;
+            return false;
+        }
+    }.among;
+    // Each entry is one of this std's, so a list cannot name what it lost.
+    inline for (reader_no_reads ++ reader_byte_reads) |name| try std.testing.expect(@hasDecl(std.Io.Reader, name));
+    // Every decoder `mem` and `fmt` declare by these stems is on the list.
+    inline for (.{ std.mem, std.fmt }, .{ "mem.", "fmt." }) |namespace, prefix| {
+        inline for (@typeInfo(namespace).@"struct".decl_names) |name| {
+            const decoder = comptime for ([_][]const u8{ "readInt", "readVarInt", "readPackedInt", "parseInt", "parseUnsigned" }) |stem| {
+                if (std.mem.startsWith(u8, name, stem)) break true;
+            } else false;
+            if (decoder) try std.testing.expect(comptime named(prefix ++ name, &std_decoders));
+        }
+    }
 }
 
 test "the aegis pack's facts fit one solve's lanes, and a set that needs more does not" {
