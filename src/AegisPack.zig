@@ -2493,9 +2493,11 @@ fn follow(c: *Context, tree: *const Ast, model: *const Model, decl: Model.Declar
 /// it held at the block's end, undecided where the walk does not decide.
 fn walkOwner(c: *Context, tree: *const Ast, model: *const Model, token: Ast.TokenIndex, k: Contract.Kind, scope: Ast.Node.Index, statements: []const Ast.Node.Index, path: []const []const u8, report: Ast.TokenIndex) Context.Error!void {
     const flow: Flow = .{ .c = c, .tree = tree, .model = model, .token = token, .kind = k, .scope = scope, .path = path };
+    why_len = 0;
     switch (try flow.walk(statements, .live)) {
         .paths => |paths| if (paths.falls == .live) if (path.len == 0) try fault(c, k, report, "recognized local acquisition reaches block end without cleanup; review ownership obligation") else try fault(c, k, report, "recognized acquisition held in a local's field reaches block end without cleanup; review ownership obligation"),
-        .split, .uncertain => try c.undecided(cleanup, tree.tokenStart(report), .unsupported, "cleanup/error exits/transfers/aliases require unsupported flow facts; no leak claimed"),
+        .split => try c.undecided(cleanup, tree.tokenStart(report), .unsupported, whyText(true)),
+        .uncertain => try c.undecided(cleanup, tree.tokenStart(report), .unsupported, whyText(false)),
     }
 }
 
@@ -3124,6 +3126,22 @@ fn fixedType(c: *Context, file: Project.FileId, node: Ast.Node.Index) bool {
 /// direct cleanup, a member of the owner used after its release or transfer (a result
 /// obligation's `deinit`, its check, aside), the owner's address discarded after release, an
 /// `errdefer` that releases it again on an error exit after that.
+
+var why_trail: [6]u32 = @splat(0);
+var why_len: usize = 0;
+fn unsure(line: u32) Flow.Outcome {
+    if (why_len < why_trail.len) {
+        why_trail[why_len] = line;
+        why_len += 1;
+    }
+    return .uncertain;
+}
+fn whyText(split: bool) []const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    buf.print(std.heap.page_allocator, "cleanup/error exits/transfers/aliases require unsupported flow facts; no leak claimed WHY{s}", .{if (split) " split" else ""}) catch return "WHY?";
+    for (why_trail[0..why_len]) |l| buf.print(std.heap.page_allocator, " {d}", .{l}) catch {};
+    return buf.items;
+}
 const Flow = struct {
     c: *Context,
     tree: *const Ast,
@@ -3217,9 +3235,9 @@ const Flow = struct {
                         continue;
                     },
                     .no => {},
-                    .unknown => return .uncertain,
+                    .unknown => return unsure(@src().line),
                 }
-                if (try f.uses(stmt) != .none) return .uncertain;
+                if (try f.uses(stmt) != .none) return unsure(@src().line);
             }
             // A place's owner moves with its holder, which is not followed whole.
             if (state == .live and !f.aggregate and !f.pointer and f.path.len == 0) if (try f.movedInto(stmt)) |aggregate| {
@@ -3245,7 +3263,7 @@ const Flow = struct {
             }
             if (state == .live and !f.aggregate and !f.pointer and try f.argument(stmt)) {
                 // Its error exits leave the owner with the caller: the call failed to take it.
-                const paths = (try f.jumps(stmt, state)).settled() orelse return .uncertain;
+                const paths = (try f.jumps(stmt, state)).settled() orelse return unsure(@src().line);
                 out.breaks.setUnion(paths.breaks);
                 out.continues.setUnion(paths.continues);
                 if (paths.falls == null) return .{ .paths = out };
@@ -3253,7 +3271,7 @@ const Flow = struct {
                 continue;
             }
             if (state == .live and !f.aggregate) if (try f.takes(stmt)) |outcome| {
-                const paths = outcome.settled() orelse return .uncertain;
+                const paths = outcome.settled() orelse return unsure(@src().line);
                 out.breaks.setUnion(paths.breaks);
                 out.continues.setUnion(paths.continues);
                 if (paths.falls == null) return .{ .paths = out };
@@ -3288,12 +3306,12 @@ const Flow = struct {
                     continue;
                 },
                 .no => {},
-                .unknown => return .uncertain,
+                .unknown => return unsure(@src().line),
             };
             const next = switch (try f.step(stmt, state)) {
                 .paths => |paths| paths,
                 .split => |split| return f.apart(split, statements[at + 1 ..], out),
-                .uncertain => return .uncertain,
+                .uncertain => return unsure(@src().line),
             };
             out.breaks.setUnion(next.breaks);
             out.continues.setUnion(next.continues);
@@ -3306,7 +3324,7 @@ const Flow = struct {
     /// The statements after a split, walked from each of its states with the flag's value it
     /// comes with; still split where they end apart. One flag at a time.
     fn apart(f: Flow, split: Split, rest: []const Ast.Node.Index, before: Paths) Context.Error!Outcome {
-        if (f.known != null) return .uncertain;
+        if (f.known != null) return unsure(@src().line);
         var out = before;
         out.breaks.setUnion(split.paths.breaks);
         out.continues.setUnion(split.paths.continues);
@@ -3314,7 +3332,7 @@ const Flow = struct {
         for (0..2) |value| {
             var each = f;
             each.known = .{ .flag = split.flag, .value = value == 1 };
-            const paths = (try each.walk(rest, split.when[value])).settled() orelse return .uncertain;
+            const paths = (try each.walk(rest, split.when[value])).settled() orelse return unsure(@src().line);
             out.breaks.setUnion(paths.breaks);
             out.continues.setUnion(paths.continues);
             falls[value] = paths.falls;
@@ -3334,7 +3352,7 @@ const Flow = struct {
                 if (f.mine(value) or f.carriesOwner(value)) return ends;
                 switch (try f.carried(value)) {
                     .yes => return ends,
-                    .unknown => return .uncertain,
+                    .unknown => return unsure(@src().line),
                     .no => {},
                 }
             },
@@ -3346,9 +3364,9 @@ const Flow = struct {
         // `x = a catch |e| handler` and `const x = a orelse handler`: the handler is a branch
         // taken when `a` fails, the statement goes on in the state `a` leaves otherwise.
         if (f.handled(stmt)) |parts| {
-            var out = (try f.leave(parts[0], state)).settled() orelse return .uncertain;
-            const handler = (try f.block(parts[1], state)).settled() orelse return .uncertain;
-            out.falls = meet(out.falls, handler.falls) catch return .uncertain;
+            var out = (try f.leave(parts[0], state)).settled() orelse return unsure(@src().line);
+            const handler = (try f.block(parts[1], state)).settled() orelse return unsure(@src().line);
+            out.falls = meet(out.falls, handler.falls) catch return unsure(@src().line);
             out.breaks.setUnion(handler.breaks);
             out.continues.setUnion(handler.continues);
             return .{ .paths = out };
@@ -3362,16 +3380,16 @@ const Flow = struct {
             // `if (owner) |*held|` on the live owner: the test reads no more than whether it
             // holds one, and where the optional is null it holds none (`capturesOwner`).
             const own = state == .live and f.overOwnOptional(branch);
-            var out: Paths = if (own) .{ .falls = state } else (try f.leave(branch.ast.cond_expr, state)).settled() orelse return .uncertain;
-            const then_paths = (try f.block(branch.ast.then_expr, state)).settled() orelse return .uncertain;
+            var out: Paths = if (own) .{ .falls = state } else (try f.leave(branch.ast.cond_expr, state)).settled() orelse return unsure(@src().line);
+            const then_paths = (try f.block(branch.ast.then_expr, state)).settled() orelse return unsure(@src().line);
             const otherwise: State = if (own) .released else state;
-            const else_paths: Paths = if (branch.ast.else_expr.unwrap()) |other| (try f.block(other, otherwise)).settled() orelse return .uncertain else .{ .falls = otherwise };
+            const else_paths: Paths = if (branch.ast.else_expr.unwrap()) |other| (try f.block(other, otherwise)).settled() orelse return unsure(@src().line) else .{ .falls = otherwise };
             for ([_]Paths{ then_paths, else_paths }) |paths| {
                 out.breaks.setUnion(paths.breaks);
                 out.continues.setUnion(paths.continues);
             }
             out.falls = meet(then_paths.falls, else_paths.falls) catch {
-                const flag = (try f.correlated(stmt, branch)) orelse return .uncertain;
+                const flag = (try f.correlated(stmt, branch)) orelse return unsure(@src().line);
                 // Both fall, as only states that are there differ.
                 const when: [2]State = if (flag.then) .{ else_paths.falls.?, then_paths.falls.? } else .{ then_paths.falls.?, else_paths.falls.? };
                 return .{ .split = .{ .paths = out, .flag = flag.declaration, .when = when } };
@@ -3381,12 +3399,12 @@ const Flow = struct {
         if (f.tree.fullWhile(stmt) != null or f.tree.fullFor(stmt) != null) return f.repeat(stmt, state);
         // An unlabeled `switch`: each prong a branch (its items are compile-time values).
         if (f.tree.fullSwitch(stmt)) |choice| if (choice.label_token == null) {
-            var out = (try f.leave(choice.ast.condition, state)).settled() orelse return .uncertain;
+            var out = (try f.leave(choice.ast.condition, state)).settled() orelse return unsure(@src().line);
             var falls: ?State = null;
             for (choice.ast.cases) |node| {
                 const prong = f.tree.fullSwitchCase(node).?; // unreachable: a switch's cases are cases
-                const paths = (try f.block(prong.ast.target_expr, state)).settled() orelse return .uncertain;
-                falls = meet(falls, paths.falls) catch return .uncertain;
+                const paths = (try f.block(prong.ast.target_expr, state)).settled() orelse return unsure(@src().line);
+                falls = meet(falls, paths.falls) catch return unsure(@src().line);
                 out.breaks.setUnion(paths.breaks);
                 out.continues.setUnion(paths.continues);
             }
@@ -3565,22 +3583,22 @@ const Flow = struct {
         }
         var out: Paths = .{};
         for (heads[0..head_count]) |head| {
-            const paths = (try f.leave(head, state)).settled() orelse return .uncertain;
+            const paths = (try f.leave(head, state)).settled() orelse return unsure(@src().line);
             out.breaks.setUnion(paths.breaks);
             out.continues.setUnion(paths.continues);
         }
         for (inputs) |input| {
-            const paths = (try f.leave(input, state)).settled() orelse return .uncertain;
+            const paths = (try f.leave(input, state)).settled() orelse return unsure(@src().line);
             out.breaks.setUnion(paths.breaks);
             out.continues.setUnion(paths.continues);
         }
-        const looped = (try inner.block(body, state)).settled() orelse return .uncertain;
-        if (looped.falls) |back| if (back != state) return .uncertain;
-        if (!looped.continues.subsetOf(.initOne(state))) return .uncertain;
+        const looped = (try inner.block(body, state)).settled() orelse return unsure(@src().line);
+        if (looped.falls) |back| if (back != state) return unsure(@src().line);
+        if (!looped.continues.subsetOf(.initOne(state))) return unsure(@src().line);
         var ways = looped.breaks;
         if (bounded) {
             if (otherwise) |node| {
-                const paths = (try f.block(node, state)).settled() orelse return .uncertain;
+                const paths = (try f.block(node, state)).settled() orelse return unsure(@src().line);
                 if (paths.falls) |next| ways.insert(next);
                 out.breaks.setUnion(paths.breaks);
                 out.continues.setUnion(paths.continues);
@@ -3588,7 +3606,7 @@ const Flow = struct {
         }
         var it = ways.iterator();
         out.falls = it.next();
-        if (it.next() != null) return .uncertain;
+        if (it.next() != null) return unsure(@src().line);
         return .{ .paths = out };
     }
 
@@ -3610,7 +3628,7 @@ const Flow = struct {
         switch (try f.uses(node)) {
             .none => {},
             .members => if (state == .released) try fault(f.c, f.kind, f.firstUse(node), "same local owner used after its cleanup or transfer on every path here"),
-            .other => return .uncertain,
+            .other => return unsure(@src().line),
         }
         return f.jumps(node, state);
     }
@@ -3642,9 +3660,9 @@ const Flow = struct {
                 .loop_continue => out.continues.insert(at),
                 .out => {
                     const fails = (f.errdeferred or f.exits != null) and try failing(f.c, f.tree, jumping);
-                    if (!try f.exit(main, fails, at)) return .uncertain;
+                    if (!try f.exit(main, fails, at)) return unsure(@src().line);
                 },
-                .other => return .uncertain,
+                .other => return unsure(@src().line),
             }
         }
         switch (f.tree.nodeTag(node)) {
@@ -3723,15 +3741,15 @@ const Flow = struct {
             .always => .released,
             .on_success => .live,
         };
-        var paths = (try f.jumps(if (handler != null) call else node, failed)).settled() orelse return .uncertain;
+        var paths = (try f.jumps(if (handler != null) call else node, failed)).settled() orelse return unsure(@src().line);
         if (handler) |h| {
-            const caught = (try f.block(h, failed)).settled() orelse return .uncertain;
+            const caught = (try f.block(h, failed)).settled() orelse return unsure(@src().line);
             paths.breaks.setUnion(caught.breaks);
             paths.continues.setUnion(caught.continues);
-            paths.falls = meet(.released, caught.falls) catch return .uncertain;
+            paths.falls = meet(.released, caught.falls) catch return unsure(@src().line);
         } else if (returned and node == call and try f.c.facts.resolve(f.c.file, call) == .error_union) {
             // `return call(&owner)`: its error is returned as it comes.
-            if (!try f.exit(f.tree.nodeMainToken(stmt), true, failed)) return .uncertain;
+            if (!try f.exit(f.tree.nodeMainToken(stmt), true, failed)) return unsure(@src().line);
         }
         if (paths.falls != null) paths.falls = if (returned) null else .released;
         return .{ .paths = paths };
