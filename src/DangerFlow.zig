@@ -264,7 +264,9 @@ pub fn boundedWork(c: *Context, rule: Rule) Context.Error!void {
             .no => {},
         }
     }
-    // What the program hands std that std sizes memory or work by (Taint.sinkSites).
+    // What the program hands std that std sizes memory by (Taint.sinkSites): one finding a
+    // value, though std may size by both its number and its length.
+    var reported: std.AutoHashMapUnmanaged(Ast.Node.Index, void) = .empty;
     for (try Taint.sinkSites(c, flow, c.file)) |found| {
         if (!site(c, found.at)) continue;
         var buffer: [1]Ast.Node.Index = undefined;
@@ -274,11 +276,17 @@ pub fn boundedWork(c: *Context, rule: Rule) Context.Error!void {
             // holds and fails past them: no work a peer sizes, unless the read allocates.
             if (fromReader(flow, decl) and call != null and try ownReader(c, flow, call.?) and !try allocates(c, decl)) continue;
         }
-        const read = if (found.length) try Taint.lengthAt(c, flow, c.file, found.value) else try ranged(c, flow, found.value);
+        // A count the callee repeats by is its number, never a length (`Taint.countAt`).
+        const read = if (found.count) try Taint.countAt(c, flow, c.file, found.value) else if (found.length) try Taint.lengthAt(c, flow, c.file, found.value) else try ranged(c, flow, found.value);
         // Not input, it is no site whatever its call's instantiation decides; input or not
         // known, read as that instantiation reads it.
         if (read != .unknown and !read.reaches(flow.spec.reaches)) continue;
         const sized = (try Taint.decidedSite(c, flow, found)) orelse continue;
+        // A count the call's instantiation repeats by: its number alone (`Taint.countAt`).
+        if (sized.count and !found.count) {
+            const counted = try Taint.countAt(c, flow, c.file, sized.value);
+            if (counted != .unknown and !counted.reaches(flow.spec.reaches)) continue;
+        }
         // What std takes only kept to a range is data, a peer's number or not.
         const level: Taint.Level = if (sized.narrowed and read == .number) .data else read;
         if (level != .unknown and !level.reaches(flow.spec.reaches)) continue;
@@ -286,6 +294,7 @@ pub fn boundedWork(c: *Context, rule: Rule) Context.Error!void {
         // bounded by it.
         if (!sized.length and try capped(c, flow, sized.value)) continue;
         const name = if (sized.callee) |decl| c.project.at(decl.file).model.declarations[@backingInt(decl.index)].name else tree.tokenSlice(tree.lastToken(sized.callee_expr));
+        if ((try reported.getOrPut(c.allocator, sized.value)).found_existing) continue;
         if (!sized.decided and level.reaches(flow.spec.reaches)) {
             try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(sized.value)), .unresolved, try c.allocator.print("{s} is given a number from input through a call that does not resolve: what it sizes by it is not known", .{name}));
             continue;

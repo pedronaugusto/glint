@@ -4096,7 +4096,9 @@ test "A012 gives a function handed out no length for a parameter whose type has 
         \\}
         \\pub const handed = .{ &number, &bytes };
     , &(std_files ++ [_]sources.Extra{keys}), &(std_imports ++ [_]sources.ExtraImport{ .{ .from = 0, .spelling = "keys.zig", .target = std_files.len }, .{ .spelling = "keys.zig", .target = std_files.len } }));
-    try std.testing.expectEqual(1, found.findings);
+    // Neither sizes a thing: a loop over memory, a slice key's bytes as many as they are, is
+    // what reading it is (A012, docs/design.md), and a `u32` key's are its type's.
+    try std.testing.expectEqual(0, found.findings);
     try std.testing.expectEqual(0, found.undecided);
 }
 

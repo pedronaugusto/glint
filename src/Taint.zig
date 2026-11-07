@@ -234,6 +234,15 @@ const Slots = struct {
         return .{ .word = word, .tail = tail };
     }
 
+    /// Its slots of parameters' values (even slots, `valueSlot`), none of their lengths.
+    fn values(s: Slots, gpa: Allocator) Allocator.Error!Slots {
+        const even: u64 = 0x5555_5555_5555_5555;
+        if (s.tail.len == 0) return .{ .word = s.word & even };
+        const tail = try gpa.alloc(u64, s.tail.len);
+        for (tail, s.tail) |*out, w| out.* = w & even;
+        return .{ .word = s.word & even, .tail = tail };
+    }
+
     /// The same set, its tail on `gpa`.
     fn kept(s: Slots, gpa: Allocator) Allocator.Error!Slots {
         return .{ .word = s.word, .tail = if (s.tail.len == 0) &.{} else try gpa.dupe(u64, s.tail) };
@@ -507,6 +516,10 @@ pub const Flow = struct {
     /// the allocator a size; not known where std's allocator does not resolve.
     allocations: std.AutoHashMapUnmanaged(Facts.Decl, void) = .empty,
     allocations_known: bool = true,
+    /// Per function of a summary, the value slots it sizes only as a count: a loop bounded by
+    /// the parameter (`for (0..n)`), or a callee's count it is handed. A count takes a caller's
+    /// number, never a length (`countDep`). Kept beside the functions, absent for one with none.
+    counts: std.AutoHashMapUnmanaged(Function.Id, Slots) = .empty,
     /// The sinks a rule reads in each function of a file the run does not select (a
     /// dependency's), by the rule and the function (`functionKey`), read once: what each takes
     /// from its function's parameters, judged at the calls that reach it (`PassedSink`,
@@ -4545,6 +4558,8 @@ pub const SinkSite = struct {
     /// Every instantiation's summary takes it through a call that does not resolve: the
     /// instantiation this call makes may decide it (`decidedSite`), read only where asked.
     refine: bool = false,
+    /// The callee repeats work by it alone, as a count: judged by its number (`countAt`).
+    count: bool = false,
 };
 
 /// `site` as the instantiation its call makes reads it (`instanceSizes`), where every
@@ -4560,6 +4575,14 @@ pub fn decidedSite(c: *Context, fact: Fact, site: SinkSite) Context.Error!?SinkS
         .allocation => .{ site.position > 0 and !site.length, false, false },
         .unknown => .{ false, false, true },
     };
+    // A count this instantiation repeats by (`Flow.counts`): its number, decided.
+    if (!sure and !ranged and !site.length and summary == .read and summary.read.counts.has(valueSlot(site.position))) {
+        var out = site;
+        out.count = true;
+        out.decided = true;
+        out.refine = false;
+        return out;
+    }
     if (!sure and !ranged and !maybe) return null;
     var out = site;
     out.narrowed = !sure and ranged and !maybe;
@@ -4735,6 +4758,73 @@ fn carries(c: *Context, fact: Fact, file: Project.FileId, callee: Callee) Contex
 }
 
 /// The level of the length of the memory `node` gives, as the fact reads it.
+/// The level of the count `node` gives (`countDep`): its number, never a length.
+pub fn countAt(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Index) Context.Error!Level {
+    const function = owner(fact.flow, file, node) orelse return .clean;
+    return concrete(fact.flow, function, try countDep(c, fact.flow, function, node, 0)).at(fact.lane);
+}
+
+/// What decides a count `node` gives: its number, a length adding nothing (`s.len`, and so
+/// `width - s.len` is `width`'s): a length never becomes a number a loop repeats by. A
+/// literal adds nothing; arithmetic, a choice, `@min`, `@max` and a cast join their operands;
+/// a local constant is its initializer's. Anything else is what it depends on (`dep`).
+fn countDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index, depth: u8) Context.Error!Dep {
+    const f = flow.functions.items[@backingInt(function)];
+    const tree = &c.project.at(f.file).file.tree;
+    const model = &c.project.at(f.file).model;
+    const at = Facts.ungrouped(tree, node);
+    if (depth > 8) return dep(c, flow, function, at);
+    switch (tree.nodeTag(at)) {
+        .number_literal, .char_literal => return .{},
+        .field_access => if (std.mem.eql(u8, tree.tokenSlice(tree.lastToken(at)), "len") and try c.facts.memoryField(f.file, at) != .field) return .{},
+        .add, .sub, .mul, .div, .mod, .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .shl, .shr, .bit_and, .bit_or, .bit_xor => {
+            const lhs, const rhs = tree.nodeData(at).node_and_node;
+            return (try countDep(c, flow, function, lhs, depth + 1)).join(c.allocator, try countDep(c, flow, function, rhs, depth + 1));
+        },
+        .@"if", .if_simple => {
+            const choice = tree.fullIf(at).?; // unreachable: tagged an if
+            var out = try countDep(c, flow, function, choice.ast.then_expr, depth + 1);
+            if (choice.ast.else_expr.unwrap()) |other| out = try out.join(c.allocator, try countDep(c, flow, function, other, depth + 1));
+            return out;
+        },
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+            const name = tree.tokenSlice(tree.nodeMainToken(at));
+            const passes_through = std.mem.eql(u8, name, "@min") or std.mem.eql(u8, name, "@max") or std.mem.eql(u8, name, "@intCast") or std.mem.eql(u8, name, "@truncate") or std.mem.eql(u8, name, "@as");
+            if (passes_through) {
+                var buffer: [2]Ast.Node.Index = undefined;
+                const args = Facts.builtinArgs(tree, at, &buffer);
+                // `@as(T, x)`'s type adds nothing.
+                const from: usize = if (std.mem.eql(u8, name, "@as")) 1 else 0;
+                var out: Dep = .{};
+                for (args[@min(from, args.len)..]) |arg| out = try out.join(c.allocator, try countDep(c, flow, function, arg, depth + 1));
+                return out;
+            }
+        },
+        .identifier => if (model.reference(at)) |ref| if (ref.declaration) |d| {
+            const record = model.declarations[@backingInt(d)];
+            if (record.kind == .variable and f.position(d) == null) if (tree.fullVarDecl(record.node)) |variable| {
+                if (tree.tokenTag(variable.ast.mut_token) == .keyword_const) if (variable.ast.init_node.unwrap()) |init| return countDep(c, flow, function, init, depth + 1);
+            };
+        },
+        else => {},
+    }
+    // A tuple or an array written in place (`.{ name, width }`, a format's arguments): each
+    // element's count.
+    var buffer: [2]Ast.Node.Index = undefined;
+    const elements: ?[]const Ast.Node.Index = if (tree.fullArrayInit(&buffer, at)) |list| list.ast.elements else if (tree.fullStructInit(&buffer, at)) |literal| literal.ast.fields else null;
+    if (elements) |each| {
+        var out: Dep = .{};
+        for (each) |element| out = try out.join(c.allocator, try countDep(c, flow, function, element, depth + 1));
+        return out;
+    }
+    // Memory is no count: a slice, a pointer or an array repeats nothing by its value.
+    switch (try c.facts.resolve(f.file, at)) {
+        .pointer, .array, .function, .fn_type => return .{},
+        else => {},
+    }
+    return dep(c, flow, function, at);
+}
+
 pub fn lengthAt(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Index) Context.Error!Level {
     const function = owner(fact.flow, file, node) orelse return .clean;
     return concreteLength(fact.flow, function, try dep(c, fact.flow, function, node)).at(fact.lane);
@@ -4839,6 +4929,11 @@ fn sizeSites(c: *Context, sized: *Flow, file: Project.FileId, callee: Callee, ou
     for (callee.args, 0..) |arg, position| {
         // A comptime parameter is fixed when the program is compiled: no input sizes by it.
         if (summary == .read and summary.read.fixed.has(position)) continue;
+        // A count the callee repeats by (`splatBytesAll(x, n)`): judged by the argument's number,
+        // never a length (`countAt`), decided where only a call that does not resolve leaves
+        // the value maybe besides.
+        const counted = summary == .read and summary.read.counts.has(valueSlot(position)) and !summary.read.sure.has(valueSlot(position)) and !summary.read.ranged.has(valueSlot(position));
+        if (counted) try out.append(c.allocator, .{ .file = file, .value = arg, .at = callee.node, .callee_expr = callee.callee_expr, .callee = callee.decl, .position = position, .count = true });
         for ([_]bool{ false, true }) |length| {
             const slot = if (length) lengthSlot(position) else valueSlot(position);
             const sure, const ranged, const maybe = switch (summary) {
@@ -4848,6 +4943,7 @@ fn sizeSites(c: *Context, sized: *Flow, file: Project.FileId, callee: Callee, ou
                 .unknown => .{ false, false, true },
             };
             if (!sure and !ranged and !maybe) continue;
+            if (counted and !length) continue;
             // Kept to a range on one path and taken through a call that does not resolve on
             // another, it may be taken whole: undecided, not data.
             try out.append(c.allocator, .{ .file = file, .value = arg, .at = callee.node, .callee_expr = callee.callee_expr, .callee = callee.decl, .position = position, .length = length, .narrowed = !sure and ranged and !maybe, .decided = sure or (ranged and !maybe), .refine = refine });
@@ -4871,7 +4967,7 @@ fn sizesOf(c: *Context, sized: *Flow, decl: ?Facts.Decl) Context.Error!Summary {
     if (c.facts.read_records and sized.shared == null) if (try openSizes(c, d)) |summary| return summary;
     const id = sized.by_node.get(.{ .file = d.file, .node = node }) orelse return .unknown;
     const f = sized.functions.items[@backingInt(id)];
-    return .{ .read = .{ .sure = f.sizes, .ranged = f.ranged_sizes, .maybe = f.maybe_sizes, .fixed = f.fixed } };
+    return .{ .read = .{ .sure = f.sizes, .ranged = f.ranged_sizes, .maybe = f.maybe_sizes, .fixed = f.fixed, .counts = sized.counts.get(id) orelse .{} } };
 }
 
 /// What std's open-world record of `decl` sizes work by (`OpenUnit`), read and closed there the
@@ -4894,7 +4990,7 @@ fn openSizes(c: *Context, decl: Facts.Decl) Context.Error!?Summary {
     const id = unit_flow.by_node.get(.{ .file = file, .node = node }) orelse return .unknown;
     const f = unit_flow.functions.items[@backingInt(id)];
     if (f.exhausted) return .unknown;
-    return .{ .read = .{ .sure = f.sizes, .ranged = f.ranged_sizes, .maybe = f.maybe_sizes, .fixed = f.fixed } };
+    return .{ .read = .{ .sure = f.sizes, .ranged = f.ranged_sizes, .maybe = f.maybe_sizes, .fixed = f.fixed, .counts = unit_flow.counts.get(id) orelse .{} } };
 }
 
 /// Closes what `next` holds in std's open-world summary on a budget of its own, a file's as the
@@ -4942,13 +5038,18 @@ const SizeRecord = struct { at: Facts.Key, exhausted: bool = false, sure: Slots,
 
 fn writeSizes(w: *Records.Writer, flow: *const Flow) Records.WriteError!void {
     try w.number(@intCast(flow.functions.items.len));
-    for (flow.functions.items) |f| {
+    for (flow.functions.items, 0..) |f, id| {
+        const counted = flow.counts.get(@fromBackingInt(@intCast(id))) orelse Slots{};
         try w.key(.{ .file = f.file, .node = f.node });
         try w.number(@intFromBool(f.exhausted));
-        for ([_]Slots{ f.sizes, f.ranged_sizes, f.maybe_sizes, f.fixed }) |set| {
-            try w.wide(set.word);
-            try w.number(@intCast(set.tail.len));
-            for (set.tail) |word| try w.wide(word);
+        // A count is recorded as a size (`sure`): a record answers no less than the run, its
+        // count's caller read whole.
+        for ([_]Slots{ f.sizes, f.ranged_sizes, f.maybe_sizes, f.fixed }, 0..) |set, k| {
+            const with: Slots = if (k == 0) counted else .{};
+            try w.wide(set.word | with.word);
+            const len = @max(set.tail.len, with.tail.len);
+            try w.number(@intCast(len));
+            for (0..len) |i| try w.wide((if (i < set.tail.len) set.tail[i] else 0) | (if (i < with.tail.len) with.tail[i] else 0));
         }
     }
 }
@@ -4990,7 +5091,9 @@ fn checkSizes(c: *Context, flow: *const Flow) Context.Error!void {
     for (back) |one| {
         const id = flow.by_node.get(one.at) orelse std.debug.panic("summary cross-check: a size summary reads back a function it does not hold", .{});
         const f = flow.functions.items[@backingInt(id)];
-        if (!one.sure.eql(f.sizes) or !one.ranged.eql(f.ranged_sizes) or !one.maybe.eql(f.maybe_sizes) or !one.fixed.eql(f.fixed)) std.debug.panic("summary cross-check: a size summary reads back other sizes", .{});
+        // A count is recorded as a size (`writeSizes`).
+        const recorded = f.sizes.unite(c.facts.gpa, flow.counts.get(id) orelse .{}) catch |err| std.debug.panic("summary cross-check: {t}", .{err});
+        if (!one.sure.eql(recorded) or !one.ranged.eql(f.ranged_sizes) or !one.maybe.eql(f.maybe_sizes) or !one.fixed.eql(f.fixed)) std.debug.panic("summary cross-check: a size summary reads back other sizes", .{});
     }
     // The summary of every instantiation is what a unit's record answers for. One closed short
     // of the file's budget (`Facts.short`) is no measure of it: what came back unknown(budget) sizes as it may, so
@@ -5106,7 +5209,7 @@ fn checkOpen(c: *Context, flow: *const Flow) Context.Error!void {
         const f = flow.functions.items[@backingInt(id)];
         const sized_by = try one.sure.unite(c.facts.gpa, one.maybe);
         const at_most = try sized_by.unite(c.facts.gpa, one.ranged);
-        if (!f.sizes.subset(sized_by) or !f.maybe_sizes.subset(sized_by) or !f.ranged_sizes.subset(at_most) or !one.fixed.subset(f.fixed)) {
+        if (!f.sizes.subset(sized_by) or !(flow.counts.get(id) orelse Slots{}).subset(sized_by) or !f.maybe_sizes.subset(sized_by) or !f.ranged_sizes.subset(at_most) or !one.fixed.subset(f.fixed)) {
             const tree = &c.project.at(f.file).file.tree;
             const location = tree.tokenLocation(0, tree.firstToken(f.node));
             std.debug.panic("summary cross-check: std's open-world size record of {s}:{d} is decided further than the run's summary (sure, ranged, maybe, fixed: record {x} {x} {x} {x}, run {x} {x} {x} {x})", .{ c.project.at(f.file).input.name, location.line + 1, one.sure.word, one.ranged.word, one.maybe.word, one.fixed.word, f.sizes.word, f.ranged_sizes.word, f.maybe_sizes.word, f.fixed.word });
@@ -5115,7 +5218,7 @@ fn checkOpen(c: *Context, flow: *const Flow) Context.Error!void {
 }
 
 /// What a function outside the program sizes by, by slot (`sizesOf`).
-const Summary = union(enum) { read: struct { sure: Slots, ranged: Slots, maybe: Slots, fixed: Slots }, allocation, unknown };
+const Summary = union(enum) { read: struct { sure: Slots, ranged: Slots, maybe: Slots, fixed: Slots, counts: Slots = .{} }, allocation, unknown };
 
 const Allocation = enum { yes, no, unknown };
 
@@ -5320,25 +5423,51 @@ fn readIn(c: *Context, flow: *Flow, id: Function.Id, env: ?*const Facts.Env, nex
     try next.append(c.allocator, .{ .id = id, .env = env });
 }
 
-/// What a function of a summary sizes work by (`Function.sizes`): every argument of an
-/// allocation; through a callee the summary reads, what it is given where that one sizes by;
-/// a loop's pass count where a counter steps toward a bound by a sum (`i += 1`), or a range or
-/// an input's length decides it. A call that does not resolve, or a loop counted otherwise,
-/// may size by what it is given (`maybe_sizes`); one whose counter shrinks or grows by a
-/// factor (`a /= 10`, `n <<= 1`) passes as often as its type has digits.
+/// What a function of a summary sizes by (`Function.sizes`): every argument of an allocation;
+/// through a callee the summary reads, what it is given where that one sizes by; and a loop
+/// whose bound is an integer parameter of the function itself (`for (0..n)`, `while (i < n)`
+/// stepped by a sum, `n` directly or adjusted by a constant): one operation repeated as often
+/// as that number says, by the parameter's value. A call that does not resolve may size by
+/// what it is given (`maybe_sizes`). Any other loop sizes nothing: one over memory or to a
+/// length (`for (bytes)`, `while (i < s.len)`), to a field or an option, or to anything a slice
+/// gives, grows with what the program holds, which is what reading it is (A012,
+/// docs/design.md); a loop a peer's number drives in the program is A020's.
 fn sizing(c: *Context, flow: *Flow, function: Function.Id) Context.Error!void {
     const f = flow.functions.items[@backingInt(function)];
-    var sizes: Sizes = .{ .sure = f.sizes, .ranged = f.ranged_sizes, .maybe = f.maybe_sizes };
+    const counted = flow.counts.get(function) orelse Slots{};
+    var sizes: Sizes = .{ .sure = f.sizes, .ranged = f.ranged_sizes, .maybe = f.maybe_sizes, .counts = counted };
+    const tree = &c.project.at(f.file).file.tree;
     for (f.nodes) |node| {
         if (try resolveCall(c, flow, f.file, node)) |callee| {
             try sizedBy(c, flow, function, callee, &sizes);
             continue;
         }
-        const counted = try countOf(c, flow, function, node) orelse continue;
-        switch (counted.kind) {
-            .sure => try sizes.add(c.allocator, counted.by),
-            .maybe => try sizes.addMaybe(c.allocator, counted.by),
+        if (tree.fullFor(node)) |loop| {
+            for (loop.ast.inputs) |input| {
+                if (tree.nodeTag(input) != .for_range) continue;
+                const last = tree.nodeData(input).node_and_opt_node[1].unwrap() orelse continue;
+                if (try boundParameter(c, flow, function, last)) |index| sizes.counts = try sizes.counts.with(c.allocator, valueSlot(index));
+            }
+            continue;
         }
+        const w = tree.fullWhile(node) orelse continue;
+        const cond = Facts.ungrouped(tree, w.ast.cond_expr);
+        switch (tree.nodeTag(cond)) {
+            .less_than, .less_or_equal, .greater_than, .greater_or_equal, .bang_equal => {},
+            else => continue,
+        }
+        const sides = tree.nodeData(cond).node_and_node;
+        var bound: ?usize = null;
+        for ([_]Ast.Node.Index{ sides[0], sides[1] }) |side| {
+            if (try boundParameter(c, flow, function, side)) |index| bound = index;
+        }
+        const index = bound orelse continue;
+        if (try stepsOf(c, flow, function, node, w.ast.cond_expr) != .sum) continue;
+        sizes.counts = try sizes.counts.with(c.allocator, valueSlot(index));
+    }
+    if (!sizes.counts.eql(counted)) {
+        try flow.counts.put(c.facts.gpa, function, try sizes.counts.kept(c.facts.gpa));
+        flow.changed = true;
     }
     if (!sizes.sure.eql(f.sizes) or !sizes.ranged.eql(f.ranged_sizes) or !sizes.maybe.eql(f.maybe_sizes)) {
         // Found on the round's memory, kept on the run's.
@@ -5349,12 +5478,56 @@ fn sizing(c: *Context, flow: *Flow, function: Function.Id) Context.Error!void {
     }
 }
 
+/// The position of the integer parameter of `function` that `node` is (`n`), or is adjusted
+/// by a constant (`n - 1`, `n + 1`, `n * 2`, `n / 2`): what a loop bounded by it repeats by.
+/// Null for anything else: a length, a field, an option, a value a slice or a call gives.
+fn boundParameter(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Context.Error!?usize {
+    const f = flow.functions.items[@backingInt(function)];
+    const tree = &c.project.at(f.file).file.tree;
+    const at = Facts.ungrouped(tree, node);
+    switch (tree.nodeTag(at)) {
+        .identifier => {
+            const model = &c.project.at(f.file).model;
+            const d = (model.reference(at) orelse return null).declaration orelse return null;
+            const index = f.position(d) orelse return null;
+            const declared = model.declarations[@backingInt(d)];
+            return switch (try c.facts.resolve(f.file, declared.node)) {
+                .primitive => |name| if (integerName(name)) index else null,
+                else => null,
+            };
+        },
+        .add, .sub, .mul, .div, .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat => {
+            const lhs, const rhs = tree.nodeData(at).node_and_node;
+            if (tree.nodeTag(Facts.ungrouped(tree, rhs)) == .number_literal) return boundIdentifier(c, flow, function, lhs);
+            if (tree.nodeTag(Facts.ungrouped(tree, lhs)) == .number_literal) return boundIdentifier(c, flow, function, rhs);
+            return null;
+        },
+        else => return null,
+    }
+}
+
+/// `boundParameter` of a bare name: one constant adjustment at most.
+fn boundIdentifier(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Context.Error!?usize {
+    const tree = &c.project.at(flow.functions.items[@backingInt(function)].file).file.tree;
+    if (tree.nodeTag(Facts.ungrouped(tree, node)) != .identifier) return null;
+    return boundParameter(c, flow, function, node);
+}
+
+/// Whether a primitive type's name is an integer's: `usize`, `isize`, `u8`, `i32`, ...
+fn integerName(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "usize") or std.mem.eql(u8, name, "isize")) return true;
+    if (name.len < 2 or (name[0] != 'u' and name[0] != 'i')) return false;
+    for (name[1..]) |ch| if (!std.ascii.isDigit(ch)) return false;
+    return true;
+}
+
 /// What a summary's function sizes work by, by slot (`Function.sizes`, `ranged_sizes`,
 /// `maybe_sizes`).
 const Sizes = struct {
     sure: Slots,
     ranged: Slots,
     maybe: Slots,
+    counts: Slots = .{},
 
     /// A size that holds `d`: by the slots it holds whole, surely; by those it holds kept to a
     /// range or as a comparison decides, as data at most; by those it holds through a call
@@ -5401,6 +5574,8 @@ fn sizedBy(c: *Context, flow: *Flow, function: Function.Id, callee: Callee, size
                         try sizes.addRanged(c.allocator, given);
                     } else try sizes.addMaybe(c.allocator, given);
                 }
+                // A count it is handed: the argument's number, never a length (`countDep`).
+                if ((flow.counts.get(target) orelse Slots{}).has(valueSlot(index))) sizes.counts = try sizes.counts.unite(c.allocator, try (try slotsOf(c.allocator, try countDep(c, flow, function, arg, 0))).values(c.allocator));
             }
         },
         .source, .outside, .none => try sizedOutside(c, flow, function, callee, sizes),
@@ -5428,27 +5603,6 @@ fn sizedOutside(c: *Context, flow: *Flow, function: Function.Id, callee: Callee,
 /// `measured` first).
 fn slotsOf(gpa: Allocator, d: Dep) Allocator.Error!Slots {
     return Slots.all(gpa, &.{ d.params, d.numbers, d.ranged, d.ruled, d.counted, d.counted_numbers });
-}
-
-/// What decides how many passes a loop takes, where it counts: a range's ends and an input's
-/// length (`for`), or a `while` whose condition compares a counter the loop steps by a sum;
-/// undecided (`maybe`) for one whose counter steps otherwise or that has none, and none for one
-/// whose every counter steps by a factor.
-fn countOf(c: *Context, flow: *Flow, function: Function.Id, loop: Ast.Node.Index) Context.Error!?struct { kind: enum { sure, maybe }, by: Dep } {
-    const tree = &c.project.at(flow.functions.items[@backingInt(function)].file).file.tree;
-    if (tree.fullFor(loop) != null) return .{ .kind = .sure, .by = try forBound(c, flow, function, loop) };
-    if (tree.fullSwitch(loop)) |choice| {
-        if (choice.label_token == null) return null;
-        return .{ .kind = .maybe, .by = try passes(c, flow, function, loop) };
-    }
-    const w = tree.fullWhile(loop) orelse return null;
-    const by = try operands(c, flow, function, w.ast.cond_expr);
-    if (by.clean()) return null;
-    return switch (try stepsOf(c, flow, function, loop, w.ast.cond_expr)) {
-        .sum => .{ .kind = .sure, .by = by },
-        .factor => null,
-        .other => .{ .kind = .maybe, .by = by },
-    };
 }
 
 /// Whether `value` takes the counter `d` by a factor: a product, a quotient or a shift of it
@@ -5555,7 +5709,6 @@ test "the size sink is what a function outside the program allocates or counts b
     try std.testing.expectEqualStrings(
         \\alloc 2 n value sure
         \\repeat 1 n value sure
-        \\sum 0 bytes length sure
         \\? 0 n value maybe
         \\? 0 n length maybe
         \\
@@ -5917,7 +6070,7 @@ fn summarySizing(gpa: Allocator, program: []const u8, mem: []const u8, how: stru
     };
     const sized = fact.flow.sized orelse return .{ .live = 0, .open_maybe = 0, .undecided = undecided };
     var live: usize = 0;
-    for (sized.functions.items) |f| if (!f.sizes.empty() or !f.maybe_sizes.empty()) {
+    for (sized.functions.items, 0..) |f, i| if (!f.sizes.empty() or !f.maybe_sizes.empty() or sized.counts.contains(@fromBackingInt(@intCast(i)))) {
         live += 1;
     };
     var open_maybe: usize = 0;
@@ -6137,7 +6290,7 @@ test "a summary settled for one file gives a later file the sites it gives that 
     defer gpa.free(after);
     const alone = try secondSites(gpa, false);
     defer gpa.free(alone);
-    try std.testing.expectEqualStrings("grow 1 n value sure\ngrow 2 s length sure\nwiden 1 m value sure\n", alone);
+    try std.testing.expectEqualStrings("grow 1 n value sure\nwiden 1 m value sure\n", alone);
     try std.testing.expectEqualStrings(alone, after);
 }
 
