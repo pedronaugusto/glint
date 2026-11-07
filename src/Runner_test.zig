@@ -765,12 +765,13 @@ fn chained(steps: usize) ![]u8 {
 test "P006 follows a function's callers to their end: a chain only the replacement reaches is its own, and one the budget does not read to its end is undecided" {
     const long = try chained(10);
     defer std.testing.allocator.free(long);
-    // Read to its end: the chain is the replacement's; only the program's two sites are judged.
+    // Read to its end: the chain is the replacement's; only the program's fdatasync is judged (this
+    // airlock replaces no symbol).
     var whole = try replacedRun(long);
     defer whole.deinit();
     try std.testing.expect(whole.complete);
     for (whole.diagnostics) |d| try std.testing.expectEqual(@as(u32, 0), @backingInt(d.span.file));
-    try std.testing.expectEqual(@as(usize, 2), whole.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 1), whole.diagnostics.len);
     // Past the budget: the site in the chain is undecided, for want of budget, never exempt.
     const longer = try chained(200);
     defer std.testing.allocator.free(longer);
