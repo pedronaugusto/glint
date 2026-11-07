@@ -518,7 +518,7 @@ pub fn cleared(c: *Context, file: Project.FileId, node: Ast.Node.Index, kind: Ki
 /// given what holds up to there. A whole value of the struct holds it by the same induction;
 /// `undefined`, or one that does not resolve to the struct, holds nothing. The relations are
 /// proved together: each reading assumes all those not yet refused, any that fails is refused and
-/// all are read again, until none fails. Those left each hold, by induction over the program's
+/// all are read again, until none fails, on one budget (none where it runs short). Those left each hold, by induction over the program's
 /// writes, whatever the order: every write keeps every one of them, given that they held before it.
 ///
 /// One holds only where every write is seen and judged: a field the program alone writes, by
@@ -560,9 +560,6 @@ fn relationsOf(c: *Context, field: Facts.Decl) Error![]const Relation {
     return if (memo.of.get(field)) |list| list.items else &.{};
 }
 
-/// The most times the relations are read together: each read but the last refuses at least one.
-const relation_passes = 8;
-
 /// A field's default, as a value at that field's type: its constant, or for `length` the length
 /// of an empty slice. Null where it has none, or it is any other value (`undefined` among them).
 fn defaultOf(c: *Context, member: Facts.Decl, length: bool) Error!?Lin {
@@ -602,12 +599,11 @@ fn proveRelations(c: *Context) Error!void {
             if (std.mem.findScalar(usize, entry.value_ptr.items, at) == null) try entry.value_ptr.append(c.allocator, at);
         }
     }
-    var passes: usize = 0;
-    while (true) : (passes += 1) {
-        // Past the passes, none is shown: refused all.
-        if (passes == relation_passes) for (proofs.items) |*proof| {
-            proof.failed = true;
-        };
+    // The proofs are one unit of solving, on the run's budget for one: every pass is charged to
+    // it, and where it runs short none is shown. Each pass but the last refuses at least one, so
+    // they end by themselves.
+    const asker = c.facts.enter(c.config.fact_budget);
+    while (true) {
         // What is read from here rests on what these assume: nothing earlier is kept.
         memo.of = .empty;
         (try c.facts.memo(Analyses)).* = .{};
@@ -622,7 +618,7 @@ fn proveRelations(c: *Context) Error!void {
                 try entry.value_ptr.append(c.allocator, proof.relation);
             }
         }
-        if (left == 0 or passes == relation_passes) break;
+        if (left == 0) break;
         var refused = false;
         for (Range.pointerWidths(c)) |width| {
             for (proofs.items) |*proof| proof.checked.clearRetainingCapacity();
@@ -641,6 +637,10 @@ fn proveRelations(c: *Context) Error!void {
                 }
             }
         }
+        // Read short of the budget, what a pass showed may rest on an answer cut short: none.
+        if (c.facts.short) for (proofs.items) |*proof| {
+            proof.failed = true;
+        };
         for (proofs.items) |*proof| {
             if (proof.failed and !proof.seen_failed) {
                 proof.seen_failed = true;
@@ -649,6 +649,7 @@ fn proveRelations(c: *Context) Error!void {
         }
         if (!refused) break;
     }
+    _ = c.facts.leave(asker);
     (try c.facts.memo(Analyses)).* = .{};
     (try c.facts.memo(Entries)).* = .{};
     memo.built = true;

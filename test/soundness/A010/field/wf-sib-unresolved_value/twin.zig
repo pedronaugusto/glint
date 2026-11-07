@@ -12,7 +12,7 @@ const Cursor = struct {
         c.pos += n;
     }
 };
-const missing = @import("missing");
+pub var offset: *const fn (usize) usize = undefined;
 pub fn f(r: *std.Io.Reader) !usize {
     const bytes = try r.take(64);
     const n: usize = try r.takeInt(u32, .little);
