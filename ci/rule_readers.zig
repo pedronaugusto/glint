@@ -79,9 +79,6 @@ fn switched(comptime list: []const Allowed) [1]glint.ProjectRule {
 const switches = [_]Allowed{
     .{ .file = "src/AegisRecursion.zig", .function = "hasReceiver", .reason = "pending: warp-fast" },
     .{ .file = "src/AegisRecursion.zig", .function = "typeKeyword", .reason = "pending: warp-fast" },
-    .{ .file = "src/Builtins.zig", .function = "namesType", .reason = "pending: aegis" },
-    .{ .file = "src/Builtins.zig", .function = "reflectedImport", .reason = "pending: aegis" },
-    .{ .file = "src/Builtins.zig", .function = "syntaxRules", .reason = "pending: aegis" },
     .{ .file = "src/Danger.zig", .function = "aegisName", .reason = "pending: warp-fast" },
     .{ .file = "src/Danger.zig", .function = "borrowed", .reason = "pending: warp-fast" },
     .{ .file = "src/Danger.zig", .function = "madeField", .reason = "pending: warp-fast" },
