@@ -1365,7 +1365,8 @@ fn prongReads(c: *Context, holder: Facts.Container, name: []const u8) Context.Er
     var found: std.ArrayList(ProngReads.Capture) = .empty;
     var unknown = false;
     const prongs = try unionProngs(c);
-    const named: []const Prong = if (prongs.named.get(name)) |list| list.items else &.{};
+    const tag = c.facts.member(holder, name);
+    const named: []const Prong = if (tag) |field| (if (prongs.named.get(field)) |list| list.items else &.{}) else &.{};
     for ([_][]const Prong{ named, prongs.others.items }, [_]bool{ true, false }) |each, by_name| for (each) |prong| {
         const subject = try c.facts.resolve(prong.file, prong.subject);
         const switched = byPointer(subject) orelse {
@@ -1387,9 +1388,22 @@ fn prongReads(c: *Context, holder: Facts.Container, name: []const u8) Context.Er
 /// its reads whole (`released`). Read once for the run, from no depth; one met again while still
 /// being read adds nothing there, and an answer of no read meanwhile is not kept (`summarized`).
 const KeptReads = struct {
-    found: std.StringHashMapUnmanaged(Stored) = .empty,
-    open: std.StringHashMapUnmanaged(void) = .empty,
+    /// Answers by the keeper's field and the held field, each by its declaration.
+    found: std.AutoHashMapUnmanaged(Kept, Stored) = .empty,
+    /// The reads in progress, innermost last: a read met again while still being read.
+    open: std.ArrayList(Reading) = .empty,
     met_open: usize = 0,
+
+    const Kept = struct { keeper: Facts.Decl, held: Facts.Decl, holder: Facts.Container };
+    const Reading = struct { keeper: Facts.Container, field: []const u8, name: []const u8, holder: ?Facts.Container };
+
+    fn reading(self: *const KeptReads, one: Reading) bool {
+        for (self.open.items) |each| {
+            if (!std.meta.eql(each.keeper, one.keeper) or !std.meta.eql(each.holder, one.holder)) continue;
+            if (std.mem.eql(u8, each.field, one.field) and std.mem.eql(u8, each.name, one.name)) return true;
+        }
+        return false;
+    }
 };
 
 fn keptReleased(c: *Context, keeper: Facts.Container, field: []const u8, name: []const u8, holder: ?Facts.Container) Context.Error!Stored {
@@ -1397,18 +1411,20 @@ fn keptReleased(c: *Context, keeper: Facts.Container, field: []const u8, name: [
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
     const state = try c.facts.memo(KeptReads);
-    const of: [2]u32 = if (holder) |h| .{ @backingInt(h.file), @backingInt(h.scope) } else .{ std.math.maxInt(u32), 0 };
-    const key = try c.allocator.print("{d}:{d}:{s}:{s}:{d}:{d}", .{ @backingInt(keeper.file), @backingInt(keeper.scope), field, name, of[0], of[1] });
-    if (state.found.get(key)) |answer| return answer;
-    if (state.open.contains(key)) {
+    // Kept where both fields are declarations; a holder whose type does not resolve is read
+    // again each time.
+    const key: ?KeptReads.Kept = if (holder) |h| (if (c.facts.member(keeper, field)) |keeping| (if (c.facts.member(h, name)) |held| KeptReads.Kept{ .keeper = keeping, .held = held, .holder = h } else null) else null) else null;
+    if (key) |k| if (state.found.get(k)) |answer| return answer;
+    const one: KeptReads.Reading = .{ .keeper = keeper, .field = field, .name = name, .holder = holder };
+    if (state.reading(one)) {
         state.met_open += 1;
         return .no;
     }
-    try state.open.put(c.allocator, key, {});
+    try state.open.append(c.allocator, one);
     const met_open = state.met_open;
     const result = try keptReads(c, keeper, field, name, holder);
-    _ = state.open.remove(key);
-    if (result != .no or state.met_open == met_open) try state.found.put(c.allocator, key, result);
+    _ = state.open.pop();
+    if (key) |k| if (result != .no or state.met_open == met_open) try state.found.put(c.allocator, k, result);
     return result;
 }
 
@@ -1447,7 +1463,8 @@ const Prong = struct { file: Project.FileId, subject: Ast.Node.Index, case: Ast.
 /// (`else`, `inline else`, a value whose tag does not resolve), which may capture any.
 const UnionProngs = struct {
     built: bool = false,
-    named: std.StringHashMapUnmanaged(std.ArrayList(Prong)) = .empty,
+    /// By the union's field each tag is.
+    named: std.AutoHashMapUnmanaged(Facts.Decl, std.ArrayList(Prong)) = .empty,
     others: std.ArrayList(Prong) = .empty,
 };
 
@@ -1471,7 +1488,11 @@ fn unionProngs(c: *Context) Context.Error!*const UnionProngs {
                         by_literal = false;
                         continue;
                     };
-                    const entry = try index.named.getOrPut(gpa, try gpa.dupe(u8, tag.name));
+                    const field = c.facts.member(tag.container, tag.name) orelse {
+                        by_literal = false;
+                        continue;
+                    };
+                    const entry = try index.named.getOrPut(gpa, field);
                     if (!entry.found_existing) entry.value_ptr.* = .empty;
                     try entry.value_ptr.append(gpa, prong);
                 }
