@@ -1071,12 +1071,14 @@ fn typeFunctionOf(c: *Context, file: Project.FileId, node: Ast.Node.Index) Conte
     const model = &c.project.at(file).model;
     var at = node;
     while (enclosingFunction(model, tree, at)) |function| : (at = function) {
+        // A function's declaration is its prototype's.
+        const prototype = tree.nodeData(function).node_and_node[0];
         var buffer: [1]Ast.Node.Index = undefined;
-        const proto = tree.fullFnProto(&buffer, tree.nodeData(function).node_and_node[0]) orelse continue;
+        const proto = tree.fullFnProto(&buffer, prototype) orelse continue;
         const returned = proto.ast.return_type.unwrap() orelse continue;
         if (!try c.facts.typeIsType(file, returned)) continue;
         for (model.declarations, 0..) |record, i| {
-            if (record.kind == .function and record.node == function) return .{ .file = file, .index = @fromBackingInt(@intCast(i)) };
+            if (record.kind == .function and record.node == prototype) return .{ .file = file, .index = @fromBackingInt(@intCast(i)) };
         }
         return null;
     }
@@ -1118,7 +1120,9 @@ fn instanceReading(c: *Context, holder: Facts.Container, file: Project.FileId, n
     const env = made.env orelse return null;
     if (file != made.function.file) return null;
     const tree = &c.project.at(file).file.tree;
-    const function = c.project.at(file).model.declarations[@backingInt(made.function.index)].node;
+    // A function's declaration is its prototype's; its body is the declaration around it.
+    const prototype = c.project.at(file).model.declarations[@backingInt(made.function.index)].node;
+    const function = c.project.at(file).model.parentOf(prototype) orelse return null;
     const token = tree.firstToken(node);
     if (token < tree.firstToken(function) or token > tree.lastToken(function)) return null;
     return env;

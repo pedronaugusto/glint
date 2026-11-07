@@ -3428,8 +3428,9 @@ fn nameIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.I
 
 /// What `@field`'s name names: the one name it spells (a string literal with its escapes read,
 /// a `const` that holds one, an enum literal, `@tagName` of one), each field of a struct whose
-/// `field_names` it ranges over, each name of a list written in place it ranges over
-/// (`inline for (.{ "a", "b" }) |name|`), or a name it computes, not known here.
+/// `field_names` it ranges over, each name of a list it ranges over, written in place or a
+/// `const`'s (`inline for (.{ "a", "b" }) |name|`, `inline for (names) |name|`), or a name it
+/// computes, not known here.
 pub const FieldName = union(enum) { name: []const u8, each_of: Container, names: []const []const u8, computed };
 pub fn fieldName(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!FieldName {
     if (try self.nameIn(null, file, node, 0)) |name| return .{ .name = name };
@@ -3873,10 +3874,23 @@ fn rangedNames(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolve
     // The input the capture takes, of several (`inline for (.{ "a", "b" }, 0..) |name, i|`).
     const position = Model.capturePosition(tree, loop, record.token) orelse return null;
     if (position >= loop.ast.inputs.len) return null;
+    // The list written in place, or a `const` holding one (`inline for (names)`,
+    // `inline for (&names)`), in its own file.
     var buffer: [2]Ast.Node.Index = undefined;
-    const list = tree.fullArrayInit(&buffer, loop.ast.inputs[position]) orelse return null;
+    var at_file = file;
+    var input = ungrouped(tree, loop.ast.inputs[position]);
+    const list = for (0..4) |_| {
+        const at_tree = &self.project.at(at_file).file.tree;
+        if (at_tree.fullArrayInit(&buffer, input)) |found| break found;
+        if (at_tree.nodeTag(input) == .address_of) {
+            input = ungrouped(at_tree, at_tree.nodeData(input).node);
+            continue;
+        }
+        at_file, input = (try self.constantValue(at_file, input)) orelse return null;
+        input = ungrouped(&self.project.at(at_file).file.tree, input);
+    } else return null;
     var names: std.ArrayList([]const u8) = .empty;
-    for (list.ast.elements) |item| try names.append(self.gpa, (try self.nameIn(null, file, item, 0)) orelse return null);
+    for (list.ast.elements) |item| try names.append(self.gpa, (try self.nameIn(null, at_file, item, 0)) orelse return null);
     return names.items;
 }
 /// Whether a `@field` name may be `name`: it spells it, or ranges over a struct that has it or
