@@ -82,6 +82,8 @@ The input fact (A009, A010, A012, A013, A020) and the peer fact (A018) are compu
 - *The program's own calls.* A call gives the callee's parameters what it passes. It takes back the callee's summary: the result's own level, the parameters it depends on, and the parameters whose memory the callee fills. So a call with clean arguments stays clean.
 - *What clears it.* What aegis gives back is clean: an `input.Untrusted`, what its `parse` refines, a checked integer. A call whose callee does not resolve gives an unknown value, and a sink holding one is undecided.
 
+- *Build scripts.* A file only build scripts reach (`--build-script FILE`; `Project.compiledBy` reads which files each compilation compiles by what each one imports) runs on the developer's machine for the developer. A read there is the operator's only where its origin is shown local: a child's output, a whole-file or `Dir` read, a `File` a `Dir` opened or stdin, and their readers, through locals the function keeps; any other read (a `File` over a socket's handle, a reader handed on, what an unresolved call returns) stays a peer's. A writer there is a peer's only where it is shown one (a stream's, a configured peer writer); one that only may be is no peer's.
+
 The facts are rounds over every function until nothing changes, at most 64. They read only the files whose configuration selects a rule that asks for them.
 
 Integer ranges (`Range.zig`) say how large a value of input can be, so a sink asks whether a peer's choice can reach its danger, not only whether the value is a peer's:

@@ -144,11 +144,13 @@ fn lookup(self: *Context, source: []const u8, path: []const u8) Context.Error!De
 
 /// The files the program's imports of module `source` reach. A governed declaration is a
 /// library's, and a library's modules are the program's: a build script's import of the same
-/// name is that dependency's build script, as the build runner names it.
+/// name is that dependency's build script, as the build runner names it. std is Zig's own and
+/// the same in every compilation: a build script's import of it is std, whoever else imports it.
 fn moduleRoots(self: *Context, source: []const u8) Context.Error![]const Project.FileId {
+    const zig_own = std.mem.eql(u8, source, "std");
     var roots: std.ArrayList(Project.FileId) = .empty;
     for (self.project.imports) |mapping| {
-        if (!std.mem.eql(u8, mapping.spelling, source) or !mapping.in.inProgram()) continue;
+        if (!std.mem.eql(u8, mapping.spelling, source) or !(mapping.in.inProgram() or zig_own)) continue;
         if (std.mem.findScalar(Project.FileId, roots.items, mapping.target) == null) try roots.append(self.allocator, mapping.target);
     }
     return roots.items;

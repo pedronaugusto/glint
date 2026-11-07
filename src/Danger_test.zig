@@ -3895,6 +3895,56 @@ test "a build script's values are the operator's: the build runner's, an option'
     }
 }
 
+test "A012 in a build script: a read of what the build itself opened is the operator's, any other a peer's" {
+    const head = "const std = @import(\"std\");\n";
+    // Positive evidence of a local source: its own stdin's reader, a directory's read, a child
+    // it ran. A peer's in the program's own file, the operator's in a build script.
+    const local = [_][]const u8{
+        head ++ "pub fn build(gpa: std.mem.Allocator, io: std.Io) !void {\n    var buf: [64]u8 = undefined;\n    var fr = std.Io.File.stdin().reader(io, &buf);\n    const r = &fr.interface;\n    const n = try r.takeInt(u32, 0);\n    _ = try gpa.alloc(u8, n);\n}\n",
+        head ++ "pub fn build(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !void {\n    const bytes = try dir.readFileAlloc(io, \"sizes\", gpa, 64);\n    _ = try gpa.alloc(u8, std.mem.readInt(u32, bytes[0..4], 0));\n}\n",
+        head ++ "pub fn build(gpa: std.mem.Allocator, io: std.Io) !void {\n    const ran = try std.process.run(gpa, io, .{});\n    _ = try gpa.alloc(u8, std.mem.readInt(u32, ran.stdout[0..4], 0));\n}\n",
+    };
+    // No proof of a local source: a file over a descriptor it was given (a socket's), a reader
+    // handed on before it is read, a file reassigned, a reader a call that does not resolve
+    // gives. A peer's in a build script too.
+    const remote = [_][]const u8{
+        head ++ "pub fn build(gpa: std.mem.Allocator, io: std.Io, fd: i32) !void {\n    var buf: [64]u8 = undefined;\n    const sock: std.Io.File = .{ .handle = fd };\n    var fr = sock.reader(io, &buf);\n    const r = &fr.interface;\n    const n = try r.takeInt(u32, 0);\n    _ = try gpa.alloc(u8, n);\n}\n",
+        head ++ "fn hand(r: *std.Io.Reader) void {\n    _ = r;\n}\npub fn build(gpa: std.mem.Allocator, io: std.Io) !void {\n    var buf: [64]u8 = undefined;\n    var fr = std.Io.File.stdin().reader(io, &buf);\n    const r = &fr.interface;\n    hand(r);\n    const n = try r.takeInt(u32, 0);\n    _ = try gpa.alloc(u8, n);\n}\n",
+        head ++ "pub fn build(gpa: std.mem.Allocator, io: std.Io, fd: i32) !void {\n    var buf: [64]u8 = undefined;\n    var file = std.Io.File.stdin();\n    file = .{ .handle = fd };\n    var fr = file.reader(io, &buf);\n    const n = try fr.interface.takeInt(u32, 0);\n    _ = try gpa.alloc(u8, n);\n}\n",
+        head ++ "pub fn build(gpa: std.mem.Allocator) !void {\n    const r: *std.Io.Reader = @import(\"missing.zig\").open();\n    const n = try r.takeInt(u32, 0);\n    _ = try gpa.alloc(u8, n);\n}\n",
+    };
+    const files = std_files ++ [_]sources.Extra{.{ .name = "src/root.zig", .bytes = "const std = @import(\"std\");\n" }};
+    const imports = std_imports ++ [_]sources.ExtraImport{.{ .from = std_files.len, .spelling = "std", .target = 0 }};
+    const build: sources.Consumer = .{ .compilations = .build };
+    for (local) |program| {
+        try std.testing.expectEqual(1, (try runAs(pack.bounded_work, program, .{}, &files, &imports)).findings);
+        const script = try runAs(pack.bounded_work, program, build, &files, &imports);
+        try std.testing.expectEqual(0, script.findings);
+        try std.testing.expectEqual(0, script.undecided);
+    }
+    for (remote) |program| {
+        const script = try runAs(pack.bounded_work, program, build, &files, &imports);
+        try std.testing.expect(script.findings + script.undecided > 0);
+    }
+}
+
+test "a build-only project reads std as std: what only a build script imports is still std's Reader" {
+    // std's files only the build runner compiles (no program file imports std): Governed finds std
+    // through the build script's import, so a reader of fixed bytes reads the bytes' fact, no
+    // call that does not resolve (red before: every value handed to std read unknown).
+    const program =
+        \\const std = @import("std");
+        \\pub fn build(gpa: std.mem.Allocator) ![]u8 {
+        \\    var r: std.Io.Reader = .fixed(&.{ 1, 2, 3, 4 });
+        \\    const n = try r.takeInt(u32, 0);
+        \\    return gpa.alloc(u8, n);
+        \\}
+    ;
+    const alone = try runAs(pack.bounded_work, program, .{ .compilations = .build, .others = .build }, &std_files, &std_imports);
+    try std.testing.expectEqual(0, alone.findings);
+    try std.testing.expectEqual(0, alone.undecided);
+}
+
 test "A012 leaves a size std only moves a position by or compares, and finds one it allocates by" {
     // `toss` adds it to a position and `take`'s fill compares it: neither sizes work by it.
     try expect(pack.bounded_work,

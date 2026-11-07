@@ -1645,7 +1645,7 @@ fn effects(c: *Context, flow: *Flow, function: Function.Id, callee: Callee) Cont
             }
         },
         .source => {
-            const lanes = try readLanes(c, flow, function, callee.receiver);
+            const lanes = try readLanes(c, flow, function, callee.receiver, callee.decl);
             if (lanes == none) return;
             const buffers = try bufferParams(c, callee.decl.?);
             for (callee.args, 0..) |arg, position| if (buffers.has(position)) try fill(c, flow, function, callee, arg, lanes);
@@ -1997,12 +1997,116 @@ fn source(c: *Context, flow: *Flow, decl: Facts.Decl, name: []const u8) Context.
 /// The lanes a read from the reader `receiver` (a read's, or a reader whose `buffer` is read)
 /// reads a peer's input in: every peer lane, but where the reader is one std's `Reader.fixed`
 /// made over bytes clean in that lane (`fixedBytes`), whose read carries the bytes' fact, not
-/// input's.
-fn readLanes(c: *Context, flow: *Flow, function: Function.Id, reader: ?Ast.Node.Index) Context.Error!Mask {
+/// input's. In a build script (`buildOnly`) a read of what the build itself opened
+/// (`localRead`) is the operator's, whoever runs the build: no peer's.
+fn readLanes(c: *Context, flow: *Flow, function: Function.Id, reader: ?Ast.Node.Index, decl: ?Facts.Decl) Context.Error!Mask {
     const f = flow.functions.items[@backingInt(function)];
+    if (buildOnly(c, f.file) and try localRead(c, flow, function, reader, decl)) return flow.masks.operator;
     const receiver = reader orelse return flow.masks.peer;
     const bytes = (try fixedBytes(c, flow, f.file, receiver)) orelse return flow.masks.peer;
     return flow.masks.peer & lanesOf(concrete(flow, function, try dep(c, flow, function, bytes)));
+}
+
+/// Whether only the build runner compiles `file`: a build script, or what only one imports.
+pub fn buildOnly(c: *Context, file: Project.FileId) bool {
+    return c.project.at(file).input.compilations == .build;
+}
+
+/// Whether a read (`decl`, from `reader`) reads only what the build itself opened, on positive
+/// evidence of the source: a child it ran (std's `process.run`) or a file read whole
+/// (`Flow.reads`), a directory's read (a `Dir` is the file system's), or a reader or file the
+/// function itself made from one (`localValue`). Anything else may be a socket, whatever its
+/// type (a `File` over a socket's descriptor, a reader a parameter or a call that does not
+/// resolve gives): a peer's.
+fn localRead(c: *Context, flow: *Flow, function: Function.Id, reader: ?Ast.Node.Index, decl: ?Facts.Decl) Context.Error!bool {
+    const read = decl orelse return false;
+    for (flow.reads.items) |each| if (std.meta.eql(each, read)) return true;
+    if (inContainer(c, read, flow.dir)) return true;
+    return localValue(c, flow, function, reader orelse return false, 0);
+}
+
+/// Whether `decl` is declared in `container`, or a container inside it.
+fn inContainer(c: *Context, decl: Facts.Decl, container: ?Facts.Container) bool {
+    const handle = container orelse return false;
+    if (handle.file != decl.file) return false;
+    const model = &c.project.at(decl.file).model;
+    var scope: ?Model.Scope.Id = model.declarations[@backingInt(decl.index)].scope;
+    while (scope) |s| : (scope = model.scopes[@backingInt(s)].parent) if (s == handle.scope) return true;
+    return false;
+}
+
+/// Whether `node`, in `function`, is a file or a reader the function made from the file
+/// system: a `File` a `Dir` gives (`openFile`, `createFile`), its own `stdin()`, a reader of
+/// one (`file.reader(io, &buf)`, its `interface`), through locals the function keeps
+/// (`keptLocal`).
+fn localValue(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index, depth: u8) Context.Error!bool {
+    if (depth > 8) return false;
+    const file = flow.functions.items[@backingInt(function)].file;
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    switch (tree.nodeTag(node)) {
+        .grouped_expression => return localValue(c, flow, function, tree.nodeData(node).node_and_token[0], depth + 1),
+        .@"try", .address_of => return localValue(c, flow, function, tree.nodeData(node).node, depth + 1),
+        .field_access => {
+            const object, const name = tree.nodeData(node).node_and_token;
+            if (!std.mem.eql(u8, tree.tokenSlice(name), "interface")) return false;
+            return localValue(c, flow, function, object, depth + 1);
+        },
+        .identifier => {
+            const d = (model.reference(node) orelse return false).declaration orelse return false;
+            const record = model.declarations[@backingInt(d)];
+            if (record.kind != .variable or owner(flow, file, record.node) != function) return false;
+            const init = (tree.fullVarDecl(record.node) orelse return false).ast.init_node.unwrap() orelse return false;
+            if (!try keptLocal(c, flow, function, d, init)) return false;
+            return localValue(c, flow, function, init, depth + 1);
+        },
+        else => {
+            var buffer: [1]Ast.Node.Index = undefined;
+            _ = tree.fullCall(&buffer, node) orelse return false;
+            const callee = (try resolveCall(c, flow, file, node)) orelse return false;
+            const decl = callee.decl orelse return false;
+            if (inContainer(c, decl, flow.dir)) return true;
+            if (!inContainer(c, decl, flow.file)) return false;
+            const name = c.project.at(decl.file).model.declarations[@backingInt(decl.index)].name;
+            if (std.mem.eql(u8, name, "stdin")) return true;
+            if (!std.mem.eql(u8, name, "reader") and !std.mem.eql(u8, name, "readerStreaming")) return false;
+            return localValue(c, flow, function, callee.receiver orelse return false, depth + 1);
+        },
+    }
+}
+
+/// Whether the local `d` (initialized with `init`) keeps what it was made with: nothing assigns
+/// it or a part of it, its address goes only into another local, and where it is itself an
+/// address (`const r = &fr.interface`) it is only read through (`r.take(n)`, `r.buffer`), never
+/// handed on or written through, so no other code makes it a socket's.
+fn keptLocal(c: *Context, flow: *Flow, function: Function.Id, d: Model.Declaration.Id, init: Ast.Node.Index) Context.Error!bool {
+    const file = flow.functions.items[@backingInt(function)].file;
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    const address = tree.nodeTag(init) == .address_of;
+    for (flow.functions.items[@backingInt(function)].nodes) |node| switch (tree.nodeTag(node)) {
+        .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => {
+            if (rootDecl(model, tree, tree.nodeData(node).node_and_node[0]) == d) return false;
+        },
+        .assign_destructure => for (tree.assignDestructure(node).ast.variables) |each| {
+            if (rootDecl(model, tree, each) == d) return false;
+        },
+        .address_of => {
+            if (rootDecl(model, tree, tree.nodeData(node).node) != d) continue;
+            const parent = model.parentOf(node) orelse return false;
+            const alias = tree.fullVarDecl(parent) orelse return false;
+            if (alias.ast.init_node.unwrap() != node) return false;
+        },
+        .identifier => {
+            if (!address) continue;
+            const ref = model.reference(node) orelse continue;
+            if (ref.declaration != d) continue;
+            const parent = model.parentOf(node) orelse return false;
+            if (tree.nodeTag(parent) != .field_access or tree.nodeData(parent).node_and_token[0] != node) return false;
+        },
+        else => {},
+    };
+    return true;
 }
 
 /// The lanes a level is other than clean in.
@@ -2229,7 +2333,7 @@ fn fieldDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Inde
     var out = try dep(c, flow, function, receiver);
     if ((try c.facts.definition(f.file, node)).orNull()) |decl| {
         // A reader's buffer holds what it read, as `buffered()` gives it.
-        if (readerBuffer(c, flow, decl)) out = try out.join(c.allocator, .{ .level = .in(try readLanes(c, flow, function, receiver), .data) });
+        if (readerBuffer(c, flow, decl)) out = try out.join(c.allocator, .{ .level = .in(try readLanes(c, flow, function, receiver, decl), .data) });
         if (decl.file == flow.zig_ast) if (c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind == .field) {
             const field = c.project.at(decl.file).model.containerField(&c.project.at(decl.file).file.tree, c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node).?;
             return treeDep(c, flow, decl.file, field.ast.type_expr.unwrap());
@@ -2755,7 +2859,7 @@ fn resultOf(c: *Context, flow: *Flow, function: Function.Id, callee: Callee) Con
             return out;
         },
         .source => {
-            const lanes = try readLanes(c, flow, function, callee.receiver);
+            const lanes = try readLanes(c, flow, function, callee.receiver, callee.decl);
             const decl = callee.decl.?;
             // A read into the caller's buffer returns how much it read: a count the buffer
             // bounds, a peer's within it.
@@ -4459,6 +4563,11 @@ fn peerSites(c: *Context, flow: *Flow, file: Project.FileId, callee: Callee, out
     // (`self: *Writer`), or untyped and not a literal; every other one is written, whatever
     // memory it shares with the writer (`.{ name }`, `&parts`).
     const params = if (callee.decl) |decl| try writerParams(c, decl) else null;
+    // In a build script (`buildOnly`) a writer is a peer's only where it is shown one: a
+    // stream's or a configured peer writer's, data in the lane. One that only may be (a type
+    // that holds a writer only through what does not resolve, a call that does not) is the
+    // developer's: no site.
+    const build = buildOnly(c, file);
     var writer: Level = .clean;
     var taken: Slots = .{};
     for (callee.args, 0..) |arg, position| {
@@ -4472,6 +4581,7 @@ fn peerSites(c: *Context, flow: *Flow, file: Project.FileId, callee: Callee, out
         const held = try writerHold(c, flow, try c.facts.resolve(file, arg), 0);
         if (held == .none) continue;
         const writer_level = try levelIn(c, flow, file, arg, flow.masks.peer_writer);
+        if (build and !writer_level.reaches(.data)) continue;
         const level: Level = if (held == .may and writer_level != .clean) .unknown else writer_level;
         if (level == .clean) continue;
         writer = writer.join(level);

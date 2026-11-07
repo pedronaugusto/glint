@@ -289,13 +289,16 @@ pub const Consumer = struct {
     /// `.build`: a build script, which only the build runner compiles; aegis's files and the
     /// extra sources (std's) are then compiled by both, as std is.
     compilations: Project.Compilations = .program,
+    /// The compilations of aegis's files and the extra sources, where not as above: `.build` for
+    /// a project only build scripts import (`Project.compiledBy` gives std's files `.build`).
+    others: ?Project.Compilations = null,
 };
 
 /// `projectWithSources`, the consumer as `as` says.
 pub fn projectAs(gpa: std.mem.Allocator, consumer: []const u8, as: Consumer, extra: []const Extra, extra_imports: []const ExtraImport) !glint.Project {
     const inputs = try gpa.alloc(Project.Input, sources.len + 1 + extra.len);
     defer gpa.free(inputs);
-    const others: Project.Compilations = if (as.compilations == .program) .program else .both;
+    const others: Project.Compilations = as.others orelse if (as.compilations == .program) .program else .both;
     inputs[0] = .{ .name = "consumer", .bytes = consumer, .package = as.package, .compilations = as.compilations };
     for (sources, 1..) |source, i| {
         inputs[i] = aegisInput(source);

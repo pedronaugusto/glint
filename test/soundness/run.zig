@@ -11,7 +11,9 @@
 //! alone, since the case's rule is the one that runs. A case's `before.zig` is a file the run
 //! selects ahead of the case's, as a program's other file: what the case's file reads after it
 //! (a run-wide answer, the budget left) is the case. What glint says of `before.zig` itself is
-//! not read.
+//! not read. A case holding a `build-script` file is a build script's: its `hole.zig` and
+//! `twin.zig` are compiled as the build runner compiles a `build.zig` (for the host, std alone)
+//! and given to glint as build scripts (`--build-script`); its `before.zig` stays a program's.
 //!
 //! Each rule's directory is a column of the matrix, and its `expected.zon` the rule's own: the
 //! cases glint does not pass yet (`open`, each a path under the rule's directory), the rows with
@@ -69,6 +71,8 @@ const Job = struct {
     policy: ?[]const u8,
     before: ?[]const u8,
     absolute: []const u8,
+    /// A build script's case (`build-script`).
+    script: bool,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -112,6 +116,7 @@ pub fn main(init: std.process.Init) !void {
                 const case_path = try std.Io.Dir.path.join(a, &.{ row_name, case });
                 const policy = try caseFile(a, io, rule_dir, suite_path, rule, case_path, "glint.json");
                 const before = try caseFile(a, io, rule_dir, suite_path, rule, case_path, "before.zig");
+                const script = try caseFile(a, io, rule_dir, suite_path, rule, case_path, "build-script") != null;
                 var any = false;
                 for ([_]Role{ .hole, .twin }) |role| {
                     const path = try std.fmt.allocPrint(a, "{s}/{t}.zig", .{ case_path, role });
@@ -132,6 +137,7 @@ pub fn main(init: std.process.Init) !void {
                         .policy = policy,
                         .before = before,
                         .absolute = try std.Io.Dir.path.join(a, &.{ suite_path, rule, path }),
+                        .script = script,
                     });
                 }
                 if (!any) try w.print("{s}/{s}/: no hole.zig or twin.zig\n", .{ rule, case_path });
@@ -246,8 +252,15 @@ const Tools = struct { zig: []const u8, lib: []const u8, aegis: []const u8, cach
 /// whether its rule's `open` list names it.
 const CaseFile = struct { name: []const u8, absolute: []const u8, listed: bool = false };
 
-/// The kinds of a case's files, each compiled apart.
-const kinds = [_][]const u8{ "hole.zig", "twin.zig", "before.zig" };
+/// The kinds of a case's files, each compiled apart: a build script's hole and twin apart from
+/// a program's (`buildKind`).
+const kinds = [_][]const u8{ "hole.zig", "twin.zig", "before.zig", "build-hole.zig", "build-twin.zig" };
+
+/// Whether files of `kind` are build scripts, which the build runner compiles for the host
+/// with std alone: no libc, no aegis module.
+fn buildKind(kind: []const u8) bool {
+    return std.mem.startsWith(u8, kind, "build-");
+}
 
 /// One kind's compilation, run beside the others on its own arena.
 const Compilation = struct {
@@ -270,7 +283,8 @@ fn compiled(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, tools: Too
     var befores: std.StringHashMapUnmanaged(void) = .empty;
     for (jobs) |job| {
         const rule = columns[job.column].rule;
-        try compilations[@intFromEnum(job.role)].files.append(a, .{ .name = try std.fmt.allocPrint(a, "{s}/{s}", .{ rule, job.path }), .absolute = job.absolute, .listed = job.listed });
+        const kind = @as(usize, if (job.script) 3 else 0) + @backingInt(job.role);
+        try compilations[kind].files.append(a, .{ .name = try std.fmt.allocPrint(a, "{s}/{s}", .{ rule, job.path }), .absolute = job.absolute, .listed = job.listed });
         const before = job.before orelse continue;
         if ((try befores.getOrPut(a, before)).found_existing) continue;
         const case = std.Io.Dir.path.dirname(job.path) orelse ".";
@@ -307,7 +321,10 @@ fn compile(a: std.mem.Allocator, io: std.Io, tools: Tools, kind: []const u8, fil
     var root: std.Io.Writer.Allocating = .init(a);
     try root.writer.writeAll("const std = @import(\"std\");\n");
     var arguments: std.ArrayList([]const u8) = .empty;
-    try arguments.appendSlice(a, &.{ "-fno-emit-bin", "-target", "aarch64-macos", "-lc", "--name", try std.fmt.allocPrint(a, "soundness-{s}", .{std.Io.Dir.path.stem(kind)}), "--zig-lib-dir", tools.lib, "--cache-dir", tools.cache });
+    const script = buildKind(kind);
+    try arguments.append(a, "-fno-emit-bin");
+    if (!script) try arguments.appendSlice(a, &.{ "-target", "aarch64-macos", "-lc" });
+    try arguments.appendSlice(a, &.{ "--name", try std.fmt.allocPrint(a, "soundness-{s}", .{std.Io.Dir.path.stem(kind)}), "--zig-lib-dir", tools.lib, "--cache-dir", tools.cache });
     for (files, 0..) |_, index| try arguments.appendSlice(a, &.{ "--dep", try std.fmt.allocPrint(a, "case{d}", .{index}) });
     const root_path = try std.Io.Dir.path.join(a, &.{ scratch, "cases.zig" });
     try arguments.append(a, try std.fmt.allocPrint(a, "-Mroot={s}", .{root_path}));
@@ -315,17 +332,19 @@ fn compile(a: std.mem.Allocator, io: std.Io, tools: Tools, kind: []const u8, fil
     for (files, 0..) |file, index| {
         // The case's stubs: each a module of its own, named for the case's import.
         const case = std.Io.Dir.path.dirname(file.absolute) orelse ".";
-        for (try stubsOf(a, io, case)) |stub| {
+        const case_stubs: []const []const u8 = if (script) &.{} else try stubsOf(a, io, case);
+        for (case_stubs) |stub| {
             try arguments.appendSlice(a, &.{ "--dep", try std.fmt.allocPrint(a, "{s}=stub{d}", .{ std.Io.Dir.path.stem(stub), stubs.items.len }) });
             try stubs.append(a, stub);
         }
         // Each file's references in a comptime block of its own, with the quota a file of many
         // declarations takes.
         try root.writer.print("comptime {{\n    @setEvalBranchQuota(100_000);\n    for (std.meta.declarations(@import(\"case{d}\"))) |name| _ = &@field(@import(\"case{d}\"), name);\n}}\n", .{ index, index });
-        try arguments.appendSlice(a, &.{ "--dep", "aegis", try std.fmt.allocPrint(a, "-Mcase{d}={s}", .{ index, file.absolute }) });
+        if (!script) try arguments.appendSlice(a, &.{ "--dep", "aegis" });
+        try arguments.append(a, try std.fmt.allocPrint(a, "-Mcase{d}={s}", .{ index, file.absolute }));
     }
     for (stubs.items, 0..) |stub, index| try arguments.appendSlice(a, &.{ "--dep", "aegis", try std.fmt.allocPrint(a, "-Mstub{d}={s}", .{ index, stub }) });
-    try arguments.append(a, try std.fmt.allocPrint(a, "-Maegis={s}", .{tools.aegis}));
+    if (!script) try arguments.append(a, try std.fmt.allocPrint(a, "-Maegis={s}", .{tools.aegis}));
     try cwd.writeFile(io, .{ .sub_path = root_path, .data = root.written() });
     var response: std.Io.Writer.Allocating = .init(a);
     for (arguments.items, 0..) |argument, index| {
@@ -502,6 +521,7 @@ fn judge(gpa: std.mem.Allocator, io: std.Io, store: *glint.Project.Store, rule: 
     try args.appendSlice(a, &.{ "glint", "--only", rule, "--zig-lib-path", lib, "--module", module, "--summary-check" });
     if (job.policy) |config| try args.appendSlice(a, &.{ "--config", config });
     if (job.before) |before| try args.append(a, before);
+    if (job.script) try args.append(a, "--build-script");
     try args.append(a, job.absolute);
     const status = try glint.cli.executeStored(gpa, io, args.items, &output.writer, &problems.writer, store);
     return verdictOf(output.written(), status, rule, job.before);

@@ -176,6 +176,45 @@ pub const InitError = File.InitError || Model.InitError || std.Io.Cancelable || 
 pub const QueryError = error{InvalidHandle};
 
 /// Copies all source inputs and lowers each valid file through std AstGen/ZIR.
+/// Sets each input's compilations from the build scripts the caller's build has (`scripts`,
+/// positions in `inputs`), by what reaches it through `imports`: a file only build scripts
+/// reach, themselves among them, is the build runner's (`.build`); one both a build script
+/// and another file reach is both's (std, a module a script imports too); any other is the
+/// program's. An import that names its one compilation (`Import.compilation`: a file both
+/// compile, binding the name apart in each) is followed only from that compilation's files.
+/// The one reading of a build script's files, for any caller that names its scripts (glint's
+/// `--build-script`, a gate assembling its inputs from its build graph's scripts).
+pub fn compiledBy(gpa: std.mem.Allocator, inputs: []Input, imports: []const Import, scripts: []const usize) std.mem.Allocator.Error!void {
+    const by_build = try reached(gpa, inputs.len, imports, scripts, .build);
+    defer gpa.free(by_build);
+    var others: std.ArrayList(usize) = .empty;
+    defer others.deinit(gpa);
+    for (inputs, 0..) |input, index| if (input.selected and std.mem.findScalar(usize, scripts, index) == null) try others.append(gpa, index);
+    const by_program = try reached(gpa, inputs.len, imports, others.items, .program);
+    defer gpa.free(by_program);
+    for (inputs, by_build, by_program) |*input, build, program| input.compilations = if (build and program) .both else if (build) .build else .program;
+}
+
+/// Which of `files` inputs `roots` reach through the `imports` that hold in compilation `in`,
+/// the roots among them.
+fn reached(gpa: std.mem.Allocator, files: usize, imports: []const Import, roots: []const usize, in: Compilations) std.mem.Allocator.Error![]bool {
+    const seen = try gpa.alloc(bool, files);
+    @memset(seen, false);
+    var stack: std.ArrayList(usize) = .empty;
+    defer stack.deinit(gpa);
+    for (roots) |root| if (root < files and !seen[root]) {
+        seen[root] = true;
+        try stack.append(gpa, root);
+    };
+    while (stack.pop()) |next| for (imports) |import| {
+        if (import.from != next or import.target >= files or seen[import.target]) continue;
+        if (import.compilation) |only| if (!in.within(only)) continue;
+        seen[import.target] = true;
+        try stack.append(gpa, import.target);
+    };
+    return seen;
+}
+
 pub fn init(gpa: std.mem.Allocator, inputs: []const Input, imports: []const Import, options: Options) InitError!Project {
     if (inputs.len > options.files or inputs.len > std.math.maxInt(u32)) return error.ProjectBudgetExceeded;
     var remaining_bytes = aegis.int.Checked(usize).init(options.bytes);
@@ -460,4 +499,44 @@ test "a ZON input is read as ZON, and the same bytes as Zig are another file" {
     var again = try init(std.testing.allocator, &.{.{ .name = "b.zon", .bytes = bytes, .kind = .zon }}, &.{}, .{ .store = &store });
     defer again.deinit();
     try std.testing.expectEqual(project.sources[0].file, again.sources[0].file);
+}
+
+test "a build script's files are the build runner's, a file both reach both's, the rest the program's" {
+    var inputs = [_]Input{
+        .{ .name = "build.zig", .bytes = "", .selected = true },
+        .{ .name = "tools.zig", .bytes = "", .selected = false },
+        .{ .name = "std.zig", .bytes = "", .selected = false },
+        .{ .name = "main.zig", .bytes = "", .selected = true },
+        .{ .name = "lib.zig", .bytes = "", .selected = false },
+    };
+    const imports = [_]Import{
+        .{ .from = 0, .spelling = "tools.zig", .target = 1 },
+        .{ .from = 0, .spelling = "std", .target = 2 },
+        .{ .from = 3, .spelling = "std", .target = 2 },
+        .{ .from = 3, .spelling = "lib.zig", .target = 4 },
+    };
+    try compiledBy(std.testing.allocator, &inputs, &imports, &.{0});
+    const expected = [_]Compilations{ .build, .build, .both, .program, .program };
+    for (inputs, expected) |input, compilations| try std.testing.expectEqual(compilations, input.compilations);
+}
+
+test "an import that names its one compilation is followed only from that compilation's files" {
+    // `shared` both compile, binding `dep` apart: the program's `dep` is the module, the build
+    // runner's the dependency's build script.
+    var inputs = [_]Input{
+        .{ .name = "build.zig", .bytes = "", .selected = true },
+        .{ .name = "main.zig", .bytes = "", .selected = true },
+        .{ .name = "shared.zig", .bytes = "", .selected = false },
+        .{ .name = "dep/root.zig", .bytes = "", .selected = false },
+        .{ .name = "dep/build.zig", .bytes = "", .selected = false },
+    };
+    const imports = [_]Import{
+        .{ .from = 0, .spelling = "shared.zig", .target = 2 },
+        .{ .from = 1, .spelling = "shared.zig", .target = 2 },
+        .{ .from = 2, .spelling = "dep", .target = 3, .compilation = .program },
+        .{ .from = 2, .spelling = "dep", .target = 4, .compilation = .build },
+    };
+    try compiledBy(std.testing.allocator, &inputs, &imports, &.{0});
+    const expected = [_]Compilations{ .build, .program, .both, .program, .build };
+    for (inputs, expected) |input, compilations| try std.testing.expectEqual(compilations, input.compilations);
 }

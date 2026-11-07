@@ -17,6 +17,8 @@ const Options = struct {
     config: Rule.Config = .{},
     format: Report.Format = .text,
     files: std.ArrayList([]const u8) = .empty,
+    /// Files checked as build scripts (`Project.compiledBy`).
+    build_scripts: std.ArrayList([]const u8) = .empty,
     modules: std.ArrayList(Module) = .empty,
     /// Directories whose files belong to a named package (`Project.Input.package`).
     packages: std.ArrayList(Module) = .empty,
@@ -248,6 +250,7 @@ pub const Arguments = struct {
     summary_check: bool = false,
     summary_records: bool = false,
     zig_lib_path: ?[]const u8 = null,
+    build_script: []const []const u8 = &.{},
     module: []const []const u8 = &.{},
     root: []const []const u8 = &.{},
     package: []const []const u8 = &.{},
@@ -278,6 +281,7 @@ pub const Arguments = struct {
             .summary_records = .{ .negatable = false, .help = "Read std's size summaries from std's open-world records, as a lint loading them would (summaries' measure of what the open world leaves undecided)" },
             .escapes_before = .{ .value_name = "FILE", .hint = .file, .help = "The escapes a run before reported (its text report, or preflight's escapes.txt): --fix names an escape in the older form, at that place with those words, with only the rules listed for it there that find something now, and leaves one not listed to its owner; never with --only" },
             .zig_lib_path = .{ .value_name = "DIR", .hint = .directory, .section = "Inputs", .help = "Zig's library, for std's imports" },
+            .build_script = .{ .value_name = "FILE", .hint = .file, .section = "Inputs", .help = "A file to check as a build script, repeated: it, and what only build scripts import, the build runner compiles" },
             .module = .{ .value_name = "NAME=FILE", .section = "Inputs", .help = "A module the files import by name, and its root file, repeated" },
             .root = .{ .value_name = "DIR", .hint = .directory, .section = "Inputs", .help = "A directory imports may read files from, repeated" },
             .package = .{ .value_name = "NAME=DIR", .section = "Inputs", .help = "The package whose files a directory holds, repeated" },
@@ -332,6 +336,7 @@ fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, definitions: 
     for (arguments.module) |mapping| try result.modules.append(a, named(mapping) orelse return error.InvalidModule);
     for (arguments.package) |mapping| try result.packages.append(a, named(mapping) orelse return error.InvalidPackage);
     try result.files.appendSlice(a, arguments.files);
+    try result.build_scripts.appendSlice(a, arguments.build_script);
     for (arguments.files_from) |from| {
         const read = try aegis.own.readFile(io, std.Io.Dir.cwd(), from, a, .fromRaw(4 * 1024 * 1024));
         // A list is a file, which may be what a repository holds: its paths are parsed into
@@ -433,16 +438,18 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
         .complete => return error.InvalidArguments,
     };
     const configured = try options(a, io, arguments, definitions);
-    if (configured.files.items.len == 0) return error.MissingSource;
+    if (configured.files.items.len == 0 and configured.build_scripts.items.len == 0) return error.MissingSource;
     record.outcome = .input_failure;
     var loader: Loader = .{ .a = a, .io = io, .options = &configured };
     for (configured.packages.items) |package| try loader.packages.append(a, .{ .name = package.name, .path = try std.Io.Dir.cwd().realPathFileAlloc(io, package.path, a) });
     for (configured.roots.items) |root| try loader.roots.append(a, try std.Io.Dir.cwd().realPathFileAlloc(io, root, a));
-    for (configured.files.items) |path| {
+    var scripts: std.ArrayList(usize) = .empty;
+    for ([_][]const []const u8{ configured.files.items, configured.build_scripts.items }, 0..) |paths, list| for (paths) |path| {
         const position = try loader.load(path, true);
+        if (list == 1) try scripts.append(a, position);
         const canonical = loader.canonical_paths.items[position];
         try loader.roots.append(a, std.Io.Dir.path.dirname(canonical) orelse canonical);
-    }
+    };
     if (configured.zig_lib_path) |lib| try loader.roots.append(a, try std.Io.Dir.cwd().realPathFileAlloc(io, lib, a));
     for (configured.modules.items) |module| {
         const canonical = try std.Io.Dir.cwd().realPathFileAlloc(io, module.path, a);
@@ -450,6 +457,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     }
     record.outcome = .traversal_failure;
     try loader.imports();
+    if (scripts.items.len != 0) try Project.compiledBy(a, loader.inputs.items, loader.mappings.items, scripts.items);
     record.outcome = .tool_failure;
     var project = try Project.init(gpa, loader.inputs.items, loader.mappings.items, .{ .io = io, .store = store });
     defer project.deinit();
