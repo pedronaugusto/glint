@@ -2387,31 +2387,35 @@ fn plainValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: us
     if (depth == 64) return false;
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    switch (tree.nodeTag(node)) {
-        // An enum's tag, an error, or a declaration literal naming a container's `const`
-        // (`.empty`), known as the program compiles: no live owner.
-        .number_literal, .char_literal, .string_literal, .multiline_string_literal, .enum_literal, .error_value => return true,
+    // An enum's tag, an error, or a declaration literal naming a container's `const`
+    // (`.empty`), known as the program compiles: no live owner (Facts.literalOf).
+    if (try c.facts.literalOf(file, node)) |literal| switch (literal) {
+        .enum_literal, .error_value, .number, .string, .char => return true,
+        else => {},
+    };
+    // By the expression's form (Facts.accesses.formOf: every tag has one).
+    switch (Facts.accesses.formOf(tree.nodeTag(node))) {
         // Zig has no operator overloading: an operator gives a number, a truth value, a vector or
         // (`+`, `-` on a pointer) a pointer, never a struct an owner is.
-        .add, .add_wrap, .add_sat, .sub, .sub_wrap, .sub_sat, .mul, .mul_wrap, .mul_sat, .div, .mod, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor, .bit_not, .negation, .negation_wrap, .bool_not, .bool_and, .bool_or, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => return true,
-        .@"comptime", .@"try", .address_of => return plainValue(c, file, tree.nodeData(node).node, depth + 1),
-        .grouped_expression => return plainValue(c, file, tree.nodeData(node).node_and_token[0], depth + 1),
+        .operator, .logic, .comparison => return true,
+        .@"comptime", .tried, .address_of => return plainValue(c, file, tree.nodeData(node).node, depth + 1),
+        .grouped => return plainValue(c, file, Facts.ungrouped(tree, node), depth + 1),
         // Arrays joined: plain when what they are made of is.
-        .array_cat => {
+        .concatenation => {
             const sides = tree.nodeData(node).node_and_node;
             return try plainValue(c, file, sides[0], depth + 1) and try plainValue(c, file, sides[1], depth + 1);
         },
         .array_access => return plainValue(c, file, tree.nodeData(node).node_and_node[0], depth + 1),
         // The payload of plain data is plain: Zig requires the other side to coerce to it.
         .@"orelse", .@"catch" => return plainValue(c, file, tree.nodeData(node).node_and_node[0], depth + 1),
-        .@"if", .if_simple => {
+        .@"if" => {
             // Peer types: a struct has none with a number, a truth value or a pointer, so one
             // plain branch makes the whole plain (a branch that never ends gives nothing).
             const branch = tree.fullIf(node).?;
             const otherwise = branch.ast.else_expr.unwrap() orelse return false;
             return try plainValue(c, file, branch.ast.then_expr, depth + 1) or try plainValue(c, file, otherwise, depth + 1);
         },
-        .block, .block_semicolon, .block_two, .block_two_semicolon => {
+        .body => {
             // `{}`: void.
             var buffer: [2]Ast.Node.Index = undefined;
             const brace = tree.nodeMainToken(node);
@@ -2419,19 +2423,22 @@ fn plainValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: us
             return plainBreaks(c, file, node, depth + 1);
         },
         // A literal of plain values, with no type of its own or of a plain type.
-        .array_init_dot_two, .array_init_dot_two_comma, .array_init_dot, .array_init_dot_comma, .array_init_one, .array_init_one_comma, .array_init, .array_init_comma => {
+        .array_literal => {
             var buffer: [2]Ast.Node.Index = undefined;
             const literal = tree.fullArrayInit(&buffer, node).?; // unreachable: the tag is an array literal's
             if (literal.ast.type_expr.unwrap()) |t| return plainType(c, file, t, depth + 1);
             for (literal.ast.elements) |element| if (!try plainValue(c, file, element, depth + 1)) return false;
             return true;
         },
-        .struct_init_dot_two, .struct_init_dot_two_comma, .struct_init_dot, .struct_init_dot_comma => {
+        .struct_literal => {
             var buffer: [2]Ast.Node.Index = undefined;
-            for (tree.fullStructInit(&buffer, node).?.ast.fields) |field| if (!try plainValue(c, file, field, depth + 1)) return false; // unreachable: the tag is a struct literal's
+            const literal = tree.fullStructInit(&buffer, node).?; // unreachable: the form is a struct literal's
+            // One of a type it names is that type's, read where it is.
+            if (literal.ast.type_expr != .none) return false;
+            for (literal.ast.fields) |field| if (!try plainValue(c, file, field, depth + 1)) return false;
             return true;
         },
-        .identifier => {
+        .leaf => {
             const ref = model.reference(node) orelse return false;
             const index = ref.declaration orelse return false;
             const decl = model.declarations[@backingInt(index)];
@@ -2440,7 +2447,7 @@ fn plainValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: us
             if (decl.kind == .capture) {
                 const loop = tree.fullFor(decl.node) orelse return false;
                 for (loop.ast.inputs) |input| {
-                    if (tree.nodeTag(input) == .for_range) continue;
+                    if (Facts.accesses.formOf(tree.nodeTag(input)) == .for_range) continue;
                     if (!try plainValue(c, file, input, depth + 1)) return false;
                 }
                 return true;
@@ -2450,7 +2457,7 @@ fn plainValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: us
             const init = v.ast.init_node.unwrap() orelse return false;
             return plainValue(c, file, init, depth + 1);
         },
-        .call_one, .call_one_comma, .call, .call_comma => {
+        .call => {
             // A call that may be of another function is not known plain here: its value's type
             // decides it where this is read.
             const origin = switch (try calledFunction(c, file, node)) {
