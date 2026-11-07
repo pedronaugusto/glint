@@ -34,6 +34,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 ### Changed
 
 - aegis pinned at its 0.3 line (7fdf0a3: one module, `aegis`, and the types that declare their roles in `lint_rules`), and preflight (development) at its 0.19 line, which builds on it.
+- `zig build check-rule-readers` (development) reads every rule-side source, from the tree: all of `src/` but the test roots, the files the layer table puts in the layers that hold no rules, and the shared query `Governed` (ci/layer_files.zig, which layers.zig reads too), so a new file is counted unless it is placed outside the rules. Each report is installed whole under `zig-out/rule-readers/` and their totals per rule, class and file are printed: the build runner cut the report it printed, so counts read off it were short.
 
 ### Fixed
 - Z026 reads a test's refusal assertion as no discard: in test code (a `test` block, or a file imported only from test blocks and such files), an `if`'s empty error branch whose success branch leaves by an error (`if (parse(b)) |_| return error.TestUnexpectedResult else |_| {}`, or `@panic`) is the test asserting the call fails. The same shape in production code, a `catch`, and a test's success branch that goes on stay sites.

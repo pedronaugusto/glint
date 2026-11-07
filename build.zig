@@ -145,18 +145,16 @@ pub fn dev(b: *std.Build, tools: type) void {
     });
     b.step("check-source-policy", "Verify complete all-cast, safety-off and length policy on explicit own inputs").dependOn(&source_policy.step);
     // glint's rules read values, writes, calls and types only through the shared queries: the
-    // rule files, with std, aegis and the shared queries' files resolved and not checked.
+    // rule side of glint's sources (`ruleSources`, read from the tree), with std, aegis and the
+    // shared queries' files resolved and not checked.
     const rule_readers = b.addExecutable(.{ .name = "glint-rule-readers", .root_module = b.createModule(.{
         .root_source_file = p.path("ci/rule_readers.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "glint", .module = module }},
     }) });
-    var rule_files: std.ArrayList(std.Build.LazyPath) = .empty;
-    for ([_][]const u8{ "AegisPack", "AegisRecursion", "Builtins", "CContract", "Danger", "DangerFlow", "DangerShapes", "DeadDeclarations", "Disallowed", "Escapes", "Metrics", "ParentPointer", "Present", "Streams", "Undefined" }) |name| {
-        rule_files.append(b.allocator, p.path(b.fmt("src/{s}.zig", .{name}))) catch @panic("OOM");
-    }
-    const rule_lint = addLint(b, rule_readers, .{ .sources = rule_files.items, .directories = &.{p.path("src")}, .args = &.{ "--only", "RULE_READERS" } });
+    const rule_files = ruleSources(b, p) catch |err| std.debug.panic("glint's src/ could not be listed for RULE_READERS: {t}", .{err});
+    const rule_lint = addLint(b, rule_readers, .{ .sources = rule_files, .directories = &.{p.path("src")}, .args = &.{ "--only", "RULE_READERS" } });
     rule_lint.addArg("--zig-lib-path");
     rule_lint.addDirectoryArg2(.zig_lib, .{});
     rule_lint.addArg("--module");
@@ -168,9 +166,19 @@ pub fn dev(b: *std.Build, tools: type) void {
     table_lint.addDirectoryArg2(.zig_lib, .{});
     table_lint.addArg("--module");
     table_lint.addPrefixedFileArg("aegis=", aegis_dependency.path("src/root.zig"));
-    const rule_readers_step = b.step("check-rule-readers", "Report where a rule reads a value, a write, a call or a type around the shared queries, and where glint keys a table by text");
-    rule_readers_step.dependOn(&rule_lint.step);
-    rule_readers_step.dependOn(&table_lint.step);
+    const rule_readers_step = b.step("check-rule-readers", "Report where a rule reads a value, a write, a call or a type around the shared queries, and where glint keys a table by text: each report whole under zig-out/rule-readers/, their totals per rule, class and file printed");
+    // Each report whole in a file, never read off the build runner's output, which it cuts.
+    const reports = [_]struct { std.Build.LazyPath, []const u8 }{ .{ rule_lint.captureStdOut(.{}), "rule-readers.json" }, .{ table_lint.captureStdOut(.{}), "name-tables.json" } };
+    const totals = b.addRunArtifact(b.addExecutable(.{ .name = "glint-rule-readers-totals", .root_module = b.createModule(.{
+        .root_source_file = p.path("ci/rule_readers_totals.zig"),
+        .target = b.graph.host,
+        .imports = &.{.{ .name = "aegis", .module = p.dependency("aegis", .{ .target = b.graph.host, .optimize = .fast }).module("aegis") }},
+    }) }));
+    for (reports) |report| {
+        rule_readers_step.dependOn(&b.addInstallFile(report[0], b.fmt("rule-readers/{s}", .{report[1]})).step);
+        totals.addFileArg(report[0]);
+    }
+    rule_readers_step.dependOn(&totals.step);
     const rule_readers_tests = b.addTest(.{ .root_module = rule_readers.root_module, .filters = if (filter) |f| &.{f} else &.{} });
     test_step.dependOn(&b.addRunArtifact(rule_readers_tests).step);
     check.dependOn(&rule_readers.step);
@@ -281,6 +289,12 @@ fn aegisSources(b: *std.Build, p: *std.Build, glint: *std.Build.Module, aegis_de
 /// Every Zig source of glint's own under `src/`, test files aside, in order: read from the tree,
 /// so a file added later is read too.
 fn ownSources(b: *std.Build, p: *std.Build) ![]const std.Build.LazyPath {
+    var found: std.ArrayList(std.Build.LazyPath) = .empty;
+    for (try ownSourcePaths(b, p)) |path| try found.append(b.allocator, p.path(path));
+    return found.items;
+}
+/// The paths of `ownSources`, from the package root (`src/Facts.zig`).
+fn ownSourcePaths(b: *std.Build, p: *std.Build) ![]const []const u8 {
     const io = b.graph.io;
     var dir = try p.root.openDir(io, "src", .{ .iterate = true });
     defer dir.close(io);
@@ -289,16 +303,36 @@ fn ownSources(b: *std.Build, p: *std.Build) ![]const std.Build.LazyPath {
     var paths: std.ArrayList([]const u8) = .empty;
     while (try walker.next(io)) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".zig") or std.mem.endsWith(u8, entry.path, "_test.zig")) continue;
-        try paths.append(b.allocator, try b.allocator.dupe(u8, entry.path));
+        try paths.append(b.allocator, b.fmt("src/{s}", .{entry.path}));
     }
     std.mem.sort([]const u8, paths.items, {}, struct {
         fn less(_: void, x: []const u8, y: []const u8) bool {
             return std.mem.order(u8, x, y) == .lt;
         }
     }.less);
+    return paths.items;
+}
+/// The rule side of glint's sources, for the rule readers' guard: every one of `ownSources` but the
+/// test roots, the files of the layers that hold no rules and the shared queries (ci/layer_files.zig),
+/// so a file added later is read unless it is placed in one of those.
+fn ruleSources(b: *std.Build, p: *std.Build) ![]const std.Build.LazyPath {
+    const layer_files = @import("ci/layer_files.zig");
     var found: std.ArrayList(std.Build.LazyPath) = .empty;
-    for (paths.items) |path| try found.append(b.allocator, p.path(b.fmt("src/{s}", .{path})));
+    each: for (try ownSourcePaths(b, p)) |path| {
+        if (std.mem.startsWith(u8, std.Io.Dir.path.basename(path), "test_")) continue;
+        for (layer_files.shared_queries) |query| if (std.mem.eql(u8, path, query)) continue :each;
+        for (layer_files.layers) |layer| {
+            if (std.mem.eql(u8, layer.name, layer_files.rules_layer)) continue;
+            for (layer.patterns) |pattern| if (layerHolds(pattern, path)) continue :each;
+        }
+        try found.append(b.allocator, p.path(path));
+    }
     return found.items;
+}
+/// Whether a layer's pattern names `path`: the file itself, or a directory's files (`src/Token/**`).
+fn layerHolds(pattern: []const u8, path: []const u8) bool {
+    if (std.mem.endsWith(u8, pattern, "/**")) return std.mem.startsWith(u8, path, pattern[0 .. pattern.len - 2]);
+    return std.mem.eql(u8, pattern, path);
 }
 
 pub fn addLinter(b: *std.Build, dependency: *std.Build.Dependency, options: LinterOptions) *std.Build.Step.Compile {

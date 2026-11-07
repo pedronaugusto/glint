@@ -1,17 +1,11 @@
 //! Source layers, lowest first; tests are outside the production graph.
 const gantry = @import("gantry");
-pub const layers: []const gantry.rules.Layer = &.{
-    .{ .name = "tokens", .patterns = &.{ "src/Token.zig", "src/Token/**" } },
-    .{ .name = "front end and selection", .patterns = &.{ "src/File.zig", "src/Constructs.zig", "src/Rule.zig", "src/FactSpec.zig", "src/names.zig", "src/Completion.zig" } },
-    .{ .name = "bindings and comments", .patterns = &.{ "src/Model.zig", "src/Suppression.zig" } },
-    .{ .name = "project", .patterns = &.{"src/Project.zig"} },
-    .{ .name = "facts and diagnostics", .patterns = &.{ "src/Facts.zig", "src/PackageRules.zig", "src/Summary.zig", "src/Library.zig", "src/Report.zig", "src/Fix.zig" } },
-    .{ .name = "rule API", .patterns = &.{"src/RuleContext.zig"} },
-    .{ .name = "built-in rules", .patterns = &.{ "src/Builtins.zig", "src/DeadDeclarations.zig", "src/Disallowed.zig", "src/Governed.zig", "src/Present.zig", "src/Escapes.zig", "src/Metrics.zig", "src/AegisRules.zig", "src/AegisContract.zig", "src/AegisRecursion.zig", "src/Danger.zig", "src/DangerShapes.zig", "src/Undefined.zig", "src/CContract.zig", "src/ParentPointer.zig", "src/Taint.zig", "src/Range.zig", "src/Bounds.zig", "src/Proof.zig", "src/Program.zig", "src/DangerFlow.zig", "src/Streams.zig", "src/AegisPack.zig", "src/releases.zig" } },
-    .{ .name = "rules", .patterns = &.{"src/Runner.zig"} },
-    .{ .name = "filesystem CLI", .patterns = &.{ "src/cli.zig", "src/Result.zig" } },
-    .{ .name = "public", .patterns = &.{"src/glint.zig"} },
-    .{ .name = "entry", .patterns = &.{ "src/main.zig", "src/BuildGate.zig" } },
+const files = @import("layer_files.zig");
+pub const layers: []const gantry.rules.Layer = blk: {
+    var out: [files.layers.len]gantry.rules.Layer = undefined;
+    for (files.layers, &out) |layer, *each| each.* = .{ .name = layer.name, .patterns = layer.patterns };
+    const done = out;
+    break :blk &done;
 };
 pub const required = [_][]const u8{ "src/glint.zig", "src/Project.zig", "src/main.zig" };
 pub const entries: []const []const u8 = &.{ "src/main.zig", "src/BuildGate.zig" };
