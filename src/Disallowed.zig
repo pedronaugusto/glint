@@ -38,6 +38,8 @@ pub fn check(self: *Context) Context.Error!void {
             try self.atDefinition(.P006, site.token, try self.allocator.print("disallowed declaration: {s}; use {s}", .{ entry.reason, entry.replacement }), site.decl);
             continue;
         }
+        // The declaration a package's lint_rules names as replaced is no use of it.
+        if (try inLintRules(self, site.node)) continue;
         const replacement = declared.entries[site.index - self.config.disallowed.len];
         switch (try replacementReach(self, site.node, replacement.with)) {
             .exempt => {},
@@ -87,8 +89,20 @@ fn declaredReplacements(self: *Context) Context.Error!struct { governed: []const
     return .{ .governed = governed.items, .entries = entries.items };
 }
 
-/// Whether a file of the package `here` imports `root`.
+/// Whether `node` lies in this file's own `lint_rules` (PackageRules.Rules.declared).
+fn inLintRules(self: *Context, node: Ast.Node.Index) Context.Error!bool {
+    const declared = (try PackageRules.of(self.facts, self.file)).declared orelse return false;
+    const model = &self.project.at(self.file).model;
+    const holder = model.declarations[@backingInt(declared.index)].node;
+    var at: ?Ast.Node.Index = node;
+    while (at) |each| : (at = model.parentOf(each)) if (each == holder) return true;
+    return false;
+}
+
+/// Whether `root` governs the package `here`: it is that (named) package's own root, or a file of `here`
+/// imports it.
 fn importedBy(project: *const Project, root: Project.FileId, here: PackageRules.Identity) bool {
+    if (here.name.len != 0 and PackageRules.Identity.of(project, root).eql(here)) return true;
     for (project.imports) |mapping| {
         if (mapping.target != root) continue;
         if (PackageRules.Identity.of(project, mapping.from).eql(here)) return true;
