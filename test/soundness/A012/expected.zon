@@ -4,5 +4,7 @@
         "address/m-a12-address_store/twin.zig",
         // matrix precision: a ceiling through @atomicStore and @atomicLoad is not carried; Range's move onto Facts.accesses
         "memory/m-a12-atomic_store/twin.zig",
+        // one reading of a bound: a container-level `const` limit holds at the sink (Bounds, branch/u-a12-const_limit_sink) but not at a call, which reads only Range's half inside the run's solve (Range does not read a `const` declaration's value; Bounds there would spill one file's budget into the others', aggregate/c1-run_budget)
+        "call/u-a12-const_limit_kept/twin.zig",
     },
 }

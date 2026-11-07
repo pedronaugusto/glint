@@ -2668,20 +2668,27 @@ fn summarized(c: *Context, flow: *Flow, function: Function.Id, callee: Callee, s
 /// Whether a ceiling the program fixes holds `node` where it is read (`Range.ceilings`, on every
 /// path to it: `if (n > max) return` before it): a limit clean where it is read, its parameters as
 /// their callers give them (`concrete`), in the fact's `lane`, or in every lane where the value
-/// is given whole (null: a call narrows every lane at once). A value so held is within a range the program chose: data, no peer's
-/// number. The one reading of a ceiling, at a sink (`capped`) and at a call given the value
-/// (`passed`). What it does not claim: memory grown by such amounts in a loop input drives (a
-/// list appended to n at a time, each n held) holds data, as `@min`'s narrowing gives today.
+/// is given whole (null: a call narrows every lane at once); or a value Range holds to a
+/// short's count (`Range.small`: a clamp on both branches, a 16-bit type). A value so held is
+/// within a range the program chose: data, no peer's number. The one reading of a bound at a
+/// call given the value (`passed`) and at a sink (`capped`); a sink reads Bounds' counts besides
+/// (`Proof.counts`: a `const` limit, a count within memory the function holds), which a call
+/// does not: a call is read inside the run's solve, whose budget is the run's, and what Bounds
+/// spends there would spill one file's budget into every other's. What it does not claim:
+/// memory grown by such amounts in a loop input drives (a list appended to n at a time, each n
+/// held) holds data, as `@min`'s narrowing gives today.
 fn ceilingHeld(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.Index, lane: ?u8) Context.Error!bool {
-    if (flow.in_ceiling) return false;
-    flow.in_ceiling = true;
-    defer flow.in_ceiling = false;
-    for (try Range.ceilings(c, file, node)) |limit| {
-        const function = owner(flow, file, limit) orelse continue;
-        const level = concrete(flow, function, try dep(c, flow, function, limit));
-        if (if (lane) |one| level.at(one) == .clean else level.isClean()) return true;
+    if (!flow.in_ceiling) {
+        flow.in_ceiling = true;
+        defer flow.in_ceiling = false;
+        for (try Range.ceilings(c, file, node)) |limit| {
+            const function = owner(flow, file, limit) orelse continue;
+            const level = concrete(flow, function, try dep(c, flow, function, limit));
+            if (if (lane) |one| level.at(one) == .clean else level.isClean()) return true;
+        }
     }
-    return false;
+    // Range reads no fact, so a limit read through a call given the value reads it too.
+    return Range.small(c, file, node);
 }
 
 /// Whether a ceiling the program fixes holds `node` where a rule's sink reads it (`ceilingHeld`).
