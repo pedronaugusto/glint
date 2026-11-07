@@ -596,29 +596,34 @@ fn published(self: *Facts, root: Project.FileId, path: []const u8) ResolveError!
 /// The role `library` publishes for a function declaration, or a type or instance of a
 /// published container, seen through pointers, optionals and error unions.
 pub fn role(self: *Facts, library: anytype, value: Value) ResolveError!?@TypeOf(library).Role {
-    const Role = @TypeOf(library).Role;
-    const found = try self.publication(library);
+    const raw = roleIn(try self.publication(library), value) orelse return null;
+    return @as(@TypeOf(library).Role, @fromBackingInt(@intCast(raw)));
+}
+
+/// The number of the role `found` publishes for `value` (`role`), seen through pointers,
+/// optionals and error unions; of a choice, the one every part agrees on, none where they
+/// differ or one has none.
+fn roleIn(found: *const Publication, value: Value) ?@FieldType(Entry, "role") {
     var current = value;
     while (true) switch (current) {
         .pointer => |inner| current = inner.child.*,
         .array, .optional, .error_union => |inner| current = inner.*,
         .function => |decl| {
-            for (found.entries) |entry| if (entry.target == .function and std.meta.eql(entry.target.function, decl)) return @as(Role, @fromBackingInt(@intCast(entry.role)));
+            for (found.entries) |entry| if (entry.target == .function and std.meta.eql(entry.target.function, decl)) return entry.role;
             return null;
         },
         .container, .instance => |c| {
-            for (found.entries) |entry| if (entry.target == .container and entry.target.container.file == c.file and entry.target.container.scope == c.scope) return @as(Role, @fromBackingInt(@intCast(entry.role)));
+            for (found.entries) |entry| if (entry.target == .container and entry.target.container.file == c.file and entry.target.container.scope == c.scope) return entry.role;
             return null;
         },
-        // A choice: the role every part agrees on, none where they differ or one has none.
         .alternatives => |parts| {
-            var agreed: ?Role = null;
-            for (parts, 0..) |part, k| {
-                const one = (try self.role(library, part)) orelse return null;
-                if (k != 0 and one != agreed.?) return null;
-                agreed = one;
+            if (parts.len == 0) return null;
+            const first = roleIn(found, parts[0]) orelse return null;
+            for (parts[1..]) |part| {
+                const other = roleIn(found, part) orelse return null;
+                if (other != first) return null;
             }
-            return agreed;
+            return first;
         },
         else => return null,
     };
