@@ -863,12 +863,15 @@ fn owns(c: *Context, rule: Rule, resources: []const ?Facts.Container, holder: Fa
         }
         const receiver = byPointer(resolved) orelse continue;
         if (receiver.file != holder.file or receiver.scope != holder.scope) continue;
+        // Read under the bindings of the call that made `holder`, where it is in that type
+        // function's body (`instanceReading`).
+        const reading = instanceReading(c, holder, use.file, use.node);
         // `@field` by a name it computes may be this field: what it does to it is undecided.
         if (!use.named) {
-            doubt = doubt or try released(c, use.file, use.node, 0) != .no or try writeOf(c, resources, use.file, use.node) != .none;
+            doubt = doubt or try releasedUnder(c, reading, use.file, use.node, 0) != .no or try writeOf(c, resources, use.file, use.node) != .none;
             continue;
         }
-        switch (try released(c, use.file, use.node, 0)) {
+        switch (try releasedUnder(c, reading, use.file, use.node, 0)) {
             .yes => return "that its file releases",
             .unknown => doubt = true,
             .no => {},
