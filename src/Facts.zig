@@ -13732,6 +13732,11 @@ pub const calls = struct {
         // A choice of holders (`if (T == bool) &memo.found else &memo.needed`): bound where
         // each is a value whose member so named is a method, as one holder is.
         if (value == .alternatives) {
+            // A choice of types (`Hasher(wide)` a `switch` returns): a type's member binds
+            // nothing, as one type's does.
+            for (value.alternatives) |one| {
+                if (one != .container) break;
+            } else return .none;
             if (tree.nodeTag(callee) != .field_access) return .{ .unknown = .unsupported };
             const name = try facts.memberName(tree.tokenSlice(tree.nodeData(callee).node_and_token[1]));
             for (value.alternatives) |one| {
@@ -14078,6 +14083,26 @@ test "a call that passes what a module the build does not have gives binds nothi
         // Unmapped, `k.fold` is unknown and so is the binding; absent, its call is not compiled.
         try std.testing.expectEqual(absent_kernels, value == .instance);
     }
+}
+
+test "a member of a choice of types binds no receiver: the call's arguments are its parameters in order" {
+    const source = "const A = struct { pub fn hash(m: []const u8, out: []u8) void { _ = m; _ = out; } };\nconst B = struct { pub fn hash(m: []const u8, out: []u8) void { _ = m; _ = out; } };\nfn Pick(comptime wide: bool) type { return switch (wide) { false => A, true => B }; }\npub fn f(comptime wide: bool, m: []const u8, out: []u8) void { const H = Pick(wide); H.hash(m, out); }";
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const node = for (0..tree.nodes.len) |i| {
+        const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const call = tree.fullCall(&buffer, at) orelse continue;
+        if (call.ast.params.len == 2) break at;
+    } else unreachable; // unreachable: the source calls `H.hash(m, out)`
+    const call = (try calls.at(&facts, project.sources[0].id, node)).?;
+    try std.testing.expect(call.receiver == .none);
+    try std.testing.expectEqual(2, call.args.known.len);
 }
 
 /// The type a struct literal takes from where it is written, as Zig gives it a result type: a
