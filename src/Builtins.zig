@@ -250,6 +250,8 @@ fn reflectedImport(self: *Context, node: Ast.Node.Index, indexes: []const Model.
     const value = try self.facts.resolve(self.file, args[0]);
     const container: ?Facts.Container = switch (value) {
         .container, .instance => |v| v,
+        // A choice of holders is no one container: the import may be what any of them reads.
+        .alternatives => null,
         else => null,
     };
     if (container) |known| if (!known.symbolic) {
@@ -888,6 +890,7 @@ fn syntaxRules(self: *Context) RunError!void {
                 // A choice between types names a type; any other choice is undecided here.
                 if (value == .alternatives) value = for (value.alternatives) |one| switch (one) {
                     .container, .primitive, .error_set, .pointer, .array, .optional, .error_union, .fn_type => {},
+                    .alternatives => unreachable, // unreachable: choose never nests alternatives
                     else => break .{ .unknown = .unsupported },
                 } else value.alternatives[0];
                 switch (value) {
@@ -902,6 +905,7 @@ fn syntaxRules(self: *Context) RunError!void {
                     .reified => |built| if (!built.value) {
                         if (names.acronymIssue(name)) try self.at(.Z032, decl.token, "treat acronyms in type names as ordinary words, for example XmlParser");
                     } else if (!try interfaceName(self, decl, name)) try self.at(.Z006, decl.token, "value binding should use snake_case"),
+                    .alternatives => unreachable, // unreachable: a choice is read as one of its parts above
                     .function => |definition| {
                         const target = &self.project.at(definition.file).file.tree;
                         const record = self.project.at(definition.file).model.declarations[@backingInt(definition.index)];
@@ -947,10 +951,15 @@ fn interfaceName(self: *Context, decl: Model.Declaration, name: []const u8) RunE
 
 /// Whether `node` of `file` is the type `type`, by what it resolves to (an alias of it too).
 fn namesType(self: *Context, file: Project.FileId, node: Ast.Node.Index) RunError!bool {
-    return switch (try self.facts.resolve(file, node)) {
+    const value = try self.facts.resolve(file, node);
+    var each: Facts.Join = .{};
+    for (Facts.valueParts(&value)) |part| each.add(part, switch (part) {
         .primitive => |name| std.mem.eql(u8, name, "type"),
+        .alternatives => unreachable, // unreachable: valueParts gives no choice as a part
         else => false,
-    };
+    });
+    // The type `type` only where every build's is.
+    return each.agreed() == true;
 }
 
 /// Whether a selected file reads `T.name` where `T` is a parameter that takes a type: declared

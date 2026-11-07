@@ -2714,6 +2714,9 @@ fn heldOwners(c: *Context, tree: *const Ast, model: *const Model, decl: Model.De
     }
     const container = switch (whole) {
         .instance => |container| container,
+        // A choice of record types: its owners are not followed, and the call is read as an
+        // acquisition.
+        .alternatives => return null,
         else => return null,
     };
     if (try c.inLibrary(Contract.library, container.file)) return null;
