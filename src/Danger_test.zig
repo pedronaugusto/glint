@@ -11199,3 +11199,64 @@ test "Z026 a call whose every error is a refusal: a fallback below in production
     // A future's await returns its task's result: never read as the call's own errors.
     try expectZ026("test \"awaited\" { var f: std.Io.Future(error{Bad}!void) = undefined; if (f.await(.{})) |_| {} else |_| {} }", 1);
 }
+
+const cursor_program =
+    \\const std = @import("std");
+    \\const Cursor = struct {
+    \\    buf: []const u8,
+    \\    pos: usize = 0,
+    \\    end: usize = 0,
+    \\    fn init(buf: []const u8) Cursor {
+    \\        return .{ .buf = buf, .end = buf.len };
+    \\    }
+    \\    fn advance(c: *Cursor, n: usize) void {
+    \\        if (n > c.end - c.pos) return;
+    \\        c.pos += n;
+    \\    }
+    \\    fn rest(c: *const Cursor) []const u8 {
+    \\        return c.buf[c.pos..c.end];
+    \\    }
+    \\};
+    \\const Loose = struct {
+    \\    buf: []const u8,
+    \\    pos: usize = 0,
+    \\    end: usize = 0,
+    \\    fn init(buf: []const u8) Loose {
+    \\        return .{ .buf = buf, .end = buf.len };
+    \\    }
+    \\    fn jump(l: *Loose, to: usize) void {
+    \\        l.pos = to;
+    \\    }
+    \\    fn rest(l: *const Loose) []const u8 {
+    \\        return l.buf[l.pos..l.end];
+    \\    }
+    \\};
+    \\const Far = struct {
+    \\    buf: []const u8,
+    \\    pos: usize = undefined,
+    \\    end: usize = undefined,
+    \\    fn rest(w: *const Far) []const u8 {
+    \\        return w.buf[w.pos..w.end];
+    \\    }
+    \\};
+    \\pub fn f(r: *std.Io.Reader) !void {
+    \\    const bytes = try r.take(64);
+    \\    const n: usize = try r.takeInt(u32, 0);
+    \\    if (n > 4) return error.Big;
+    \\    _ = (Far{ .buf = bytes }).rest();
+    \\    var cur = Cursor.init(bytes);
+    \\    if (n > cur.end - cur.pos) return error.Short;
+    \\    cur.advance(n);
+    \\    _ = cur.rest();
+    \\    var loose = Loose.init(bytes);
+    \\    loose.jump(n);
+    \\    _ = loose.end - loose.pos;
+    \\    _ = loose.rest();
+    \\}
+;
+
+test "A009 and A010 read a field's relation to its siblings: a cursor at most its end and the end at most its buffer's length, while every store keeps them; a default that holds nothing and a store past the other side keep none" {
+    try expect(pack.integers, cursor_program, 1);
+    // Loose's start, not shown at most its end: its start and its end, as A009 counts an order.
+    try expect(pack.untrusted_input, cursor_program, 2);
+}

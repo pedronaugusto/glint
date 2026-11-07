@@ -425,6 +425,7 @@ fn analysisIn(c: *Context, bound: ?*const Facts.Env, file: Project.FileId, funct
     // What it keeps in its memo stays for the run.
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
+    try proveRelations(c);
     const memo = try c.facts.memo(Analyses);
     const key = .{ file, function, width, bound };
     if (memo.map.get(key)) |found| return found;
@@ -502,6 +503,252 @@ pub fn cleared(c: *Context, file: Project.FileId, node: Ast.Node.Index, kind: Ki
         return false;
     }
     return true;
+}
+
+//======================================================================
+// Relations between a struct's fields.
+//======================================================================
+
+/// `small <= large` (or at most `large`'s length) of two fields of one struct, on every instance
+/// of it at every point a program reads it: `pos <= end`, `end <= buf.len`.
+///
+/// Proved by induction over every write the program makes of either, each judged by this file's
+/// own reading of the function that makes it (`judgeStore`, `judgeLiteral`): a literal gives
+/// both; `x.small = v` puts `v` at most `x.large` there, and `x.large = w` at least `x.small`,
+/// given what holds up to there. A whole value of the struct holds it by the same induction;
+/// `undefined`, or one that does not resolve to the struct, holds nothing. The relations are
+/// proved together: each reading assumes all those not yet refused, any that fails is refused and
+/// all are read again, until none fails. Those left each hold, by induction over the program's
+/// writes, whatever the order: every write keeps every one of them, given that they held before it.
+///
+/// One holds only where every write is seen and judged: a field the program alone writes, by
+/// name, its address never taken (`Range.placeable`), and each write in a function Bounds reads,
+/// through a name it tracks. Anything else, a holder that does not resolve, a budget, a
+/// function it does not model, leaves no relation: it never decides a site, it only clears one.
+///
+/// A public field a consumer in another package writes is outside this: a package's lint reads
+/// its own program, as `Range`'s field ranges do. Two stores in sequence are each judged against
+/// the other's old value, so no point between them breaks it for this task; another task reading
+/// there without a lock is a race, which is not this rule's.
+const Relation = struct { small: Facts.Decl, large: Facts.Decl, length: bool };
+
+/// A relation being proved: the literals that write it and what each gives, the nodes of the
+/// writes a reading must meet, and those it has met.
+const Proof = struct {
+    relation: Relation,
+    failed: bool = false,
+    /// Refused in an earlier pass, as `proveRelations` counts them.
+    seen_failed: bool = false,
+    literals: std.AutoHashMapUnmanaged(Ast.Node.Index, LiteralGives) = .empty,
+    checked: std.AutoHashMapUnmanaged(Ast.Node.Index, void) = .empty,
+    expected: std.ArrayList(Expected) = .empty,
+
+    const LiteralGives = struct { small: ?Ast.Node.Index = null, large: ?Ast.Node.Index = null };
+    const Expected = struct { file: Project.FileId, function: Ast.Node.Index, node: Ast.Node.Index };
+};
+
+const Relations = struct {
+    built: bool = false,
+    building: bool = false,
+    /// By either field: what holds of it.
+    of: std.AutoHashMapUnmanaged(Facts.Decl, std.ArrayList(Relation)) = .empty,
+};
+
+/// What holds of `field` with its siblings: what the proofs assume while they run.
+fn relationsOf(c: *Context, field: Facts.Decl) Error![]const Relation {
+    const memo = try c.facts.memo(Relations);
+    return if (memo.of.get(field)) |list| list.items else &.{};
+}
+
+/// The most times the relations are read together: each read but the last refuses at least one.
+const relation_passes = 8;
+
+/// A field's default, as a value at that field's type: its constant, or for `length` the length
+/// of an empty slice. Null where it has none, or it is any other value (`undefined` among them).
+fn defaultOf(c: *Context, member: Facts.Decl, length: bool) Error!?Lin {
+    const tree = &c.project.at(member.file).file.tree;
+    const model = &c.project.at(member.file).model;
+    const record = model.declarations[@backingInt(member.index)];
+    const full = model.containerField(tree, record.node) orelse return null;
+    const node = full.ast.value_expr.unwrap() orelse return null;
+    if (length) {
+        const held = (try Range.memoryLength(c, member.file, node)) orelse return null;
+        return if (held <= std.math.maxInt(Coef)) constant(@intCast(held)) else null;
+    }
+    const value = (try Range.constantValue(c, member.file, node)) orelse return null;
+    if (value > std.math.maxInt(Coef)) return null;
+    return constant(@intCast(value));
+}
+
+/// Proves the relations, once, before anything Bounds keeps is read: what a reading finds with
+/// them is read with all of them, in any order of files. What the proofs read of their callees
+/// is dropped when they end.
+fn proveRelations(c: *Context) Error!void {
+    const memo = try c.facts.memo(Relations);
+    if (memo.built or memo.building) return;
+    memo.building = true;
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
+    var proofs: std.ArrayList(Proof) = .empty;
+    for (try Range.programFiles(c)) |file| try candidatesIn(c, file, &proofs);
+    // Each function is read once per width, for every relation it writes.
+    var by_function: std.AutoArrayHashMapUnmanaged(Callee, std.ArrayList(usize)) = .empty;
+    for (proofs.items, 0..) |*proof, at| {
+        if (proof.failed) continue;
+        for (proof.expected.items) |one| {
+            const entry = try by_function.getOrPut(c.allocator, .{ .file = one.file, .function = one.function });
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            if (std.mem.findScalar(usize, entry.value_ptr.items, at) == null) try entry.value_ptr.append(c.allocator, at);
+        }
+    }
+    var passes: usize = 0;
+    while (true) : (passes += 1) {
+        // Past the passes, none is shown: refused all.
+        if (passes == relation_passes) for (proofs.items) |*proof| {
+            proof.failed = true;
+        };
+        // What is read from here rests on what these assume: nothing earlier is kept.
+        memo.of = .empty;
+        (try c.facts.memo(Analyses)).* = .{};
+        (try c.facts.memo(Entries)).* = .{};
+        var left: usize = 0;
+        for (proofs.items) |*proof| {
+            if (proof.failed) continue;
+            left += 1;
+            for ([_]Facts.Decl{ proof.relation.small, proof.relation.large }) |member| {
+                const entry = try memo.of.getOrPut(c.allocator, member);
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(c.allocator, proof.relation);
+            }
+        }
+        if (left == 0 or passes == relation_passes) break;
+        var refused = false;
+        for (Range.pointerWidths(c)) |width| {
+            for (proofs.items) |*proof| proof.checked.clearRetainingCapacity();
+            var each = by_function.iterator();
+            while (each.next()) |entry| {
+                var some = false;
+                for (entry.value_ptr.items) |at| some = some or !proofs.items[at].failed;
+                if (!some) continue;
+                try readProving(c, entry.key_ptr.*, width, proofs.items, entry.value_ptr.items);
+            }
+            // A write no reading met is one no reading judged.
+            for (proofs.items) |*proof| {
+                if (proof.failed) continue;
+                for (proof.expected.items) |one| {
+                    if (!proof.checked.contains(one.node)) proof.failed = true;
+                }
+            }
+        }
+        for (proofs.items) |*proof| {
+            if (proof.failed and !proof.seen_failed) {
+                proof.seen_failed = true;
+                refused = true;
+            }
+        }
+        if (!refused) break;
+    }
+    (try c.facts.memo(Analyses)).* = .{};
+    (try c.facts.memo(Entries)).* = .{};
+    memo.built = true;
+    memo.building = false;
+}
+
+/// One reading of `callee` judging the relations at `which`.
+fn readProving(c: *Context, callee: Callee, width: u16, proofs: []Proof, which: []const usize) Error!void {
+    var scratch: std.heap.ArenaAllocator = .init(c.backing);
+    defer scratch.deinit();
+    const proving = try scratch.allocator().alloc(Proof, which.len);
+    for (which, proving) |at, *one| one.* = proofs[at];
+    var frame: Frame = .{ .c = c, .a = scratch.allocator(), .file = callee.file, .tree = &c.project.at(callee.file).file.tree, .model = &c.project.at(callee.file).model, .width = width, .function = callee.function, .entry = null, .bound = null, .proving = proving };
+    frame.run() catch |err| switch (err) {
+        // A function it does not model meets no write: each stays unchecked, and fails.
+        error.Unsupported => {},
+        else => |e| return e,
+    };
+    for (which, proving) |at, one| proofs[at] = one;
+}
+
+/// The relations a file's structs may hold: an integer field at most another, or at most a
+/// slice field's length; each with what the program writes of either read, or failed where a
+/// write is not one a reading can judge.
+fn candidatesIn(c: *Context, file: Project.FileId, proofs: *std.ArrayList(Proof)) Error!void {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    var fields: std.ArrayList(Sibling) = .empty;
+    for (model.declarations, 0..) |record, d| {
+        if (record.kind != .field) continue;
+        const decl: Facts.Decl = .{ .file = file, .index = @fromBackingInt(@intCast(d)) };
+        const full = model.containerField(tree, record.node) orelse continue;
+        const type_node = full.ast.type_expr.unwrap() orelse continue;
+        const slice = if (tree.fullPtrType(type_node)) |pointer| pointer.size == .slice else false;
+        if (!slice and !try Range.integral(c, file, type_node)) continue;
+        if (!try Range.placeable(c, decl)) continue;
+        try fields.append(c.allocator, .{ .decl = decl, .scope = record.scope, .slice = slice });
+    }
+    for (fields.items) |small| {
+        if (small.slice) continue;
+        for (fields.items) |large| {
+            if (large.scope != small.scope or std.meta.eql(large.decl, small.decl)) continue;
+            var proof: Proof = .{ .relation = .{ .small = small.decl, .large = large.decl, .length = large.slice } };
+            try sitesOf(c, &proof);
+            if (!proof.failed) try proofs.append(c.allocator, proof);
+        }
+    }
+}
+
+const Sibling = struct { decl: Facts.Decl, scope: Model.Scope.Id, slice: bool };
+
+/// What the program writes of a relation's fields, into `proof`.
+fn sitesOf(c: *Context, proof: *Proof) Error!void {
+    for ([_]Facts.Decl{ proof.relation.small, proof.relation.large }, 0..) |member, side| {
+        var sites = Facts.accesses.writes(c.facts, .{ .field = member }, try Range.programFiles(c));
+        while (try sites.next()) |site| {
+            const tree = &c.project.at(site.file).file.tree;
+            if (site.computed) return fail(proof);
+            switch (site.kind) {
+                .read => continue,
+                .init, .set, .update => {},
+                .covered, .address, .open => return fail(proof),
+            }
+            switch (site.reach) {
+                .named, .unresolved => return fail(proof),
+                .holder => {
+                    // A whole value holds it where the struct does; a literal is judged itself.
+                    const value = Facts.ungrouped(tree, site.value orelse return fail(proof));
+                    var buffer: [2]Ast.Node.Index = undefined;
+                    if (tree.fullStructInit(&buffer, value) != null) continue;
+                    const made = try c.facts.resolve(site.file, value);
+                    const record = c.project.at(member.file).model.declarations[@backingInt(member.index)];
+                    if (made != .instance or made.instance.file != member.file or made.instance.scope != record.scope) return fail(proof);
+                    continue;
+                },
+                .exact => {},
+            }
+            // The field's own default: read with the literals that take it.
+            if (c.project.at(site.file).model.containerField(tree, site.node) != null) continue;
+            const function = functionOf(c, site.file, site.node) orelse return fail(proof);
+            var buffer: [2]Ast.Node.Index = undefined;
+            if (tree.fullStructInit(&buffer, site.node) != null) {
+                const entry = try proof.literals.getOrPut(c.facts.gpa, site.node);
+                if (!entry.found_existing) entry.value_ptr.* = .{};
+                if (side == 0) entry.value_ptr.small = site.value else entry.value_ptr.large = site.value;
+                try proof.expected.append(c.facts.gpa, .{ .file = site.file, .function = function, .node = site.node });
+                continue;
+            }
+            const target = site.target orelse return fail(proof);
+            try proof.expected.append(c.facts.gpa, .{ .file = site.file, .function = function, .node = target });
+        }
+    }
+    // A literal naming neither takes both defaults, and no site shows it: they must hold it.
+    const small = (try defaultOf(c, proof.relation.small, false)) orelse return;
+    const large = (try defaultOf(c, proof.relation.large, proof.relation.length)) orelse return;
+    if (large.c < small.c) proof.failed = true;
+}
+
+fn fail(proof: *Proof) void {
+    proof.failed = true;
 }
 
 //======================================================================
@@ -908,6 +1155,9 @@ const Frame = struct {
     entry_places: bool = true,
     /// The places the summary's slots read (`summarize`).
     slot_places: []const SlotPlace = &.{},
+    /// The relations this reading is proving (`proveRelations`): each store and literal it
+    /// meets of their fields is judged where it is made.
+    proving: []Proof = &.{},
     /// The fields the function may write, or whether it may write any (`wrote`).
     writes: std.ArrayList(Facts.Decl) = .empty,
     writes_any: bool = false,
@@ -1120,6 +1370,7 @@ const Frame = struct {
         var seen: std.AutoHashMapUnmanaged(Var, void) = .empty;
         const most = Range.longest(f.width);
         for ([_][]const Lin{ s.rows, if (goal) |g| &.{g} else &.{} }) |group| for (group) |row| for (row.terms) |term| {
+            if (space == .frame) try f.relationRows(&rows, term.v);
             if (!f.isLength(space, term.v)) continue;
             if ((try seen.getOrPut(f.a, term.v)).found_existing) continue;
             const x = try single(f.a, term.v);
@@ -1131,6 +1382,65 @@ const Frame = struct {
             if (most <= std.math.maxInt(Coef)) if (try atLeast(f.a, constant(@intCast(most)), x)) |row_most| try rows.append(f.a, row_most);
         };
         return .{ .rows = rows.items };
+    }
+
+    /// What every store keeps of the place `v` and its siblings on one instance (`Relations`):
+    /// the same root, so one instance while nothing assigns it, which forgets its places.
+    fn relationRows(f: *Frame, rows: *std.ArrayList(Lin), v: Var) Error!void {
+        const p = f.places.get(v) orelse return;
+        for (try relationsOf(f.c, p.field)) |one| {
+            const small = try single(f.a, try f.placeVar(.{ .root = p.root, .field = one.small }, false));
+            const large = try single(f.a, try f.placeVar(.{ .root = p.root, .field = one.large }, one.length));
+            if (try atLeast(f.a, large, small)) |row| try rows.append(f.a, row);
+        }
+    }
+
+    /// A store of `value` into the place `p` at `target`, judged for each relation being proved
+    /// of its field: it holds there, given that it held on this instance before the store.
+    fn judgeStore(f: *Frame, s: State, target: Ast.Node.Index, p: Place, value: Value) Error!void {
+        for (f.proving) |*proof| {
+            const is_small = std.meta.eql(p.field, proof.relation.small);
+            if (!is_small and !std.meta.eql(p.field, proof.relation.large)) continue;
+            try proof.checked.put(f.c.facts.gpa, target, {});
+            if (proof.failed) continue;
+            const small_var = try single(f.a, try f.placeVar(.{ .root = p.root, .field = proof.relation.small }, false));
+            const large_var = try single(f.a, try f.placeVar(.{ .root = p.root, .field = proof.relation.large }, proof.relation.length));
+            const given = if (is_small) value.lin else if (proof.relation.length) value.length else value.lin;
+            const made = given orelse {
+                proof.failed = true;
+                continue;
+            };
+            const goal = (if (is_small) try atLeast(f.a, large_var, made) else try atLeast(f.a, made, small_var)) orelse {
+                proof.failed = true;
+                continue;
+            };
+            const before = try assume(f.a, s, try atLeast(f.a, large_var, small_var));
+            if (!try f.shows(before, goal)) proof.failed = true;
+        }
+    }
+
+    /// A struct literal at `node`, its fields' values evaluated, judged for each relation being
+    /// proved that a site of it writes: what it gives both sides or their defaults.
+    fn judgeLiteral(f: *Frame, s: State, node: Ast.Node.Index, fields: []const Ast.Node.Index, values: []const Value) Error!void {
+        for (f.proving) |*proof| {
+            const given = proof.literals.get(node) orelse continue;
+            try proof.checked.put(f.c.facts.gpa, node, {});
+            if (proof.failed) continue;
+            const small = try f.givenOr(s, given.small, proof.relation.small, false, fields, values);
+            const large = try f.givenOr(s, given.large, proof.relation.large, proof.relation.length, fields, values);
+            const goal = if (small != null and large != null) try atLeast(f.a, large.?, small.?) else null;
+            if (goal == null or !try f.shows(s, goal.?)) proof.failed = true;
+        }
+    }
+
+    /// What a literal gives a field: its value (its length, where `length`), or its default's.
+    fn givenOr(f: *Frame, s: State, value: ?Ast.Node.Index, member: Facts.Decl, length: bool, fields: []const Ast.Node.Index, values: []const Value) Error!?Lin {
+        if (value) |node| {
+            const at = std.mem.findScalar(Ast.Node.Index, fields, node) orelse return null;
+            if (!length) return values[at].lin;
+            return (try f.lengthOf(s, node, values[at]))[1];
+        }
+        return defaultOf(f.c, member, length);
     }
 
     /// Which variables a state is written over: the frame's own, or a summary's slots
@@ -1602,12 +1912,14 @@ const Frame = struct {
         const current = try f.placeValue(e.s, target, p);
         const out = try f.storedIn(current.s, p);
         const result = try f.arith(out, node, opOf(tag), current.v.lin, e.v.lin, rhs, int);
+        if (f.proving.len != 0) try f.judgeStore(current.s, target, p, .{ .lin = result.v.lin });
         return f.assign(result.s, try f.placeVar(p, false), result.v.lin, int);
     }
 
     /// The state past `p` given `value` (`=`): within its type, or the length of the memory it
     /// holds.
     fn setPlace(f: *Frame, s: State, target: Ast.Node.Index, p: Place, value: Value) Error!State {
+        if (f.proving.len != 0) try f.judgeStore(s, target, p, value);
         const int = try f.intOf(target);
         const out = try f.storedIn(s, p);
         if (int != null) return f.assign(out, try f.placeVar(p, false), value.lin, int);
@@ -1887,7 +2199,13 @@ const Frame = struct {
                 var buffer: [2]Ast.Node.Index = undefined;
                 const full = tree.fullStructInit(&buffer, node).?; // unreachable: the tag is a struct literal's
                 var out = s;
-                for (full.ast.fields) |each| out = (try f.eval(out, each)).s;
+                var values: std.ArrayList(Value) = .empty;
+                for (full.ast.fields) |each| {
+                    const e = try f.eval(out, each);
+                    out = e.s;
+                    if (f.proving.len != 0) try values.append(f.a, e.v);
+                }
+                if (f.proving.len != 0) try f.judgeLiteral(out, node, full.ast.fields, values.items);
                 return .{ .s = out };
             },
             .array_init_one, .array_init_one_comma, .array_init_dot_two, .array_init_dot_two_comma, .array_init_dot, .array_init_dot_comma, .array_init, .array_init_comma => {

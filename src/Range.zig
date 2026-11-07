@@ -1050,7 +1050,7 @@ fn typeShapes(c: *Context, memo: *Given, value: Facts.Value, depth: u8) Context.
 }
 
 /// The program's own files, the ones whose stores a field's invariant reads.
-fn programFiles(c: *Context) Context.Error![]const Project.FileId {
+pub fn programFiles(c: *Context) Context.Error![]const Project.FileId {
     // What it keeps in its memo stays for the run.
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
