@@ -1213,6 +1213,8 @@ fn typePosition(self: *Facts, function: Decl, node: Ast.Node.Index, depth: usize
             .assign => {
                 const target = t.nodeData(parent).node_and_node[0];
                 if (t.nodeData(parent).node_and_node[1] != at or t.nodeTag(target) != .identifier) return false;
+                // A discard (`_ = by.raw()`) names nothing.
+                if (std.mem.eql(u8, t.tokenSlice(t.nodeMainToken(target)), "_")) return false;
                 const reference = model.reference(target) orelse return true;
                 return self.namedAsType(function, reference.declaration orelse return true, depth + 1);
             },
@@ -3429,13 +3431,30 @@ pub const Written = enum { type, other, unknown };
 /// T: type`, a function returning `type`, an alias of it (`const Type = type;`) named for it.
 /// The one reading of a written `type`; nothing reads its spelling. One that does not resolve
 /// is unknown, never another type: an alias may name `type`, or a parameter be bound to it.
+/// Whether the type `node` writes is read through one of Zig's reflection builtins, which give
+/// whatever type the binding's argument has, `type` among them.
+fn reflects(tree: *const Ast, node: Ast.Node.Index) bool {
+    var token = tree.firstToken(node);
+    while (token <= tree.lastToken(node)) : (token += 1) {
+        if (tree.tokenTag(token) != .builtin) continue;
+        const name = tree.tokenSlice(token);
+        for ([_][]const u8{ "@typeInfo", "@FieldType", "@TypeOf" }) |each| if (std.mem.eql(u8, name, each)) return true;
+    }
+    return false;
+}
 pub fn writesType(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Written {
     // A primitive's name is the primitive (Zig lets nothing shadow one): read with no fact spent.
     const tree = &self.project.at(file).file.tree;
     if (tree.nodeTag(node) == .identifier) if (self.project.at(file).model.reference(node)) |reference| if (reference.unknown == .primitive)
         return if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "type")) .type else .other;
-    const answer = writtenOf(try self.resolve(file, node));
-    if (answer == .unknown and try self.writtenInGeneric(file, node)) return .other;
+    const value = try self.resolve(file, node);
+    // A type read through reflection (`@typeInfo(F)...`, `@FieldType`, `@TypeOf`) may be `type` in
+    // a binding: unknown where it does not resolve, never each binding's own as one written over a
+    // generic's parameter (`T`, `*T`, `?T`) is.
+    const through_reflection = value == .reflected or reflects(tree, node);
+    if (through_reflection and value == .unknown) return .unknown;
+    const answer = writtenOf(value);
+    if (answer == .unknown and !through_reflection and try self.writtenInGeneric(file, node)) return .other;
     return answer;
 }
 
