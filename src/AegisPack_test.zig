@@ -1503,9 +1503,9 @@ test "every guarded owner's backing state and guard are its contract's, whicheve
 test "a guard read in a condition before its release, and one waited on through its own wait, are decided" {
     const head = "const aegis = @import(\"aegis\");\n";
     // Read in an `if`'s condition and through its capture, then released.
-    try expectJudged(head ++ "pub fn f(io: anytype, b: *aegis.BlockingGuarded(?u32)) void { var held = b.acquireUncancelable(io); if (held.value().*) |v| { _ = v; } held.deinit(io); }", pack.cleanup, true, 0);
+    try expectUnbound(head ++ "pub fn f(io: anytype, b: *aegis.BlockingGuarded(?u32)) void { var held = b.acquireUncancelable(io); if (held.value().*) |v| { _ = v; } held.deinit(io); }", pack.cleanup, 1, 0);
     // Acquired by `try`, its release deferred, waited on through its own `wait`, which holds it again on return.
-    try expectJudged(head ++ "pub fn f(io: anytype, b: *aegis.BlockingGuarded(u32), c: *aegis.Condition) !void { var held = try b.acquire(io); defer held.deinit(io); while (held.value().* == 0) held.wait(c, io, .none) catch |err| switch (err) { error.Timeout => return, else => |e| return e }; }", pack.cleanup, true, 0);
+    try expectUnbound(head ++ "pub fn f(io: anytype, b: *aegis.BlockingGuarded(u32), c: *aegis.Condition) !void { var held = try b.acquire(io); defer held.deinit(io); while (held.value().* == 0) held.wait(c, io, .none) catch |err| switch (err) { error.Timeout => return, else => |e| return e }; }", pack.cleanup, 1, 0);
     // Lent anywhere else, its release may move: undecided.
     try expectJudged(head ++ "var kept: ?*anyopaque = null;\nfn keep(g: anytype) void { kept = @ptrCast(g); }\npub fn f(io: anytype, b: *aegis.BlockingGuarded(u32)) !void { var held = try b.acquire(io); defer held.deinit(io); keep(&held); }", pack.cleanup, false, 0);
     // A guard never released is still a finding when it was read in a condition.
