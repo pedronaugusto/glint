@@ -250,6 +250,7 @@ fn upperByConstant(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: 
             const call = tree.fullCall(&buffer, large) orelse continue;
             const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
                 .function => |d| d,
+                .alternatives => continue,
                 else => continue,
             };
             break :most (try extreme(c, file, decl, call, pointer)) orelse continue;
@@ -504,6 +505,8 @@ fn pointerValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: 
     const at = bare(tree, node);
     switch (try c.facts.resolve(file, at)) {
         .pointer => return true,
+        // A choice is judged by its arithmetic and constants below, as no one pointer.
+        .alternatives => {},
         else => {},
     }
     if (formAt(tree, at) == .operator) if (accesses.operatorOf(tree.nodeTag(at))) |operator| {
@@ -631,6 +634,8 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
             const call = tree.fullCall(&buffer, node).?; // unreachable: a call's form holds calls
             return switch (try c.facts.resolve(file, call.ast.fn_expr)) {
                 .function => |decl| (try extreme(c, file, decl, call, pointer)) orelse (try readCount(c, file, decl, call)) orelse returned(c, decl, pointer, next),
+                // A choice of functions bounds nothing here: not known.
+                .alternatives => null,
                 else => null,
             };
         },
@@ -984,6 +989,8 @@ fn typeArgument(c: *Context, memo: *Given, file: Project.FileId, callee: Ast.Nod
 fn takesType(c: *Context, file: Project.FileId, callee: Ast.Node.Index, at: usize) Context.Error!bool {
     const function = switch (try c.facts.resolve(file, callee)) {
         .function => |f| f,
+        // A choice of functions may take one.
+        .alternatives => return true,
         else => return true,
     };
     const tree = &c.project.at(function.file).file.tree;
@@ -997,6 +1004,8 @@ fn takesType(c: *Context, file: Project.FileId, callee: Ast.Node.Index, at: usiz
     const at_call = &c.project.at(file).file.tree;
     const bound_receiver = formAt(at_call, callee) == .member and switch (try c.facts.resolve(file, at_call.nodeData(callee).node_and_token[0])) {
         .container => false,
+        // A choice may or may not hand a receiver first: its position is not known.
+        .alternatives => return true,
         else => true,
     };
     var params = proto.iterate(tree);
@@ -1280,6 +1289,7 @@ fn element(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!?Typed {
     while (true) switch (value) {
         .pointer => |inner| value = inner.child.*,
         .array => |inner| value = inner.*,
+        .alternatives => break,
         else => break,
     };
     return switch (integer(value, pointer)) {
@@ -1444,6 +1454,7 @@ pub fn floating(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context
     while (true) value = switch (value) {
         .optional, .error_union => |inner| inner.*,
         .primitive => |name| return (name.len >= 2 and (name[0] == 'f' and std.ascii.isDigit(name[1]))) or std.mem.eql(u8, name, "comptime_float"),
+        .alternatives => return false,
         else => return false,
     };
 }
@@ -1597,6 +1608,7 @@ fn backed(c: *Context, file: Project.FileId, call: Ast.Node.Index, pointer: u16)
     while (made == .optional) made = made.optional.*;
     const container = switch (made) {
         .container, .instance => |k| k,
+        .alternatives => return null,
         else => return null,
     };
     const tree = &c.project.at(container.file).file.tree;
@@ -1660,6 +1672,7 @@ fn argument(c: *Context, file: Project.FileId, call: Ast.full.Call, arg: Ast.Nod
     const position_of = std.mem.findScalar(Ast.Node.Index, call.ast.params, arg) orelse return null;
     const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
         .function => |d| d,
+        .alternatives => return null,
         else => return null,
     };
     // A method called on a value takes it as its first parameter.
@@ -1688,10 +1701,12 @@ fn field(c: *Context, file: Project.FileId, literal_node: Ast.Node.Index, value:
     while (true) holder = switch (holder) {
         .pointer => |inner| inner.child.*,
         .optional, .error_union => |inner| inner.*,
+        .alternatives => break,
         else => break,
     };
     const container = switch (holder) {
         .container, .instance => |k| k,
+        .alternatives => return null,
         else => return null,
     };
     const name = tree.tokenSlice(Model.initName(tree, value) orelse return null);
@@ -2431,6 +2446,7 @@ fn readFacts(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), value
         // One buffer of bytes, a slice or an array's address, not a vector held elsewhere.
         const bytes = switch (try c.facts.resolve(file, one)) {
             .pointer => |item| item.child.* == .primitive or (item.child.* == .array and item.child.array.* == .primitive),
+            .alternatives => false,
             else => false,
         };
         if (!bytes) return;
@@ -2486,6 +2502,8 @@ fn readBuffers(c: *Context, file: Project.FileId, call_node: Ast.Node.Index, dep
     var skip: usize = 0;
     if (formAt(tree, call.ast.fn_expr) == .member) switch (try c.facts.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
         .instance, .pointer, .optional => skip = 1,
+        // A choice may or may not hand a receiver first: which argument is not known.
+        .alternatives => return null,
         else => {},
     };
     if (param < skip or param - skip >= call.ast.params.len) return null;
@@ -2937,6 +2955,7 @@ fn varies(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error
         const call = tree.fullCall(&buffer, at).?; // unreachable: a call's form holds calls
         const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
             .function => |d| d,
+            .alternatives => return true,
             else => return true,
         };
         var constant_of_type = false;
@@ -2959,6 +2978,7 @@ pub fn inert(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Er
     const call = tree.fullCall(&buffer, node) orelse return false;
     const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
         .function => |d| d,
+        .alternatives => return false,
         else => return false,
     };
     if (!try pure(c, decl)) return false;
@@ -2969,6 +2989,8 @@ pub fn inert(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Er
     var skip: usize = 0;
     if (formAt(tree, call.ast.fn_expr) == .member) switch (try c.facts.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
         .instance, .pointer, .optional => skip = 1,
+        // A choice may or may not hand a receiver first: which argument is not known.
+        .alternatives => return false,
         else => {},
     };
     var it = proto.iterate(callee);
@@ -3114,6 +3136,8 @@ fn placeOf(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Erro
         switch (try c.facts.resolve(file, memory)) {
             .array => return null,
             .pointer => |inner| if (inner.child.* == .array) return null,
+            // A choice may hold memory whose length is written: read as a place.
+            .alternatives => {},
             else => {},
         }
     }
@@ -3171,10 +3195,12 @@ fn fieldFollows(c: *Context, file: Project.FileId, access: Ast.Node.Index, recei
                 // (`p: *[]const u8`), whose `len` is read through it.
                 .pointer => true,
                 .primitive, .array, .optional, .scalar => false,
+                .alternatives => true,
                 else => true,
             };
         },
         .instance, .array, .literal, .reified, .primitive, .scalar, .error_union, .optional, .error_set, .function, .fn_type => false,
+        .alternatives => true,
         else => true,
     };
 }
@@ -3185,6 +3211,7 @@ fn structured(c: *Context, file: Project.FileId, root: Ast.Node.Index) Context.E
     if (value == .pointer) value = value.pointer.child.*;
     const k = switch (value) {
         .instance => |k| k,
+        .alternatives => return false,
         else => return false,
     };
     const tree = &c.project.at(k.file).file.tree;
@@ -3686,6 +3713,7 @@ pub fn ownId(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: A
     if (args.len != 1) return false;
     const id = switch (try c.facts.resolve(file, args[0])) {
         .instance => |k| k,
+        .alternatives => return false,
         else => return false,
     };
     const owner = ownerOf(c, id) orelse return false;
@@ -3726,6 +3754,7 @@ fn elementOf(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Context.
     if (value == .array) value = value.array.*;
     return switch (value) {
         .instance => |k| k,
+        .alternatives => null,
         else => null,
     };
 }
@@ -3746,6 +3775,8 @@ pub fn madeId(c: *Context, file: Project.FileId, call: Ast.Node.Index) Context.E
     return switch (made) {
         .container, .instance => |k| if (ownerOf(c, k)) |owner| .{ .id = owner } else .other,
         .unknown => .unknown,
+        // A choice may hold a table's id: not known.
+        .alternatives => .unknown,
         else => .other,
     };
 }
@@ -4011,6 +4042,7 @@ fn identity(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
     if (call.ast.params.len != 1) return null;
     const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
         .function => |d| d,
+        .alternatives => return null,
         else => return null,
     };
     const model = &c.project.at(decl.file).model;
@@ -4293,6 +4325,7 @@ pub fn keptArgument(c: *Context, file: Project.FileId, node: Ast.Node.Index) Con
     if (call.ast.params.len != 1) return null;
     const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
         .function => |decl| decl,
+        .alternatives => return null,
         else => return null,
     };
     for ([_][]const u8{ "Io.Limit.limited", "Io.Limit.limited64" }) |path| switch (try Governed.declarations(c, "std", path)) {
@@ -4311,6 +4344,7 @@ pub fn lengthArgument(c: *Context, file: Project.FileId, node: Ast.Node.Index) C
     const call = tree.fullCall(&buffer, node) orelse return null;
     const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
         .function => |decl| decl,
+        .alternatives => return null,
         else => return null,
     };
     for ([_][]const u8{ "Io.Reader.take", "Io.Reader.peek" }) |path| switch (try Governed.declarations(c, "std", path)) {
@@ -4335,6 +4369,7 @@ fn allocator(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Er
     if (value_of == .pointer) value_of = value_of.pointer.child.*;
     const k = switch (value_of) {
         .instance => |k| k,
+        .alternatives => return false,
         else => return false,
     };
     for (((try Governed.declarations(c, "std", "mem.Allocator")).orNull()) orelse return false) |decl| {
@@ -4362,6 +4397,7 @@ fn prongField(c: *Context, capture: Facts.Decl) Context.Error!?Facts.Decl {
     if (operand == .pointer) operand = operand.pointer.child.*;
     const container = switch (operand) {
         .instance, .container => |k| k,
+        .alternatives => return null,
         else => return null,
     };
     const member = c.facts.member(container, named_tag.enum_literal) orelse return null;
