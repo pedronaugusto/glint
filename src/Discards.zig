@@ -12,12 +12,26 @@ const AegisContract = @import("AegisContract.zig");
 const Context = @import("RuleContext.zig");
 const Ast = std.zig.Ast;
 const Error = Context.Error;
+const accesses = Facts.accesses;
+
+/// The form of the syntax `node` is (`Facts.accesses.formOf`).
+fn formAt(tree: *const Ast, node: Ast.Node.Index) accesses.Form {
+    return accesses.formOf(tree.nodeTag(node));
+}
+
+/// The declaration of this file a name refers to (`Facts.definition`); null for any other.
+fn ownDeclaration(c: *Context, node: Ast.Node.Index) Error!?Model.Declaration {
+    return switch (try c.facts.definition(c.file, node)) {
+        .decl => |found| if (found.file == c.file) c.project.at(c.file).model.declarations[@backingInt(found.index)] else null,
+        .none, .unknown => null,
+    };
+}
 
 /// Whether the empty handler of `site`, a `catch` or an `if`'s or `while`'s `else |err|`, drops
 /// nothing (the forms this file reads).
 pub fn dropsNothing(c: *Context, site: Ast.Node.Index) Error!bool {
     const tree = &c.project.at(c.file).file.tree;
-    if (onErrorPath(c, site)) return true;
+    if (try onErrorPath(c, site)) return true;
     const handled = Facts.ungrouped(tree, handledOf(tree, site) orelse return false);
     if (try canceledOwningNothing(c, handled)) return true;
     if (tree.fullIf(site)) |branch| if (try releaseOnly(c, branch)) return true;
@@ -38,7 +52,7 @@ fn handledOf(tree: *const Ast, site: Ast.Node.Index) ?Ast.Node.Index {
 /// error.X`, or `return e` of an error a `catch |e|` or `else |e|` captured) with no other jump
 /// before it. Zig returns one error: the one leaving is the failure reported, and a cleanup's own
 /// can only be dropped or made a panic.
-fn onErrorPath(c: *Context, site: Ast.Node.Index) bool {
+fn onErrorPath(c: *Context, site: Ast.Node.Index) Error!bool {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
     var up = site;
@@ -58,7 +72,7 @@ fn onErrorPath(c: *Context, site: Ast.Node.Index) bool {
         const statements = tree.blockStatements(&buffer, parent) orelse continue;
         const position = std.mem.findScalar(Ast.Node.Index, statements, at) orelse continue;
         for (statements[position + 1 ..]) |statement| {
-            if (tree.nodeTag(statement) == .@"return") return errorReturned(tree, model, statement);
+            if (tree.nodeTag(statement) == .@"return") return errorReturned(c, statement);
             if (jumps(tree, statement)) return false;
         }
         return false;
@@ -68,12 +82,11 @@ fn onErrorPath(c: *Context, site: Ast.Node.Index) bool {
 
 /// Whether a `return` gives its function an error: `error.X`, or an error a `catch |e|` or an
 /// `if`'s or `while`'s `else |e|` captured.
-fn errorReturned(tree: *const Ast, model: *const Model, statement: Ast.Node.Index) bool {
+fn errorReturned(c: *Context, statement: Ast.Node.Index) Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
     const operand = Facts.ungrouped(tree, tree.nodeData(statement).opt_node.unwrap() orelse return false);
-    if (tree.nodeTag(operand) == .error_value) return true;
-    if (tree.nodeTag(operand) != .identifier) return false;
-    const id = (model.reference(operand) orelse return false).declaration orelse return false;
-    const decl = model.declarations[@backingInt(id)];
+    if (try c.facts.literalOf(c.file, operand)) |written| return written == .error_value;
+    const decl = (try ownDeclaration(c, operand)) orelse return false;
     if (decl.kind != .capture) return false;
     if (tree.nodeTag(decl.node) == .@"catch") return true;
     if (tree.fullIf(decl.node)) |branch| return branch.error_token == decl.token;
@@ -116,21 +129,23 @@ fn futureCancel(c: *Context, call: Facts.calls.Call) Error!bool {
         .function => |function| function,
         .choice, .any => return false,
     };
-    const record = c.project.at(callee.file).model.declarations[@backingInt(callee.index)];
-    if (!std.mem.eql(u8, record.name, "cancel")) return false;
     const holder = switch (call.receiver) {
         .bound => |holder| holder,
         .none, .unknown => return false,
     };
     var value = try c.facts.resolve(c.file, holder);
     while (value == .pointer) value = value.pointer.child.*;
-    const made = switch (value) {
-        .instance, .container => |found| found.made_by orelse return false,
+    const future = switch (value) {
+        .instance, .container => |found| found,
         // A receiver chosen per build is no one future to read.
         .alternatives => return false,
         else => return false,
     };
-    return try Governed.isStd(c, made.function, "Io.Future") == .yes;
+    const made = future.made_by orelse return false;
+    if (try Governed.isStd(c, made.function, "Io.Future") != .yes) return false;
+    // By the declaration the future's type gives the name, never another `cancel`.
+    const cancel = c.facts.member(future, "cancel") orelse return false;
+    return std.meta.eql(cancel, callee);
 }
 
 /// The release: `if (r) |p| <one release of p> else |_| {}` on a held result (a name, a field,
@@ -139,7 +154,6 @@ fn futureCancel(c: *Context, call: Facts.calls.Call) Error!bool {
 /// empty branch drops no failure a fresh call would report.
 fn releaseOnly(c: *Context, branch: Ast.full.If) Error!bool {
     const tree = &c.project.at(c.file).file.tree;
-    const model = &c.project.at(c.file).model;
     const payload = branch.payload_token orelse return false;
     const name = if (tree.tokenTag(payload) == .asterisk) payload + 1 else payload;
     const held = Facts.ungrouped(tree, branch.ast.cond_expr);
@@ -155,18 +169,23 @@ fn releaseOnly(c: *Context, branch: Ast.full.If) Error!bool {
     }
     var call_buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&call_buffer, statement) orelse return false;
-    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
+    if (formAt(tree, call.ast.fn_expr) != .member) return false;
     const receiver, const method_token = tree.nodeData(call.ast.fn_expr).node_and_token;
-    const method = tree.tokenSlice(method_token);
-    const released = if (std.mem.eql(u8, method, "deinit") or std.mem.eql(u8, method, "close"))
-        receiver
-    else if ((std.mem.eql(u8, method, "free") or std.mem.eql(u8, method, "destroy")) and call.ast.params.len == 1)
-        call.ast.params[0]
-    else
-        return false;
-    if (tree.nodeTag(released) != .identifier) return false;
-    const id = (model.reference(released) orelse return false).declaration orelse return false;
-    return model.declarations[@backingInt(id)].token == name;
+    const released = if (try allocatorRelease(c, statement) and call.ast.params.len == 1) call.ast.params[0] else if (releaseMethod(tree.tokenSlice(method_token))) receiver else return false;
+    const decl = (try ownDeclaration(c, released)) orelse return false;
+    return decl.token == name;
+}
+
+/// Whether the call `node` frees what std's `mem.Allocator` gave, by the function it calls.
+fn allocatorRelease(c: *Context, node: Ast.Node.Index) Error!bool {
+    for ([_][]const u8{ "mem.Allocator.free", "mem.Allocator.destroy" }) |path| if (try Governed.stdCall(c, node, path) == .yes) return true;
+    return false;
+}
+
+/// Whether a method's name says it releases its receiver: Zig has no destructor, and a type of
+/// the program's, whatever it is, gives up what it holds by these names alone.
+fn releaseMethod(name: []const u8) bool {
+    return std.mem.eql(u8, name, "deinit") or std.mem.eql(u8, name, "close");
 }
 
 /// The one reading of an owner here: whether a value owns nothing its drop leaks. It holds no
@@ -229,12 +248,11 @@ fn stderrValue(c: *Context, written: Ast.Node.Index) Error!bool {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
     const node = Facts.ungrouped(tree, written);
-    switch (tree.nodeTag(node)) {
-        .field_access => return stderrValue(c, tree.nodeData(node).node_and_token[0]),
-        .address_of, .@"try" => return stderrValue(c, tree.nodeData(node).node),
-        .identifier => {
-            const id = (model.reference(node) orelse return false).declaration orelse return false;
-            const decl = model.declarations[@backingInt(id)];
+    switch (formAt(tree, node)) {
+        .member => return stderrValue(c, tree.nodeData(node).node_and_token[0]),
+        .address_of, .tried => return stderrValue(c, tree.nodeData(node).node),
+        .leaf => {
+            const decl = (try ownDeclaration(c, node)) orelse return false;
             if (decl.kind != .variable) return false;
             // A local's: a container's variable may be set anywhere.
             switch (model.scopes[@backingInt(decl.scope)].kind) {
@@ -348,11 +366,12 @@ fn leaves(tree: *const Ast, written: Ast.Node.Index) bool {
     const node = Facts.ungrouped(tree, written);
     var buffer: [2]Ast.Node.Index = undefined;
     if (tree.blockStatements(&buffer, node)) |statements| return statements.len != 0 and leaves(tree, statements[statements.len - 1]);
-    switch (tree.nodeTag(node)) {
-        .@"return", .@"break", .@"continue", .unreachable_literal => return true,
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@panic"),
-        .@"switch", .switch_comma => {
-            const whole = tree.fullSwitch(node).?; // unreachable: tagged a switch
+    switch (formAt(tree, node)) {
+        .@"return", .@"break", .@"continue" => return true,
+        .leaf => return tree.tokenTag(tree.nodeMainToken(node)) == .keyword_unreachable,
+        .builtin => return Facts.isBuiltin(tree, node, "@panic"),
+        .@"switch" => {
+            const whole = tree.fullSwitch(node).?; // unreachable: a switch's form holds switches
             for (whole.ast.cases) |case| if (!leaves(tree, tree.fullSwitchCase(case).?.ast.target_expr)) return false; // unreachable: a switch's cases are cases
             return true;
         },
