@@ -91,23 +91,23 @@ const depth_limit = 12;
 const expression_tokens = @as(File.Limits, .{}).expression_tokens;
 
 const accesses = Facts.accesses;
-const Op = @FieldType(accesses.Operator, "op");
+pub const Op = @FieldType(accesses.Operator, "op");
 
 /// The form of the syntax `node` is (`Facts.accesses.formOf`).
-fn formAt(tree: *const Ast, node: Ast.Node.Index) accesses.Form {
+pub fn formAt(tree: *const Ast, node: Ast.Node.Index) accesses.Form {
     return accesses.formOf(tree.nodeTag(node));
 }
 
 /// The operation `node` makes where it is an operator a past-range value stops (`a + b`, not
 /// `a +% b`, `a +| b` or `a += b`); null for anything else.
-fn checkedOp(tree: *const Ast, node: Ast.Node.Index) ?Op {
+pub fn checkedOp(tree: *const Ast, node: Ast.Node.Index) ?Op {
     if (formAt(tree, node) != .operator) return null;
     const operator = accesses.operatorOf(tree.nodeTag(node)) orelse return null;
     return if (operator.overflow == .checked) operator.op else null;
 }
 
 /// Whether `node` is the checked compound assignment of `op` (`a += b`, not `a +%= b`).
-fn updates(tree: *const Ast, node: Ast.Node.Index, op: Op) bool {
+pub fn updates(tree: *const Ast, node: Ast.Node.Index, op: Op) bool {
     if (formAt(tree, node) != .compound_assign) return false;
     const operator = accesses.operatorOf(tree.nodeTag(node)) orelse return false;
     return operator.op == op and operator.overflow == .checked;
@@ -115,14 +115,14 @@ fn updates(tree: *const Ast, node: Ast.Node.Index, op: Op) bool {
 
 /// The reference `node` makes by its name, where it is a name a declaration may stand behind; an
 /// enum literal the model also records is none (`Model.reference`).
-fn nameRef(model: *const Model, node: Ast.Node.Index) ?Model.Reference {
+pub fn nameRef(model: *const Model, node: Ast.Node.Index) ?Model.Reference {
     const reference = model.reference(node) orelse return null;
     return if (reference.unknown == .literal_context) null else reference;
 }
 
 /// Whether `node` is written as a name, where the model may index none (a prototype's own types,
 /// `true`): a word on its own, not an enum literal's after its dot.
-fn spellsName(tree: *const Ast, node: Ast.Node.Index) bool {
+pub fn spellsName(tree: *const Ast, node: Ast.Node.Index) bool {
     if (formAt(tree, node) != .leaf) return false;
     const token = tree.nodeMainToken(node);
     return tree.tokenTag(token) == .identifier and (token == 0 or tree.tokenTag(token - 1) != .period);
@@ -142,7 +142,7 @@ fn openSlice(tree: *const Ast, node: Ast.Node.Index) ?Ast.full.Slice {
 }
 
 /// Whether a store's target is `_`, which discards: only a name can spell it.
-fn discards(tree: *const Ast, target: Ast.Node.Index) bool {
+pub fn discards(tree: *const Ast, target: Ast.Node.Index) bool {
     return formAt(tree, target) == .leaf and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_");
 }
 

@@ -41,6 +41,11 @@ const Facts = @import("Facts.zig");
 const Records = @import("Summary.zig");
 const Model = @import("Model.zig");
 const Range = @import("Range.zig");
+const accesses = Facts.accesses;
+const formAt = Range.formAt;
+const nameRef = Range.nameRef;
+const spellsName = Range.spellsName;
+const discards = Range.discards;
 const Project = @import("Project.zig");
 const Governed = @import("Governed.zig");
 const Contract = @import("AegisContract.zig");
@@ -754,6 +759,7 @@ fn known(c: *Context, flow: *Flow) Context.Error!void {
             };
             switch (try c.facts.declaration(origin)) {
                 .container => |k| try flow.writer_types.append(c.allocator, k),
+                .alternatives => flow.writer_unknown = true,
                 else => flow.writer_unknown = true,
             }
         },
@@ -895,48 +901,43 @@ fn bindings(c: *Context, flow: *Flow, function: Function.Id) Context.Error!void 
     const tree = &c.project.at(f.file).file.tree;
     const model = &c.project.at(f.file).model;
     for (f.nodes) |node| {
-        switch (tree.nodeTag(node)) {
-            .simple_var_decl, .local_var_decl, .aligned_var_decl, .global_var_decl => {
+        switch (formAt(tree, node)) {
+            .variable => {
                 const init = (tree.fullVarDecl(node) orelse continue).ast.init_node.unwrap() orelse continue;
                 const d = declaredAt(model, node) orelse continue;
                 try raiseLocal(c, flow, .{ .file = f.file, .index = d }, try dep(c, flow, function, init));
             },
-            .assign, .assign_add, .assign_sub, .assign_div, .assign_mod, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_add_sat, .assign_sub_sat => {
+            .assign, .compound_assign => {
                 const target, const value = tree.nodeData(node).node_and_node;
+                const operator = accesses.operatorOf(tree.nodeTag(node));
+                // A product or a shift in place grows what the target held by what it is given.
+                if (operator) |update| if (update.op == .mul or update.op == .shl) {
+                    const grown = try (try dep(c, flow, function, target)).widened(c.allocator);
+                    const given = try grown.join(c.allocator, try dep(c, flow, function, value));
+                    try storeAt(c, flow, function, node, target, value, try given.join(c.allocator, try control(c, flow, function, node, target)));
+                    continue;
+                };
                 var given = try dep(c, flow, function, value);
                 const ruled = try control(c, flow, function, node, target);
                 // A sum or a product that feeds its own target accumulates a number past any
                 // range what it adds holds (`n = n * 10 + d`, `total += b`).
-                const accumulating = tree.nodeTag(node) == .assign and accumulates(tree, model, target, value);
-                switch (tree.nodeTag(node)) {
-                    .assign_add, .assign_add_wrap, .assign_add_sat => given = try given.widened(c.allocator),
-                    else => if (accumulating) {
-                        given = try given.widened(c.allocator);
-                    },
-                }
+                const accumulating = operator == null and accumulates(tree, model, target, value);
+                const update_op: ?Range.Op = if (operator) |update| update.op else null;
+                if (update_op == .add or accumulating) given = try given.widened(c.allocator);
                 var held = try given.join(c.allocator, ruled);
                 // A sum each pass steps again counts the passes of the loops around it.
-                const stepped = accumulating or switch (tree.nodeTag(node)) {
-                    .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat => true,
-                    else => false,
-                };
+                const stepped = accumulating or update_op == .add or update_op == .sub;
                 if (stepped) held = try held.join(c.allocator, try counts(c, flow, function, node, target));
                 // A slice's length written (`s.len = n`): the memory's length is the value. What
                 // decides whether it is written chooses between it and the length it had, which
                 // was within the memory; one taken from (`s.len -= k`, which a safe build checks)
                 // stays within it.
-                if (std.mem.eql(u8, tree.tokenSlice(tree.lastToken(target)), "len") and try c.facts.memoryField(f.file, target) != .field) {
-                    held = if (tree.nodeTag(node) == .assign_sub) try ruled.sizing(c.allocator) else try (try given.written(c.allocator)).join(c.allocator, try ruled.sizing(c.allocator));
+                if (try c.facts.lengthOf(f.file, target) != null) {
+                    held = if (Range.updates(tree, node, .sub)) try ruled.sizing(c.allocator) else try (try given.written(c.allocator)).join(c.allocator, try ruled.sizing(c.allocator));
                 }
                 try storeAt(c, flow, function, node, target, value, held);
             },
-            .assign_mul, .assign_shl, .assign_mul_wrap, .assign_mul_sat, .assign_shl_sat => {
-                const target, const value = tree.nodeData(node).node_and_node;
-                const grown = try (try dep(c, flow, function, target)).widened(c.allocator);
-                const given = try grown.join(c.allocator, try dep(c, flow, function, value));
-                try storeAt(c, flow, function, node, target, value, try given.join(c.allocator, try control(c, flow, function, node, target)));
-            },
-            .assign_destructure => {
+            .destructure => {
                 const parts = tree.assignDestructure(node);
                 const all = try dep(c, flow, function, parts.ast.value_expr);
                 // A literal of as many elements gives each variable its own (`x, y = .{ 5, n }`).
@@ -1016,18 +1017,14 @@ const Filler = struct {
 };
 
 fn filler(tree: *const Ast, node: Ast.Node.Index) ?Filler {
-    switch (tree.nodeTag(node)) {
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
-            const name = tree.tokenSlice(tree.nodeMainToken(node));
-            if (std.mem.eql(u8, name, "@memcpy") or std.mem.eql(u8, name, "@memmove")) return .{ .destination = 0, .value = 1, .kind = .copy };
-            if (std.mem.eql(u8, name, "@memset")) return .{ .destination = 0, .value = 1, .kind = .fill };
-            if (std.mem.eql(u8, name, "@atomicStore")) return .{ .destination = 1, .value = 2, .kind = .fill };
-            if (std.mem.eql(u8, name, "@cmpxchgWeak") or std.mem.eql(u8, name, "@cmpxchgStrong")) return .{ .destination = 1, .value = 3, .kind = .fill };
-            if (std.mem.eql(u8, name, "@atomicRmw")) return .{ .destination = 1, .value = 3, .kind = .combine };
-            return null;
-        },
-        else => return null,
-    }
+    if (formAt(tree, node) != .builtin) return null;
+    const name = tree.tokenSlice(tree.nodeMainToken(node));
+    if (std.mem.eql(u8, name, "@memcpy") or std.mem.eql(u8, name, "@memmove")) return .{ .destination = 0, .value = 1, .kind = .copy };
+    if (std.mem.eql(u8, name, "@memset")) return .{ .destination = 0, .value = 1, .kind = .fill };
+    if (std.mem.eql(u8, name, "@atomicStore")) return .{ .destination = 1, .value = 2, .kind = .fill };
+    if (std.mem.eql(u8, name, "@cmpxchgWeak") or std.mem.eql(u8, name, "@cmpxchgStrong")) return .{ .destination = 1, .value = 3, .kind = .fill };
+    if (std.mem.eql(u8, name, "@atomicRmw")) return .{ .destination = 1, .value = 3, .kind = .combine };
+    return null;
 }
 
 /// What a capture binds: an `if`'s or `while`'s payload its condition, a `switch` prong's the
@@ -1302,10 +1299,11 @@ fn places(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.Inde
     const f = flow.functions.items[@backingInt(function)];
     const tree = &c.project.at(f.file).file.tree;
     const model = &c.project.at(f.file).model;
-    switch (tree.nodeTag(target)) {
-        .identifier => {
+    switch (formAt(tree, target)) {
+        .leaf => {
+            if (!spellsName(tree, target)) return;
             // `_ = v` discards; a name that does not resolve may be any memory.
-            if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) return;
+            if (discards(tree, target)) return;
             const ref = model.reference(target) orelse return addPlace(c, out, .unknown);
             const d = ref.declaration orelse return addPlace(c, out, .unknown);
             const decl = model.declarations[@backingInt(d)];
@@ -1322,8 +1320,8 @@ fn places(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.Inde
             try addPlace(c, out, .{ .local = d });
             if (decl.kind == .variable) if (tree.fullVarDecl(decl.node)) |variable| if (variable.ast.init_node.unwrap()) |init| {
                 var buffer: [2]Ast.Node.Index = undefined;
-                switch (tree.nodeTag(init)) {
-                    .address_of, .slice_open, .slice, .slice_sentinel => try places(c, flow, function, init, out),
+                switch (formAt(tree, init)) {
+                    .address_of, .slice => try places(c, flow, function, init, out),
                     else => if (tree.fullArrayInit(&buffer, init) != null) {
                         try places(c, flow, function, init, out);
                     } else if (try pointing(c, f.file, target)) {
@@ -1335,7 +1333,7 @@ fn places(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.Inde
             };
             if (decl.kind == .capture) if (try capturedFrom(c, f.file, decl)) |from| try places(c, flow, function, from, out);
         },
-        .field_access => {
+        .member => {
             // The program's own field holds the fact by its declaration; a field of a type
             // outside it (std's writer, a dependency's list) is every instance's everywhere, so
             // the store reaches only the value it belongs to. A container-level variable named
@@ -1356,25 +1354,27 @@ fn places(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.Inde
             return places(c, flow, function, holder, out);
         },
         .array_access => return places(c, flow, function, tree.nodeData(target).node_and_node[0], out),
-        .deref, .address_of, .@"try" => return places(c, flow, function, tree.nodeData(target).node, out),
-        .grouped_expression, .unwrap_optional => return places(c, flow, function, tree.nodeData(target).node_and_token[0], out),
-        .slice_open, .slice, .slice_sentinel => return places(c, flow, function, (tree.fullSlice(target) orelse return).ast.sliced, out),
+        .deref, .address_of, .tried => return places(c, flow, function, tree.nodeData(target).node, out),
+        .grouped, .unwrap_optional => return places(c, flow, function, tree.nodeData(target).node_and_token[0], out),
+        .slice => return places(c, flow, function, (tree.fullSlice(target) orelse return).ast.sliced, out),
         // Many-item pointer arithmetic stays in the memory it starts from.
-        .add, .sub, .add_wrap, .sub_wrap => return places(c, flow, function, tree.nodeData(target).node_and_node[0], out),
+        .operator => if (accesses.operatorOf(tree.nodeTag(target))) |operator| {
+            if ((operator.op == .add or operator.op == .sub) and operator.overflow != .saturating) return places(c, flow, function, tree.nodeData(target).node_and_node[0], out);
+        },
         .@"orelse", .@"catch" => {
             const lhs, const rhs = tree.nodeData(target).node_and_node;
             try places(c, flow, function, lhs, out);
             try places(c, flow, function, rhs, out);
         },
-        .@"if", .if_simple => {
+        .@"if" => {
             const branch = tree.fullIf(target).?;
             try places(c, flow, function, branch.ast.then_expr, out);
             if (branch.ast.else_expr.unwrap()) |otherwise| try places(c, flow, function, otherwise, out);
         },
-        .@"switch", .switch_comma => for (tree.fullSwitch(target).?.ast.cases) |case| {
+        .@"switch" => for (tree.fullSwitch(target).?.ast.cases) |case| {
             try places(c, flow, function, (tree.fullSwitchCase(case) orelse continue).ast.target_expr, out);
         },
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+        .builtin => {
             const name = tree.tokenSlice(tree.nodeMainToken(target));
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, target, &buffer);
@@ -1398,8 +1398,8 @@ fn places(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.Inde
             var buffer: [2]Ast.Node.Index = undefined;
             if (tree.fullArrayInit(&buffer, target)) |vector| {
                 // A vector of buffers: each one it names, by address, part or pointer.
-                for (vector.ast.elements) |element| switch (tree.nodeTag(element)) {
-                    .address_of, .slice_open, .slice, .slice_sentinel => try places(c, flow, function, element, out),
+                for (vector.ast.elements) |element| switch (formAt(tree, element)) {
+                    .address_of, .slice => try places(c, flow, function, element, out),
                     else => if (try pointing(c, f.file, element)) try places(c, flow, function, element, out),
                 };
                 return;
@@ -1481,27 +1481,37 @@ pub fn namedFields(c: *Context, file: Project.FileId, node: Ast.Node.Index) Cont
     var buffer: [2]Ast.Node.Index = undefined;
     const args = Facts.builtinArgs(tree, node, &buffer);
     if (args.len != 2) return &.{};
-    var holder = try c.facts.resolve(file, args[0]);
-    while (true) holder = switch (holder) {
-        .pointer => |inner| inner.child.*,
-        .optional => |inner| inner.*,
-        else => break,
-    };
-    const container = switch (holder) {
-        .instance, .container => |k| k,
-        else => return &.{},
-    };
-    if (tree.nodeTag(args[1]) == .string_literal) {
-        const text = tree.tokenSlice(tree.nodeMainToken(args[1]));
-        if (text.len >= 2) {
-            const decl = c.facts.member(container, text[1 .. text.len - 1]) orelse return &.{};
-            if (c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind != .field) return &.{};
-            const one = try c.allocator.alloc(Facts.Decl, 1);
-            one[0] = decl;
-            return one;
+    var out: std.ArrayList(Facts.Decl) = .empty;
+    for (try heldContainers(c, try c.facts.resolve(file, args[0]))) |container| {
+        // The one field its name spells (`Facts.fieldName`); any other, each of them.
+        switch (try c.facts.fieldName(file, args[1])) {
+            .name => |text| {
+                const decl = c.facts.member(container, text) orelse continue;
+                if (c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind != .field) continue;
+                try out.append(c.allocator, decl);
+            },
+            else => try out.appendSlice(c.allocator, try fieldsOf(c, container)),
         }
     }
-    return fieldsOf(c, container);
+    return out.items;
+}
+
+/// The containers a value's type is, behind pointers and optionals: each part's, of a choice. A
+/// part that is no container gives none.
+fn heldContainers(c: *Context, value: Facts.Value) Context.Error![]const Facts.Container {
+    var out: std.ArrayList(Facts.Container) = .empty;
+    try gatherContainers(c, value, &out);
+    return out.items;
+}
+
+fn gatherContainers(c: *Context, value: Facts.Value, out: *std.ArrayList(Facts.Container)) Context.Error!void {
+    switch (value) {
+        .pointer => |inner| try gatherContainers(c, inner.child.*, out),
+        .optional => |inner| try gatherContainers(c, inner.*, out),
+        .instance, .container => |k| try out.append(c.allocator, k),
+        .alternatives => |each| for (each) |part| try gatherContainers(c, part, out),
+        else => {},
+    }
 }
 
 /// The fields a container declares.
@@ -1560,6 +1570,8 @@ fn raiseFields(c: *Context, flow: *Flow, function: Function.Id, fields: []const 
         if (tree.fullStructInit(&buffer, one)) |literal| {
             switch (try c.facts.resolve(f.file, one)) {
                 .instance => |k| made = k,
+                // No one type: each field takes what all its parts hold.
+                .alternatives => {},
                 else => {},
             }
             for (literal.ast.fields) |part| parts = try parts.join(c.allocator, try dep(c, flow, function, part));
@@ -1728,6 +1740,7 @@ fn parserOf(c: *Context, flow: *Flow, file: Project.FileId, params: []const Ast.
     if (try c.role(Contract.library, container) != .untrusted) return null;
     const parser = switch (try c.facts.resolve(file, params[params.len - 1])) {
         .function => |function| function,
+        .alternatives => return null,
         else => return null,
     };
     return flow.by_node.get(.{ .file = parser.file, .node = fnDecl(c, parser) orelse return null });
@@ -1758,7 +1771,7 @@ fn mutableParams(c: *Context, decl: Facts.Decl) Context.Error!Slots {
             continue;
         };
         var at = kind;
-        if (tree.nodeTag(at) == .optional_type) at = tree.nodeData(at).node;
+        if (formAt(tree, at) == .optional_type) at = tree.nodeData(at).node;
         const pointer = tree.fullPtrType(at) orelse continue;
         if (pointer.const_token == null) out = try out.with(c.allocator, position);
     }
@@ -1915,7 +1928,7 @@ fn written(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Erro
     const tree = &c.project.at(file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
     if (tree.fullCall(&buffer, node)) |call| {
-        const field = tree.nodeTag(call.ast.fn_expr) == .field_access;
+        const field = formAt(tree, call.ast.fn_expr) == .member;
         const holder = [1]Ast.Node.Index{if (field) tree.nodeData(call.ast.fn_expr).node_and_token[0] else call.ast.fn_expr};
         return std.mem.concat(c.allocator, Ast.Node.Index, &.{ holder[0..@intFromBool(field)], call.ast.params });
     }
@@ -1956,7 +1969,7 @@ fn into(c: *Context, flow: *Flow, decl: Facts.Decl, out: *Callee) Context.Error!
     for (flow.peer_writers.items) |writer| if (std.meta.eql(writer, decl)) {
         out.writer = true;
     };
-    if (flow.stream) |stream| if (stream.file == decl.file and std.mem.eql(u8, record.name, "writer")) {
+    if (flow.stream) |stream| if (memberIs(c, stream, "writer", decl)) {
         out.writer = true;
     };
     if (flow.by_node.get(.{ .file = decl.file, .node = fnDecl(c, decl) orelse record.node })) |target| {
@@ -1966,7 +1979,7 @@ fn into(c: *Context, flow: *Flow, decl: Facts.Decl, out: *Callee) Context.Error!
     // A function of the program the fact does not read (one in a file whose rules read no
     // fact) gives what it does unread: undecided.
     if (flow.own(decl.file)) return;
-    out.kind = if (try source(c, flow, decl, record.name)) .source else .outside;
+    out.kind = if (try source(c, flow, decl)) .source else .outside;
 }
 
 /// The `fn_decl` node of a function declaration.
@@ -1977,20 +1990,21 @@ fn fnDecl(c: *Context, decl: Facts.Decl) ?Ast.Node.Index {
     return if (tree.nodeTag(parent) == .fn_decl) parent else null;
 }
 
+/// std's `Io.Reader` functions that hand over what a peer sent.
+const reader_reads = [_][]const u8{ "allocRemaining", "allocRemainingAlignedSentinel", "appendExact", "appendRemaining", "appendRemainingAligned", "appendRemainingUnlimited", "buffered", "bufferedLen", "peek", "peekArray", "peekByte", "peekDelimiterExclusive", "peekDelimiterInclusive", "peekGreedy", "peekInt", "peekSentinel", "peekStruct", "peekStructPointer", "readAllocAll", "readAllocShort", "readSliceAll", "readSliceEndian", "readSliceEndianAlloc", "readSliceShort", "readVec", "readVecAll", "take", "takeArray", "takeByte", "takeByteSigned", "takeDelimiter", "takeDelimiterExclusive", "takeDelimiterInclusive", "takeEnum", "takeEnumNonexhaustive", "takeInt", "takeLeb128", "takeSentinel", "takeStruct", "takeStructPointer", "takeVarInt" };
+
+/// Whether `decl` is the member `name` of the container `holder`, by its declaration.
+fn memberIs(c: *Context, holder: Facts.Container, name: []const u8, decl: Facts.Decl) bool {
+    const member = c.facts.member(holder, name) orelse return false;
+    return std.meta.eql(member, decl);
+}
+
 /// Whether a function outside the program reads a peer's input.
-fn source(c: *Context, flow: *Flow, decl: Facts.Decl, name: []const u8) Context.Error!bool {
-    _ = c;
-    const file = decl.file;
+fn source(c: *Context, flow: *Flow, decl: Facts.Decl) Context.Error!bool {
     for (flow.reads.items) |read| if (std.meta.eql(read, decl)) return true;
-    if (flow.reader) |reader| if (reader.file == file) {
-        for ([_][]const u8{ "take", "peek", "readSlice", "readVec", "readAlloc", "allocRemaining", "appendExact", "appendRemaining", "buffered" }) |prefix| if (std.mem.startsWith(u8, name, prefix)) return true;
-    };
-    if (flow.file) |handle| if (handle.file == file) {
-        for ([_][]const u8{ "readStreaming", "readPositional", "readPositionalAll" }) |read| if (std.mem.eql(u8, name, read)) return true;
-    };
-    if (flow.dir) |dir| if (dir.file == file) {
-        for ([_][]const u8{ "readFile", "readFileAlloc", "readFileAllocOptions", "readLink" }) |read| if (std.mem.eql(u8, name, read)) return true;
-    };
+    if (flow.reader) |reader| if (reader.file == decl.file) for (reader_reads) |read| if (memberIs(c, reader, read, decl)) return true;
+    if (flow.file) |handle| for ([_][]const u8{ "readStreaming", "readPositional", "readPositionalAll" }) |read| if (memberIs(c, handle, read, decl)) return true;
+    if (flow.dir) |dir| for ([_][]const u8{ "readFile", "readFileAlloc", "readFileAllocOptions", "readLink" }) |read| if (memberIs(c, dir, read, decl)) return true;
     return false;
 }
 
@@ -2024,9 +2038,8 @@ pub fn fixedBytes(c: *Context, flow: *const Flow, file: Project.FileId, receiver
     const reader = flow.reader orelse return null;
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    if (tree.nodeTag(receiver) != .identifier) return null;
     const function = owner(flow, file, receiver) orelse return null;
-    const d = (model.reference(receiver) orelse return null).declaration orelse return null;
+    const d = (nameRef(model, receiver) orelse return null).declaration orelse return null;
     const record = model.declarations[@backingInt(d)];
     if (record.kind != .variable or owner(flow, file, record.node) != function) return null;
     const variable = tree.fullVarDecl(record.node) orelse return null;
@@ -2035,32 +2048,28 @@ pub fn fixedBytes(c: *Context, flow: *const Flow, file: Project.FileId, receiver
     const made = tree.fullCall(&buffer, init) orelse return null;
     if (made.ast.params.len != 1) return null;
     const fixed = c.facts.member(reader, "fixed") orelse return null;
-    const by_std = switch (tree.nodeTag(made.ast.fn_expr)) {
-        .enum_literal => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(made.ast.fn_expr)), "fixed") and switch (try c.facts.literalType(file, init)) {
-            .container, .instance => |k| k.file == reader.file and k.scope == reader.scope,
-            else => false,
-        },
-        else => switch (try c.facts.resolve(file, made.ast.fn_expr)) {
-            .function => |decl| std.meta.eql(((try c.facts.origin(decl)).orNull()) orelse decl, fixed),
-            else => false,
-        },
+    // By the function it calls, a decl literal's (`.fixed(bytes)`) by the type it is given.
+    const making = (try Facts.calls.at(c.facts, file, init)) orelse return null;
+    const by_std = switch (making.callee) {
+        .function => |decl| std.meta.eql(((try c.facts.origin(decl)).orNull()) orelse decl, fixed),
+        .choice, .any => false,
     };
     if (!by_std) return null;
     for (flow.functions.items[@backingInt(function)].nodes) |node| {
-        switch (tree.nodeTag(node)) {
-            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => {
+        switch (formAt(tree, node)) {
+            .assign, .compound_assign => {
                 if (rootDecl(model, tree, tree.nodeData(node).node_and_node[0]) == d) return null;
             },
-            .assign_destructure => for (tree.assignDestructure(node).ast.variables) |each| {
+            .destructure => for (tree.assignDestructure(node).ast.variables) |each| {
                 if (rootDecl(model, tree, each) == d) return null;
             },
             .address_of => {
                 if (rootDecl(model, tree, tree.nodeData(node).node) != d) continue;
                 // An address discarded (`_ = &rd;`) reaches nothing.
                 const parent = model.parentOf(node) orelse return null;
-                if (tree.nodeTag(parent) != .assign) return null;
+                if (formAt(tree, parent) != .assign) return null;
                 const target, const value = tree.nodeData(parent).node_and_node;
-                if (value != node or tree.nodeTag(target) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) return null;
+                if (value != node or !discards(tree, target)) return null;
             },
             else => {},
         }
@@ -2071,24 +2080,22 @@ pub fn fixedBytes(c: *Context, flow: *const Flow, file: Project.FileId, receiver
 /// Whether `value` adds to, multiplies or shifts the local `target` names: an assignment that
 /// grows it.
 fn accumulates(tree: *const Ast, model: *const Model, target: Ast.Node.Index, value: Ast.Node.Index) bool {
-    if (tree.nodeTag(target) != .identifier) return false;
-    const declared = (model.reference(target) orelse return false).declaration orelse return false;
+    const declared = (nameRef(model, target) orelse return false).declaration orelse return false;
     const first = tree.firstToken(value);
     const last = tree.lastToken(value);
-    for (tree.nodes.items(.tag), 0..) |tag, i| switch (tag) {
-        .mul, .mul_wrap, .mul_sat, .shl, .shl_sat, .add, .add_wrap, .add_sat => {
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            const token = tree.nodeMainToken(node);
-            if (token < first or token > last) continue;
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            for ([_]Ast.Node.Index{ lhs, rhs }) |operand| {
-                if (tree.nodeTag(operand) != .identifier) continue;
-                const ref = model.reference(operand) orelse continue;
-                if (ref.declaration == declared) return true;
-            }
-        },
-        else => {},
-    };
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (accesses.formOf(tag) != .operator) continue;
+        const operator = accesses.operatorOf(tag) orelse continue;
+        if (operator.op != .mul and operator.op != .shl and operator.op != .add) continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(node);
+        if (token < first or token > last) continue;
+        const lhs, const rhs = tree.nodeData(node).node_and_node;
+        for ([_]Ast.Node.Index{ lhs, rhs }) |operand| {
+            const ref = nameRef(model, operand) orelse continue;
+            if (ref.declaration == declared) return true;
+        }
+    }
     return false;
 }
 
@@ -2096,13 +2103,17 @@ fn accumulates(tree: *const Ast, model: *const Model, target: Ast.Node.Index, va
 fn dep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Context.Error!Dep {
     const f = flow.functions.items[@backingInt(function)];
     const tree = &c.project.at(f.file).file.tree;
-    switch (tree.nodeTag(node)) {
-        .identifier => return declaredDep(c, flow, function, node),
-        .field_access => return fieldDep(c, flow, function, node),
+    switch (formAt(tree, node)) {
+        .leaf => {
+            if (spellsName(tree, node)) return declaredDep(c, flow, function, node);
+            // An error is its text: what `@errorName` and a format's `{t}` make bytes of.
+            if (try c.facts.literalOf(f.file, node)) |spelled| if (spelled == .error_value) return errorText(flow);
+        },
+        .member => return fieldDep(c, flow, function, node),
         .array_access => return dep(c, flow, function, tree.nodeData(node).node_and_node[0]),
         // A slice holds what it slices, in a length its bounds set: past its start to its end,
         // or to the end of what it slices.
-        .slice_open, .slice, .slice_sentinel => {
+        .slice => {
             const slice = tree.fullSlice(node) orelse return .{};
             const memory = try dep(c, flow, function, slice.ast.sliced);
             var out = try memory.held().join(c.allocator, try (try dep(c, flow, function, slice.ast.start)).sizing(c.allocator));
@@ -2111,41 +2122,45 @@ fn dep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Co
             } else out = try out.join(c.allocator, memory.lengthOnly());
             return out;
         },
-        .grouped_expression, .unwrap_optional => return dep(c, flow, function, tree.nodeData(node).node_and_token[0]),
-        .deref, .address_of, .@"try", .negation, .negation_wrap, .bit_not => return dep(c, flow, function, tree.nodeData(node).node),
-        // What is left of a length (`buf.len - at`) is bounded by it; a mask or a remainder by
-        // the program's own value is bounded by it, a peer's value within that range: data.
-        .sub, .sub_sat => {
+        .grouped, .unwrap_optional => return dep(c, flow, function, tree.nodeData(node).node_and_token[0]),
+        .deref, .address_of, .tried => return dep(c, flow, function, tree.nodeData(node).node),
+        .operator => {
+            if (accesses.unaryOf(tree.nodeTag(node)) != null) return dep(c, flow, function, tree.nodeData(node).node);
+            const operator = accesses.operatorOf(tree.nodeTag(node)).?; // unreachable: an operator on two is `operatorOf`'s
             const lhs, const rhs = tree.nodeData(node).node_and_node;
-            const out = try (try dep(c, flow, function, lhs)).join(c.allocator, try dep(c, flow, function, rhs));
-            return if (try c.facts.memoryField(f.file, lhs) != .field) try out.narrowed(c.allocator) else out;
+            switch (operator.op) {
+                // What is left of a length (`buf.len - at`) is bounded by it.
+                .sub => if (operator.overflow != .wrapping) {
+                    const out = try (try dep(c, flow, function, lhs)).join(c.allocator, try dep(c, flow, function, rhs));
+                    return if (try c.facts.memoryField(f.file, lhs) != .field) try out.narrowed(c.allocator) else out;
+                },
+                // A mask or a remainder by the program's own value is bounded by it, a peer's
+                // value within that range: data.
+                .bit_and, .mod => {
+                    const left = try dep(c, flow, function, lhs);
+                    const right = try dep(c, flow, function, rhs);
+                    if (left.clean() or right.clean()) return try (try left.join(c.allocator, right)).narrowed(c.allocator);
+                    return try left.join(c.allocator, right);
+                },
+                // Bytes shifted into place assemble a number; a clean value shifted by data is a
+                // mask.
+                .shl => {
+                    const shifted = try (try dep(c, flow, function, lhs)).widened(c.allocator);
+                    return shifted.join(c.allocator, try dep(c, flow, function, rhs));
+                },
+                else => {},
+            }
+            // Wrapping arithmetic stays in its type's range, which is the peer's to choose in a
+            // wide type: a sink reads it as data only where the result is shown small (a hash
+            // shifted to a table's bits).
+            return try (try dep(c, flow, function, lhs)).join(c.allocator, try dep(c, flow, function, rhs));
         },
-        .bit_and, .mod => {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            const left = try dep(c, flow, function, lhs);
-            const right = try dep(c, flow, function, rhs);
-            if (left.clean() or right.clean()) return try (try left.join(c.allocator, right)).narrowed(c.allocator);
-            return try left.join(c.allocator, right);
-        },
-        // Wrapping arithmetic stays in its type's range, which is the peer's to choose in a wide
-        // type: a sink reads it as data only where the result is shown small (a hash shifted to
-        // a table's bits).
-        .add_wrap, .sub_wrap, .mul_wrap, .add, .div, .shr, .bit_or, .bit_xor, .add_sat, .array_cat, .@"orelse", .@"catch" => {
+        .concatenation, .@"orelse", .@"catch" => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             return try (try dep(c, flow, function, lhs)).join(c.allocator, try dep(c, flow, function, rhs));
         },
-        .mul, .mul_sat => {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            return try (try dep(c, flow, function, lhs)).join(c.allocator, try dep(c, flow, function, rhs));
-        },
-        // Bytes shifted into place assemble a number; a clean value shifted by data is a mask.
-        .shl, .shl_sat => {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            const shifted = try (try dep(c, flow, function, lhs)).widened(c.allocator);
-            return shifted.join(c.allocator, try dep(c, flow, function, rhs));
-        },
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return builtinDep(c, flow, function, node),
-        .@"if", .if_simple => {
+        .builtin => return builtinDep(c, flow, function, node),
+        .@"if" => {
             const branch = tree.fullIf(node).?;
             // Which branch gives the value is the condition's choice.
             var out = try (try dep(c, flow, function, branch.ast.cond_expr)).ruling(c.allocator, flow.masks);
@@ -2153,23 +2168,31 @@ fn dep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Co
             if (branch.ast.else_expr.unwrap()) |e| out = try out.join(c.allocator, try dep(c, flow, function, e));
             return out;
         },
-        .@"switch", .switch_comma => {
+        .@"switch" => {
             var out = try (try dep(c, flow, function, tree.fullSwitch(node).?.ast.condition)).ruling(c.allocator, flow.masks);
             for (tree.fullSwitch(node).?.ast.cases) |case| out = try out.join(c.allocator, try dep(c, flow, function, (tree.fullSwitchCase(case) orelse continue).ast.target_expr));
             return out;
         },
-        .block, .block_semicolon, .block_two, .block_two_semicolon => return labeled(c, flow, function, node),
-        .while_simple, .while_cont, .@"while", .for_simple, .@"for" => return loopValue(c, flow, function, node),
+        .body => {
+            var buffer: [2]Ast.Node.Index = undefined;
+            if (tree.blockStatements(&buffer, node) != null) return labeled(c, flow, function, node);
+        },
+        .@"while", .@"for" => return loopValue(c, flow, function, node),
         // A comparison's truth is what it compares chose: a bool, data, for the facts that take
         // what they decide.
-        .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal, .bool_and, .bool_or => {
+        .comparison => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             const both = try (try dep(c, flow, function, lhs)).join(c.allocator, try dep(c, flow, function, rhs));
             return both.ruling(c.allocator, flow.masks);
         },
-        .bool_not => return try (try dep(c, flow, function, tree.nodeData(node).node)).ruling(c.allocator, flow.masks),
-        // An error is its text: what `@errorName` and a format's `{t}` make bytes of.
-        .error_value => return errorText(flow),
+        .logic => switch (Facts.conditionOf(tree, node)) {
+            .not => |inner| return try (try dep(c, flow, function, inner)).ruling(c.allocator, flow.masks),
+            .both, .either => |sides| {
+                const both = try (try dep(c, flow, function, sides[0])).join(c.allocator, try dep(c, flow, function, sides[1]));
+                return both.ruling(c.allocator, flow.masks);
+            },
+            .compare, .other => {},
+        },
         else => {},
     }
     if (try literalDep(c, flow, function, node)) |out| return out;
@@ -2222,7 +2245,7 @@ fn fieldDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Inde
     // An address is no number a peer chooses; a length is one within the memory the program
     // holds: data, which a sink judges against what it reaches.
     if (try c.facts.memoryField(f.file, node) != .field) {
-        if (std.mem.eql(u8, tree.tokenSlice(name), "ptr")) return .{};
+        if (try c.facts.languageField(f.file, node) == .ptr) return .{};
         const memory = try dep(c, flow, function, receiver);
         return try (try memory.held().narrowed(c.allocator)).join(c.allocator, memory.measured());
     }
@@ -2251,8 +2274,7 @@ fn fieldDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Inde
 /// the reader reads one.
 fn readerBuffer(c: *Context, flow: *const Flow, decl: Facts.Decl) bool {
     const reader = flow.reader orelse return false;
-    const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
-    return decl.file == reader.file and record.scope == reader.scope and record.kind == .field and std.mem.eql(u8, record.name, "buffer");
+    return memberIs(c, reader, "buffer", decl);
 }
 
 /// What a struct or an array literal holds, or null where `node` is neither.
@@ -2395,11 +2417,15 @@ fn unnamed(flow: *const Flow) Dep {
 fn composed(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Context.Error!Dep {
     const f = flow.functions.items[@backingInt(function)];
     const tree = &c.project.at(f.file).file.tree;
-    switch (tree.nodeTag(node)) {
+    switch (formAt(tree, node)) {
         // What the program computes as it compiles is no input, but an error's text it names
         // is still the error's (`comptime @errorName(error.Full)`).
         .@"comptime" => return answered(try dep(c, flow, function, tree.nodeData(node).node), ~flow.masks.error_text),
-        .fn_decl, .fn_proto, .fn_proto_one, .fn_proto_simple, .fn_proto_multi, .test_decl, .ptr_type, .ptr_type_aligned, .ptr_type_bit_range, .ptr_type_sentinel, .array_type, .array_type_sentinel, .optional_type, .error_union, .error_set_decl, .merge_error_sets, .anyframe_type, .container_decl, .container_decl_trailing, .container_decl_two, .container_decl_two_trailing, .container_decl_arg, .container_decl_arg_trailing, .tagged_union, .tagged_union_trailing, .tagged_union_two, .tagged_union_two_trailing, .tagged_union_enum_tag, .tagged_union_enum_tag_trailing => return .{},
+        // A declaration or a type holds no value.
+        .fn_decl, .prototype, .pointer_type, .array_type, .optional_type, .error_union, .merged_errors, .anyframe_type => return .{},
+        // A test or a container, as `dep` reads a block before it comes here.
+        .body => return .{},
+        .leaf => if (tree.tokenTag(tree.nodeMainToken(node)) == .keyword_error) return .{},
         else => {},
     }
     var out: Dep = .{};
@@ -2419,12 +2445,18 @@ fn alternativeFields(c: *Context, flow: *Flow, file: Project.FileId, receiver: A
         while (true) held = switch (held) {
             .pointer => |inner| inner.child.*,
             .optional, .error_union => |inner| inner.*,
+            .alternatives => break,
             else => break,
         };
         const container = switch (held) {
             .container, .instance => |k| k,
             .unknown => |why| {
                 if (why != .zig_own and why != .absent) out = out.join(Levels.all(.unknown).join(unnamed(flow).level));
+                continue;
+            },
+            // A pointer to a choice: read as what does not resolve.
+            .alternatives => {
+                out = out.join(Levels.all(.unknown).join(unnamed(flow).level));
                 continue;
             },
             else => continue,
@@ -2444,6 +2476,11 @@ fn unresolvedHolder(value: Facts.Value) bool {
         .pointer => |inner| inner.child.*,
         .optional, .error_union => |inner| inner.*,
         .unknown => |why| return why != .zig_own and why != .absent,
+        // Where any part does not resolve.
+        .alternatives => |parts| {
+            for (parts) |part| if (unresolvedHolder(part)) return true;
+            return false;
+        },
         else => return false,
     };
 }
@@ -2485,10 +2522,12 @@ fn literalFields(c: *Context, file: Project.FileId, node: Ast.Node.Index, litera
     while (true) holder = switch (holder) {
         .pointer => |inner| inner.child.*,
         .optional, .error_union => |inner| inner.*,
+        .alternatives => break,
         else => break,
     };
     const container = switch (holder) {
         .container, .instance => |k| k,
+        .alternatives => return null,
         else => return null,
     };
     const tree = &c.project.at(file).file.tree;
@@ -2507,15 +2546,15 @@ fn literalFields(c: *Context, file: Project.FileId, node: Ast.Node.Index, litera
 fn returned(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
     var at = node;
     while (model.parentOf(at)) |parent| : (at = parent) {
-        switch (tree.nodeTag(parent)) {
+        switch (formAt(tree, parent)) {
             .@"return" => return true,
-            .grouped_expression => {},
-            .@"if", .if_simple => {
+            .grouped => {},
+            .@"if" => {
                 const branch = tree.fullIf(parent).?;
                 if (at != branch.ast.then_expr and at.toOptional() != branch.ast.else_expr) return false;
             },
-            .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline => if (at != tree.fullSwitchCase(parent).?.ast.target_expr) return false,
-            .@"switch", .switch_comma => if (at == tree.fullSwitch(parent).?.ast.condition) return false,
+            .prong => if (at != tree.fullSwitchCase(parent).?.ast.target_expr) return false,
+            .@"switch" => if (at == tree.fullSwitch(parent).?.ast.condition) return false,
             else => return false,
         }
     }
@@ -2529,7 +2568,7 @@ fn shownField(c: *Context, file: Project.FileId, value: Ast.Node.Index, decl: Fa
     const tree = &c.project.at(decl.file).file.tree;
     const field = c.project.at(decl.file).model.containerField(tree, c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return false;
     const declared = field.ast.type_expr.unwrap() orelse return false;
-    if (tree.nodeTag(declared) != .identifier or !Model.primitive(tree.tokenSlice(tree.nodeMainToken(declared)))) return false;
+    if (!spellsName(tree, declared) or !Model.primitive(tree.tokenSlice(tree.nodeMainToken(declared)))) return false;
     return Range.shown(c, file, value, decl.file, declared);
 }
 
@@ -2549,13 +2588,13 @@ fn unrefined(c: *Context, flow: *Flow, function: Function.Id, value: Ast.Node.In
         for (choice.ast.cases) |case| try unrefined(c, flow, function, tree.fullSwitchCase(case).?.ast.target_expr);
         return;
     }
-    if (tree.nodeTag(value) == .grouped_expression) return unrefined(c, flow, function, tree.nodeData(value).node_and_token[0]);
+    if (formAt(tree, value) == .grouped) return unrefined(c, flow, function, tree.nodeData(value).node_and_token[0]);
     var buffer: [2]Ast.Node.Index = undefined;
     if (tree.fullStructInit(&buffer, value)) |literal| if (try literalFields(c, f.file, value, literal) != null) return;
     var proto_buffer: [1]Ast.Node.Index = undefined;
     const proto = tree.fullFnProto(&proto_buffer, tree.nodeData(f.node).node_and_node[0]) orelse return;
     var payload = proto.ast.return_type.unwrap() orelse return;
-    if (tree.nodeTag(payload) == .error_union) payload = tree.nodeData(payload).node_and_node[1];
+    if (formAt(tree, payload) == .error_union) payload = tree.nodeData(payload).node_and_node[1];
     // A tuple's numbers are read one by one, each against its field's type; a tuple the parser
     // holds in a value of its own gives every number it holds.
     var container_buffer: [2]Ast.Node.Index = undefined;
@@ -2760,7 +2799,7 @@ fn resultOf(c: *Context, flow: *Flow, function: Function.Id, callee: Callee) Con
             // A read into the caller's buffer returns how much it read: a count the buffer
             // bounds, a peer's within it.
             if (!(try bufferParams(c, decl)).empty() and returnsCount(c, decl)) return .{ .level = .in(lanes, .data) };
-            if (decodes(c, decl)) return .{ .level = .in(lanes, if (narrow(c, f.file, callee.params)) .data else .number) };
+            if (try decodes(c, decl)) return .{ .level = .in(lanes, if (narrow(c, f.file, callee.params)) .data else .number) };
             return .{ .level = .in(lanes, .data) };
         },
         .outside => {
@@ -2790,9 +2829,9 @@ fn resultOf(c: *Context, flow: *Flow, function: Function.Id, callee: Callee) Con
             // `math`, `base64`), or one of them that decodes an integer, may make any number of
             // what it is given (`std.json` parsing a struct, a hash of the bytes). A decode of 16
             // bits or fewer stays in their range.
-            if (callee.receiver == null and (!flow.data_files.contains(@backingInt(decl.file)) or decodes(c, decl))) return if (narrow(c, f.file, callee.params)) out else try out.widened(c.allocator);
+            if (callee.receiver == null and (!flow.data_files.contains(@backingInt(decl.file)) or try decodes(c, decl))) return if (narrow(c, f.file, callee.params)) out else try out.widened(c.allocator);
             // A value clamped between the program's own bounds is held to them.
-            if (std.mem.eql(u8, c.project.at(decl.file).model.declarations[@backingInt(decl.index)].name, "clamp") and callee.params.len == 3) {
+            if (try Governed.isStd(c, decl, "math.clamp") == .yes and callee.params.len == 3) {
                 if ((try dep(c, flow, function, callee.params[1])).clean() and (try dep(c, flow, function, callee.params[2])).clean()) return try out.narrowed(c.allocator);
             }
             return out;
@@ -2852,10 +2891,9 @@ fn narrow(c: *Context, file: Project.FileId, params: []const Ast.Node.Index) boo
 /// Whether a std function decodes an integer from bytes or text: `readInt` and its forms,
 /// `parseInt`, `parseUnsigned`, a reader's `takeInt`, `peekInt`, `takeVarInt`, `takeLeb128`,
 /// `takeEnum`.
-fn decodes(c: *Context, decl: Facts.Decl) bool {
-    const name = c.project.at(decl.file).model.declarations[@backingInt(decl.index)].name;
-    for ([_][]const u8{ "readInt", "readVarInt", "readPackedInt", "parseInt", "parseUnsigned", "takeInt", "peekInt", "takeVarInt", "takeLeb128", "takeEnum" }) |decoder| {
-        if (std.mem.startsWith(u8, name, decoder)) return true;
+fn decodes(c: *Context, decl: Facts.Decl) Context.Error!bool {
+    for ([_][]const u8{ "mem.readInt", "mem.readVarInt", "mem.readPackedInt", "fmt.parseInt", "fmt.parseIntSizeSuffix", "fmt.parseUnsigned", "Io.Reader.takeInt", "Io.Reader.peekInt", "Io.Reader.takeVarInt", "Io.Reader.takeLeb128", "Io.Reader.takeEnum", "Io.Reader.takeEnumNonexhaustive" }) |decoder| {
+        if (try Governed.isStd(c, decl, decoder) == .yes) return true;
     }
     return false;
 }
@@ -3173,8 +3211,7 @@ pub fn counterLevel(c: *Context, fact: Fact, file: Project.FileId, loop: Ast.Nod
     const function = owner(flow, file, operand) orelse return null;
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    if (tree.nodeTag(operand) != .identifier) return null;
-    const d = (model.reference(operand) orelse return null).declaration orelse return null;
+    const d = (nameRef(model, operand) orelse return null).declaration orelse return null;
     const decl = model.declarations[@backingInt(d)];
     if (decl.kind != .variable) return null;
     switch (model.scopes[@backingInt(decl.scope)].kind) {
@@ -3189,14 +3226,11 @@ pub fn counterLevel(c: *Context, fact: Fact, file: Project.FileId, loop: Ast.Nod
         out = try (try out.join(c.allocator, try dep(c, flow, function, init))).join(c.allocator, try control(c, flow, function, decl.node, null));
     };
     for (tree.nodes.items(.tag), 0..) |tag, i| {
-        switch (tag) {
-            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => {},
-            else => continue,
-        }
+        const form = accesses.formOf(tag);
+        if (form != .assign and form != .compound_assign) continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const target, const value = tree.nodeData(node).node_and_node;
-        if (tree.nodeTag(target) != .identifier) continue;
-        const ref = model.reference(target) orelse continue;
+        const ref = nameRef(model, target) orelse continue;
         if (ref.declaration != d) continue;
         const token = tree.nodeMainToken(node);
         if (token < first or token > last) {
@@ -3230,8 +3264,8 @@ fn stepOf(tree: *const Ast, model: *const Model, counter: Model.Declaration.Id, 
 }
 
 fn namesDeclaration(tree: *const Ast, model: *const Model, node: Ast.Node.Index, d: Model.Declaration.Id) bool {
-    if (tree.nodeTag(node) != .identifier) return false;
-    const ref = model.reference(node) orelse return false;
+    _ = tree;
+    const ref = nameRef(model, node) orelse return false;
     return ref.declaration == d;
 }
 
@@ -3294,11 +3328,12 @@ const TreeValue = enum { index, container, data };
 
 fn treeValue(c: *Context, flow: *const Flow, file: Project.FileId, type_node: Ast.Node.Index) Context.Error!TreeValue {
     const tree = &c.project.at(file).file.tree;
-    switch (tree.nodeTag(type_node)) {
+    switch (formAt(tree, type_node)) {
         .optional_type => return treeValue(c, flow, file, tree.nodeData(type_node).node),
         .error_union => return treeValue(c, flow, file, tree.nodeData(type_node).node_and_node[1]),
-        .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range => return treeValue(c, flow, file, tree.fullPtrType(type_node).?.ast.child_type),
-        .identifier, .field_access => {
+        .pointer_type => return treeValue(c, flow, file, tree.fullPtrType(type_node).?.ast.child_type),
+        .leaf, .member => {
+            if (formAt(tree, type_node) == .leaf and !spellsName(tree, type_node)) return .data;
             const decl = ((try c.facts.definition(file, type_node)).orNull()) orelse return .data;
             if (flow.zig_index.contains(decl)) return .index;
             if (decl.file != flow.zig_ast) return .data;
@@ -3405,7 +3440,7 @@ const Walk = struct {
         const tree = &w.c.project.at(f.file).file.tree;
         const model = &w.c.project.at(f.file).model;
         if (try resolveCall(w.c, w.flow, f.file, node)) |callee| return w.throughCall(function, node, callee, depth);
-        if (tree.nodeTag(node) == .identifier) {
+        if (spellsName(tree, node)) {
             const ref = model.reference(node) orelse return null;
             const d = ref.declaration orelse return null;
             if (f.position(d)) |index| return w.callers(function, index, depth);
@@ -3415,13 +3450,13 @@ const Walk = struct {
             return w.local(function, d, depth);
         }
         // A field holds what the program stores in it anywhere, by its declaration.
-        if (tree.nodeTag(node) == .field_access) if ((try w.c.facts.definition(f.file, node)).orNull()) |decl| {
+        if (formAt(tree, node) == .member) if ((try w.c.facts.definition(f.file, node)).orNull()) |decl| {
             if ((w.flow.globals.get(decl) orelse Levels.clean).at(w.lane) != .clean) if (try w.stored(decl, depth)) |found| return found;
         };
         // Memory's length holds what was written to it (`s.len = n`), where its contents carry
         // nothing: the receiver is walked back for the write, whatever it carries itself.
-        if (tree.nodeTag(node) == .field_access and std.mem.eql(u8, tree.tokenSlice(tree.lastToken(node)), "len") and try w.c.facts.memoryField(f.file, node) == .memory) {
-            if (try w.from(function, tree.nodeData(node).node_and_token[0], depth + 1)) |found| return found;
+        if (try w.c.facts.lengthOf(f.file, node)) |memory| {
+            if (try w.from(function, memory, depth + 1)) |found| return found;
         }
         for (try children(w.c, f.file, node)) |child| {
             if (!try w.carries(function, child)) continue;
@@ -3490,7 +3525,7 @@ const Walk = struct {
         if (scope == .file or scope == .container) return null;
         if (try w.from(function, decl.node, depth + 1)) |found| return found;
         for (f.nodes) |node| {
-            if (tree.nodeTag(node) == .assign) {
+            if (formAt(tree, node) == .assign) {
                 const target, const value = tree.nodeData(node).node_and_node;
                 if (rootDecl(model, tree, target) != d or !try w.carries(function, value)) continue;
                 if (try w.from(function, value, depth + 1)) |found| return found;
@@ -3538,9 +3573,9 @@ const Walk = struct {
             const args = Facts.builtinArgs(tree, node, &buffer);
             return if (writes.value < args.len) args[writes.value] else null;
         }
-        return switch (tree.nodeTag(node)) {
+        return switch (formAt(tree, node)) {
             .assign => tree.nodeData(node).node_and_node[1],
-            .assign_destructure => tree.assignDestructure(node).ast.value_expr,
+            .destructure => tree.assignDestructure(node).ast.value_expr,
             else => null,
         };
     }
@@ -3575,12 +3610,12 @@ const Walk = struct {
 /// The declaration an expression is rooted at: `x`, `x.field`, `x[i]`, `&x`, `x[a..b]`.
 fn rootDecl(model: *const Model, tree: *const Ast, node: Ast.Node.Index) ?Model.Declaration.Id {
     var at = node;
-    while (true) switch (tree.nodeTag(at)) {
-        .identifier => return (model.reference(at) orelse return null).declaration,
-        .field_access, .unwrap_optional, .grouped_expression => at = tree.nodeData(at).node_and_token[0],
+    while (true) switch (formAt(tree, at)) {
+        .leaf => return (nameRef(model, at) orelse return null).declaration,
+        .member, .unwrap_optional, .grouped => at = tree.nodeData(at).node_and_token[0],
         .array_access => at = tree.nodeData(at).node_and_node[0],
         .address_of, .deref => at = tree.nodeData(at).node,
-        .slice_open, .slice, .slice_sentinel => at = (tree.fullSlice(at) orelse return null).ast.sliced,
+        .slice => at = (tree.fullSlice(at) orelse return null).ast.sliced,
         else => return null,
     };
 }
@@ -3646,26 +3681,22 @@ fn callSites(c: *Context, flow: *Flow) Context.Error!*CallSites {
 /// every field of the union for `else` or a value that is no tag.
 fn prongFields(c: *Context, file: Project.FileId, operand: Ast.Node.Index, case_node: Ast.Node.Index) Context.Error![]const Facts.Decl {
     const tree = &c.project.at(file).file.tree;
-    var held_value = try c.facts.resolve(file, operand);
-    while (true) held_value = switch (held_value) {
-        .pointer => |inner| inner.child.*,
-        .optional => |inner| inner.*,
-        else => break,
-    };
-    const container = switch (held_value) {
-        .instance, .container => |k| k,
-        else => return &.{},
-    };
     const case = tree.fullSwitchCase(case_node) orelse return &.{};
     var out: std.ArrayList(Facts.Decl) = .empty;
-    if (case.ast.values.len == 0) return fieldsOf(c, container);
+    for (try heldContainers(c, try c.facts.resolve(file, operand))) |container| try prongFieldsOf(c, file, case, container, &out);
+    return out.items;
+}
+
+/// `prongFields` of one union.
+fn prongFieldsOf(c: *Context, file: Project.FileId, case: Ast.full.SwitchCase, container: Facts.Container, out: *std.ArrayList(Facts.Decl)) Context.Error!void {
+    if (case.ast.values.len == 0) return out.appendSlice(c.allocator, try fieldsOf(c, container));
     for (case.ast.values) |item| {
-        if (tree.nodeTag(item) != .enum_literal) return fieldsOf(c, container);
-        const decl = c.facts.member(container, tree.tokenSlice(tree.nodeMainToken(item))) orelse return fieldsOf(c, container);
+        const named_tag = (try c.facts.literalOf(file, item)) orelse return out.appendSlice(c.allocator, try fieldsOf(c, container));
+        if (named_tag != .enum_literal) return out.appendSlice(c.allocator, try fieldsOf(c, container));
+        const decl = c.facts.member(container, named_tag.enum_literal) orelse return out.appendSlice(c.allocator, try fieldsOf(c, container));
         if (c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind != .field) continue;
         try out.append(c.allocator, decl);
     }
-    return out.items;
 }
 
 /// Every `Link` the program makes: each pointer-valued expression kept somewhere, by the places
@@ -3706,13 +3737,12 @@ fn linksOf(c: *Context, flow: *Flow) Context.Error!void {
 /// (`hold` reads where): no use that only reads through it (`p.*`, `p[i]`, `p.len`, a
 /// comparison), and no operand `places` already reads through (a branch, a cast).
 fn keeps(tree: *const Ast, parent: Ast.Node.Index, node: Ast.Node.Index) bool {
-    return switch (tree.nodeTag(parent)) {
-        .simple_var_decl, .local_var_decl, .aligned_var_decl, .global_var_decl => true,
+    return switch (formAt(tree, parent)) {
+        .variable => true,
         .assign => tree.nodeData(parent).node_and_node[1] == node,
-        .assign_destructure, .@"return", .@"break" => true,
-        .call_one, .call_one_comma, .call, .call_comma => true,
-        .struct_init_one, .struct_init_one_comma, .struct_init_dot_two, .struct_init_dot_two_comma, .struct_init_dot, .struct_init_dot_comma, .struct_init, .struct_init_comma => true,
-        .array_init_one, .array_init_one_comma, .array_init_dot_two, .array_init_dot_two_comma, .array_init_dot, .array_init_dot_comma, .array_init, .array_init_comma => true,
+        .destructure, .@"return", .@"break" => true,
+        .call => true,
+        .struct_literal, .array_literal => true,
         else => false,
     };
 }
@@ -3726,8 +3756,8 @@ fn hold(c: *Context, flow: *Flow, function: Function.Id, owners: []const Place, 
     const parent = model.parentOf(node) orelse return false;
     var holders: std.ArrayList(Place) = .empty;
     var grew = false;
-    switch (tree.nodeTag(parent)) {
-        .simple_var_decl, .local_var_decl, .aligned_var_decl, .global_var_decl => {
+    switch (formAt(tree, parent)) {
+        .variable => {
             const d = declaredAt(model, parent) orelse return false;
             const scope = model.scopes[@backingInt(model.declarations[@backingInt(d)].scope)].kind;
             try holders.append(c.allocator, if (scope == .file or scope == .container) .{ .global = .{ .file = f.file, .index = d } } else .{ .local = d });
@@ -3759,7 +3789,7 @@ fn hold(c: *Context, flow: *Flow, function: Function.Id, owners: []const Place, 
             };
             return hold(c, flow, function, owners, target);
         },
-        .grouped_expression, .unwrap_optional, .@"try", .@"orelse", .@"catch", .@"if", .if_simple, .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline, .@"switch", .switch_comma => {
+        .grouped, .unwrap_optional, .tried, .@"orelse", .@"catch", .@"if", .prong, .@"switch" => {
             // A switch's operand or a branch's condition is read, not passed on.
             if (tree.fullIf(parent)) |branch| if (branch.ast.cond_expr == node) return false;
             if (tree.fullSwitch(parent)) |choice| if (choice.ast.condition == node) return false;
@@ -3793,12 +3823,16 @@ fn hold(c: *Context, flow: *Flow, function: Function.Id, owners: []const Place, 
             } else if (tree.fullArrayInit(&literal_buffer, parent)) |literal| {
                 if (literal.ast.type_expr.unwrap() == node) return false;
                 return hold(c, flow, function, owners, parent);
-            } else if (tree.nodeTag(parent) == .assign_destructure) {
+            } else if (formAt(tree, parent) == .destructure) {
                 try holders.append(c.allocator, .unknown);
-            } else switch (tree.nodeTag(parent)) {
+            } else switch (formAt(tree, parent)) {
                 // A use that reads through it keeps nothing.
-                .field_access, .array_access, .deref, .slice, .slice_open, .slice_sentinel, .equal_equal, .bang_equal, .less_than, .less_or_equal, .greater_than, .greater_or_equal, .for_simple, .@"for", .@"while", .while_simple, .while_cont, .@"defer", .@"errdefer", .block, .block_semicolon, .block_two, .block_two_semicolon => {},
-                .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+                .member, .array_access, .deref, .slice, .comparison, .@"for", .@"while", .deferred => {},
+                .body => {
+                    var block_buffer: [2]Ast.Node.Index = undefined;
+                    if (tree.blockStatements(&block_buffer, parent) == null) try holders.append(c.allocator, .unknown);
+                },
+                .builtin => {
                     const name = tree.tokenSlice(tree.nodeMainToken(parent));
                     for ([_][]const u8{ "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@as", "@ptrFromInt", "@intFromPtr" }) |cast| if (std.mem.eql(u8, name, cast)) {
                         return hold(c, flow, function, owners, parent);
@@ -3940,13 +3974,12 @@ fn boundOf(c: *Context, flow: *Flow, function: Function.Id, target: ?Ast.Node.In
     const tree = &c.project.at(f.file).file.tree;
     const model = &c.project.at(f.file).model;
     var root = target orelse return null;
-    while (true) root = switch (tree.nodeTag(root)) {
-        .field_access, .unwrap_optional, .grouped_expression => tree.nodeData(root).node_and_token[0],
+    while (true) root = switch (formAt(tree, root)) {
+        .member, .unwrap_optional, .grouped => tree.nodeData(root).node_and_token[0],
         .array_access => tree.nodeData(root).node_and_node[0],
         else => break,
     };
-    if (tree.nodeTag(root) != .identifier) return null;
-    const d = (model.reference(root) orelse return null).declaration orelse return null;
+    const d = (nameRef(model, root) orelse return null).declaration orelse return null;
     const decl = model.declarations[@backingInt(d)];
     const scope = model.scopes[@backingInt(decl.scope)].kind;
     if ((decl.kind == .variable or decl.kind == .capture) and scope != .file and scope != .container) return decl.token;
@@ -4103,12 +4136,12 @@ fn placeSteps(c: *Context, flow: *Flow, function: Function.Id, loop: Ast.Node.In
         }
         if (site.reach != .exact) return .other;
         const step: Step = switch (site.kind) {
-            .update => switch (tree.nodeTag(site.node)) {
-                .assign_add, .assign_add_wrap, .assign_add_sat => .up,
-                .assign_sub, .assign_sub_wrap, .assign_sub_sat => .down,
-                .assign_mul, .assign_div, .assign_shl, .assign_shr, .assign_mul_wrap, .assign_mul_sat, .assign_shl_sat => .factor,
+            .update => if (accesses.operatorOf(tree.nodeTag(site.node))) |update| switch (update.op) {
+                .add => .up,
+                .sub => .down,
+                .mul, .div, .shl, .shr => .factor,
                 else => .other,
-            },
+            } else .other,
             .set => set: {
                 const d = local orelse break :set .other;
                 const value = site.value orelse break :set .other;
@@ -4160,10 +4193,10 @@ fn controlUpTo(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.I
     var at = node;
     while (model.parentOf(at)) |parent| : (at = parent) {
         if (bound) |token| if (token >= tree.firstToken(parent) and token <= tree.lastToken(parent)) break;
-        switch (tree.nodeTag(parent)) {
+        switch (formAt(tree, parent)) {
             .fn_decl => break,
             // A statement before it that may jump past it (`leaves`) decides whether it runs.
-            .block, .block_semicolon, .block_two, .block_two_semicolon => {
+            .body => {
                 var buffer: [2]Ast.Node.Index = undefined;
                 for (tree.blockStatements(&buffer, parent) orelse &.{}) |statement| {
                     if (statement == at) break;
@@ -4172,20 +4205,20 @@ fn controlUpTo(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.I
             },
             // A deferred write runs on whichever exit is taken: what decides each exit after it
             // decides what it reads.
-            .@"defer", .@"errdefer" => out = try out.join(c.allocator, try exitsAfter(c, flow, function, parent)),
+            .deferred => out = try out.join(c.allocator, try exitsAfter(c, flow, function, parent)),
             // The right side of `and` and `or` runs as the left decides.
-            .bool_and, .bool_or => switch (Facts.conditionOf(tree, parent)) {
+            .logic => switch (Facts.conditionOf(tree, parent)) {
                 .both, .either => |sides| if (at == sides[1]) {
                     out = try out.join(c.allocator, try (try dep(c, flow, function, sides[0])).held().narrowed(c.allocator));
                 },
                 .not, .compare, .other => {},
             },
-            .@"if", .if_simple => {
-                const branch = tree.fullIf(parent).?; // unreachable: the tag is an if's
+            .@"if" => {
+                const branch = tree.fullIf(parent).?; // unreachable: the form is an if's
                 if (at != branch.ast.cond_expr) out = try out.join(c.allocator, try (try dep(c, flow, function, branch.ast.cond_expr)).held().narrowed(c.allocator));
             },
-            .@"switch", .switch_comma => {
-                const choice = tree.fullSwitch(parent).?; // unreachable: the tag is a switch's
+            .@"switch" => {
+                const choice = tree.fullSwitch(parent).?; // unreachable: the form is a switch's
                 if (at != choice.ast.condition) out = try out.join(c.allocator, try (try dep(c, flow, function, choice.ast.condition)).held().narrowed(c.allocator));
                 // A labeled switch is a loop: `continue :label value` dispatches again.
                 if (choice.label_token != null) out = try out.join(c.allocator, try passes(c, flow, function, parent));
@@ -4194,7 +4227,7 @@ fn controlUpTo(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.I
                 const lhs, const rhs = tree.nodeData(parent).node_and_node;
                 if (at == rhs) out = try out.join(c.allocator, try (try dep(c, flow, function, lhs)).held().narrowed(c.allocator));
             },
-            .@"while", .while_simple, .while_cont, .@"for", .for_simple => out = try out.join(c.allocator, try passes(c, flow, function, parent)),
+            .@"while", .@"for" => out = try out.join(c.allocator, try passes(c, flow, function, parent)),
             else => {},
         }
     }
@@ -4499,7 +4532,7 @@ fn writerParams(c: *Context, decl: Facts.Decl) Context.Error!struct { single: Sl
             continue;
         };
         var at = kind;
-        if (tree.nodeTag(at) == .optional_type) at = tree.nodeData(at).node;
+        if (formAt(tree, at) == .optional_type) at = tree.nodeData(at).node;
         const pointer = tree.fullPtrType(at) orelse continue;
         if (pointer.size == .one and pointer.const_token == null) single = try single.with(c.allocator, position);
     }
@@ -4541,9 +4574,10 @@ fn levelIn(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.Index,
 /// literal, a slice, an address or an operator's result holds no error value of its own.
 pub fn errorShown(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!Level {
     const tree = &c.project.at(file).file.tree;
-    switch (tree.nodeTag(node)) {
-        .identifier, .field_access, .call_one, .call_one_comma, .call, .call_comma, .unwrap_optional, .deref, .array_access, .@"orelse", .@"catch", .grouped_expression => {},
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+    switch (formAt(tree, node)) {
+        .leaf => if (!spellsName(tree, node)) return .clean,
+        .member, .call, .unwrap_optional, .deref, .array_access, .@"orelse", .@"catch", .grouped => {},
+        .builtin => {
             const name = tree.tokenSlice(tree.nodeMainToken(node));
             if (!std.mem.eql(u8, name, "@as") and !std.mem.eql(u8, name, "@errorCast") and !std.mem.eql(u8, name, "@field")) return .clean;
         },
@@ -4641,9 +4675,11 @@ fn unlimitedIn(c: *Context, sized: *Flow, limits: []const Facts.Decl) Context.Er
 fn givesUnlimited(c: *Context, limits: []const Facts.Decl, file: Project.FileId, callee: Callee) Context.Error!bool {
     for (callee.args) |arg| {
         const tag = (try c.facts.tagNamed(file, arg)) orelse continue;
-        if (!std.mem.eql(u8, tag.name, "unlimited")) continue;
+        const unlimited = c.facts.member(tag.container, "unlimited") orelse continue;
+        if (!memberIs(c, tag.container, tag.name, unlimited)) continue;
         for (limits) |limit| switch (try c.facts.declaration(limit)) {
             .container => |k| if (k.file == tag.container.file and k.scope == tag.container.scope) return true,
+            .alternatives => {},
             else => {},
         };
     }
@@ -5319,22 +5355,20 @@ fn countOf(c: *Context, flow: *Flow, function: Function.Id, loop: Ast.Node.Index
 /// Whether `value` takes the counter `d` by a factor: a product, a quotient or a shift of it
 /// (`a * 2`, `@divTrunc(a, 10)`, `n >> 1`).
 fn scaled(tree: *const Ast, model: *const Model, d: Model.Declaration.Id, value: Ast.Node.Index) bool {
-    switch (tree.nodeTag(value)) {
-        .mul, .mul_wrap, .mul_sat, .div, .shl, .shl_sat, .shr => {
-            const lhs, const rhs = tree.nodeData(value).node_and_node;
-            return namesDeclaration(tree, model, lhs, d) or namesDeclaration(tree, model, rhs, d);
-        },
-        .builtin_call_two, .builtin_call_two_comma => {
-            const name = tree.tokenSlice(tree.nodeMainToken(value));
-            for ([_][]const u8{ "@divTrunc", "@divFloor", "@divExact", "@shrExact", "@shlExact" }) |each| if (std.mem.eql(u8, name, each)) {
-                var buffer: [2]Ast.Node.Index = undefined;
-                const args = Facts.builtinArgs(tree, value, &buffer);
-                return args.len > 0 and namesDeclaration(tree, model, args[0], d);
-            };
-            return false;
-        },
-        else => return false,
+    if (formAt(tree, value) == .operator) {
+        const operator = accesses.operatorOf(tree.nodeTag(value)) orelse return false;
+        if (operator.op != .mul and operator.op != .div and operator.op != .shl and operator.op != .shr) return false;
+        const lhs, const rhs = tree.nodeData(value).node_and_node;
+        return namesDeclaration(tree, model, lhs, d) or namesDeclaration(tree, model, rhs, d);
     }
+    if (formAt(tree, value) != .builtin) return false;
+    const name = tree.tokenSlice(tree.nodeMainToken(value));
+    for ([_][]const u8{ "@divTrunc", "@divFloor", "@divExact", "@shrExact", "@shlExact" }) |each| if (std.mem.eql(u8, name, each)) {
+        var buffer: [2]Ast.Node.Index = undefined;
+        const args = Facts.builtinArgs(tree, value, &buffer);
+        return args.len > 0 and namesDeclaration(tree, model, args[0], d);
+    };
+    return false;
 }
 
 test "the aegis pack's facts fit one solve's lanes, and a set that needs more does not" {
