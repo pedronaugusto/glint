@@ -794,7 +794,7 @@ test "P006 reads what a package declares it replaces: in every package that impo
     for (report.diagnostics) |d| {
         try std.testing.expectEqual(glint.Rule.P006, d.rule);
         try std.testing.expect(std.mem.find(u8, d.message, "replaced by airlock: durability belongs to airlock; use syncFile") != null);
-        lines[n] = d.span.file.raw() * 100 + d.span.line;
+        lines[n] = @backingInt(d.span.file) * 100 + d.span.line;
         n += 1;
     }
     std.mem.sort(u32, lines[0..n], {}, std.sort.asc(u32));
