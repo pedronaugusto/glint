@@ -5201,8 +5201,14 @@ fn sizing(c: *Context, flow: *Flow, function: Function.Id) Context.Error!void {
         }
         const counted = try countOf(c, flow, function, node) orelse continue;
         switch (counted.kind) {
-            .sure => try sizes.add(c.allocator, counted.by),
-            .maybe => try sizes.addMaybe(c.allocator, counted.by),
+            .sure => {
+                if (!(try slotsOf(c.allocator, counted.by)).empty()) traceMaybe(c, flow, function, node, "SURE loop counted");
+                try sizes.add(c.allocator, counted.by);
+            },
+            .maybe => {
+                if (!(try (try slotsOf(c.allocator, counted.by)).unite(c.allocator, counted.by.maybe)).empty()) traceMaybe(c, flow, function, node, "loop not counted");
+                try sizes.addMaybe(c.allocator, counted.by);
+            },
         }
     }
     if (!sizes.sure.eql(f.sizes) or !sizes.ranged.eql(f.ranged_sizes) or !sizes.maybe.eql(f.maybe_sizes)) {
@@ -5284,8 +5290,12 @@ fn sizedOutside(c: *Context, flow: *Flow, function: Function.Id, callee: Callee,
         if (allocates == .yes and position == 0) continue;
         const given = try whole(c, flow, function, arg);
         if (allocates == .yes and flow.allocations_known) {
+            if (!(try slotsOf(c.allocator, given)).empty()) traceMaybe(c, flow, function, callee.node, "SURE allocation");
             try sizes.add(c.allocator, given);
-        } else try sizes.addMaybe(c.allocator, given);
+        } else {
+            if (!(try (try slotsOf(c.allocator, given)).unite(c.allocator, given.maybe)).empty()) traceMaybe(c, flow, function, callee.node, if (callee.decl == null) "call, no decl" else if (allocates == .unknown) "call, origin unknown" else if (allocates == .yes) "allocation, allocations not known" else "call outside, not an allocation");
+            try sizes.addMaybe(c.allocator, given);
+        }
     }
 }
 
@@ -6108,4 +6118,13 @@ test "a size a generic takes through its context is read in the instantiation th
         \\get 1 k value sure
         \\
     , seen);
+}
+
+fn traceMaybe(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index, why: []const u8) void {
+    const f = flow.functions.items[@backingInt(function)];
+    const input = c.project.at(f.file).input;
+    const tree = &c.project.at(f.file).file.tree;
+    const loc = tree.tokenLocation(0, tree.firstToken(node));
+    const src = tree.getNodeSource(node);
+    std.debug.print("MAYBE {s} {s}:{d} [{s}] {s}\n", .{ if (flow.shared != null) "instance" else "shared", input.name, loc.line + 1, why, src[0..@min(src.len, 90)] });
 }
