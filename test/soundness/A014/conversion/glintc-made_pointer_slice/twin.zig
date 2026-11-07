@@ -10,3 +10,8 @@ pub fn copy(old: *const State, fresh: *State, other: anytype) void {
     fresh.bytes = moved(old.bytes, old, fresh);
     _ = moved(other, old, fresh);
 }
+
+/// A binding: the ruling's remedy for a public generic nothing else binds.
+pub fn copyBytes(old: *const State, fresh: *State, other: []u8) void {
+    copy(old, fresh, other);
+}
