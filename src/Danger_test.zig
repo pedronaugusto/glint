@@ -29,16 +29,17 @@ const std_files = [_]sources.Extra{
     \\pub const AutoHashMapUnmanaged = hash_map.AutoHashMapUnmanaged;
     \\pub const c = @import("c.zig");
     \\pub const os = @import("os.zig");
+    \\pub const meta = @import("meta.zig");
     },
     .{ .name = "std/Io.zig", .bytes =
     \\pub const File = @import("Io/File.zig");
     \\pub const Reader = @import("Io/Reader.zig");
     \\pub const Limit = Reader.Limit;
-    \\pub const Dir = struct { handle: i32, pub fn openFile(dir: Dir, io: anytype, sub_path: []const u8, options: anytype) !void { _ = dir; _ = io; _ = sub_path; _ = options; } pub fn readFileAlloc(dir: Dir, io: anytype, sub_path: []const u8, gpa: anytype, limit: usize) ![]u8 { _ = dir; _ = io; _ = sub_path; _ = gpa; _ = limit; return &.{}; } pub fn statFile(dir: Dir, io: anytype, sub_path: []const u8) !u64 { _ = dir; _ = io; _ = sub_path; return 0; } pub fn readLink(dir: Dir, io: anytype, sub_path: []const u8, buffer: []u8) !usize { _ = dir; _ = io; _ = sub_path; _ = buffer; return 0; } };
+    \\pub const Dir = struct { handle: i32, pub fn close(dir: Dir) void { _ = dir; } pub fn openFile(dir: Dir, io: anytype, sub_path: []const u8, options: anytype) !void { _ = dir; _ = io; _ = sub_path; _ = options; } pub fn readFileAlloc(dir: Dir, io: anytype, sub_path: []const u8, gpa: anytype, limit: usize) ![]u8 { _ = dir; _ = io; _ = sub_path; _ = gpa; _ = limit; return &.{}; } pub fn statFile(dir: Dir, io: anytype, sub_path: []const u8) !u64 { _ = dir; _ = io; _ = sub_path; return 0; } pub fn readLink(dir: Dir, io: anytype, sub_path: []const u8, buffer: []u8) !usize { _ = dir; _ = io; _ = sub_path; _ = buffer; return 0; } };
     \\pub const Writer = struct { buffer: []u8 = &.{}, end: usize = 0, vtable: *const Writer.VTable = undefined, pub const VTable = struct { drain: *const fn (*Writer, []const []const u8, usize) anyerror!usize }; pub fn writeAll(w: *Writer, bytes: []const u8) !void { _ = w; _ = bytes; } pub fn print(w: *Writer, comptime format: []const u8, args: anytype) !void { _ = w; _ = format; _ = args; } pub fn fixed(buffer: []u8) Writer { return .{ .buffer = buffer }; } pub fn buffered(w: *const Writer) []u8 { return w.buffer[0..w.end]; } pub fn unusedCapacitySlice(w: *const Writer) []u8 { return w.buffer[w.end..]; } };
     \\pub fn random(io: @This(), buffer: []u8) void { _ = io; _ = buffer; }
     \\pub fn protocolWriter(buffer: []u8) Writer { _ = buffer; return .{}; }
-    \\pub const net = struct { pub const Stream = struct { handle: i32, pub fn writer(s: Stream, buffer: []u8) Writer { _ = s; _ = buffer; return .{}; } }; pub const Server = struct { stream: Stream }; };
+    \\pub const net = struct { pub const Stream = struct { handle: i32, pub fn close(s: *const Stream) void { _ = s; } pub fn writer(s: Stream, buffer: []u8) Writer { _ = s; _ = buffer; return .{}; } }; pub const Server = struct { stream: Stream }; };
     \\pub const Cancelable = error{Canceled};
     \\pub fn checkCancel(io: @This()) error{Canceled}!void { _ = io; }
     \\pub fn recancel(io: @This()) void { _ = io; }
@@ -98,7 +99,7 @@ const std_files = [_]sources.Extra{
     },
     .{ .name = "std/debug.zig", .bytes = "pub fn assert(ok: bool) void { if (!ok) unreachable; }\npub fn lockStderr(buffer: []u8) void { _ = buffer; }" },
     .{ .name = "std/Io/File.zig", .bytes = "handle: i32,\nconst File = @This();\npub const Handle = i32;\npub fn stdin() @This() { return .{ .handle = 0 }; }\npub fn stdout() @This() { return .{ .handle = 1 }; }\npub fn stderr() @This() { return .{ .handle = 2 }; }\npub fn close(f: @This()) void { _ = f; }\npub const Reader = struct { io: ?*anyopaque = null, file: File = undefined, interface: @import(\"Reader.zig\") };\npub fn reader(f: @This(), io: anytype, buffer: []u8) Reader { _ = io; _ = buffer; return .{ .file = f, .interface = .{} }; }\npub fn writer(f: @This(), io: anytype, buffer: []u8) void { _ = f; _ = io; _ = buffer; }\npub fn readStreaming(f: @This(), io: anytype, buffer: []const []u8) !usize { _ = f; _ = io; _ = buffer; return 0; }\npub fn readPositional(f: @This(), io: anytype, buffer: []const []u8, offset: u64) !usize { _ = f; _ = io; _ = buffer; _ = offset; return 0; }" },
-    .{ .name = "std/process.zig", .bytes = "pub const Child = struct { id: i32 };\npub const RunResult = struct { stdout: []u8 = &.{}, stderr: []u8 = &.{} };\npub fn run(gpa: anytype, io: anytype, options: anytype) !RunResult { _ = gpa; _ = io; _ = options; return .{}; }" },
+    .{ .name = "std/process.zig", .bytes = "pub const Child = struct { id: i32, pub fn kill(child: *Child) void { _ = child; } pub fn wait(child: *Child) !void { _ = child; } };\npub const RunResult = struct { stdout: []u8 = &.{}, stderr: []u8 = &.{} };\npub fn run(gpa: anytype, io: anytype, options: anytype) !RunResult { _ = gpa; _ = io; _ = options; return .{}; }" },
     .{ .name = "std/array_list.zig", .bytes = "pub fn Aligned(comptime T: type, comptime a: ?u8) type { _ = a; return struct { items: []T = &.{}, capacity: usize = 0, pub fn append(self: *@This(), x: T) void { _ = self; _ = x; } pub fn deinit(self: *@This(), gpa: anytype) void { _ = gpa; const held = self.capacity; _ = held; self.* = undefined; } }; }" },
     .{ .name = "std/hash_map.zig", .bytes = "pub fn AutoHashMapUnmanaged(comptime K: type, comptime V: type) type { return struct { k: K, v: V, pub fn getPtr(self: *@This(), key: K) ?*V { _ = key; return &self.v; } }; }" },
     .{ .name = "std/array_hash_map.zig", .bytes = "pub const Nothing = struct {};" },
@@ -229,10 +230,25 @@ const std_files = [_]sources.Extra{
     \\    pub const IO_STATUS_BLOCK = extern struct { status: usize, information: usize };
     \\};
     },
+    // `Io.concurrent`'s and `Io.async`'s arguments: the tuple of the function's parameters.
+    .{ .name = "std/meta.zig", .bytes =
+    \\pub fn ArgsTuple(comptime Function: type) type {
+    \\    const info = @typeInfo(Function);
+    \\    if (info != .@"fn") @compileError("ArgsTuple expects a function type");
+    \\    const function_info = info.@"fn";
+    \\    var argument_field_list: [function_info.param_types.len]type = undefined;
+    \\    inline for (function_info.param_types, 0..) |arg_type, i| {
+    \\        const T = arg_type orelse @compileError("cannot create ArgsTuple for function with an 'anytype' parameter");
+    \\        argument_field_list[i] = T;
+    \\    }
+    \\    return @Tuple(&argument_field_list);
+    \\}
+    },
 };
 const std_imports = [_]sources.ExtraImport{
     .{ .from = 0, .spelling = "c.zig", .target = 24 },
     .{ .from = 0, .spelling = "os.zig", .target = 25 },
+    .{ .from = 0, .spelling = "meta.zig", .target = 26 },
     .{ .spelling = "std", .target = 0 },
     .{ .from = 0, .spelling = "Io.zig", .target = 1 },
     .{ .from = 0, .spelling = "atomic.zig", .target = 2 },
