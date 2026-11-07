@@ -249,6 +249,8 @@ const std_imports = [_]sources.ExtraImport{
     .{ .from = 0, .spelling = "c.zig", .target = 24 },
     .{ .from = 0, .spelling = "os.zig", .target = 25 },
     .{ .from = 0, .spelling = "meta.zig", .target = 26 },
+    // std's own files import std, as `Io.concurrent`'s `@import("std").meta.ArgsTuple` does.
+    .{ .from = 1, .spelling = "std", .target = 0 },
     .{ .spelling = "std", .target = 0 },
     .{ .from = 0, .spelling = "Io.zig", .target = 1 },
     .{ .from = 0, .spelling = "atomic.zig", .target = 2 },
