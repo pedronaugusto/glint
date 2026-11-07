@@ -964,7 +964,9 @@ fn recordReading(c: *Context, call_node: Ast.Node.Index, token: ?Ast.TokenIndex)
     if (token) |local| {
         const tree = try c.project.syntax(try c.source());
         const named = Facts.ungrouped(tree, receiver);
-        if (tree.nodeTag(named) != .identifier or declaringToken(&c.project.at(c.file).model, named) != local) return .unknown;
+        if (tree.nodeTag(named) != .identifier) return .unknown;
+        const on = declaringToken(&c.project.at(c.file).model, named) orelse return .unknown;
+        if (on != local and !capturesOwner(c, on, local)) return .unknown;
     }
     const container = recordOf(try c.facts.resolve(c.file, receiver)) orelse return .unknown;
     var paths: std.ArrayList([]const Facts.Decl) = .empty;
@@ -3357,9 +3359,13 @@ const Flow = struct {
                 const node = if (taken) branch.ast.then_expr else branch.ast.else_expr.unwrap() orelse return .{ .paths = .{ .falls = state } };
                 return f.block(node, state);
             };
-            var out = (try f.leave(branch.ast.cond_expr, state)).settled() orelse return .uncertain;
+            // `if (owner) |*held|` on the live owner: the test reads no more than whether it
+            // holds one, and where the optional is null it holds none (`capturesOwner`).
+            const own = state == .live and f.overOwnOptional(branch);
+            var out: Paths = if (own) .{ .falls = state } else (try f.leave(branch.ast.cond_expr, state)).settled() orelse return .uncertain;
             const then_paths = (try f.block(branch.ast.then_expr, state)).settled() orelse return .uncertain;
-            const else_paths: Paths = if (branch.ast.else_expr.unwrap()) |other| (try f.block(other, state)).settled() orelse return .uncertain else .{ .falls = state };
+            const otherwise: State = if (own) .released else state;
+            const else_paths: Paths = if (branch.ast.else_expr.unwrap()) |other| (try f.block(other, otherwise)).settled() orelse return .uncertain else .{ .falls = otherwise };
             for ([_]Paths{ then_paths, else_paths }) |paths| {
                 out.breaks.setUnion(paths.breaks);
                 out.continues.setUnion(paths.continues);
@@ -3393,6 +3399,15 @@ const Flow = struct {
             else => {},
         }
         return f.leave(stmt, state);
+    }
+
+    /// Whether `branch` is `if (owner) |*held|` over the owner local itself, its optional's
+    /// payload captured by pointer: its other side is where the optional is null.
+    fn overOwnOptional(f: Flow, branch: Ast.full.If) bool {
+        if (f.path.len != 0) return false;
+        const payload = branch.payload_token orelse return false;
+        if (f.tree.tokenTag(payload) != .asterisk or branch.error_token != null) return false;
+        return capturesOwner(f.c, payload + 1, f.token);
     }
 
     /// The value of a condition that is the flag the walk knows, or its negation.
@@ -4071,7 +4086,9 @@ const Flow = struct {
             .bound => |bound| Facts.ungrouped(f.tree, bound),
             .none, .unknown => return false,
         };
-        if (f.tree.nodeTag(receiver) != .identifier or declaringToken(f.model, receiver) != f.token) return false;
+        if (f.tree.nodeTag(receiver) != .identifier) return false;
+        const on = declaringToken(f.model, receiver) orelse return false;
+        if (on != f.token and !capturesOwner(f.c, on, f.token)) return false;
         var value = try f.c.facts.resolve(f.c.file, receiver);
         var fields: std.ArrayList(Facts.Decl) = .empty;
         for (f.path) |name| {
@@ -4818,7 +4835,26 @@ fn releasedEach(c: *Context, node: Ast.Node.Index, token: Ast.TokenIndex, k: Con
 /// The member `node` calls on the local `token` declares, if it is such a call.
 fn ownerCall(c: *Context, node: Ast.Node.Index, token: Ast.TokenIndex) Context.Error!?[]const u8 {
     const called = (try calledOn(c, c.file, node)) orelse return null;
-    return if (called.on == token) called.name else null;
+    return if (called.on == token or capturesOwner(c, called.on, token)) called.name else null;
+}
+
+/// Whether the name `capture` declares is a pointer capture of the optional the owner local
+/// `owner` declares, in an `if` over that local alone (`if (owner) |*held|`, no error capture):
+/// the owner itself where the optional holds it, so a release through it is the owner's. The
+/// one reading every kind's release match takes (main's piece 3); a capture by value is a
+/// copy, never the owner.
+fn capturesOwner(c: *Context, capture: Ast.TokenIndex, owner: Ast.TokenIndex) bool {
+    const model = &c.project.at(c.file).model;
+    const tree = &c.project.at(c.file).file.tree;
+    if (capture == 0 or tree.tokenTag(capture - 1) != .asterisk) return false;
+    for (model.declarations) |decl| {
+        if (decl.kind != .capture or decl.token != capture) continue;
+        const branch = tree.fullIf(decl.node) orelse return false;
+        if (branch.error_token != null) return false;
+        const source = Facts.ungrouped(tree, branch.ast.cond_expr);
+        return tree.nodeTag(source) == .identifier and declaringToken(model, source) == owner;
+    }
+    return false;
 }
 
 /// A call of a member of what a name of the file's own holds (`owner.deinit()`): the member's

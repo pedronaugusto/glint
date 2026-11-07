@@ -8,11 +8,12 @@
         "call/glintb-helper/twin.zig",
         // glint-b precision: A003's flow does not follow a release through an alias, a capture, a comptime-known branch, @field, a byte copy or an unwrap
         "address/glintb-alias/twin.zig",
-        "capture/glintb-pointer/twin.zig",
         "capture/glintb-value/twin.zig",
         "compile_time/glintb-known/twin.zig",
         "memory/glintb-bytes/twin.zig",
         "unwrap/glintb-optional/twin.zig",
+        // glint-b precision: an owner written after its release (`maybe = null` once its capture released it) is a use the walk does not follow past the release (undecided, never clear)
+        "capture/glintb-capture_overwritten/twin.zig",
         // warp-fast precision: A003's flow does not read std's File.closeMany of a slice of a local's address as its release (A015's released does)
         "memory/wf-closemany-slice/twin.zig",
     },
