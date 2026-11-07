@@ -591,7 +591,7 @@ fn privateType(self: *Context, signature: Signature, file: Project.FileId, writt
         // Error-set policy is not Z012.
         .error_set_decl, .merge_error_sets => {},
         // A type function's call is named by its callee and its arguments, whatever it makes.
-        .call, .call_comma, .call_one, .call_one_comma => try writtenCall(self, signature, file, node, depth + 1),
+        .call, .call_comma, .call_one, .call_one_comma => try writtenCall(self, signature, file, node, depth + 1, false),
         // A comptime choice is one of its branches: each is read.
         .@"if", .if_simple, .@"switch", .switch_comma => try eachBranch(self, signature, file, node, depth + 1),
         // A builtin or a comptime choice: the type it gives.
@@ -617,7 +617,7 @@ fn eachBranch(self: *Context, signature: Signature, file: Project.FileId, node: 
 fn chosen(self: *Context, signature: Signature, file: Project.FileId, node: Ast.Node.Index, depth: usize) RunError!void {
     const value = try self.facts.resolve(file, node);
     if (value == .unknown or isType(value)) return privateType(self, signature, file, node, depth);
-    try exposedInferred(self, signature, file, node, value, depth);
+    try exposedInferred(self, signature, file, node, value, depth, false);
 }
 
 /// Z012 over a type `node` of `file` resolves to: the containers a caller has to name to use it.
@@ -652,7 +652,7 @@ fn exposedContainer(self: *Context, signature: Signature, file: Project.FileId, 
             return self.atDefinition(.Z012, signature.site, try self.allocator.print("public signature exposes private type function '{s}'", .{maker.name}), made.function);
         var buffer: [1]Ast.Node.Index = undefined;
         const call = self.project.at(made.file).file.tree.fullCall(&buffer, made.call) orelse return undecidedType(self, signature, file, node, .unsupported);
-        for (call.ast.params) |argument| try exposedArgument(self, signature, made.file, argument, depth + 1);
+        for (call.ast.params) |argument| try exposedArgument(self, signature, made.file, argument, depth + 1, false);
         return;
     }
     if (container.symbolic) return undecidedType(self, signature, file, node, .comptime_dependent);
@@ -669,7 +669,8 @@ fn exposedContainer(self: *Context, signature: Signature, file: Project.FileId, 
 /// A call written where a caller has to name what it gives (a type function's, or a function's
 /// whose result a public constant holds): named by its callee and its arguments, whatever it
 /// makes.
-fn writtenCall(self: *Context, signature: Signature, file: Project.FileId, node: Ast.Node.Index, depth: usize) RunError!void {
+/// `held` as for `exposedArgument`: the call is inside one a public constant holds.
+fn writtenCall(self: *Context, signature: Signature, file: Project.FileId, node: Ast.Node.Index, depth: usize, held: bool) RunError!void {
     const tree = &self.project.at(file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, node).?;
@@ -678,23 +679,31 @@ fn writtenCall(self: *Context, signature: Signature, file: Project.FileId, node:
         .none => try exposedValue(self, signature, file, call.ast.fn_expr, try self.facts.resolve(file, call.ast.fn_expr), depth + 1),
         .unknown => |why| try undecidedType(self, signature, file, call.ast.fn_expr, why),
     };
-    for (call.ast.params) |argument| try exposedArgument(self, signature, file, argument, depth + 1);
+    for (call.ast.params) |argument| try exposedArgument(self, signature, file, argument, depth + 1, held);
 }
 
 /// A type function's argument: a type a caller names, or a value, named by its declaration
-/// (`Wrap(helper)`, `Gen(config)`) or written in the call.
-fn exposedArgument(self: *Context, signature: Signature, file: Project.FileId, node: Ast.Node.Index, depth: usize) RunError!void {
+/// (`Wrap(helper)`, `Gen(config)`) or written in the call. `held`: the call is what a public
+/// constant holds (`pub const File = OwnedIo(Io.File, closeFile)`), so the constant is the name a
+/// user spells and a value argument is read by its type, what of it comes back through the result;
+/// a call written in a signature cannot be spelled where a value it takes is private.
+fn exposedArgument(self: *Context, signature: Signature, file: Project.FileId, node: Ast.Node.Index, depth: usize, held: bool) RunError!void {
     if (depth >= 128) return undecidedType(self, signature, file, node, .budget);
     const tree = &self.project.at(file).file.tree;
     if (selfNamed(tree, node) or try fromParameter(self, file, node)) return;
     switch (tree.nodeTag(node)) {
-        .call, .call_comma, .call_one, .call_one_comma => return writtenCall(self, signature, file, node, depth + 1),
+        .call, .call_comma, .call_one, .call_one_comma => return writtenCall(self, signature, file, node, depth + 1, held),
         .identifier, .field_access => switch (try self.facts.definition(file, node)) {
             .decl => |definition| {
                 const value = try self.facts.resolve(file, node);
-                // A type is named by what it is; a value by its declaration.
+                // A type is named by what it is; a value by its declaration, or, in a call a public
+                // constant holds, by its type.
                 if (isType(value) and value != .unknown) return exposedValue(self, signature, file, node, value, depth + 1);
-                if (value == .unknown) if (initOf(self, definition)) |init| return exposedArgument(self, signature, definition.file, init, depth + 1);
+                if (value == .unknown) {
+                    if (initOf(self, definition)) |init| return exposedArgument(self, signature, definition.file, init, depth + 1, held);
+                    return namedDeclaration(self, signature, definition);
+                }
+                if (held) return exposedInferred(self, signature, file, node, value, depth + 1, true);
                 return namedDeclaration(self, signature, definition);
             },
             .none => {},
@@ -704,7 +713,7 @@ fn exposedArgument(self: *Context, signature: Signature, file: Project.FileId, n
     }
     const value = try self.facts.resolve(file, node);
     if (isType(value)) return exposedValue(self, signature, file, node, value, depth + 1);
-    try exposedInferred(self, signature, file, node, value, depth + 1);
+    try exposedInferred(self, signature, file, node, value, depth + 1, held);
 }
 
 /// Whether `node` is a literal its own text names: a number, a string, a character, an enum
@@ -765,7 +774,7 @@ fn publicValue(self: *Context, signature: Signature, index: Model.Declaration.Id
         // surface (`pub const Step = StepOf(u8);`), its arguments are.
         var made: [1]Ast.Node.Index = undefined;
         if (source.file.tree.fullCall(&made, Facts.ungrouped(&source.file.tree, init))) |call| {
-            for (call.ast.params) |argument| try exposedArgument(self, signature, self.file, argument, 1);
+            for (call.ast.params) |argument| try exposedArgument(self, signature, self.file, argument, 1, true);
             return;
         }
         return privateType(self, signature, self.file, init, 0);
@@ -773,21 +782,21 @@ fn publicValue(self: *Context, signature: Signature, index: Model.Declaration.Id
     if (value == .unknown) {
         // What a call gives is of the type its callee declares it returns.
         var buffer: [1]Ast.Node.Index = undefined;
-        const call = source.file.tree.fullCall(&buffer, init) orelse return exposedInferred(self, signature, self.file, init, value, 0);
+        const call = source.file.tree.fullCall(&buffer, init) orelse return exposedInferred(self, signature, self.file, init, value, 0, false);
         const callee = switch (try self.facts.definition(self.file, call.ast.fn_expr)) {
             .decl => |callee| callee,
-            .none => return exposedInferred(self, signature, self.file, init, value, 0),
+            .none => return exposedInferred(self, signature, self.file, init, value, 0, false),
             .unknown => |why| return undecidedType(self, signature, self.file, call.ast.fn_expr, why),
         };
         const callee_source = self.project.at(callee.file);
         var prototype: [1]Ast.Node.Index = undefined;
-        const function = callee_source.file.tree.fullFnProto(&prototype, callee_source.model.declarations[@backingInt(callee.index)].node) orelse return exposedInferred(self, signature, self.file, init, value, 0);
+        const function = callee_source.file.tree.fullFnProto(&prototype, callee_source.model.declarations[@backingInt(callee.index)].node) orelse return exposedInferred(self, signature, self.file, init, value, 0, false);
         const result = function.ast.return_type.unwrap() orelse return;
         // A type function's call is a type: the constant names it.
         if (try namesType(self, callee.file, result)) return;
         return privateType(self, signature, callee.file, result, 0);
     }
-    try exposedInferred(self, signature, self.file, init, value, 0);
+    try exposedInferred(self, signature, self.file, init, value, 0, false);
 }
 
 /// What a constant is written as, for an alias whose value does not resolve: `const Repr =
@@ -824,15 +833,17 @@ fn fromParameter(self: *Context, file: Project.FileId, node: Ast.Node.Index) Run
 
 /// The types a value exposes: an instance's container, a function's signature, a literal's
 /// fields' values. A type held is named by the declaration holding it.
-fn exposedInferred(self: *Context, signature: Signature, file: Project.FileId, node: Ast.Node.Index, value: Facts.Value, depth: usize) RunError!void {
+/// `held` as for `exposedArgument`: a literal's fields are read as the call holding it reads its
+/// arguments.
+fn exposedInferred(self: *Context, signature: Signature, file: Project.FileId, node: Ast.Node.Index, value: Facts.Value, depth: usize, held: bool) RunError!void {
     if (depth >= 128) return undecidedType(self, signature, file, node, .budget);
     switch (value) {
         .unknown => |why| try undecidedType(self, signature, file, node, why),
         .container, .primitive, .error_set, .fn_type, .scalar => {},
         .instance => |container| try exposedContainer(self, signature, file, node, container, depth + 1),
-        .pointer => |inner| try exposedInferred(self, signature, file, node, inner.child.*, depth + 1),
-        .array, .optional, .error_union => |inner| try exposedInferred(self, signature, file, node, inner.*, depth + 1),
-        .alternatives => |each| for (each) |one| try exposedInferred(self, signature, file, node, one, depth + 1),
+        .pointer => |inner| try exposedInferred(self, signature, file, node, inner.child.*, depth + 1, held),
+        .array, .optional, .error_union => |inner| try exposedInferred(self, signature, file, node, inner.*, depth + 1, held),
+        .alternatives => |each| for (each) |one| try exposedInferred(self, signature, file, node, one, depth + 1, held),
         .function => |function| {
             // An alias of a function: its signature, named through the alias.
             const model = &self.project.at(function.file).model;
@@ -846,7 +857,7 @@ fn exposedInferred(self: *Context, signature: Signature, file: Project.FileId, n
             const tree = &self.project.at(key.file).file.tree;
             var buffer: [2]Ast.Node.Index = undefined;
             const init = tree.fullStructInit(&buffer, key.node) orelse return undecidedType(self, signature, file, node, .unsupported);
-            for (init.ast.fields) |field| try exposedArgument(self, signature, key.file, field, depth + 1);
+            for (init.ast.fields) |field| try exposedArgument(self, signature, key.file, field, depth + 1, held);
         },
         .reified => |reified| if (reified.value) try undecidedType(self, signature, file, node, .unsupported),
         .reflected => try undecidedType(self, signature, file, node, .unsupported),

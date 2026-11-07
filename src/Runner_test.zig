@@ -373,9 +373,24 @@ test "Z012 judges the whole public surface: constants' types, reached fields, al
     // A container is held by the declaration around it, whatever expression writes it.
     try check(.Z012, "const Hidden = (struct { x: u8 }); pub fn make() Hidden { return .{ .x = 1 }; }", 1);
     try check(.Z012, "pub const Hidden = (struct { x: u8 }); pub fn make() Hidden { return .{ .x = 1 }; }", 0);
-    // A type function's argument named by a private declaration, a function or a value.
+    // A type function's call written in a signature, with a value argument named by a private
+    // declaration: a caller cannot spell the type.
     try check(.Z012, "pub fn Wrap(comptime g: fn () u8) type { return struct { pub fn get() u8 { return g(); } }; } fn helper() u8 { return 1; } pub fn make() Wrap(helper) { return .{}; }", 1);
     try check(.Z012, "pub fn Wrap(comptime g: fn () u8) type { return struct { pub fn get() u8 { return g(); } }; } pub fn helper() u8 { return 1; } pub fn make() Wrap(helper) { return .{}; }", 0);
+    // The same call held by a public constant: the constant is the name a user spells, and a value
+    // argument is read by its type, what of it comes back through the result.
+    try check(.Z012, "pub fn Owned(comptime T: type, comptime cleanup: fn (*T) void) type { return struct { v: T, pub fn deinit(s: *@This()) void { cleanup(&s.v); } }; } fn closeIt(v: *u32) void { v.* = 0; } pub const File = Owned(u32, closeIt);", 0);
+    try check(.Z012, "const Hidden = struct { x: u8 }; pub fn Wrap(comptime g: anytype) type { return struct { pub const get = g; }; } fn helper() Hidden { return .{ .x = 1 }; } pub const W = Wrap(helper);", 1);
+    try check(.Z012, "pub fn Keep(comptime v: anytype) type { return struct { pub const value = v; }; } const Setting = struct { level: u32 }; const chosen: Setting = .{ .level = 1 }; pub const K = Keep(chosen);", 1);
+    try check(.Z012, "pub fn Keep(comptime v: anytype) type { return struct { pub const value = v; }; } pub const Setting = struct { level: u32 }; const chosen: Setting = .{ .level = 1 }; pub const K = Keep(chosen);", 0);
+    // Inside a held call alike: a literal's fields and a nested call's arguments are read by their type.
+    try check(.Z012, "pub fn Keep(comptime v: anytype) type { return struct { pub const value = v; }; } const Setting = struct { level: u32 }; const chosen: Setting = .{ .level = 1 }; pub const K = Keep(.{ .v = chosen });", 1);
+    try check(.Z012, "pub fn Keep(comptime v: anytype) type { return struct { pub const value = v; }; } pub const Setting = struct { level: u32 }; const chosen: Setting = .{ .level = 1 }; pub const K = Keep(.{ .v = chosen });", 0);
+    try check(.Z012, "pub fn Keep(comptime v: anytype) type { return struct { pub const value = v; }; } pub fn Same(comptime v: anytype) @TypeOf(v) { return v; } const Setting = struct { level: u32 }; const chosen: Setting = .{ .level = 1 }; pub const K = Keep(Same(chosen));", 1);
+    try check(.Z012, "pub fn Keep(comptime v: anytype) type { return struct { pub const value = v; }; } pub fn Same(comptime v: anytype) @TypeOf(v) { return v; } pub const Setting = struct { level: u32 }; const chosen: Setting = .{ .level = 1 }; pub const K = Keep(Same(chosen));", 0);
+    // A call in a signature names what it takes at every level.
+    try check(.Z012, "pub fn Keep(comptime v: anytype) type { return struct { pub const value = v; }; } pub const Setting = struct { level: u32 }; const chosen: Setting = .{ .level = 1 }; pub fn make() Keep(.{ .v = chosen }) { return undefined; }", 1);
+    try check(.Z012, "pub fn Owned(comptime T: type, comptime cleanup: fn (*T) void) type { return struct { v: T, pub fn deinit(s: *@This()) void { cleanup(&s.v); } }; } fn closeIt(v: *u32) void { v.* = 0; } pub const File = Owned(u32, closeIt); pub fn open() File { return .{ .v = 0 }; }", 0);
     // What a generic's parameter gives is the caller's: a part of it, `@TypeOf` of it.
     try check(.Z012, "pub fn Gen(comptime h: anytype) type { return struct { pub const n = h.n; }; }", 0);
     try check(.Z012, "pub fn get(x: anytype) @TypeOf(x) { return x; }", 0);
