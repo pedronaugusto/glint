@@ -350,7 +350,7 @@ fn amendedPolicies(self: *Context) RunError!void {
 /// error read as "no such file"), and it stays a site; so does a `catch`, and a test's success
 /// branch that goes on.
 fn refusalAsserted(self: *Context, tree: *const Ast, branch: Ast.full.If) RunError!bool {
-    if (!leavesByError(tree, branch.ast.then_expr, 0)) return false;
+    if (!try leavesByError(self, tree, branch.ast.then_expr, 0)) return false;
     return self.inTestCode(branch.payload_token orelse branch.ast.if_token);
 }
 
@@ -358,28 +358,30 @@ fn refusalAsserted(self: *Context, tree: *const Ast, branch: Ast.full.If) RunErr
 /// error (`return error.TestUnexpectedResult`) or in `@panic`, and nothing before that leaves or
 /// jumps any other way (`break`, `continue`, a `return` of a value). A `try` leaves by an error
 /// too, so it may stand anywhere.
-fn leavesByError(tree: *const Ast, written: Ast.Node.Index, depth: usize) bool {
+fn leavesByError(self: *Context, tree: *const Ast, written: Ast.Node.Index, depth: usize) RunError!bool {
     if (depth == 8) return false;
     const node = Facts.ungrouped(tree, written);
     var buffer: [2]Ast.Node.Index = undefined;
     if (tree.blockStatements(&buffer, node)) |statements| {
         if (statements.len == 0) return false;
-        for (statements[0 .. statements.len - 1]) |statement| if (jumpsBut(tree, statement)) return false;
-        return leavesByError(tree, statements[statements.len - 1], depth + 1);
+        for (statements[0 .. statements.len - 1]) |statement| if (try jumpsBut(self, tree, statement)) return false;
+        return leavesByError(self, tree, statements[statements.len - 1], depth + 1);
     }
-    switch (tree.nodeTag(node)) {
-        .@"return" => {
-            const operand = tree.nodeData(node).opt_node.unwrap() orelse return false;
-            return tree.nodeTag(Facts.ungrouped(tree, operand)) == .error_value;
-        },
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@panic"),
-        else => return false,
-    }
+    if (Facts.isBuiltin(tree, node, "@panic")) return true;
+    if (tree.nodeTag(node) != .@"return") return false;
+    const operand = tree.nodeData(node).opt_node.unwrap() orelse return false;
+    return try returnsError(self, operand);
+}
+
+/// Whether a `return`'s operand is an error written in place (`error.Name`), by Facts.literalOf.
+fn returnsError(self: *Context, operand: Ast.Node.Index) RunError!bool {
+    const literal = (try self.facts.literalOf(self.file, operand)) orelse return false;
+    return literal == .error_value;
 }
 
 /// Whether a statement holds a jump other than a `return` of an error: a `break`, a `continue`,
 /// or a `return` of anything else, anywhere inside it.
-fn jumpsBut(tree: *const Ast, statement: Ast.Node.Index) bool {
+fn jumpsBut(self: *Context, tree: *const Ast, statement: Ast.Node.Index) RunError!bool {
     const first = tree.firstToken(statement);
     const last = tree.lastToken(statement);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
@@ -390,7 +392,7 @@ fn jumpsBut(tree: *const Ast, statement: Ast.Node.Index) bool {
             .@"break", .@"continue" => return true,
             .@"return" => {
                 const operand = tree.nodeData(inner).opt_node.unwrap() orelse return true;
-                if (tree.nodeTag(Facts.ungrouped(tree, operand)) != .error_value) return true;
+                if (!try returnsError(self, operand)) return true;
             },
             else => {},
         }
