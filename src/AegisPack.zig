@@ -4264,7 +4264,7 @@ const Flow = struct {
             .bound => |bound| Facts.ungrouped(f.tree, bound),
             .none, .unknown => return false,
         };
-        if (f.tree.nodeTag(receiver) != .identifier) return false;
+        // A name's declaring token (the model's resolution); none for any other expression.
         const on = declaringToken(f.model, receiver) orelse return false;
         if (on != f.token and !capturesOwner(f.c, on, f.token)) return false;
         var value = try f.c.facts.resolve(f.c.file, receiver);
@@ -4394,11 +4394,9 @@ const Flow = struct {
     /// or `join` (`task.await(io)`, `_ = task.cancel(io)`, `try task.await(io)`).
     fn endsFuture(f: Flow, stmt: Ast.Node.Index, future: Ast.TokenIndex) Context.Error!bool {
         var value = stmt;
-        if (f.tree.nodeTag(value) == .assign) {
-            const sides = f.tree.nodeData(value).node_and_node;
-            if (f.tree.nodeTag(sides[0]) != .identifier or !std.mem.eql(u8, f.tree.tokenSlice(f.tree.nodeMainToken(sides[0])), "_")) return false;
-            value = sides[1];
-        }
+        // `_ = task.cancel(io)`: what the statement discards (Facts.accesses.discardedBy); any
+        // other assignment ends nothing.
+        if (Facts.accesses.formOf(f.tree.nodeTag(stmt)) == .assign) value = (try Facts.accesses.discardedBy(f.c.facts, f.c.file, stmt)) orelse return false;
         while (Facts.accesses.carriedFrom(f.tree, value)) |inner| value = inner;
         const call = (try Facts.calls.at(f.c.facts, f.c.file, value)) orelse return false;
         const holder = switch (call.receiver) {
@@ -5063,7 +5061,8 @@ fn capturesOwner(c: *Context, capture: Ast.TokenIndex, owner: Ast.TokenIndex) bo
         const branch = tree.fullIf(decl.node) orelse return false;
         if (branch.error_token != null) return false;
         const source = Facts.ungrouped(tree, branch.ast.cond_expr);
-        return tree.nodeTag(source) == .identifier and declaringToken(model, source) == owner;
+        // A name's declaring token (the model's resolution); none for any other expression.
+        return declaringToken(model, source) == owner;
     }
     return false;
 }
@@ -5339,7 +5338,7 @@ fn rawValue(c: *Context, node: Ast.Node.Index, seen: []const Model.Declaration.I
             const v = tree.fullVarDecl(decl.node) orelse return false;
             if (v.ast.init_node.unwrap()) |init| {
                 if (try rawValue(c, init, followed)) return true;
-            } else if (model.parentOf(decl.node)) |parent| if (tree.nodeTag(parent) == .assign_destructure) {
+            } else if (model.parentOf(decl.node)) |parent| if (Facts.accesses.formOf(tree.nodeTag(parent)) == .destructure) {
                 // `const a, const b = .{ s.raw(), 0 };`: what is destructured.
                 if (try rawValue(c, tree.assignDestructure(parent).ast.value_expr, followed)) return true;
             };
@@ -5348,7 +5347,7 @@ fn rawValue(c: *Context, node: Ast.Node.Index, seen: []const Model.Declaration.I
             // copy of bytes into it (`@memcpy(std.mem.asBytes(&v), std.mem.asBytes(&i))`).
             for (tree.nodes.items(.tag), 0..) |tag, i| {
                 const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
-                if (tag == .assign_destructure) {
+                if (Facts.accesses.formOf(tag) == .destructure) {
                     const destructure = tree.assignDestructure(at);
                     for (destructure.ast.variables) |target| {
                         if (try writtenLocal(c, target) == index and try rawValue(c, destructure.ast.value_expr, followed)) return true;
