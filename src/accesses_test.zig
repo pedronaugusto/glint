@@ -960,6 +960,9 @@ test "consolidate: a member read's step, which language field it is, the program
         \\    @field(s, n) = 2;
         \\    inline for (.{ "f", "g" }) |each| @field(s, each) = 3;
         \\    _ = @field(s, "g");
+        \\    const listed = [_][]const u8{"g"};
+        \\    inline for (listed) |one| _ = @field(s, one);
+        \\    inline for (&listed) |one| _ = @field(s, one);
         \\    _ = b.ptr;
         \\    return s.len + b.len + a.len + x.len + s.ptr;
         \\}
@@ -1002,7 +1005,8 @@ test "consolidate: a member read's step, which language field it is, the program
     var computed_seen: usize = 0;
     for (for_f) |use| computed_seen += @intFromBool(use.computed);
     try std.testing.expectEqual(@as(usize, 1), computed_seen);
-    try std.testing.expectEqual(@as(usize, 3), (try facts.fieldUses(arena.allocator(), "g")).len);
+    // A `const` list ranged over, by value or through `&`, names only its names.
+    try std.testing.expectEqual(@as(usize, 5), (try facts.fieldUses(arena.allocator(), "g")).len);
     const other = try facts.fieldUses(arena.allocator(), "h");
     try std.testing.expectEqual(@as(usize, 1), other.len);
     try std.testing.expect(other[0].computed);

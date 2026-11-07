@@ -1326,9 +1326,10 @@ fn spawnArguments(c: *Context, decl: Facts.Decl, index: usize) Context.Error!boo
         // `std.meta.ArgsTuple(@TypeOf(function))`.
         var call_buffer: [1]Ast.Node.Index = undefined;
         const tuple = tree.fullCall(&call_buffer, param.type_expr orelse return false) orelse return false;
-        const made_by = switch (try c.facts.definition(decl.file, tuple.ast.fn_expr)) {
-            .decl => |made_by| made_by,
-            .none, .unknown => return false,
+        // The function the tuple's type is made by, as `spawned` reads a callee.
+        const made_by = switch (try c.facts.resolve(decl.file, tuple.ast.fn_expr)) {
+            .function => |made_by| made_by,
+            else => return false,
         };
         if (try Governed.isStd(c, made_by, "meta.ArgsTuple") != .yes) return false;
         if (tuple.ast.params.len != 1 or !Facts.isBuiltin(tree, tuple.ast.params[0], "@TypeOf")) return false;
