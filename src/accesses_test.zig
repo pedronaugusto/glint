@@ -1043,3 +1043,39 @@ test "consolidate: a member read's step, which language field it is, the program
     try std.testing.expect(Facts.integerType(.{ .primitive = "c_longdouble" }, 64) == .unknown);
     try std.testing.expect(Facts.integerType(.{ .primitive = "bool" }, 64) == .unknown);
 }
+
+test "Q5: a type's field list, by descriptions or names, and the field names a name is one of" {
+    const source =
+        \\const S = struct { a: u8, b: u8 };
+        \\const info = @typeInfo(S).@"struct";
+        \\fn f(out: *S) void {
+        \\    inline for (@typeInfo(S).@"struct".fields) |field| @field(out, field.name) = 0;
+        \\    inline for (info.field_names) |name| @field(out, name) = 0;
+        \\    const other = .{ .fields = 1 };
+        \\    _ = other.fields;
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const file = project.sources[0].id;
+    const tree = &project.sources[0].file.tree;
+
+    // The descriptions in place, the names through a constant; a literal's own `fields` is none.
+    const descriptions = (try facts.fieldList(file, spelledNode(tree, "@typeInfo(S).@\"struct\".fields", 0).?)).?;
+    try std.testing.expect(!descriptions.names);
+    try std.testing.expectEqualStrings("S", tree.getNodeSource(descriptions.of.subject));
+    const names = (try facts.fieldList(file, spelledNode(tree, "info.field_names", 0).?)).?;
+    try std.testing.expect(names.names);
+    try std.testing.expectEqualStrings("S", tree.getNodeSource(names.of.subject));
+    try std.testing.expect(try facts.fieldList(file, spelledNode(tree, "other.fields", 0).?) == null);
+
+    // A description's `name` and a capture of the names are field names of S; the capture of
+    // the descriptions itself is none.
+    try std.testing.expectEqualStrings("S", tree.getNodeSource((try facts.fieldNameOf(file, spelledNode(tree, "field.name", 0).?)).?.subject));
+    try std.testing.expectEqualStrings("S", tree.getNodeSource((try facts.fieldNameOf(file, spelledNode(tree, "name", 0).?)).?.subject));
+    try std.testing.expect(try facts.fieldNameOf(file, spelledNode(tree, "field", 0).?) == null);
+}

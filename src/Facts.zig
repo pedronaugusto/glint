@@ -5364,7 +5364,25 @@ fn enumOf(value: Value) ?Container {
 /// gives of a value declared of the subject; the list and the
 /// information named in place, through constants, or by a capture of a `switch` on or an `if`
 /// over `@typeInfo(subject)`.
-const NamesOf = struct { subject: Ast.Node.Index, info: Ast.Node.Index };
+pub const NamesOf = struct { subject: Ast.Node.Index, info: Ast.Node.Index };
+
+/// The type whose field names `node` is one of (`NamesOf`), as a `@field` name reads it: a rule
+/// asks it rather than spelling `std.builtin.Type`'s `name`, `fields` or `field_names`.
+pub fn fieldNameOf(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?NamesOf {
+    return self.namesOf(file, node, 0);
+}
+
+/// A list of a type's fields: of their descriptions (`info.fields`) or of their names
+/// (`info.field_names`), and the type (`subject`, of the information `info` names).
+pub const FieldList = struct { of: NamesOf, names: bool };
+
+/// The list of a type's fields `node` is, in place or through constants (`FieldList`); null for
+/// any other node.
+pub fn fieldList(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?FieldList {
+    if (try self.listOf(file, node, "field_names", 0)) |of| return .{ .of = of, .names = true };
+    if (try self.listOf(file, node, "fields", 0)) |of| return .{ .of = of, .names = false };
+    return null;
+}
 
 fn namesOf(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: usize) ResolveError!?NamesOf {
     if (depth > 8) return null;
