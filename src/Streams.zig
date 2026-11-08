@@ -263,7 +263,7 @@ fn wrapped(c: *Context, ks: *const Kinds, file: Project.FileId, local: Ast.Node.
         .unknown => return null,
     };
     for (args) |operand| {
-        if (!try interface(c, file, operand)) continue;
+        if (!try interface(c, ks, file, operand)) continue;
         const p = (try placeOf(c, ks, file, operand, depth + 1)) orelse continue;
         return p.parent();
     }
@@ -271,8 +271,8 @@ fn wrapped(c: *Context, ks: *const Kinds, file: Project.FileId, local: Ast.Node.
 }
 
 /// Whether `node` (or what it points at) is `x.interface`.
-fn interface(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
-    return (try ownField(c, file, interfaceRead(&c.project.at(file).file.tree, node), "interface")) orelse false;
+fn interface(c: *Context, ks: *const Kinds, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    return streamField(c, ks, file, interfaceRead(&c.project.at(file).file.tree, node), "interface");
 }
 
 /// The member read under `&` and parentheses (`&r.interface`).
@@ -311,7 +311,7 @@ fn operations(c: *Context, ks: *const Kinds, file: Project.FileId, call: *const 
     };
     // What it passes, the receiver first, in the callee's parameter order (Facts.calls).
     for (args, 0..) |operand, position| {
-        if (try interface(c, file, operand)) {
+        if (try interface(c, ks, file, operand)) {
             // By its place, a wrapper read as the stream it wraps; else by the expression.
             if (try placeOf(c, ks, file, operand, 0)) |p| {
                 const stream = p.parent();
@@ -325,7 +325,7 @@ fn operations(c: *Context, ks: *const Kinds, file: Project.FileId, call: *const 
             continue;
         }
         // A wrapper, or an alias of an interface, read as its stream.
-        if (try placeOf(c, ks, file, operand, 0)) |p| if (p.len > 0 and (try ownField(c, p.file, p.node(), "interface") orelse false) and p.root != rootOf(c, file, operand)) {
+        if (try placeOf(c, ks, file, operand, 0)) |p| if (p.len > 0 and try streamField(c, ks, p.file, p.node(), "interface") and p.root != rootOf(c, file, operand)) {
             const stream = p.parent();
             const kind = (try kindOf(c, ks, file, stream.node())) orelse continue;
             try out.append(c.allocator, .{ .place = stream, .stream = stream.node(), .file = p.file, .kind = kind });
@@ -372,7 +372,7 @@ fn unknownArgs(c: *Context, ks: *const Kinds, file: Project.FileId, call: *const
     var receiver: ?Ast.Node.Index = null;
     if (formAt(tree, call.callee_expr) == .member) {
         const holder, const method = tree.nodeData(call.callee_expr).node_and_token;
-        if (formAt(tree, holder) == .member and try interface(c, file, holder)) {
+        if (formAt(tree, holder) == .member and try interface(c, ks, file, holder)) {
             const stream = tree.nodeData(holder).node_and_token[0];
             const kind = (try kindOf(c, ks, file, stream)) orelse return &.{};
             try out.append(c.allocator, .{ .place = try placeOf(c, ks, file, stream, 0), .stream = stream, .file = file, .kind = kind, .side = sideOf(c, ks, tree.tokenSlice(method)) });
@@ -400,7 +400,7 @@ fn unknownOperand(c: *Context, ks: *const Kinds, file: Project.FileId, operand: 
         .enum_literal, .number, .string, .char => return,
         else => {},
     };
-    const stream = if (try interface(c, file, operand)) tree.nodeData(interfaceRead(tree, operand)).node_and_token[0] else operand;
+    const stream = if (try interface(c, ks, file, operand)) tree.nodeData(interfaceRead(tree, operand)).node_and_token[0] else operand;
     const kind = (try kindOf(c, ks, file, stream)) orelse return;
     try out.append(c.allocator, .{ .place = try placeOf(c, ks, file, stream, 0), .stream = stream, .file = file, .kind = kind });
 }
