@@ -146,6 +146,30 @@ fn ownField(c: *Context, file: Project.FileId, node: Ast.Node.Index, name: []con
     };
 }
 
+/// Whether the member read `node` is the field `name` of the stream its holder is (`ownField`),
+/// and where the holder's type does not resolve (a generic's local, a choice per build), whether
+/// it is so for every stream it may be: if the holder is one of std's streams, Zig resolves the
+/// name it spells in that stream's type, so the access is `name` where, in each stream type that
+/// declares the spelled name, it is the declaration of `name`. A holder that may be no stream, or
+/// streams whose declarations std's could not all be read, is none.
+fn streamField(c: *Context, ks: *const Kinds, file: Project.FileId, node: Ast.Node.Index, name: []const u8) Context.Error!bool {
+    if (try ownField(c, file, node, name)) |own| return own;
+    if (ks.unknown) return false;
+    const step = (try Facts.accesses.memberRead(c.facts, file, node)) orelse return false;
+    const spelled = step.name orelse return false;
+    if (try kindOf(c, ks, file, step.receiver.?) == null) return false; // unreachable: a member's step has its holder
+    var any = false;
+    for (ks.each) |each| {
+        const k = each orelse continue;
+        // A stream type with no such name: Zig would not compile the access on one.
+        const named = c.facts.member(k, spelled) orelse continue;
+        const declared = c.facts.member(k, name) orelse return false;
+        if (!std.meta.eql(named, declared)) return false;
+        any = true;
+    }
+    return any;
+}
+
 /// A place a stream is named by: a declaration and the fields read from it (`self.source`),
 /// with the node naming the place after each step (`nodes[0]` the root's). An alias
 /// (`const in = &r.interface`, `const p = &r`) names the place it points at, and a wrapper made
@@ -703,7 +727,7 @@ fn causeless(c: *Context, ks: *const Kinds, file: Project.FileId, node: Ast.Node
 fn isErr(c: *Context, ks: *const Kinds, file: Project.FileId, node: Ast.Node.Index, stream: *const Place) Context.Error!bool {
     const p = (try placeOf(c, ks, file, node, 0)) orelse return false;
     // The stream's own `err`, by the declaration its type gives the name.
-    if (p.len == 0 or !(try ownField(c, p.file, p.node(), "err") orelse false)) return false;
+    if (p.len == 0 or !try streamField(c, ks, p.file, p.node(), "err")) return false;
     const holder = p.parent();
     return holder.same(stream);
 }
