@@ -178,11 +178,15 @@ const Walk = struct {
     /// member step's field found through its holder's type, `.*` and `.?` passed through.
     fn match(w: *const Walk, node: Ast.Node.Index) Error!Match {
         const path = try Facts.accesses.pathOf(w.facts, w.file, Facts.ungrouped(w.tree, node));
-        const root_step = path.steps[path.steps.len - 1];
-        if (w.tree.nodeTag(root_step.node) != .identifier) return .{ .unknown = .unsupported };
-        const reference = w.model.reference(root_step.node) orelse return .{ .unknown = .unresolved };
-        const decl = reference.declaration orelse return .{ .unknown = .unresolved };
-        const root = w.rootOf(decl) orelse return .apart;
+        const decl = switch (path.root) {
+            .decl => |d| d,
+            // A value of its own (a call's result, a literal): no place of the owner's.
+            .none => return .{ .unknown = .unsupported },
+            .unknown => return .{ .unknown = .unresolved },
+        };
+        // The roots are this function's parameter and captures, declared in its file.
+        if (decl.file != w.file) return .apart;
+        const root = w.rootOf(decl.index) orelse return .apart;
         var k = root.past;
         var i = path.steps.len - 1;
         while (i > 0) {
@@ -218,44 +222,48 @@ const Walk = struct {
         w.touched = true;
         var at = node;
         while (w.model.parentOf(at)) |parent| : (at = parent) {
-            const tag = w.tree.nodeTag(parent);
-            switch (tag) {
-                .block, .block_semicolon, .block_two, .block_two_semicolon => {
-                    const lbrace = w.tree.nodeMainToken(parent);
-                    if (lbrace >= 2 and w.tree.tokenTag(lbrace - 1) == .colon) return; // a labeled block: its value and breaks are not read
-                    const index = w.statementIndex(parent, at) orelse return;
-                    try w.anchors.append(w.facts.gpa, .{ .block = parent, .index = index, .kind = .normal });
-                    if (parent == w.body) return;
-                },
-                .@"defer" => {
-                    const block = w.model.parentOf(parent) orelse return;
-                    const index = w.statementIndex(block, parent) orelse return;
-                    try w.anchors.append(w.facts.gpa, .{ .block = block, .index = index, .kind = .deferred });
-                    // Its scope's end is a release for what follows the block.
-                    if (block != w.body) try w.anchorAfter(block);
-                    return;
-                },
-                .@"errdefer" => {
-                    const block = w.model.parentOf(parent) orelse return;
-                    const index = w.statementIndex(block, parent) orelse return;
-                    try w.anchors.append(w.facts.gpa, .{ .block = block, .index = index, .kind = .error_deferred });
-                    return;
-                },
-                .grouped_expression, .@"try", .field_access, .simple_var_decl, .local_var_decl, .aligned_var_decl, .@"return" => {},
-                .assign => if (w.tree.nodeData(parent).node_and_node[1] != at) return,
-                .@"catch", .@"orelse" => if (w.tree.nodeData(parent).node_and_node[0] != at) return,
-                else => {
-                    var buffer: [1]Ast.Node.Index = undefined;
-                    if (w.tree.fullCall(&buffer, parent) != null) continue;
-                    if (w.tree.fullIf(parent)) |branch| {
-                        if (branch.ast.cond_expr == at) continue;
-                        if (branch.ast.then_expr == at and try w.ownOptional(branch)) continue;
+            switch (try Facts.accesses.useOf(w.facts, w.file, at)) {
+                .statement => switch (w.tree.nodeTag(parent)) {
+                    .block, .block_semicolon, .block_two, .block_two_semicolon => {
+                        const lbrace = w.tree.nodeMainToken(parent);
+                        if (lbrace >= 2 and w.tree.tokenTag(lbrace - 1) == .colon) return; // a labeled block: its value and breaks are not read
+                        const index = w.statementIndex(parent, at) orelse return;
+                        try w.anchors.append(w.facts.gpa, .{ .block = parent, .index = index, .kind = .normal });
+                        if (parent == w.body) return;
+                    },
+                    .@"defer" => {
+                        const block = w.model.parentOf(parent) orelse return;
+                        const index = w.statementIndex(block, parent) orelse return;
+                        try w.anchors.append(w.facts.gpa, .{ .block = block, .index = index, .kind = .deferred });
+                        // Its scope's end is a release for what follows the block.
+                        if (block != w.body) try w.anchorAfter(block);
                         return;
-                    }
-                    var builtin_buffer: [2]Ast.Node.Index = undefined;
-                    if (std.mem.findScalar(Ast.Node.Index, Facts.builtinArgs(w.tree, parent, &builtin_buffer), at) != null) continue;
-                    return;
+                    },
+                    .@"errdefer" => {
+                        const block = w.model.parentOf(parent) orelse return;
+                        const index = w.statementIndex(block, parent) orelse return;
+                        try w.anchors.append(w.facts.gpa, .{ .block = block, .index = index, .kind = .error_deferred });
+                        return;
+                    },
+                    // A loop's or a switch's body, a function's: it may not run, or runs again.
+                    else => return,
                 },
+                // Parentheses, `try`, the left of `catch`/`orelse`: what runs it runs it.
+                .carried => |carried| switch (carried.how) {
+                    .grouped, .tried, .payload => {},
+                    // The owner's own optional's arm, where null holds nothing.
+                    .prong => {
+                        const branch = w.tree.fullIf(parent) orelse return;
+                        if (branch.ast.then_expr != at or !try w.ownOptional(branch)) return;
+                    },
+                    else => return,
+                },
+                // An `if`'s condition runs whichever arm is taken; a loop's may run again.
+                .tested => if (w.tree.fullIf(parent) == null) return,
+                // A declaration's or a store's value, `_ = v`, a member read on it, what a call
+                // or a builtin is given or calls, what returns.
+                .initializes, .stored, .discarded, .member, .callee, .argument, .builtin_argument, .returned => {},
+                else => return,
             }
         }
     }
@@ -356,7 +364,9 @@ fn judge(facts: *Facts, function: Facts.Decl, owner: Owner, comptime base: Base,
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const error_exit = switch (tag) {
             .@"try" => true,
-            .@"return" => if (tree.nodeData(node).opt_node.unwrap()) |value| tree.nodeTag(value) == .error_value else false,
+            // An error returned by what it names (`error.X`, `Set.X`, a const given one): one
+            // not shown is read as no error's, which only an errdefer's release misses.
+            .@"return" => if (tree.nodeData(node).opt_node.unwrap()) |value| try facts.errorName(function.file, value) != null else false,
             else => continue,
         };
         if (!w.inside(body, node) or !w.own(node)) continue;
@@ -402,25 +412,21 @@ fn parameterAt(tree: *const Ast, model: *const Model, proto_node: Ast.Node.Index
     return null;
 }
 
-/// The place expression a reference starts: out through member reads, `.?`, `.*` and
+/// The place expression a reference starts: out through member reads, elements, `.?`, `.*` and
 /// parentheses, but not to a method's name.
-fn placeOf(w: *const Walk, reference: Ast.Node.Index) Ast.Node.Index {
+fn placeOf(w: *const Walk, reference: Ast.Node.Index) Error!Ast.Node.Index {
     var at = reference;
-    while (w.model.parentOf(at)) |parent| {
-        switch (w.tree.nodeTag(parent)) {
-            .grouped_expression, .unwrap_optional, .deref => {},
-            .field_access => {
-                if (w.tree.nodeData(parent).node_and_token[0] != at) break;
-                // `x.f()`: `x` is the receiver, `f` no field.
-                if (w.model.parentOf(parent)) |above| {
-                    var buffer: [1]Ast.Node.Index = undefined;
-                    if (w.tree.fullCall(&buffer, above)) |call| if (call.ast.fn_expr == parent) break;
-                }
+    while (true) {
+        at = switch (try Facts.accesses.useOf(w.facts, w.file, at)) {
+            .carried => |carried| switch (carried.how) {
+                .grouped, .unwrapped => carried.into,
+                else => break,
             },
-            .array_access => if (w.tree.nodeData(parent).node_and_node[0] != at) break,
+            .dereferenced, .element => |into| into,
+            // `x.f()`: `x` is the receiver, `f` no field.
+            .member => |access| if (try Facts.accesses.useOf(w.facts, w.file, access) == .callee) break else access,
             else => break,
-        }
-        at = parent;
+        };
     }
     return at;
 }
@@ -428,7 +434,7 @@ fn placeOf(w: *const Walk, reference: Ast.Node.Index) Ast.Node.Index {
 /// Reads one reference of a root: a release, a use that is no harm, one that must come after a
 /// release, a capture of the owner's optional (a new root), or one that leaves the answer unknown.
 fn use(w: *Walk, reference: Ast.Node.Index, comptime base: Base, depth: u8) Error!void {
-    const place = placeOf(w, reference);
+    const place = try placeOf(w, reference);
     const found = try w.match(place);
     switch (found) {
         .apart => return,
@@ -437,20 +443,24 @@ fn use(w: *Walk, reference: Ast.Node.Index, comptime base: Base, depth: u8) Erro
     }
     var at = place;
     var address = false;
-    var parent = w.model.parentOf(at) orelse return w.fail(.unsupported, place);
-    if (w.tree.nodeTag(parent) == .address_of) {
+    if (w.model.parentOf(at) == null) return w.fail(.unsupported, place);
+    var how = try Facts.accesses.useOf(w.facts, w.file, at);
+    if (how == .address) {
         address = true;
-        at = parent;
-        parent = w.model.parentOf(at) orelse return w.fail(.unsupported, place);
+        at = how.address;
+        if (w.model.parentOf(at) == null) return w.fail(.unsupported, place);
+        how = try Facts.accesses.useOf(w.facts, w.file, at);
     }
     // A call given it: its receiver or an argument.
-    if (try Facts.calls.at(w.facts, w.file, parent)) |call| {
-        if (call.callee_expr != at) return given(w, call, at, found, base, depth);
+    switch (how) {
+        .argument => |argument| if (try Facts.calls.at(w.facts, w.file, argument.call)) |call| return given(w, call, at, found, base, depth),
+        .member => |access| if (w.model.parentOf(access)) |above| {
+            if (try Facts.calls.at(w.facts, w.file, above)) |call| if (call.receiver == .bound and call.receiver.bound == at) return given(w, call, at, found, base, depth);
+        },
+        else => {},
     }
-    if (w.tree.nodeTag(parent) == .field_access) if (w.model.parentOf(parent)) |above| {
-        if (try Facts.calls.at(w.facts, w.file, above)) |call| if (call.receiver == .bound and call.receiver.bound == at) return given(w, call, at, found, base, depth);
-    };
     if (address) return w.after.append(w.facts.gpa, place);
+    const parent = w.model.parentOf(at).?; // unreachable: checked above
     // `if (p.opt) |*o|`: `o` stands for the owner's optional's payload.
     if (w.tree.fullIf(parent)) |branch| if (branch.ast.cond_expr == at) {
         const payload = branch.payload_token orelse return; // a test reads it
@@ -467,18 +477,15 @@ fn use(w: *Walk, reference: Ast.Node.Index, comptime base: Base, depth: u8) Erro
         };
         return w.fail(.unresolved, place);
     };
-    // A store over it, or over what holds it.
-    switch (w.tree.nodeTag(parent)) {
-        .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_shl, .assign_shr => if (w.tree.nodeData(parent).node_and_node[0] == at) return w.after.append(w.facts.gpa, place),
+    switch (how) {
+        // A store over it, or over what holds it; a use not read here, which never clears.
+        .written, .updated, .unknown => return w.after.append(w.facts.gpa, place),
+        // The owner compared (`p.opt != null`): no harm.
+        .compared => return,
         else => {},
     }
-    // A part of the owner read, or the owner compared (`p.opt != null`): no harm. The owner, or
-    // what holds it, read whole: a copy.
+    // A part of the owner read: no harm. The owner, or what holds it, read whole: a copy.
     if (found == .inside) return;
-    switch (w.tree.nodeTag(parent)) {
-        .equal_equal, .bang_equal => return,
-        else => {},
-    }
     return w.after.append(w.facts.gpa, place);
 }
 
