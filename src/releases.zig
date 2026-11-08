@@ -55,9 +55,26 @@ pub const Base = struct {
 /// How many calls deep a release is followed; past it, unknown.
 const depth_limit = 8;
 
+/// A summary asked: of which function, for which owner, under which notion.
+const Key = struct { function: Facts.Decl, parameter: usize, notion: Notion, path: []const Facts.Decl };
+
+const KeyContext = struct {
+    pub fn hash(_: KeyContext, key: Key) u64 {
+        var hasher: std.hash.Wyhash = .init(0);
+        std.hash.autoHashStrat(&hasher, key, .Deep);
+        return hasher.final();
+    }
+
+    pub fn eql(_: KeyContext, a: Key, b: Key) bool {
+        if (!std.meta.eql(a.function, b.function) or a.parameter != b.parameter or a.notion != b.notion or a.path.len != b.path.len) return false;
+        for (a.path, b.path) |x, y| if (!std.meta.eql(x, y)) return false;
+        return true;
+    }
+};
+
 const State = struct {
-    answers: std.StringHashMapUnmanaged(Released) = .empty,
-    active: std.StringHashMapUnmanaged(void) = .empty,
+    answers: std.HashMapUnmanaged(Key, Released, KeyContext, std.hash_map.default_max_load_percentage) = .empty,
+    active: std.HashMapUnmanaged(Key, void, KeyContext, std.hash_map.default_max_load_percentage) = .empty,
 };
 
 /// Whether `function` releases `owner`, this instance, on every exit.
@@ -68,7 +85,7 @@ pub fn released(facts: *Facts, function: Facts.Decl, owner: Owner, comptime base
 fn releasedAt(facts: *Facts, function: Facts.Decl, owner: Owner, comptime base: Base, depth: u8) Error!Released {
     if (depth >= depth_limit) return unknown(.budget, null);
     const state = try facts.memo(State);
-    const key = try keyOf(facts.gpa, function, owner, base.notion);
+    const key: Key = .{ .function = function, .parameter = owner.parameter, .notion = base.notion, .path = try facts.gpa.dupe(Facts.Decl, owner.path) };
     if (state.answers.get(key)) |kept| return kept;
     // A call back into a summary being read: no fixed point is sought.
     if (state.active.contains(key)) return unknown(.cycle, null);
@@ -77,14 +94,6 @@ fn releasedAt(facts: *Facts, function: Facts.Decl, owner: Owner, comptime base: 
     _ = state.active.remove(key);
     try state.answers.put(facts.gpa, key, answer);
     return answer;
-}
-
-fn keyOf(gpa: std.mem.Allocator, function: Facts.Decl, owner: Owner, notion: Notion) Error![]const u8 {
-    const head = [_]u32{ @backingInt(function.file), @backingInt(function.index), @intCast(owner.parameter), @backingInt(notion) };
-    var bytes: std.ArrayList(u8) = .empty;
-    try bytes.appendSlice(gpa, std.mem.sliceAsBytes(&head));
-    for (owner.path) |field| try bytes.appendSlice(gpa, std.mem.sliceAsBytes(&[_]u32{ @backingInt(field.file), @backingInt(field.index) }));
-    return bytes.items;
 }
 
 fn unknown(why: Facts.Unknown, site: ?Facts.Key) Released {
@@ -316,6 +325,16 @@ fn holderContainer(value: Facts.Value) ?Facts.Container {
         .container, .instance => |container| container,
         .pointer => |inner| holderContainer(inner.child.*),
         .optional => |inner| holderContainer(inner.*),
+        // A holder chosen per build: the one container every choice is, else none known.
+        .alternatives => |parts| {
+            var found: ?Facts.Container = null;
+            for (parts) |part| {
+                const one = holderContainer(part) orelse return null;
+                if (found) |known| if (known.file != one.file or known.scope != one.scope) return null;
+                found = one;
+            }
+            return found;
+        },
         else => null,
     };
 }
@@ -336,6 +355,8 @@ fn judge(facts: *Facts, function: Facts.Decl, owner: Owner, comptime base: Base,
     // whose release is the copy's.
     switch (try facts.declaration(.{ .file = function.file, .index = param })) {
         .pointer => {},
+        // A type chosen per build: by pointer in every one.
+        .alternatives => |parts| for (parts) |part| if (part != .pointer) return unknown(.unsupported, null),
         else => return unknown(.unsupported, null),
     }
     var w: Walk = .{ .facts = facts, .file = function.file, .tree = tree, .model = model, .owner = owner, .function_node = function_node, .body = body };

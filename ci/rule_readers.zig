@@ -125,8 +125,6 @@ const switches = [_]Allowed{
     .{ .file = "src/Present.zig", .function = "valued", .reason = "pending: warp-fast" },
     .{ .file = "src/RuleContext.zig", .function = "accepts", .reason = "pending: warp-fast" },
     .{ .file = "src/RuleContext.zig", .function = "isType", .reason = "pending: warp-fast" },
-    .{ .file = "src/releases.zig", .function = "holderContainer", .reason = "pending: warp-fast" },
-    .{ .file = "src/releases.zig", .function = "judge", .reason = "pending: warp-fast" },
     .{ .file = "src/releases_test.zig", .function = "fieldOf", .reason = "pending: warp-fast" },
 };
 
