@@ -350,6 +350,7 @@ const Masks = struct {
     operator: Mask = none,
     error_text: Mask = none,
     peer_writer: Mask = none,
+    uncounted_id: Mask = none,
     /// The facts what they decide takes (`Spec.control`).
     control: Mask = none,
     /// The facts aegis answers.
@@ -660,6 +661,7 @@ fn masksOf(specs: []const Spec) Masks {
             },
             .error_text => out.error_text |= bit,
             .peer_writer => out.peer_writer |= bit,
+            .uncounted_id => out.uncounted_id |= bit,
         }
         if (spec.control) out.control |= bit;
         if (spec.answers.aegis) out.aegis |= bit;
@@ -2470,6 +2472,8 @@ fn builtinDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.In
         if (std.mem.eql(u8, name, "@min") and each.clean()) bounded = true;
         out = try out.join(c.allocator, each);
     }
+    // A table's own id made other than by counting its entries starts that fact.
+    if (flow.masks.uncounted_id != none and try Range.uncountedMake(c, file, node)) out = try out.join(c.allocator, .{ .level = .in(flow.masks.uncounted_id, .data) });
     // A count of bits, a bool's integer and a least under a clean bound stay in a range
     // the program chose: data, which a sink judges against what it reaches. A
     // truncation keeps the bits its type holds, a peer's choice in a wide one: a sink

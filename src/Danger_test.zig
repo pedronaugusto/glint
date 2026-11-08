@@ -3765,14 +3765,13 @@ test "A009 gives no bound where an integer type's width overflows Range's own ar
     try std.testing.expectEqual(@as(u32, 7), found.lines[0]);
 }
 
-test "A009 reads a table's own id by its structure, reports each id made from an integer that does not count the table's entries, and leaves the table's positions undecided while one is made so" {
+test "A009 reads a table's own id by its structure, reports each id made from an integer that does not count the table's entries, and leaves undecided the table's positions such a make reaches" {
     // A table's own id indexes and slices it (lines 8-10); ids counted over it (13) or its
     // length less one after an append (23) are made. Findings: an id made from input (18), a
     // constant (19), a counter over another table (21), another element's id indexing this
     // table (26), an id with a named value (27), an id declared outside its element (28),
-    // arithmetic on an id (29), and the length itself, one past the end (31). Those makes leave
-    // Entry's ids unproven, so its own positions (8-10) are undecided, neither clear nor
-    // findings. Other's ids index no table of Other's: one made from input (25) makes no table's
+    // arithmetic on an id (29), and the length itself, one past the end (31). Those made from
+    // input reach Entry's own positions (8-10): undecided, neither clear nor findings. Other's ids index no table of Other's: one made from input (25) makes no table's
     // id.
     const result = try run(pack.untrusted_input,
         \\const std = @import("std");
@@ -3812,7 +3811,7 @@ test "A009 reads a table's own id by its structure, reports each id made from an
     try std.testing.expectEqualSlices(u32, &.{ 18, 19, 21, 26, 27, 28, 29, 31 }, result.lines[0..result.findings]);
 }
 
-test "A009 reads a table's own id by its structure and clears it only on proof: every make counted clears, a make from a peer's number leaves the index undecided, and the id's name changes neither" {
+test "A009 reads a table's own id by its structure and clears it only on proof: every make counted clears, a make from a peer's number reaching the index leaves it undecided, and the id's name changes neither" {
     inline for (.{ "Id", "Key" }) |name| {
         const head = "const std = @import(\"std\");\n" ++
             "const Entry = struct { name: u8, pub const " ++ name ++ " = enum(u32) { _ }; };\n" ++
@@ -3838,6 +3837,76 @@ test "A009 reads a table's own id by its structure and clears it only on proof: 
         try std.testing.expectEqualSlices(u32, &.{10}, peer.lines[0..peer.findings]);
         try std.testing.expectEqual(@as(usize, 1), peer.undecided);
     }
+}
+
+test "A009 reads the type a conversion makes through its call's binding and a break's target" {
+    const head =
+        \\const std = @import("std");
+        \\const Entry = struct { name: u8, pub const Id = enum(u32) { _ }; };
+        \\const Table = struct {
+        \\    entries: []Entry, ids: std.ArrayList(Entry.Id),
+        \\    fn at(t: *const Table, id: Entry.Id) u8 { return t.entries[@backingInt(id)].name; }
+        \\};
+        \\pub fn f(r: *std.Io.Reader, t: *Table) !u8 {
+        \\    const want = try r.takeByte();
+        \\
+    ;
+    // Ids counted over the table, given to a generic's parameter (line 9, `T` bound to
+    // `Entry.Id` by the list's type) and left by a `break` (line 11): both resolve to the
+    // table's id and count its entries, so neither is a finding and the position the one left
+    // by the `break` reaches, chosen by the peer's byte, names an entry.
+    const counted = try run(pack.untrusted_input, head ++
+        \\    for (t.entries, 0..) |_, i| t.ids.append(@fromBackingInt(@intCast(i)));
+        \\    const found: Entry.Id = for (t.entries, 0..) |e, i| {
+        \\        if (e.name == want) break @fromBackingInt(@intCast(i));
+        \\    } else return 0;
+        \\    return t.at(found);
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), counted.findings);
+    try std.testing.expectEqual(@as(usize, 0), counted.undecided);
+    // A peer's number given to the same parameter is the table's id made from an integer: a
+    // finding where it is made (line 9), not a conversion whose type does not resolve.
+    const peer = try run(pack.untrusted_input, head ++
+        \\    t.ids.append(@fromBackingInt(try r.takeInt(u32, 0)));
+        \\    return want;
+        \\}
+    );
+    try std.testing.expectEqualSlices(u32, &.{9}, peer.lines[0..peer.findings]);
+    try std.testing.expectEqual(@as(usize, 0), peer.undecided);
+}
+
+test "A009 decides a table's own id at each position: an uncounted make leaves undecided only the positions it reaches" {
+    const head =
+        \\const std = @import("std");
+        \\const Entry = struct { name: u8, pub const Id = enum(u32) { _ }; };
+        \\const Table = struct {
+        \\    entries: []Entry,
+        \\    fn at(t: *const Table, id: Entry.Id) u8 { return t.entries[@backingInt(id)].name; }
+        \\    fn label(t: *const Table, id: Entry.Id) u8 { return t.entries[@backingInt(id)].name; }
+        \\};
+        \\pub fn f(r: *std.Io.Reader, t: *Table) !u8 {
+        \\    const made: Entry.Id = @fromBackingInt(try r.takeInt(u32, 0));
+        \\    const pos = try r.takeInt(u32, 0);
+        \\
+    ;
+    // The make from a peer's number (line 9) is a finding and reaches `at` (line 5) alone:
+    // `label` (line 6) takes only ids counted over the table, chosen by the peer's position.
+    const one = try run(pack.untrusted_input, head ++
+        \\    for (t.entries, 0..) |_, i| if (i == pos) return t.label(@fromBackingInt(@intCast(i)));
+        \\    return t.at(made);
+        \\}
+    );
+    try std.testing.expectEqualSlices(u32, &.{9}, one.lines[0..one.findings]);
+    try std.testing.expectEqual(@as(usize, 1), one.undecided);
+    // Given to both, it leaves both undecided.
+    const both = try run(pack.untrusted_input, head ++
+        \\    for (t.entries, 0..) |_, i| if (i == pos) return t.label(@fromBackingInt(@intCast(i)));
+        \\    return t.at(made) +% t.label(made);
+        \\}
+    );
+    try std.testing.expectEqualSlices(u32, &.{9}, both.lines[0..both.findings]);
+    try std.testing.expectEqual(@as(usize, 2), both.undecided);
 }
 
 /// `run` with `other.zig`, a file of the program the selection leaves out, imported by path.

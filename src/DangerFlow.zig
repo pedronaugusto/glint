@@ -92,7 +92,7 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
                 for (decided.leaves.items) |leaf| try judged(c, flow, rule, leaf, try loopOperand(c, flow, node, leaf), .number, loop_message);
                 if (decided.unknown) try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a loop whose condition calls a function whose returns this rule does not follow, which may compare input");
             },
-            // A table trusts its own ids to name its entries (Range.ownId): one made from an
+            // A table trusts its own ids to name its entries (Range.ownTable): one made from an
             // integer is a finding unless it counts the table's entries, whatever the
             // integer's fact. Where the type it makes does not resolve and the program declares
             // such ids, it may be one.
@@ -1532,16 +1532,19 @@ fn within(c: *Context, node: Ast.Node.Index, param: Ast.Node.Index) bool {
 
 /// A sink in the checked file: a finding where the value is input, undecided where the fact
 /// cannot tell.
-/// Whether `node` positions `memory` by a table's own id not every make of which is shown to
-/// count the table's entries (Range.unprovenId): the id may name an entry or not, so where input
-/// may reach it the site is undecided, neither a finding nor clear on the id's shape alone. In a
-/// file the run does not select it is judged at the calls into it, as any sink is.
+/// Whether `node` positions `memory` by a table's own id (Range.ownTable), decided here. Where
+/// no make of the id that is not shown to count the table's entries reaches it (Taint's
+/// `uncounted_id` fact, clean at the site), it names an entry. Where one may, the id may name an
+/// entry or not, so where input may reach it the site is undecided, neither a finding nor clear
+/// on the id's shape alone. In a file the run does not select such a site is judged at the
+/// calls into it, as any sink is.
 fn unprovenIndex(c: *Context, flow: Taint.Fact, rule: Rule, node: Ast.Node.Index, memory: Ast.Node.Index) Context.Error!bool {
+    if (!try Range.ownTable(c, c.file, node, memory)) return false;
+    if (try Taint.levelAt(c, try Taint.get(c, Danger.uncounted_ids), c.file, node) == .clean) return true;
     if (flow.flow.recording != null) return false;
-    if (!try Range.unprovenId(c, c.file, node, memory)) return false;
     const level = try Taint.levelAt(c, flow, c.file, node);
     const tree = &c.project.at(c.file).file.tree;
-    if (level == .unknown or level.reaches(.data)) try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a table's own id positions it, and not every make of that id is shown to count the table's entries: it may name no entry");
+    if (level == .unknown or level.reaches(.data)) try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a table's own id positions it, and a make of that id not shown to count the table's entries may reach it: it may name no entry");
     return true;
 }
 

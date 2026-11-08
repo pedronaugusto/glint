@@ -1486,7 +1486,9 @@ fn integer(value: Facts.Value, pointer: u16) Typed {
 /// function's result it returns), what it is assigned to, a struct literal's field, or the
 /// backing integer of a `@fromBackingInt` or `@enumFromInt` it is given to.
 const Destination = union(enum) {
-    named: struct { file: Project.FileId, node: Ast.Node.Index },
+    /// A type expression, read under the call's binding where it is a callee's parameter
+    /// (`list.append(gpa, x)`'s `T`).
+    named: struct { file: Project.FileId, node: Ast.Node.Index, env: ?*const Facts.Env = null },
     assigned: Ast.Node.Index,
     field: Facts.Decl,
     backing: Ast.Node.Index,
@@ -1498,13 +1500,21 @@ fn destined(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
     var at = node;
-    while (model.parentOf(at)) |parent| : (at = parent) {
+    var next = node;
+    while (model.parentOf(at)) |parent| : (at = next) {
+        next = parent;
         switch (formAt(tree, parent)) {
             .grouped, .tried => continue,
             // A branch's value is the `if`'s: its destination is the `if`'s.
             .@"if" => {
                 const branch = tree.fullIf(parent).?;
                 if (branch.ast.then_expr != at and branch.ast.else_expr.unwrap() != at) return null;
+                continue;
+            },
+            // A `break`'s value is what it leaves: the labeled block's, or the loop's.
+            .@"break" => {
+                if (tree.nodeData(parent).opt_token_and_opt_node[1].unwrap() != at) return null;
+                next = accesses.breakTarget(tree, model, parent) orelse return null;
                 continue;
             },
             .builtin => {
@@ -1564,7 +1574,10 @@ fn destined(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
 /// The integer type a conversion's result is read into.
 fn destination(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16) Context.Error!?Int {
     return switch ((try destined(c, file, node)) orelse return null) {
-        .named => |type_node| try named(c, type_node.file, type_node.node, pointer),
+        .named => |type_node| switch (integer(try typeNamed(c, type_node), pointer)) {
+            .int => |int| int,
+            else => null,
+        },
         .assigned => |lhs| switch (try typeOf(c, file, lhs, pointer, 0)) {
             .int => |int| int,
             else => null,
@@ -1592,7 +1605,7 @@ const Backing = struct {
 
 fn backed(c: *Context, file: Project.FileId, call: Ast.Node.Index, pointer: u16) Context.Error!?Backing {
     var made = switch ((try destined(c, file, call)) orelse return null) {
-        .named => |type_node| try c.facts.resolve(type_node.file, type_node.node),
+        .named => |type_node| try typeNamed(c, type_node),
         .assigned => |lhs| try c.facts.resolve(file, lhs),
         .field => |decl| try c.facts.declaration(decl),
         .backing, .shifted => return null,
@@ -1681,9 +1694,15 @@ fn argument(c: *Context, file: Project.FileId, call: Ast.full.Call, arg: Ast.Nod
     var index: usize = 0;
     while (it.next()) |param| : (index += 1) {
         if (index != position_of + skip) continue;
-        return .{ .named = .{ .file = decl.file, .node = param.type_expr orelse return null } };
+        return .{ .named = .{ .file = decl.file, .node = param.type_expr orelse return null, .env = try c.facts.bind(file, call, decl, null) } };
     }
     return null;
+}
+
+/// The type a destination's type expression names, under the call's binding where it has one.
+fn typeNamed(c: *Context, type_node: @FieldType(Destination, "named")) Context.Error!Facts.Value {
+    const env = type_node.env orelse return c.facts.resolve(type_node.file, type_node.node);
+    return c.facts.resolveBound(env, type_node.file, type_node.node);
 }
 
 /// The field a struct literal's `value` initializes.
@@ -3656,7 +3675,6 @@ pub fn within(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: 
 const Nesting = struct { level: u8 = 0 };
 
 fn withinOnce(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: Ast.Node.Index, end: bool) Context.Error!bool {
-    if (try ownId(c, file, index, memory)) return true;
     // A remainder by the memory's length is below it (a zero length stops the remainder), and
     // so is a `for` counter over its length or beside it.
     if (try remainderOf(c, file, index, memory)) return true;
@@ -3699,23 +3717,14 @@ fn withinOnce(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: 
     return true;
 }
 
-/// Whether `index` is a table's own id read as its integer, `t[@backingInt(id)]` (`ownIndex`),
-/// where every make of that id the program writes is shown to count the table's entries
-/// (`countedIds`): then it names one of them. Where one is not shown, the id may name none
-/// (`unprovenId`). The type does not tell which table of that element: an id of one table read in
-/// another of the same element, or in one the program has shrunk since, is the program's to keep
-/// apart.
-pub fn ownId(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: Ast.Node.Index) Context.Error!bool {
-    const owner = (try ownIndex(c, file, index, memory)) orelse return false;
-    return countedIds(c, owner);
-}
-
-/// Whether `index` is a table's own id read as its integer (`ownIndex`) not every make of which
-/// is shown to count the table's entries: a position that may name no entry, never shown out of
-/// it either.
-pub fn unprovenId(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: Ast.Node.Index) Context.Error!bool {
-    const owner = (try ownIndex(c, file, index, memory)) orelse return false;
-    return !try countedIds(c, owner);
+/// Whether `index` is a table's own id read as its integer, `t[@backingInt(id)]` (`ownIndex`).
+/// Such a position names an entry where no make of the id that is not shown to count the
+/// table's entries reaches it: Taint's `uncounted_id` fact decides that at each site (A009's
+/// index and slice sinks), and each such make is judged where it is written. The type does not
+/// tell which table of that element: an id of one table read in another of the same element, or
+/// in one the program has shrunk since, is the program's to keep apart.
+pub fn ownTable(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: Ast.Node.Index) Context.Error!bool {
+    return (try ownIndex(c, file, index, memory)) != null;
 }
 
 /// The container whose own id `index` reads as its integer to index its table: `index` is
@@ -3739,11 +3748,10 @@ fn ownIndex(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: As
 }
 
 /// The run's table ids: the containers whose ids index a table of their values somewhere in the
-/// program (`ownIndex`), and for each whether every make of its ids is shown counted.
+/// program (`ownIndex`).
 const TableIds = struct {
     /// The list itself, which owns its storage: what is read of it is its items.
     indexed: ?std.ArrayList(Facts.Container) = null,
-    counted: std.AutoHashMapUnmanaged(struct { Project.FileId, Model.Scope.Id }, bool) = .empty,
 };
 
 /// The containers whose own ids index a table of their values somewhere in the program.
@@ -3777,41 +3785,27 @@ fn isTable(c: *Context, owner: Facts.Container) Context.Error!bool {
     return false;
 }
 
-/// Whether every make of `owner`'s id the program writes counts the entries of a table of
-/// `owner` (`countsEntries`): each `@fromBackingInt` or `@enumFromInt` that makes one, none made
-/// by `@bitCast` or `@ptrCast`, and no conversion whose type does not resolve where it may make
-/// one. Read once for the run; while it is being read, not shown.
-fn countedIds(c: *Context, owner: Facts.Container) Context.Error!bool {
-    const memo = try c.facts.memo(TableIds);
-    const key = .{ owner.file, owner.scope };
-    if (memo.counted.get(key)) |known| return known;
-    try memo.counted.put(c.facts.gpa, key, false);
-    const answer = all: for (c.project.sources) |*source| {
-        const file = source.id;
-        if (!try Program.owns(c, file)) continue;
-        const tree = &source.file.tree;
-        for (tree.nodes.items(.tag), 0..) |tag, i| {
-            if (Facts.accesses.formOf(tag) != .builtin) continue;
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            const counts = Facts.isBuiltin(tree, node, "@fromBackingInt") or Facts.isBuiltin(tree, node, "@enumFromInt");
-            if (!counts and !Facts.isBuiltin(tree, node, "@bitCast") and !Facts.isBuiltin(tree, node, "@ptrCast")) continue;
-            switch (try madeOf(c, file, node, !counts)) {
-                .other => {},
-                .unknown => break :all false,
-                .id => |made| if (made.file == owner.file and made.scope == owner.scope) {
-                    if (!counts or !try countsEntries(c, file, node, owner)) break :all false;
-                },
-            }
-        }
-    } else true;
-    try memo.counted.put(c.facts.gpa, key, answer);
-    return answer;
+/// Whether `call` makes a table's own id other than by counting the table's entries: a
+/// `@fromBackingInt` or `@enumFromInt` making one whose operand `countsEntries` does not show
+/// within, a `@bitCast` or `@ptrCast` making one, or a conversion whose type does not resolve
+/// where the program has such ids (`madeOf`). The source of Taint's `uncounted_id` fact. A make
+/// in test code is none: a test's ids reach no proof of the program's own.
+pub fn uncountedMake(c: *Context, file: Project.FileId, call: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    const counts = Facts.isBuiltin(tree, call, "@fromBackingInt") or Facts.isBuiltin(tree, call, "@enumFromInt");
+    if (!counts and !Facts.isBuiltin(tree, call, "@bitCast") and !Facts.isBuiltin(tree, call, "@ptrCast")) return false;
+    if (try c.inTestCodeOf(file, tree.nodeMainToken(call))) return false;
+    return switch (try madeOf(c, file, call, !counts)) {
+        .other => false,
+        .unknown => true,
+        .id => |owner| !counts or !try countsEntries(c, file, call, owner),
+    };
 }
 
 /// The container whose own id `id` may be, by its structure alone: `id` is an enum with a
 /// backing integer whose one member is `_` (no named value, so none is made without a
 /// conversion), declared directly in that container, whatever it is named. Only a candidate:
-/// what clears an index on it is `countedIds`.
+/// what clears an index on it is that no uncounted make reaches it (`ownTable`).
 fn ownerOf(c: *Context, id: Facts.Container) ?Facts.Container {
     if (id.made_by != null or id.symbolic) return null;
     const tree = &c.project.at(id.file).file.tree;
@@ -3860,7 +3854,7 @@ pub fn madeId(c: *Context, file: Project.FileId, call: Ast.Node.Index) Context.E
 /// container (`isTable`).
 fn madeOf(c: *Context, file: Project.FileId, call: Ast.Node.Index, pointed: bool) Context.Error!Made {
     var made = switch ((try destined(c, file, call)) orelse return .unknown) {
-        .named => |type_node| try c.facts.resolve(type_node.file, type_node.node),
+        .named => |type_node| try typeNamed(c, type_node),
         .assigned => |lhs| try c.facts.resolve(file, lhs),
         .field => |decl| try c.facts.declaration(decl),
         .backing, .shifted => return .other,

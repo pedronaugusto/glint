@@ -262,7 +262,12 @@ pub fn inTest(self: *const RuleContext, token: std.zig.Ast.TokenIndex) bool {
 /// private function only tests reach (`testOnly`: a fuzz target, a property's helper). One answer
 /// for every rule that reads test code so.
 pub fn inTestCode(self: *RuleContext, token: std.zig.Ast.TokenIndex) Error!bool {
-    return self.inTest(token) or try testReached(self, self.file) or try inTestOnlyFunction(self, self.file, token);
+    return inTestCodeOf(self, self.file, token);
+}
+
+/// `inTestCode` of a token in `file`, which need not be the file the rule checks.
+pub fn inTestCodeOf(self: *RuleContext, file: Project.FileId, token: std.zig.Ast.TokenIndex) Error!bool {
+    return inTestScope(self.project.at(file), token) or try testReached(self, file) or try inTestOnlyFunction(self, file, token);
 }
 
 /// Which files only tests reach, one entry a file by its id, found as each is asked and kept for

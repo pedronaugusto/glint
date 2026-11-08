@@ -12584,7 +12584,7 @@ pub const accesses = struct {
 
     /// What the `break` `jump` leaves: the block, loop or switch its label names, or without
     /// one the innermost loop whose body holds it. Null past the function, or a label not found.
-    fn breakTarget(tree: *const Ast, model: *const Model, jump: Ast.Node.Index) ?Ast.Node.Index {
+    pub fn breakTarget(tree: *const Ast, model: *const Model, jump: Ast.Node.Index) ?Ast.Node.Index {
         const label = tree.nodeData(jump).opt_token_and_opt_node[0].unwrap();
         var at = jump;
         while (model.parentOf(at)) |up| : (at = up) {

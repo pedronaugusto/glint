@@ -34,6 +34,9 @@ pub const bounded_input: Taint.Spec = .{ .source = peer_input.source, .control =
 /// only as data does (a copy, a pointer, a store), never by what a branch or a loop's passes
 /// decide: a value chosen under a condition that reads a writer holds no writer of its own.
 pub const peer_writer: Taint.Spec = .{ .source = .peer_writer, .control = false };
+/// A009's table ids: a table's own id made other than by counting its entries, reaching a
+/// position only as data does (`Range.uncountedMake`).
+pub const uncounted_ids: Taint.Spec = .{ .source = .uncounted_id, .control = false };
 /// A018's: an error's text, which aegis's public text and an error's integer answer, judged
 /// where a peer writer writes it (`Taint.sinkSites`). What an error decides is no text of it.
 pub const error_text: Taint.Spec = .{ .source = .error_text, .control = false, .answers = .{ .aegis = true, .int_from_error = true }, .sinks = .{ .peer_write = true } };

@@ -44,6 +44,11 @@ pub const Source = union(enum) {
     /// A writer whose bytes reach a peer: what `net.Stream.writer` gives, and the functions the
     /// configuration declares write to one.
     peer_writer,
+    /// A table's own id made other than by counting the table's entries: an integer converted
+    /// to it that is not shown within the table, its bytes reinterpreted as one, or a
+    /// conversion whose type does not resolve where the program has such ids
+    /// (`Range.uncountedMake`). A make in test code is none.
+    uncounted_id,
 };
 
 pub const Provenance = packed struct(u2) { peer: bool, operator: bool };
