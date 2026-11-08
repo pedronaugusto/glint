@@ -1451,8 +1451,9 @@ const Walk = struct {
     /// What a field description's name is read on: `f` of `f.name`, `f` a capture of
     /// `@typeInfo(T).@"struct".fields`. Null for any other node.
     fn descriptionName(w: *const Walk, node: Ast.Node.Index) Context.Error!?Ast.Node.Index {
+        // A field's name as Facts reads one (`fieldNameOf`), a member of a description.
+        if (try w.c.facts.fieldNameOf(w.file, node) == null) return null;
         const read = (try Facts.accesses.memberRead(w.c.facts, w.file, node)) orelse return null;
-        if (!std.mem.eql(u8, read.name orelse return null, "name")) return null;
         return read.receiver;
     }
 
@@ -1563,26 +1564,10 @@ const Walk = struct {
     /// or through a constant (`const info = @typeInfo(own).@"struct"; info.field_names`): true
     /// for their names, false for their descriptions.
     fn fieldList(w: *const Walk, input: Ast.Node.Index, own: Ast.Node.Index) Context.Error!?bool {
-        const tree = w.tree;
-        if (tree.nodeTag(input) != .field_access) return null;
-        const info, const member = tree.nodeData(input).node_and_token;
-        const by_name = if (std.mem.eql(u8, tree.tokenSlice(member), "field_names")) true else if (std.mem.eql(u8, tree.tokenSlice(member), "fields")) false else return null;
-        var of = info;
-        if (tree.nodeTag(of) == .identifier) {
-            const ref = w.model.reference(of) orelse return null;
-            const decl = w.model.declarations[@backingInt(ref.declaration orelse return null)];
-            if (decl.kind != .variable) return null;
-            const variable = tree.fullVarDecl(decl.node) orelse return null;
-            if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
-            of = variable.ast.init_node.unwrap() orelse return null;
-        }
-        if (tree.nodeTag(of) != .field_access) return null;
-        const reflected, const kind = tree.nodeData(of).node_and_token;
-        if (!std.mem.eql(u8, tree.tokenSlice(kind), "@\"struct\"") or !Facts.isBuiltin(tree, reflected, "@typeInfo")) return null;
-        var buffer: [2]Ast.Node.Index = undefined;
-        const args = Facts.builtinArgs(tree, reflected, &buffer);
-        if (args.len != 1 or !try sameTypeNamed(w.c.facts, w.file, args[0], own)) return null;
-        return by_name;
+        // The list as Facts reads one (`Facts.fieldList`), of the type the local is declared with.
+        const list = (try w.c.facts.fieldList(w.file, input)) orelse return null;
+        if (!try sameTypeNamed(w.c.facts, w.file, list.of.subject, own)) return null;
+        return list.names;
     }
 
     /// Whether `node` sets the field a pass is on from what does not read the local: `@field`
