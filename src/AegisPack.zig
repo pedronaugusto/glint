@@ -1585,6 +1585,9 @@ fn boundBy(c: *Context, tree: *const Ast, call: Facts.calls.Call, rule: Rule, fu
     // Which parameters take a type: a binding of one is a type the call writes.
     var types: [64]bool = @splat(false);
     var values: [64]bool = @splat(false);
+    // An argument left undecided is one site of the binding, however many of the generic's
+    // copies read it: reported once, at its first.
+    var undecided_at: [64]bool = @splat(false);
     var count: usize = 0;
     var it = proto.iterate(written);
     while (it.next()) |param| : (count += 1) {
@@ -1645,7 +1648,10 @@ fn boundBy(c: *Context, tree: *const Ast, call: Facts.calls.Call, rule: Rule, fu
                     } else try casts.append(c.allocator, span);
                 },
                 .other => {},
-                .unknown => if (!bindingTyped(value)) try c.undecided(scalar, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a generic that casts integers by its parameter's type is bound to a type that does not resolve"),
+                .unknown => if (!bindingTyped(value) and !undecided_at[copy.position]) {
+                    undecided_at[copy.position] = true;
+                    try c.undecided(scalar, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a generic that casts integers by its parameter's type is bound to a type that does not resolve");
+                },
             }
             continue;
         }
@@ -1660,7 +1666,10 @@ fn boundBy(c: *Context, tree: *const Ast, call: Facts.calls.Call, rule: Rule, fu
             switch (owner) {
                 .owner => |k| if (owes(k)) try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unsupported, try c.allocator.print("this binding makes an owner of what {s}:{d} acquires by the generic's type parameter; its cleanup is not walked per binding", .{ c.project.at(copy.site.file).input.name, line })),
                 .other => {},
-                .unknown => if (!bindingTyped(bound)) try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a generic that acquires by its type parameter is bound to a type that does not resolve"),
+                .unknown => if (!bindingTyped(bound) and !undecided_at[copy.position]) {
+                    undecided_at[copy.position] = true;
+                    try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a generic that acquires by its type parameter is bound to a type that does not resolve");
+                },
             }
             continue;
         }
@@ -1672,7 +1681,10 @@ fn boundBy(c: *Context, tree: *const Ast, call: Facts.calls.Call, rule: Rule, fu
                 return true;
             },
             .other => {},
-            .unknown => if (!bindingTyped(bound)) try c.undecided(copies, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a generic that copies its parameter is bound to a type that does not resolve"),
+            .unknown => if (!bindingTyped(bound) and !undecided_at[copy.position]) {
+                undecided_at[copy.position] = true;
+                try c.undecided(copies, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a generic that copies its parameter is bound to a type that does not resolve");
+            },
         }
     }
     if (casts.items.len == 0) return false;
