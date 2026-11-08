@@ -158,10 +158,15 @@ fn valued(self: *Present, file: Project.FileId, value: Ast.Node.Index) Context.E
     const proto = tree.fullFnProto(&proto_buffer, source.model.declarations[@backingInt(function.index)].node) orelse return false;
     const returned = proto.ast.return_type.unwrap() orelse return false;
     // What the written result resolves to: a container type or a pointer, no optional.
-    return switch (try self.c.facts.resolve(function.file, returned)) {
+    // In every build's reading of it.
+    const result = try self.c.facts.resolve(function.file, returned);
+    var each: Facts.Join = .{};
+    for (Facts.valueParts(&result)) |part| each.add(part, switch (part) {
         .container, .pointer => true,
+        .alternatives => null, // a choice, never a part (valueParts): not known
         else => false,
-    };
+    });
+    return each.all() == true;
 }
 
 /// An element of a switch's cases (`for (whole.ast.cases) |case| tree.fullSwitchCase(case).?`)

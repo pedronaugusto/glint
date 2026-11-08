@@ -171,10 +171,15 @@ fn compileTime(self: *Walk, f: Facts.Decl) Context.Error!bool {
 
 /// Whether a type expression is the type `type`, by what it resolves to.
 fn typeKeyword(c: *Context, file: @import("Project.zig").FileId, node: Ast.Node.Index) Context.Error!bool {
-    return switch (try c.facts.resolve(file, node)) {
+    // The type `type` only where every build's is.
+    const value = try c.facts.resolve(file, node);
+    var each: Facts.Join = .{};
+    for (Facts.valueParts(&value)) |part| each.add(part, switch (part) {
         .primitive => |primitive| std.mem.eql(u8, primitive, "type"),
+        .alternatives => null, // a choice, never a part (valueParts): not known
         else => false,
-    };
+    });
+    return each.agreed() == true;
 }
 
 /// The cycle `looped` (the stack from the function called again) makes back to its first
@@ -437,10 +442,15 @@ fn fieldOf(c: *Context, file: @import("Project.zig").FileId, node: Ast.Node.Inde
 fn hasReceiver(c: *Context, file: @import("Project.zig").FileId, call: Ast.full.Call) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
     if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
-    return switch (try c.facts.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
+    // A value in every build's reading of it.
+    const holder = try c.facts.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0]);
+    var each: Facts.Join = .{};
+    for (Facts.valueParts(&holder)) |part| each.add(part, switch (part) {
         .instance, .pointer, .optional => true,
+        .alternatives => null, // a choice, never a part (valueParts): not known
         else => false,
-    };
+    });
+    return each.all() == true;
 }
 
 /// What a call gives its callee's parameter at `position`.

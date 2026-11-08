@@ -95,11 +95,18 @@ pub fn accepts(self: *RuleContext, decl: Facts.Decl, call: Ast.full.Call, skip: 
         const given_type = !literal and try self.isType(argument);
         if (!literal and !given_type) continue;
         const kind = try self.facts.resolve(decl.file, written);
-        if (given_type) switch (kind) {
-            .container, .pointer, .optional => return false,
-            .primitive => |name| if (!std.mem.eql(u8, name, "type")) return false,
-            else => {},
-        };
+        // A type given where the parameter takes a value: turned away only where every build's
+        // parameter type does.
+        if (given_type) {
+            var rejects: Facts.Join = .{};
+            for (Facts.valueParts(&kind)) |part| rejects.add(part, switch (part) {
+                .container, .pointer, .optional => true,
+                .primitive => |name| !std.mem.eql(u8, name, "type"),
+                .alternatives => null, // a choice, never a part (valueParts): not known
+                else => false,
+            });
+            if (rejects.all() == true) return false;
+        }
         if (literal and kind == .container) {
             const scope_node = self.project.at(kind.container.file).model.scopes[@backingInt(kind.container.scope)].node;
             const owner = &self.project.at(kind.container.file).file.tree;
@@ -143,10 +150,17 @@ fn isType(self: *RuleContext, node: Ast.Node.Index) Error!bool {
             return false;
         },
         .optional_type, .error_union => return true,
-        .identifier, .field_access => return switch (try self.facts.resolve(self.file, node)) {
-            .container => true,
-            .primitive => |name| !std.mem.eql(u8, name, "type"),
-            else => false,
+        // A type in every build's reading of the name.
+        .identifier, .field_access => {
+            const value = try self.facts.resolve(self.file, node);
+            var each: Facts.Join = .{};
+            for (Facts.valueParts(&value)) |part| each.add(part, switch (part) {
+                .container => true,
+                .primitive => |name| !std.mem.eql(u8, name, "type"),
+                .alternatives => null, // a choice, never a part (valueParts): not known
+                else => false,
+            });
+            return each.all() == true;
         },
         else => return false,
     }

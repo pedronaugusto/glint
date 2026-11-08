@@ -731,6 +731,8 @@ const Reader = struct {
         };
         const container = switch ((try r.facts.template(made_by)) orelse return .unresolved) {
             .container, .instance => |c| c,
+            // A template chosen per build is no one container to read a member of.
+            .alternatives => return .unresolved,
             else => return .unresolved,
         };
         return if (r.facts.member(container, member orelse return .not)) |decl| .{ .decl = decl } else .unresolved;

@@ -213,25 +213,35 @@ const Walk = struct {
     /// Whether a local's fields and elements live in it: its type, written or of its value, is
     /// no pointer Zig would dereference. A type the reading does not know may be a value.
     fn value(self: Walk, d: Model.Declaration.Id) Context.Error!bool {
-        return switch (try self.typeOf(d)) {
+        // A value where any build's type is one, or one not known.
+        const typed = try self.typeOf(d);
+        var each: Facts.Join = .{};
+        for (Facts.valueParts(&typed)) |part| each.add(part, switch (part) {
             .pointer => false,
+            .alternatives => null, // a choice, never a part (valueParts): not known
             else => true,
-        };
+        });
+        return each.any() orelse true;
     }
 
     /// Whether a local is an array a slice of which is its frame's memory: its type, written
     /// or of its value, is an array, or one the reading does not know but for a local its value
     /// makes a pointer (`Facts.makesPointer`).
     fn array(self: Walk, d: Model.Declaration.Id) Context.Error!bool {
-        return switch (try self.typeOf(d)) {
-            .array => true,
-            // Made a pointer (`@ptrFromInt`, a pointer cast), it is one whatever its type spells.
-            .unknown => if (self.tree.fullVarDecl(self.model.declarations[@backingInt(d)].node)) |decl|
-                !(if (decl.ast.init_node.unwrap()) |init| self.c.facts.makesPointer(self.c.file, init) else false)
-            else
-                true,
-            else => false,
+        // Made a pointer (`@ptrFromInt`, a pointer cast), it is one whatever its type spells.
+        const unknown = if (self.tree.fullVarDecl(self.model.declarations[@backingInt(d)].node)) |decl|
+            !(if (decl.ast.init_node.unwrap()) |init| self.c.facts.makesPointer(self.c.file, init) else false)
+        else
+            true;
+        // An array where any build's type is one.
+        const typed = try self.typeOf(d);
+        for (Facts.valueParts(&typed)) |part| switch (part) {
+            .array => return true,
+            // A choice, which valueParts never gives as a part, is read as one not known.
+            .unknown, .alternatives => if (unknown) return true,
+            else => {},
         };
+        return false;
     }
 
     /// What a local's type resolves to: the type it is written with, or its value's.

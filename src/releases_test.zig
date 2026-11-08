@@ -56,6 +56,7 @@ fn fieldOf(facts: *Facts, file: Project.FileId, container: []const u8, field: []
         const value = try facts.declaration(.{ .file = file, .index = @fromBackingInt(@intCast(i)) });
         const found = switch (value) {
             .container, .instance => |c| c,
+            .alternatives => return error.TestUnexpectedResult,
             else => return error.TestUnexpectedResult,
         };
         return facts.member(found, field) orelse error.TestUnexpectedResult;

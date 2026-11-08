@@ -80,8 +80,6 @@ fn switched(comptime list: []const Allowed) [1]glint.ProjectRule {
 /// owner converts to Facts' part readers (the list only shrinks), or `conservative: <why>; row:
 /// <test>`, a claim that its default is the safe answer for that function, proved by the row named.
 const switches = [_]Allowed{
-    .{ .file = "src/AegisRecursion.zig", .function = "hasReceiver", .reason = "pending: warp-fast" },
-    .{ .file = "src/AegisRecursion.zig", .function = "typeKeyword", .reason = "pending: warp-fast" },
     .{ .file = "src/Danger.zig", .function = "aegisName", .reason = "pending: warp-fast" },
     .{ .file = "src/Danger.zig", .function = "borrowed", .reason = "pending: warp-fast" },
     .{ .file = "src/Danger.zig", .function = "madeField", .reason = "pending: warp-fast" },
@@ -103,14 +101,10 @@ const switches = [_]Allowed{
     .{ .file = "src/DangerShapes.zig", .function = "neverReturns", .reason = "pending: glint-b" },
     .{ .file = "src/DangerShapes.zig", .function = "pointsAtGuard", .reason = "pending: glint-b" },
     .{ .file = "src/DangerShapes.zig", .function = "writtenThrough", .reason = "pending: glint-b" },
-    .{ .file = "src/Escapes.zig", .function = "Walk.array", .reason = "pending: warp-fast" },
-    .{ .file = "src/Escapes.zig", .function = "Walk.value", .reason = "pending: warp-fast" },
     .{ .file = "src/Facts.zig", .function = "evaluateCall", .reason = "pending: glint-c" },
     .{ .file = "src/Facts.zig", .function = "holdsTypes", .reason = "pending: glint-c" },
     .{ .file = "src/Facts.zig", .function = "literalDeclaration", .reason = "pending: glint-c" },
     .{ .file = "src/Facts.zig", .function = "mayBeType", .reason = "pending: glint-c" },
-    .{ .file = "src/Governed.zig", .function = "aliasNames", .reason = "pending: warp-fast" },
-    .{ .file = "src/PackageRules.zig", .function = "Reader.generic", .reason = "pending: warp-fast" },
     .{ .file = "src/ParentPointer.zig", .function = "Carry.holds", .reason = "pending: glint-b" },
     .{ .file = "src/ParentPointer.zig", .function = "Carry.spawned", .reason = "pending: glint-b" },
     .{ .file = "src/ParentPointer.zig", .function = "Follow.pointer", .reason = "pending: glint-b" },
@@ -122,10 +116,6 @@ const switches = [_]Allowed{
     .{ .file = "src/ParentPointer.zig", .function = "namedByField", .reason = "pending: glint-b" },
     .{ .file = "src/ParentPointer.zig", .function = "pointee", .reason = "pending: glint-b" },
     .{ .file = "src/ParentPointer.zig", .function = "receiverKind", .reason = "pending: glint-b" },
-    .{ .file = "src/Present.zig", .function = "valued", .reason = "pending: warp-fast" },
-    .{ .file = "src/RuleContext.zig", .function = "accepts", .reason = "pending: warp-fast" },
-    .{ .file = "src/RuleContext.zig", .function = "isType", .reason = "pending: warp-fast" },
-    .{ .file = "src/releases_test.zig", .function = "fieldOf", .reason = "pending: warp-fast" },
 };
 
 fn checkSwitches(context: *glint.RuleContext, list: []const Allowed) glint.RuleContext.Error!void {

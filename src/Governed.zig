@@ -388,7 +388,8 @@ pub fn aliasNames(self: *Context, comptime among: AliasScope, decls: []const Fac
                     .function => |function| try aliasOf(self, found, function, decl, d.name),
                     .alternatives => |each| for (each) |one| switch (one) {
                         .function => |function| try aliasOf(self, found, function, decl, d.name),
-                        .unknown => unknown = true,
+                        // A choice, which a choice never holds, is read as one not known.
+                        .unknown, .alternatives => unknown = true,
                         else => {},
                     },
                     .unknown => unknown = true,
