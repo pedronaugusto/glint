@@ -7858,14 +7858,14 @@ fn loopedWith(self: *Facts, site: accesses.Site) ResolveError!?(?[]const Key) {
     const parent = model.parentOf(site.node) orelse return null;
     const loop = tree.fullFor(parent) orelse return null;
     const position = std.mem.findScalar(Ast.Node.Index, loop.ast.inputs, site.node) orelse return null;
-    const capture = for (model.declarations, 0..) |d, i| {
-        if (d.kind == .capture and d.node == parent and Model.capturePosition(tree, loop, d.token) == position) break i;
+    const capture: Model.Declaration.Id = for (model.declarations, 0..) |d, i| {
+        if (d.kind == .capture and d.node == parent and Model.capturePosition(tree, loop, d.token) == position) break @fromBackingInt(@intCast(i));
     } else return @as(?[]const Key, &.{});
-    const record = model.declarations[capture];
+    const record = model.declarations[@backingInt(capture)];
     if (tree.tokenTag(record.token - 1) != .asterisk) return @as(?[]const Key, &.{});
     var out: std.ArrayList(Key) = .empty;
     const in_file = [_]Project.FileId{site.file};
-    var mentions = accesses.reads(self, .{ .declaration = .{ .file = site.file, .index = @fromBackingInt(@intCast(capture)) } }, &in_file);
+    var mentions = accesses.reads(self, .{ .declaration = .{ .file = site.file, .index = capture } }, &in_file);
     while (try mentions.next()) |mention| {
         if (mention.reach != .exact) return @as(?[]const Key, null);
         // The place the mention leads to through members, elements, payloads and `.*`.

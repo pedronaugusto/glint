@@ -3870,8 +3870,11 @@ fn madeOf(c: *Context, file: Project.FileId, call: Ast.Node.Index, pointed: bool
 }
 
 /// Whether a conversion making `owner`'s id counts the entries of a table of `owner`: its
-/// operand is shown within that table, as a `for` counter over it (`for (t, 0..) |_, i|`) or
-/// its length less what cannot be zero (`t.len - 1`, after an append).
+/// operand is shown within that table when it is made, and a table whose ids are kept only
+/// grows. As a `for` counter over it (`for (t, 0..) |_, i|`), its length less what cannot be
+/// zero (`t.len - 1`, after an append), or below the length of a table of `owner`'s entries the
+/// function names, by what `within` reads there (`if (n >= t.len) return error.Malformed;`
+/// before `@fromBackingInt(n)`).
 pub fn countsEntries(c: *Context, file: Project.FileId, call: Ast.Node.Index, owner: Facts.Container) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
     var buffer: [2]Ast.Node.Index = undefined;
@@ -3880,11 +3883,15 @@ pub fn countsEntries(c: *Context, file: Project.FileId, call: Ast.Node.Index, ow
     const operand = bare(tree, args[0]);
     if (checkedOp(tree, operand) == .sub) {
         const table = (try c.facts.lengthOf(file, bare(tree, tree.nodeData(operand).node_and_node[0]))) orelse return false;
-        if (!try entriesOf(c, file, table, owner)) return false;
-        return within(c, file, args[0], table, false);
-    }
-    // A counter from zero beside the table taken first: below its length when the loop began, and
-    // a table whose ids are kept only grows.
+        if (try entriesOf(c, file, table, owner) and try within(c, file, args[0], table, false)) return true;
+    } else if (try counterOver(c, file, operand, owner)) return true;
+    return belowTable(c, file, call, args[0], owner);
+}
+
+/// Whether `operand` is a counter from zero beside a table of `owner`'s entries taken first
+/// (`for (t, 0..) |_, i|`): below its length when the loop began.
+fn counterOver(c: *Context, file: Project.FileId, operand: Ast.Node.Index, owner: Facts.Container) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
     const d = (nameRef(model, operand) orelse return false).declaration orelse return false;
     const record = model.declarations[@backingInt(d)];
@@ -3895,6 +3902,30 @@ pub fn countsEntries(c: *Context, file: Project.FileId, call: Ast.Node.Index, ow
     const start, const end = tree.nodeData(loop.ast.inputs[taken]).node_and_opt_node;
     if (literal(tree, start) != 0 or end != .none) return false;
     return entriesOf(c, file, loop.ast.inputs[0], owner);
+}
+
+/// Whether `operand`, made into `owner`'s id at `call`, is shown within a table of `owner`'s
+/// entries the enclosing function names by its length (`t.len`) or loops over (`for (t)`):
+/// each such table is asked of `within` at the operand.
+fn belowTable(c: *Context, file: Project.FileId, call: Ast.Node.Index, operand: Ast.Node.Index, owner: Facts.Container) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    var function = call;
+    while (formAt(tree, function) != .fn_decl) function = model.parentOf(function) orelse return false;
+    const first = tree.firstToken(function);
+    const last = tree.lastToken(function);
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const table: Ast.Node.Index = switch (accesses.formOf(tag)) {
+            .member => (try c.facts.lengthOf(file, node)) orelse continue,
+            .@"for" => tree.fullFor(node).?.ast.inputs[0], // unreachable: the form is a for's
+            else => continue,
+        };
+        if (tree.firstToken(node) < first or tree.lastToken(node) > last) continue;
+        if (!try entriesOf(c, file, table, owner)) continue;
+        if (try within(c, file, operand, table, false)) return true;
+    }
+    return false;
 }
 
 /// Whether `table` is memory of `owner`'s entries.

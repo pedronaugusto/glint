@@ -977,8 +977,8 @@ fn addFunction(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.In
     @memset(levels, .clean);
     const writes = try c.allocator.alloc(Dep, params.items.len);
     @memset(writes, .{});
-    const id: Function.Id = @fromBackingInt(@intCast(flow.functions.items.len));
     try flow.functions.append(c.allocator, .{ .file = file, .node = node, .params = params.items, .levels = levels, .writes = writes, .fixed = fixed });
+    const id: Function.Id = @fromBackingInt(@intCast(flow.functions.items.len - 1));
     try flow.by_node.put(c.allocator, .{ .file = file, .node = node }, id);
     return id;
 }
@@ -5163,30 +5163,35 @@ fn openUnit(c: *Context) Context.Error!*OpenUnit {
     unit.built = true;
     const gpa = c.facts.gpa;
     var inputs: std.ArrayList(Project.Input) = .empty;
-    unit.in_unit = try gpa.alloc(?Project.FileId, c.project.sources.len);
-    @memset(unit.in_unit, null);
+    // Each run file's position among std's inputs, which the project made of them keeps: its
+    // ids are read from that project's own sources once it is made.
+    const positions = try gpa.alloc(?u32, c.project.sources.len);
+    defer gpa.free(positions);
+    @memset(positions, null);
     for (c.project.sources) |*each| {
         if (!try c.facts.standard(each.id)) continue;
-        unit.in_unit[@backingInt(each.id)] = @fromBackingInt(@intCast(inputs.items.len));
+        positions[@backingInt(each.id)] = @intCast(inputs.items.len);
         var input = each.input;
         input.selected = false;
         try inputs.append(gpa, input);
     }
     var imports: std.ArrayList(Project.Import) = .empty;
-    var root: ?Project.FileId = null;
+    var root: ?u32 = null;
     var named = false;
     for (c.project.imports) |edge| {
-        const target = unit.in_unit[@backingInt(edge.target)] orelse continue;
+        const target = positions[@backingInt(edge.target)] orelse continue;
         const by_name = std.mem.eql(u8, edge.spelling, Project.std_module);
         if (by_name) root = target;
-        const from = unit.in_unit[@backingInt(edge.from)] orelse continue;
+        const from = positions[@backingInt(edge.from)] orelse continue;
         named = named or by_name;
-        try imports.append(gpa, .{ .from = @backingInt(from), .spelling = edge.spelling, .target = @backingInt(target), .compilation = edge.in });
+        try imports.append(gpa, .{ .from = from, .spelling = edge.spelling, .target = target, .compilation = edge.in });
     }
     // std's module may import itself by its name: where no file of std does, its root does, so
     // std alone knows its files (`Facts.outside`) as a program importing it does.
-    if (!named) if (root) |file| try imports.append(gpa, .{ .from = @backingInt(file), .spelling = Project.std_module, .target = @backingInt(file) });
+    if (!named) if (root) |file| try imports.append(gpa, .{ .from = file, .spelling = Project.std_module, .target = file });
     unit.project = Project.init(gpa, inputs.items, imports.items, .{ .store = c.project.store }) catch |err| std.debug.panic("summary cross-check: std alone does not make a project: {t}", .{err});
+    unit.in_unit = try gpa.alloc(?Project.FileId, c.project.sources.len);
+    for (positions, unit.in_unit) |position, *file| file.* = if (position) |at| unit.project.sources[at].id else null;
     unit.facts = try gpa.create(Facts);
     unit.facts.* = .{ .project = &unit.project, .gpa = gpa, .open_world = true };
     unit.context = c.*;

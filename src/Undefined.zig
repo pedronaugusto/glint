@@ -2966,10 +2966,10 @@ fn vtableSlot(c: *Context, file: Project.FileId, function: Ast.Node.Index) Conte
 /// (`std_interface_implementations`).
 fn installed(c: *Context, slot: Slot) Context.Error!?[]const Facts.Decl {
     var files: std.ArrayList(Project.FileId) = .empty;
-    for (0..c.project.count()) |i| {
-        const file: Project.FileId = @fromBackingInt(@intCast(i));
+    for (c.project.sources) |*source| {
+        const file = source.id;
         if (try inStd(c, file)) continue;
-        if (c.project.at(file).file.status != .parsed) return null;
+        if (source.file.status != .parsed) return null;
         try files.append(c.allocator, file);
     }
     const stored = (try c.facts.fieldStores(slot.field, files.items)) orelse return null;
@@ -4484,15 +4484,15 @@ fn nameGiven(facts: *Facts, source: *const Project.Source, node: Ast.Node.Index,
     } else return null;
     // A function is declared at its prototype.
     const prototype = tree.nodeData(function).node_and_node[0];
-    const declared = for (model.declarations, 0..) |record, i| {
-        if (record.kind == .function and record.node == prototype) break i;
+    const declared: Model.Declaration.Id = for (model.declarations, 0..) |record, i| {
+        if (record.kind == .function and record.node == prototype) break @fromBackingInt(@intCast(i));
     } else return null;
     var buffer: [1]Ast.Node.Index = undefined;
     const proto = tree.fullFnProto(&buffer, prototype) orelse return null;
     var it = proto.iterate(tree);
     var index: usize = 0;
     while (it.next()) |param| : (index += 1) {
-        if (param.name_token == decl.token) return .{ .function = .{ .file = source.id, .index = @fromBackingInt(@intCast(declared)) }, .index = index };
+        if (param.name_token == decl.token) return .{ .function = .{ .file = source.id, .index = declared }, .index = index };
     }
     return null;
 }

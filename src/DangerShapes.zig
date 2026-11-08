@@ -937,10 +937,10 @@ fn owns(c: *Context, rule: Rule, resources: []const ?Facts.Container, holder: Fa
     }
     // A write to part of it (`s.files[0] = opened()`), as accesses finds it.
     if (for (model.declarations, 0..) |each, i| {
-        if (each.kind == .field and each.node == decl.node) break i;
+        if (each.kind == .field and each.node == decl.node) break @as(Model.Declaration.Id, @fromBackingInt(@intCast(i)));
     } else null) |at| {
         const in_file = [_]Project.FileId{file};
-        var found_sites = Facts.accesses.writes(c.facts, .{ .field = .{ .file = file, .index = @fromBackingInt(@intCast(at)) } }, &in_file);
+        var found_sites = Facts.accesses.writes(c.facts, .{ .field = .{ .file = file, .index = at } }, &in_file);
         while (try found_sites.next()) |site| {
             // A program the unit is read for may fill it with anything.
             if (site.kind == .open) doubt = true;
