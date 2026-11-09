@@ -516,6 +516,10 @@ pub const Flow = struct {
     /// the allocator a size; not known where std's allocator does not resolve.
     allocations: std.AutoHashMapUnmanaged(Facts.Decl, void) = .empty,
     allocations_known: bool = true,
+    /// std's frees: `Allocator.rawFree`, `free` and `destroy`, by their declarations. A free
+    /// gives back memory judged where it was allocated: it sizes nothing and writes nothing
+    /// the program reads, and its body (a call through the allocator's vtable) is not read.
+    frees: std.AutoHashMapUnmanaged(Facts.Decl, void) = .empty,
     /// Per function of a summary, the value slots it sizes only as a count: a loop bounded by
     /// the parameter (`for (0..n)`), or a callee's count it is handed. A count takes a caller's
     /// number, never a length (`countDep`). Kept beside the functions, absent for one with none.
@@ -797,6 +801,15 @@ fn known(c: *Context, flow: *Flow) Context.Error!void {
         },
         .none => {},
         .unknown => flow.allocations_known = false,
+    };
+    for ([_][]const u8{ "mem.Allocator.rawFree", "mem.Allocator.free", "mem.Allocator.destroy" }) |path| switch (try Governed.declarations(c, "std", path)) {
+        .decls => |decls| for (decls) |decl| switch (try c.facts.origin(decl)) {
+            .decl => |origin| try flow.frees.put(c.allocator, origin, {}),
+            .none => try flow.frees.put(c.allocator, decl, {}),
+            // A free whose alias does not resolve is read as any call is.
+            .unknown => {},
+        },
+        .none, .unknown => {},
     };
     for (((try Governed.declarations(c, "std", "zig.Ast.parse")).orNull()) orelse &.{}) |decl| {
         try flow.zig_parse.put(c.allocator, decl, {});
@@ -1797,6 +1810,8 @@ fn accounting(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.E
 /// to, a destination copied into.
 fn outsideWrites(c: *Context, flow: *Flow, function: Function.Id, callee: Callee) Context.Error!void {
     const decl = callee.decl orelse return;
+    // A free writes nothing the program reads again (`Flow.frees`).
+    if (try freeing(c, flow, decl)) return;
     var given: Dep = .{};
     for (callee.args) |arg| given = try given.join(c.allocator, try passed(c, flow, function, arg, try whole(c, flow, function, arg)));
     const writes = try mutableParams(c, decl);
@@ -4936,6 +4951,8 @@ fn sizeSites(c: *Context, sized: *Flow, file: Project.FileId, callee: Callee, ou
         .program => if (judged(c, callee.decl.?.file)) return, // unreachable: a program callee has its declaration
         .none, .source, .outside, .aegis => {},
     }
+    // A free is no site: it sizes nothing (`Flow.frees`).
+    if (callee.decl) |decl| if (try freeing(c, sized, decl)) return;
     const summary = try sizesOf(c, sized, callee.decl);
     // Taken through a call every instantiation does not resolve: the one this call makes may
     // decide it, read where a rule asks (`decidedSite`).
@@ -5247,6 +5264,16 @@ fn allocation(c: *Context, flow: *const Flow, decl: Facts.Decl) Context.Error!Al
     return if (flow.allocations.contains(origin)) .yes else .no;
 }
 
+/// Whether `decl` is one of std's frees (`Flow.frees`), by the declaration it aliases; one
+/// whose alias does not resolve is not.
+fn freeing(c: *Context, flow: *const Flow, decl: Facts.Decl) Context.Error!bool {
+    return switch (try c.facts.origin(decl)) {
+        .decl => |origin| flow.frees.contains(origin),
+        .none => flow.frees.contains(decl),
+        .unknown => false,
+    };
+}
+
 /// The summary of the code outside the program that `main`'s calls reach, grown by `calls`:
 /// from each function outside the program one of them calls, through each function that one
 /// calls, what each body sizes work by, as every instantiation reads it. A function read is
@@ -5374,8 +5401,10 @@ fn reach(c: *Context, flow: *Flow, decl: Facts.Decl, env: ?*const Facts.Env, nex
     // What it keeps in the run's solve stays for the run.
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
-    // An allocation is a sink itself; one whose alias does not resolve has no body read.
+    // An allocation is a sink itself; one whose alias does not resolve has no body read. A
+    // free sizes and writes nothing (`Flow.frees`).
     if (try allocation(c, flow, decl) != .no) return;
+    if (try freeing(c, flow, decl)) return;
     if (flow.own(decl.file) and judged(c, decl.file)) return;
     const node = fnDecl(c, decl) orelse return;
     if (flow.by_node.get(.{ .file = decl.file, .node = node })) |known_id| return readIn(c, flow, known_id, env, next);
@@ -5616,6 +5645,8 @@ fn sizedOutside(c: *Context, flow: *Flow, function: Function.Id, callee: Callee,
     // The program's own function in a file the run judges (a context's `hash` std calls)
     // sizes its work in its own body, judged there with what it is handed: none here.
     if (callee.decl) |d| if (flow.own(d.file) and judged(c, d.file)) return;
+    // A free gives back memory judged where it was allocated: it sizes nothing.
+    if (callee.decl) |d| if (try freeing(c, flow, d)) return;
     const allocates: Allocation = if (callee.decl) |d| try allocation(c, flow, d) else .unknown;
     for (callee.args, 0..) |arg, position| {
         // An allocation's first parameter is the allocator itself.
