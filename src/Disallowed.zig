@@ -20,6 +20,7 @@ const Governed = @import("Governed.zig");
 const PackageRules = @import("PackageRules.zig");
 const Facts = @import("Facts.zig");
 const Project = @import("Project.zig");
+const Model = @import("Model.zig");
 const Disallowed = @import("Rule.zig").Config.Disallowed;
 
 pub fn check(self: *Context) Context.Error!void {
@@ -297,14 +298,15 @@ fn among(door: []const Facts.Decl, decl: Facts.Decl) bool {
 
 /// What holds each use of `decl`: for a function, each call's holder (`Facts.programCallSites`);
 /// for another container-level declaration, each reference's, in its own file (a private one's
-/// only uses). Judged where any code may use it: a function handed on as a value, a public
-/// function on the package's surface, a public declaration that is no function, or a use held by
+/// only uses). Judged where any code may use it: a function handed on as a value, an exported
+/// function, a public function its package's outside can name (`keptInside`), a public declaration that is no function, or a use held by
 /// no declaration (a test's). Unknown where a call that may be of it does not resolve.
 const Users = union(enum) { holders: []const Facts.Decl, judged, unknown };
 fn usersOf(self: *Context, decl: Facts.Decl) Context.Error!Users {
     const model = &self.project.at(decl.file).model;
     const record = model.declarations[@backingInt(decl.index)];
-    if (record.public and try self.facts.onSurface(decl.file, record.scope)) return .judged;
+    if (record.exported) return .judged;
+    if (record.public and try self.facts.onSurface(decl.file, record.scope) and !try keptInside(self, decl)) return .judged;
     var found: std.ArrayList(Facts.Decl) = .empty;
     if (record.kind == .function) {
         if (try handedOn(self, decl)) return .judged;
@@ -322,6 +324,108 @@ fn usersOf(self: *Context, decl: Facts.Decl) Context.Error!Users {
         try found.append(self.allocator, (try holderOf(self, decl.file, node)) orelse return .judged);
     }
     return .{ .holders = found.items };
+}
+
+/// `keptInside`'s reading of each file's namespace, once per run.
+const Namespaces = struct { map: std.AutoHashMapUnmanaged(Project.FileId, ?[]const []const u8) = .empty };
+
+/// Whether the top-level function `decl`, `pub` though it is, can be named by no one outside its
+/// package: its file's namespace never leaves, and no code of the package hands the function on.
+/// A `pub fn` of an internal file is public to the package's other files alone, so its callers
+/// are all in the program and the door's walk goes on through them.
+fn keptInside(self: *Context, decl: Facts.Decl) Context.Error!bool {
+    const model = &self.project.at(decl.file).model;
+    const record = model.declarations[@backingInt(decl.index)];
+    if (record.kind != .function or record.exported or record.scope != model.root()) return false;
+    const memo = try self.facts.memo(Namespaces);
+    const handed = memo.map.get(decl.file) orelse blk: {
+        const read = try namespaceMembers(self, decl.file);
+        try memo.map.put(self.facts.gpa, decl.file, read);
+        break :blk read;
+    };
+    for (handed orelse return false) |name| if (std.mem.eql(u8, name, record.name)) return false;
+    return true;
+}
+
+/// The members of `file`'s namespace the program uses other than by calling them, where the
+/// namespace stays among the files that import it: each `@import` of it is read at once as a
+/// member (`@import("sys.zig").f()`) or held by a private constant only ever read as one
+/// (`sys.f()`). Null where it may leave: a file a module roots, a file that is itself a type (top-level
+/// fields, whose `pub` methods any holder of a value calls), a file naming itself (`@This()`), or
+/// any other use of an import, which may publish it (`pub const sys = ...`, `const s2 = sys;`,
+/// an `if` choosing it).
+fn namespaceMembers(self: *Context, file: Project.FileId) Context.Error!?[]const []const u8 {
+    if (std.mem.findScalar(Project.FileId, try PackageRules.roots(self.facts), file) != null) return null;
+    if (namesItself(self.project, file)) return null;
+    var handed: std.ArrayList([]const u8) = .empty;
+    for (self.project.imports) |edge| {
+        if (edge.target != file or !edge.in.inProgram()) continue;
+        const model = &self.project.at(edge.from).model;
+        const tree = &self.project.at(edge.from).file.tree;
+        for (model.import_nodes) |node| {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, node, &buffer);
+            if (args.len != 1 or tree.nodeTag(args[0]) != .string_literal) return null;
+            const spelling = std.zig.string_literal.parseAlloc(self.allocator, tree.tokenSlice(tree.nodeMainToken(args[0]))) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidLiteral => return null,
+            };
+            if (!std.mem.eql(u8, spelling, edge.spelling)) continue;
+            const parent = model.parentOf(node) orelse return null;
+            if (tree.nodeTag(parent) == .field_access) {
+                try noteMember(self, edge.from, parent, &handed);
+                continue;
+            }
+            const holder = privateConstantOf(model, tree, parent, node) orelse return null;
+            for (tree.nodes.items(.tag), 0..) |tag, i| {
+                if (Facts.accesses.formOf(tag) != .leaf) continue;
+                const leaf: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                const ref = model.reference(leaf) orelse continue;
+                if (ref.declaration != holder or tree.nodeMainToken(leaf) == model.declarations[@backingInt(holder)].token) continue;
+                const over = model.parentOf(leaf) orelse return null;
+                if (tree.nodeTag(over) != .field_access or tree.nodeData(over).node_and_token[0] != leaf) return null;
+                try noteMember(self, edge.from, over, &handed);
+            }
+        }
+    }
+    return handed.items;
+}
+
+/// Adds the name of the member read at `access`, unless the read is a call of it.
+fn noteMember(self: *Context, file: Project.FileId, access: Ast.Node.Index, handed: *std.ArrayList([]const u8)) Context.Error!void {
+    if (try Facts.accesses.useOf(self.facts, file, access) == .callee) return;
+    const tree = &self.project.at(file).file.tree;
+    try handed.append(self.facts.gpa, tree.tokenSlice(tree.nodeData(access).node_and_token[1]));
+}
+
+/// The private declaration `declaration_node` writes, whose whole value is `value`.
+fn privateConstantOf(model: *const Model, tree: *const Ast, declaration_node: Ast.Node.Index, value: Ast.Node.Index) ?Model.Declaration.Id {
+    const written = tree.fullVarDecl(declaration_node) orelse return null;
+    if (written.ast.init_node.unwrap() != value) return null;
+    for (model.declarations, 0..) |decl, i| {
+        if (decl.node != declaration_node or decl.kind != .variable) continue;
+        return if (decl.public or decl.exported) null else @fromBackingInt(@intCast(i));
+    }
+    return null;
+}
+
+/// Whether `file` declares a field at its top level or names its own namespace (`@This()` in no
+/// container of its own).
+fn namesItself(project: *const Project, file: Project.FileId) bool {
+    const model = &project.at(file).model;
+    const tree = &project.at(file).file.tree;
+    for (model.declarations) |decl| if (decl.kind == .field and decl.scope == model.root()) return true;
+    for (tree.nodes.items(.tag), 0..) |tag, i| switch (tag) {
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@This")) continue;
+            var at = model.scopeOf(tree.nodeMainToken(node));
+            while (model.scopes[@backingInt(at)].kind != .container and model.scopes[@backingInt(at)].kind != .file) at = model.scopes[@backingInt(at)].parent orelse break;
+            if (model.scopes[@backingInt(at)].kind == .file) return true;
+        },
+        else => {},
+    };
+    return false;
 }
 
 /// Whether the function `decl` is used in its own file other than by a call of it: handed on as a
