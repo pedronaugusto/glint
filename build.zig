@@ -47,45 +47,50 @@ pub fn dev(b: *std.Build, tools: type) void {
     b.step("check-token-portable", "Compile the std-only token API at a different pointer width").dependOn(&portable_contract.step);
     const test_step = b.step("test", "Run selected contract tests and benchmark smoke");
     const check = b.step("check", "Compile CLI and tests");
+    // The soundness suite's glint is ReleaseSafe whatever `-Doptimize` says: the suite runs
+    // glint over every case, which costs about 8 times the CPU in Debug, and ReleaseSafe keeps
+    // every safety check.
+    const soundness_optimize = b.option(std.lang.Optimize, "soundness-optimize", "The mode the soundness suite's glint is built in (default: ReleaseSafe)") orelse .safe;
+    const soundness_package = b.dependency("glint", .{ .target = target, .optimize = soundness_optimize });
+    const shakedown = b.dependency("shakedown", .{ .target = target, .optimize = optimize }).module("shakedown");
     // The contract tests, in a few roots that compile and run as parallel steps. The two whose
-    // every test runs the whole analysis many times (the danger rules' and the pack's) are
-    // ReleaseSafe with their glint where `-Doptimize` is Debug, as the soundness suite's glint
-    // is: Debug costs them about 10 times the time, and ReleaseSafe keeps every safety check,
-    // assertion and the testing allocator's leak check. The light roots stay in `-Doptimize`,
+    // every test runs the whole analysis many times (the danger rules' and the pack's) run on
+    // the soundness suite's glint, and are built in its mode, where `-Doptimize` is Debug:
+    // Debug costs them about 10 times the time, and ReleaseSafe keeps every safety check,
+    // assertion and the testing allocator's leak check. The light roots stay on `-Doptimize`'s,
     // where they compile in a fraction of the time. A mode asked of `-Doptimize` other than
-    // Debug is kept, and `-Dunit-optimize` chooses for the heavy two.
-    const unit_optimize = b.option(std.lang.Optimize, "unit-optimize", "The mode the danger rules' and the pack's unit tests and their glint are built in (default: ReleaseSafe where -Doptimize is Debug, else -Doptimize's)") orelse if (optimize == .debug) .safe else optimize;
-    const unit_package = b.dependency("glint", .{ .target = target, .optimize = unit_optimize });
-    const unit_module = unit_package.module("glint");
-    const unit_aegis_dependency = unit_package.builder.dependency("aegis", .{ .target = target, .optimize = unit_optimize });
-    const heavy_imports = [_]std.Build.Module.Import{
-        .{ .name = "aegis", .module = unit_aegis_dependency.module("aegis") },
-        .{ .name = "glint", .module = unit_module },
-        .{ .name = "aegis_sources", .module = aegisSources(b, p, unit_module, unit_aegis_dependency, target) },
-        .{ .name = "shakedown", .module = b.dependency("shakedown", .{ .target = target, .optimize = unit_optimize }).module("shakedown") },
-    };
+    // Debug is kept, and `-Dunit-safe` chooses for the heavy two.
+    const unit_safe = b.option(bool, "unit-safe", "Build the danger rules' and the pack's unit tests on the soundness suite's glint, in -Dsoundness-optimize (default: where -Doptimize is Debug), else on -Doptimize's") orelse (optimize == .debug);
+    const unit_module = if (unit_safe) soundness_package.module("glint") else module;
+    const unit_optimize = if (unit_safe) soundness_optimize else optimize;
     const light_imports = [_]std.Build.Module.Import{
         .{ .name = "aegis", .module = aegis_dependency.module("aegis") },
         .{ .name = "glint", .module = module },
         .{ .name = "aegis_sources", .module = aegisSources(b, p, module, aegis_dependency, target) },
-        .{ .name = "shakedown", .module = b.dependency("shakedown", .{ .target = target, .optimize = optimize }).module("shakedown") },
+        .{ .name = "shakedown", .module = shakedown },
     };
-    const Root = struct { path: []const u8, heavy: bool };
-    for ([_]Root{ .{ .path = "src/tests.zig", .heavy = false }, .{ .path = "src/test_danger.zig", .heavy = true }, .{ .path = "src/test_pack.zig", .heavy = true } }) |root| {
-        const mode = if (root.heavy) unit_optimize else optimize;
-        const imports: []const std.Build.Module.Import = if (root.heavy) &heavy_imports else &light_imports;
-        const tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = p.path(root.path), .target = target, .optimize = mode, .imports = imports }), .filters = if (filter) |f| &.{f} else &.{} });
+    // The heavy roots' aegis is the one their glint imports, so that a value of one is a value
+    // of the other; aegis's source tree they read as data is the same files whatever the mode.
+    const heavy_imports = [_]std.Build.Module.Import{
+        .{ .name = "aegis", .module = unit_module.import_table.get("aegis") orelse @panic("glint's module imports aegis") },
+        .{ .name = "glint", .module = unit_module },
+        .{ .name = "aegis_sources", .module = aegisSources(b, p, unit_module, aegis_dependency, target) },
+        .{ .name = "shakedown", .module = shakedown },
+    };
+    for ([_][]const u8{"src/tests.zig"}) |root| {
+        const tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = p.path(root), .target = target, .optimize = optimize, .imports = &light_imports }), .filters = if (filter) |f| &.{f} else &.{} });
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+        check.dependOn(&tests.step);
+    }
+    for ([_][]const u8{ "src/test_danger.zig", "src/test_pack.zig" }) |root| {
+        const tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = p.path(root), .target = target, .optimize = unit_optimize, .imports = &heavy_imports }), .filters = if (filter) |f| &.{f} else &.{} });
         test_step.dependOn(&b.addRunArtifact(tests).step);
         check.dependOn(&tests.step);
     }
     const library_tests = b.addTest(.{ .root_module = module, .filters = if (filter) |f| &.{f} else &.{} });
     test_step.dependOn(&b.addRunArtifact(library_tests).step);
     // The soundness suite: every case under test/soundness/ on the glint just built, std from
-    // this Zig and aegis as glint pins it, each case compiled by this Zig first. Its glint is ReleaseSafe whatever `-Doptimize` says:
-    // the suite runs glint over every case, which costs about 8 times the CPU in Debug, and
-    // ReleaseSafe keeps every safety check.
-    const soundness_optimize = b.option(std.lang.Optimize, "soundness-optimize", "The mode the soundness suite's glint is built in (default: ReleaseSafe)") orelse .safe;
-    const soundness_package = b.dependency("glint", .{ .target = target, .optimize = soundness_optimize });
+    // this Zig and aegis as glint pins it, each case compiled by this Zig first.
     const soundness = b.addExecutable(.{ .name = "glint-soundness", .root_module = b.createModule(.{
         .root_source_file = p.path("test/soundness/run.zig"),
         .target = target,
