@@ -481,7 +481,7 @@ fn use(w: *Walk, reference: Ast.Node.Index, comptime base: Base, depth: u8) Erro
         else => {},
     }
     if (address) return w.after.append(w.facts.gpa, place);
-    const parent = w.model.parentOf(at).?; // unreachable: checked above
+    const parent = w.model.parentOf(at) orelse return w.fail(.unsupported, place);
     // `if (p.opt) |*o|`: `o` stands for the owner's optional's payload.
     if (w.tree.fullIf(parent)) |branch| if (branch.ast.cond_expr == at) {
         const payload = branch.payload_token orelse return; // a test reads it
