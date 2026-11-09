@@ -6,6 +6,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ### Breaking
 
+- `lint_rules`' `.door` lists a package's other functions that do what it replaces themselves; with every `.with` they are its door (P006). An entry that resolves to no declaration of the package is A001; one that reaches no replaced call is a P006 finding. `.with` and `.door` read through aliases.
+- P006 no longer judges the declaring package's own files that none of its modules reaches (a benchmark measuring the raw call it replaces).
 - Z026 reads five more shapes of an empty error handler as dropping nothing, where they were sites needing a written reason: inside an `errdefer`, or before a `return` of the error in hand; a cancel of an `Io.Future` whose result owns nothing; an `if` whose success branch only releases a held result; a write to standard error through a local writer; a call whose every error is a refusal of its input (in test code, or in production before a fallback below the branch). A reason written at one of these now suppresses nothing, which a strict run (`--strict-suppressions`, preflight) reads as incomplete: a package removes it with the re-pin. `RuleContext.inTestCode` counts a private function only tests name as test code. `Facts.callErrors` and `Facts.declaredErrors` give a call's error names (`Facts.ErrorNames`), and A020 reads std's cancellation points through `declaredErrors`.
 
 - `glint.Unknown`'s `glint.Unknown.std_internal` is `glint.Unknown.zig_own`: Zig's own per-build file, the compiler's `builtin` any file imports or the `root` std reads.

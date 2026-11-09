@@ -25,7 +25,9 @@
 //! every public declaration referenced, and a case it refuses fails the run at its path, or is
 //! open where its rule's `open` list names it (a refused case never passes). A case's
 //! `stubs/<name>.zig` is a module named `<name>` the compiler is given and glint is not: a module
-//! a program has that glint is not handed. A case's files share what is beside them (a `dep.zig` its hole and twin import), which a file
+//! a program has that glint is not handed. A case's `module/module.zig` is a module named
+//! `module` both are given, the files of `module/` selected: a package's published code, the case
+//! a package of its own where a `build.zig.zon` stands beside it. A case's files share what is beside them (a `dep.zig` its hole and twin import), which a file
 //! of one compilation may belong to one module alone, so each kind of file is a compilation of
 //! its own; Zig's cache (`.zig-cache` in the run's directory, the package root) keeps what has
 //! not changed.
@@ -270,7 +272,7 @@ fn compiled(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, tools: Too
     var befores: std.StringHashMapUnmanaged(void) = .empty;
     for (jobs) |job| {
         const rule = columns[job.column].rule;
-        try compilations[@intFromEnum(job.role)].files.append(a, .{ .name = try std.fmt.allocPrint(a, "{s}/{s}", .{ rule, job.path }), .absolute = job.absolute, .listed = job.listed });
+        try compilations[@backingInt(job.role)].files.append(a, .{ .name = try std.fmt.allocPrint(a, "{s}/{s}", .{ rule, job.path }), .absolute = job.absolute, .listed = job.listed });
         const before = job.before orelse continue;
         if ((try befores.getOrPut(a, before)).found_existing) continue;
         const case = std.Io.Dir.path.dirname(job.path) orelse ".";
@@ -348,7 +350,19 @@ fn compile(a: std.mem.Allocator, io: std.Io, tools: Tools, kind: []const u8, fil
 
 /// The `.zig` files of `case`'s `stubs` directory, sorted; none where it has none.
 fn stubsOf(a: std.mem.Allocator, io: std.Io, case: []const u8) ![]const []const u8 {
-    const path = try std.Io.Dir.path.join(a, &.{ case, "stubs" });
+    var out: std.ArrayList([]const u8) = .empty;
+    try out.appendSlice(a, try zigFiles(a, io, try std.Io.Dir.path.join(a, &.{ case, "stubs" })));
+    for (try moduleFiles(a, io, case)) |file| if (std.mem.eql(u8, std.Io.Dir.path.basename(file), "module.zig")) try out.append(a, file);
+    return out.items;
+}
+
+/// The files of a case's own module, `module/`: none where it has none.
+fn moduleFiles(a: std.mem.Allocator, io: std.Io, case: []const u8) ![]const []const u8 {
+    return zigFiles(a, io, try std.Io.Dir.path.join(a, &.{ case, "module" }));
+}
+
+/// The `.zig` files directly in `path`, sorted: none where there is no such directory.
+fn zigFiles(a: std.mem.Allocator, io: std.Io, path: []const u8) ![]const []const u8 {
     var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return &.{},
         else => return err,
@@ -502,6 +516,9 @@ fn judge(gpa: std.mem.Allocator, io: std.Io, store: *glint.Project.Store, rule: 
     try args.appendSlice(a, &.{ "glint", "--only", rule, "--zig-lib-path", lib, "--module", module, "--summary-check" });
     if (job.policy) |config| try args.appendSlice(a, &.{ "--config", config });
     if (job.before) |before| try args.append(a, before);
+    const own = try moduleFiles(a, io, std.Io.Dir.path.dirname(job.absolute) orelse ".");
+    for (own) |file| if (std.mem.eql(u8, std.Io.Dir.path.basename(file), "module.zig")) try args.appendSlice(a, &.{ "--module", try std.fmt.allocPrint(a, "module={s}", .{file}) });
+    try args.appendSlice(a, own);
     try args.append(a, job.absolute);
     const status = try glint.cli.executeStored(gpa, io, args.items, &output.writer, &problems.writer, store);
     return verdictOf(output.written(), status, rule, job.before);

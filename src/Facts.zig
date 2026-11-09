@@ -8385,7 +8385,7 @@ pub fn literalParts(self: *Facts, literal: Key) ResolveError![]const Value {
     return parts;
 }
 
-fn memberName(self: *Facts, raw: []const u8) ResolveError![]const u8 {
+pub fn memberName(self: *Facts, raw: []const u8) ResolveError![]const u8 {
     return Model.identifier(self.gpa, raw);
 }
 

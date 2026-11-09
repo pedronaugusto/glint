@@ -39,9 +39,21 @@ pub const Reference = union(enum) {
     /// It resolves outside the declaring package (std's aside for `.std`): a package declares
     /// rules only for what it declares, so the declarer's own lint reports it.
     foreign: Facts.Decl,
+    /// A member of std's that each target declares in a holder of its own (`std.c.F.FULLFSYNC`,
+    /// `c.F` a different struct per target): that name's declaration in each holder that has one.
+    each_target: []const Facts.Decl,
 
     pub fn declaration(self: Reference) ?Facts.Decl {
         return if (self == .decl) self.decl else null;
+    }
+
+    /// Every declaration it names: the one, or each target's.
+    pub fn declarations(self: *const Reference) []const Facts.Decl {
+        return switch (self.*) {
+            .decl => |*one| @as(*const [1]Facts.Decl, one),
+            .each_target => |all| all,
+            .unresolved, .foreign => &.{},
+        };
     }
 };
 
@@ -50,6 +62,10 @@ pub const Reference = union(enum) {
 /// the other.
 pub const Replace = struct { std: ?Reference = null, symbol: ?[]const u8 = null, with: Reference, why: []const u8 };
 /// A declaration of the package's to move off (Z011's).
+/// A function of the package that itself does the work a replacement stands for (`.door`, P006):
+/// with every `.with`, the package's door. `node` is where the list names it.
+pub const Door = struct { reference: Reference, file: Project.FileId, node: Ast.Node.Index };
+
 pub const Deprecated = struct { decl: Reference, with: ?Reference, why: []const u8 };
 /// What a type means: its role, by the enum literal's name, and the fields only the package may
 /// touch (A001's), by name.
@@ -130,6 +146,7 @@ pub const Rules = struct {
     /// Null where the root declares no `lint_rules`.
     declared: ?Facts.Decl = null,
     replaces: []const Replace = &.{},
+    door: []const Door = &.{},
     deprecated: []const Deprecated = &.{},
     roles: []const Role = &.{},
     pairs: []const Pair = &.{},
@@ -150,6 +167,7 @@ pub fn of(facts: *Facts, root: Project.FileId) Facts.ResolveError!*const Rules {
         try reader.declaration(decl);
         try reader.settlePairs();
         found.replaces = try reader.replaces.toOwnedSlice(facts.gpa);
+        found.door = try reader.door.toOwnedSlice(facts.gpa);
         found.deprecated = try reader.deprecated.toOwnedSlice(facts.gpa);
         found.roles = try reader.roles.toOwnedSlice(facts.gpa);
         found.pairs = try reader.pairs.toOwnedSlice(facts.gpa);
@@ -331,6 +349,7 @@ const Reader = struct {
     /// Each `lint_rules` read, so an `.include` cycle or repeat is read once.
     seen: std.AutoHashMapUnmanaged(Facts.Decl, void) = .empty,
     replaces: std.ArrayList(Replace) = .empty,
+    door: std.ArrayList(Door) = .empty,
     deprecated: std.ArrayList(Deprecated) = .empty,
     /// The part of the rules being read, which a problem found there records.
     part: Problem.Part = .roles,
@@ -372,6 +391,10 @@ const Reader = struct {
                 r.part = .replaces;
                 defer r.part = .roles;
                 for (try r.list(decl.file, field) orelse continue) |entry| try r.replace(decl.file, entry);
+            } else if (std.mem.eql(u8, name, "door")) {
+                r.part = .replaces;
+                defer r.part = .roles;
+                for (try r.list(decl.file, field) orelse continue) |entry| try r.door.append(r.facts.gpa, .{ .reference = try r.reference(decl.file, entry, .own), .file = decl.file, .node = entry });
             } else if (std.mem.eql(u8, name, "deprecated")) {
                 r.part = .deprecated;
                 defer r.part = .roles;
@@ -618,6 +641,7 @@ const Reader = struct {
     /// the member `m` of the container the type function `F` returns, resolved there once.
     /// `.std` must name one of std's; any other, one of the declaring package's.
     fn reference(r: *Reader, file: Project.FileId, node: Ast.Node.Index, whose: enum { std, own }) Error!Reference {
+        if (whose == .std) if (try r.targetMember(file, node)) |each| return each;
         const found: Facts.Decl = switch (try r.generic(file, node)) {
             .decl => |decl| decl,
             .unresolved => {
@@ -641,6 +665,42 @@ const Reader = struct {
             return .{ .foreign = found };
         }
         return .{ .decl = found };
+    }
+
+    /// What `node` names where it is a member of a choice of holders, as std's per-target
+    /// constants are: the name's declaration in each part that declares it. A target whose
+    /// holder has no such name (`void`, a struct without it) has nothing to replace; a part that
+    /// does not resolve, or a name no part declares, leaves it unresolved. Null where `node` is
+    /// no member of a choice.
+    fn targetMember(r: *Reader, file: Project.FileId, node: Ast.Node.Index) Error!?Reference {
+        const t = r.tree(file);
+        if (Facts.accesses.formOf(t.nodeTag(node)) != .member) return null;
+        const holder_node, const name_token = t.nodeData(node).node_and_token;
+        const holder = try r.facts.resolve(file, holder_node);
+        if (holder != .alternatives) return null;
+        const name = try r.facts.memberName(t.tokenSlice(name_token));
+        var found: std.ArrayList(Facts.Decl) = .empty;
+        for (Facts.valueParts(&holder)) |part| switch (part) {
+            .container, .instance => |container| if (r.facts.member(container, name)) |decl| {
+                if (!try r.facts.standard(decl.file)) {
+                    try r.problem(file, node, .foreign);
+                    return .{ .foreign = decl };
+                }
+                for (found.items) |known| {
+                    if (std.meta.eql(known, decl)) break;
+                } else try found.append(r.facts.gpa, decl);
+            },
+            .unknown => {
+                try r.problem(file, node, .unresolved);
+                return .unresolved;
+            },
+            else => {},
+        };
+        if (found.items.len == 0) {
+            try r.problem(file, node, .unresolved);
+            return .unresolved;
+        }
+        return .{ .each_target = found.items };
     }
 
     /// What a `.{ .generic = F, .member = .m }` names: the member `m` of the container the type
@@ -856,6 +916,65 @@ test "a replacement names a std declaration or an external symbol, one of the tw
     var whys: [4]Problem.Why = undefined;
     for (rules.problems, 0..) |problem, i| whys[i] = problem.why;
     try std.testing.expectEqualSlices(Problem.Why, &.{ .malformed, .malformed }, whys[0..rules.problems.len]);
+}
+
+test "a door entry names a declaration of the package: one that does not resolve or is another's is a problem where it is written, the rest read" {
+    var f: Fixture = undefined;
+    try f.init(&.{
+        .{ .name = "pkg/root.zig", .package = "pkg", .fingerprint = 7, .bytes =
+        \\const other = @import("other");
+        \\pub fn publish() void {}
+        \\pub fn flush() void {}
+        \\const Ns = struct {};
+        \\pub const lint_rules = .{
+        \\    .version = 1,
+        \\    .door = .{ flush, Ns.gone, other.thing },
+        \\};
+        },
+        .{ .name = "other/root.zig", .package = "other", .fingerprint = 8, .selected = false, .bytes = "pub fn thing() void {}\n" },
+    }, &.{.{ .from = 0, .spelling = "other", .target = 1 }});
+    defer f.deinit();
+    const rules = try of(&f.facts, f.project.sources[0].id);
+    try std.testing.expectEqual(@as(usize, 3), rules.door.len);
+    try std.testing.expectEqualStrings("flush", f.name(rules.door[0].reference));
+    var whys: [4]Problem.Why = undefined;
+    for (rules.problems, 0..) |problem, i| whys[i] = problem.why;
+    try std.testing.expectEqualSlices(Problem.Why, &.{ .unresolved, .foreign }, whys[0..rules.problems.len]);
+    for (rules.problems) |problem| try std.testing.expectEqual(Problem.Part.replaces, problem.part);
+}
+
+test "a replaced std member each target declares in a holder of its own is read in every holder that has it" {
+    var f: Fixture = undefined;
+    try f.init(&.{
+        .{ .name = "pkg/root.zig", .package = "pkg", .fingerprint = 7, .bytes =
+        \\const std = @import("std");
+        \\pub fn publish() void {}
+        \\pub const lint_rules = .{
+        \\    .version = 1,
+        \\    .replaces = .{
+        \\        .{ .std = std.F.BOTH, .with = publish, .why = "two targets" },
+        \\        .{ .std = std.F.ONE, .with = publish, .why = "one target" },
+        \\        .{ .std = std.F.NONE, .with = publish, .why = "no target" },
+        \\    },
+        \\};
+        },
+        .{ .name = "std", .selected = false, .bytes =
+        \\const native = @import("builtin").os.tag;
+        \\pub const F = switch (native) {
+        \\    .macos => struct { pub const BOTH = 1; pub const ONE = 2; },
+        \\    .linux => struct { pub const BOTH = 3; },
+        \\    else => void,
+        \\};
+        },
+    }, &.{.{ .from = 0, .spelling = "std", .target = 1 }});
+    defer f.deinit();
+    const rules = try of(&f.facts, f.project.sources[0].id);
+    try std.testing.expectEqual(@as(usize, 3), rules.replaces.len);
+    try std.testing.expectEqual(@as(usize, 2), rules.replaces[0].std.?.declarations().len);
+    try std.testing.expectEqual(@as(usize, 1), rules.replaces[1].std.?.declarations().len);
+    try std.testing.expectEqual(@as(usize, 0), rules.replaces[2].std.?.declarations().len);
+    try std.testing.expectEqual(@as(usize, 1), rules.problems.len);
+    try std.testing.expectEqual(Problem.Why.unresolved, rules.problems[0].why);
 }
 
 test "a fork's copy of a package is the package by its stated identity, wherever its tree is" {

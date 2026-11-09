@@ -1,0 +1,1 @@
+.{ .name = .door, .version = "0.0.0", .fingerprint = 0x4d5a6b7c8d9eaf10, .minimum_zig_version = "0.17.0", .paths = .{""} }

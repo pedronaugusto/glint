@@ -855,6 +855,48 @@ test "P006 reads the replacements a package declares as one door: what only they
     try std.testing.expectEqualSlices(u32, &.{}, airlockLines(unresolved, &buffer));
 }
 
+test "P006 leaves the declarer's files no module of its reaches, and judges a file a module reaches and another package's" {
+    const P = glint.Project;
+    const raw = "const std = @import(\"std\");\npub fn probe() void {\n    std.posix.fdatasync(1);\n}\n";
+    const inputs = [_]P.Input{
+        .{ .name = "airlock/root.zig", .package = "airlock", .fingerprint = 2, .bytes = "const std = @import(\"std\");\nconst part = @import(\"part.zig\");\npub fn syncFile(fd: i32) void {\n    std.posix.fdatasync(fd);\n    part.probe();\n}\npub const lint_rules = .{ .version = 1, .replaces = .{.{ .std = std.posix.fdatasync, .with = syncFile, .why = \"durable\" }} };\n" },
+        .{ .name = "airlock/part.zig", .package = "airlock", .fingerprint = 2, .bytes = raw ++ "pub fn other() void {\n    probe();\n}\n" },
+        .{ .name = "airlock/bench/main.zig", .package = "airlock", .fingerprint = 2, .bytes = "const airlock = @import(\"airlock\");\nconst baseline = @import(\"baseline.zig\");\npub fn main() void {\n    airlock.syncFile(1);\n    baseline.probe();\n}\n" },
+        .{ .name = "airlock/bench/baseline.zig", .package = "airlock", .fingerprint = 2, .bytes = raw },
+        .{ .name = "app/main.zig", .package = "app", .fingerprint = 1, .bytes = "const airlock = @import(\"airlock\");\nconst std = @import(\"std\");\npub fn main() void {\n    airlock.syncFile(1);\n    std.posix.fdatasync(1);\n}\n" },
+        .{ .name = "std/std.zig", .selected = false, .bytes = "pub const posix = @import(\"posix.zig\");\n" },
+        .{ .name = "std/posix.zig", .selected = false, .bytes = "pub fn fdatasync(fd: i32) void {\n    _ = fd;\n}\n" },
+    };
+    const imports = [_]P.Import{
+        .{ .from = 0, .spelling = "std", .target = 5 },
+        .{ .from = 0, .spelling = "part.zig", .target = 1 },
+        .{ .from = 1, .spelling = "std", .target = 5 },
+        .{ .from = 2, .spelling = "airlock", .target = 0 },
+        .{ .from = 2, .spelling = "baseline.zig", .target = 3 },
+        .{ .from = 3, .spelling = "std", .target = 5 },
+        .{ .from = 4, .spelling = "airlock", .target = 0 },
+        .{ .from = 4, .spelling = "std", .target = 5 },
+        .{ .from = 5, .spelling = "posix.zig", .target = 6 },
+    };
+    var project = try P.init(std.testing.allocator, &inputs, &imports, .{});
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.selections = &.{.{ .rule = .P006, .level = .gate }};
+    var report = try glint.run(std.testing.allocator, &project, config);
+    defer report.deinit();
+    try std.testing.expect(report.complete);
+    // The module's part, reached from outside the door by `other` (line 3), and the importer (5);
+    // neither benchmark file, the baseline's raw call included.
+    var files: [4]u32 = undefined;
+    var n: usize = 0;
+    for (report.diagnostics) |d| {
+        files[n] = @backingInt(d.span.file);
+        n += 1;
+    }
+    std.mem.sort(u32, files[0..n], {}, std.sort.asc(u32));
+    try std.testing.expectEqualSlices(u32, &.{ 1, 4 }, files[0..n]);
+}
+
 /// airlock's replacement reached through a chain of `steps` private functions, each called once by
 /// the next: every one of them only the replacement reaches.
 fn chained(steps: usize) ![]u8 {
