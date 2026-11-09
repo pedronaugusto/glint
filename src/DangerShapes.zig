@@ -1966,8 +1966,7 @@ fn leafViewed(c: *Context, resources: []const ?Facts.Container, file: Project.Fi
                 .unknown => return false,
             };
             if (call.receiver != .bound or args.len != 1) return false;
-            const method = (try Facts.accesses.memberRead(c.facts, file, call.callee_expr)) orelse return false;
-            if (!std.mem.eql(u8, method.name orelse return false, "borrow")) return false;
+            if (!(try readsOwn(c, file, call.callee_expr, "borrow") orelse false)) return false;
             return try c.role(Contract.library, try c.facts.resolve(file, call.receiver.bound)) == .owned;
         },
         else => {},
@@ -2037,9 +2036,9 @@ fn callViewed(c: *Context, resources: []const ?Facts.Container, file: Project.Fi
         .unknown => return false,
     };
     // An `own.Lent`'s `get()`: a copy its owner lends.
-    if (call.receiver == .bound and args.len == 1) if (try Facts.accesses.memberRead(c.facts, file, call.callee_expr)) |method| {
-        if (std.mem.eql(u8, method.name orelse "", "get") and try c.role(Contract.library, try c.facts.resolve(file, call.receiver.bound)) == .lent) return true;
-    };
+    if (call.receiver == .bound and args.len == 1 and (try readsOwn(c, file, call.callee_expr, "get") orelse false)) {
+        if (try c.role(Contract.library, try c.facts.resolve(file, call.receiver.bound)) == .lent) return true;
+    }
     // One that does not resolve is no view: what it gives is judged an owner. Of a choice, each
     // must give one.
     const choices: []const Facts.Decl = switch (call.callee) {
@@ -2632,8 +2631,14 @@ fn guardRelease(c: *Context, callee: Facts.calls.Callee) Context.Error!bool {
     for (each) |choice| {
         const decl = (try originKnown(c, choice)) orelse return false;
         const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
-        if (record.kind != .function or !(std.mem.eql(u8, record.name, "deinit") or std.mem.eql(u8, record.name, "release"))) return false;
-        switch (try guardType(c, .{ .file = decl.file, .scope = record.scope })) {
+        if (record.kind != .function) return false;
+        // The guard type's own `deinit` or `release`, by the declaration it gives the name.
+        const guard: Facts.Container = .{ .file = decl.file, .scope = record.scope };
+        const own = for ([_][]const u8{ "deinit", "release" }) |name| {
+            if (c.facts.member(guard, name)) |declared| if (std.meta.eql(declared, decl)) break true;
+        } else false;
+        if (!own) return false;
+        switch (try guardType(c, guard)) {
             .plain, .ranked => {},
             .no, .unknown => return false,
         }
@@ -4368,7 +4373,7 @@ fn borrow(c: *Context, tree: *const Ast, namespaces: []const ?Facts.Container, n
         return borrow(c, tree, namespaces, path.steps[1].node);
     }
     if (try Facts.accesses.memberRead(c.facts, c.file, node)) |step| {
-        if (!std.mem.eql(u8, step.name orelse return null, "items")) return null;
+        if (!(try readsOwn(c, c.file, node, "items") orelse false)) return null;
         return if (try ofStd(c, namespaces, step.receiver.?)) "items" else null; // unreachable: a member's step has its holder
     }
     // A payload, a slice: of what holds it.
@@ -4380,8 +4385,7 @@ fn borrow(c: *Context, tree: *const Ast, namespaces: []const ?Facts.Container, n
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, node) orelse return null;
     const method = (try Facts.accesses.memberRead(c.facts, c.file, call.ast.fn_expr)) orelse return null;
-    const spelled = method.name orelse return null;
-    for ([_][]const u8{ "getPtr", "getEntry", "getKeyPtr", "keys", "values" }) |each| if (std.mem.eql(u8, spelled, each)) {
+    for ([_][]const u8{ "getPtr", "getEntry", "getKeyPtr", "keys", "values" }) |each| if (try readsOwn(c, c.file, call.ast.fn_expr, each) orelse false) {
         return if (try ofStd(c, namespaces, method.receiver.?)) each else null; // unreachable: a member's step has its holder
     };
     return null;
@@ -4450,9 +4454,9 @@ fn settled(c: *Context, store: Ast.Node.Index, value: Ast.Node.Index) Context.Er
         };
         // A list freed at all, wherever the free is written (a `defer` before the store runs
         // after it), leaves the borrow pointing at freed memory.
-        const member = ((try Facts.accesses.memberRead(c.facts, c.file, parent)) orelse return false).name orelse return false;
+        // By the declaration the list's own type gives each name; one not shown may free.
         for ([_][]const u8{ "deinit", "clearAndFree", "shrinkAndFree", "toOwnedSlice", "toOwnedSliceSentinel", "moveToUnmanaged", "clearRetainingCapacity" }) |frees| {
-            if (std.mem.eql(u8, member, frees)) return false;
+            if (try readsOwn(c, c.file, parent, frees) orelse true) return false;
         }
         var up_from = node;
         while (model.parentOf(up_from)) |outer| : (up_from = outer) {
@@ -4464,6 +4468,18 @@ fn settled(c: *Context, store: Ast.Node.Index, value: Ast.Node.Index) Context.Er
         }
     }
     return true;
+}
+
+/// Whether the member read `node` is the declaration its holder's own type gives `name` (an
+/// `own.Owned`'s `borrow`, a std list's `items`): what Zig resolves the name it spells to in the
+/// type its holder is, through pointers and optionals. Null where the holder's type does not
+/// resolve to one container (a choice per build among them), or the spelled name to nothing.
+fn readsOwn(c: *Context, file: Project.FileId, node: Ast.Node.Index, name: []const u8) Context.Error!?bool {
+    const step = (try Facts.accesses.memberRead(c.facts, file, node)) orelse return false;
+    const holder = byPointer(step.holder orelse return null) orelse return null;
+    const declared = c.facts.member(holder, name) orelse return false;
+    const named = c.facts.member(holder, step.name orelse return null) orelse return null;
+    return std.meta.eql(named, declared);
 }
 
 /// Whether a value is a container declared in one of std's container namespaces.

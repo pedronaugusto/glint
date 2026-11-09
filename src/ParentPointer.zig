@@ -1318,14 +1318,13 @@ fn spawnArguments(c: *Context, decl: Facts.Decl, index: usize) Context.Error!boo
     var at: usize = 0;
     var function: ?Ast.TokenIndex = null;
     while (it.next()) |param| : (at += 1) {
-        const name = tree.tokenSlice(param.name_token orelse return false);
+        if (param.name_token == null) return false;
         if (at + 1 == index) {
             if (param.anytype_ellipsis3 == null) return false;
             function = param.name_token;
         }
         if (at != index) continue;
-        if (!std.mem.eql(u8, name, "args")) return false;
-        // `std.meta.ArgsTuple(@TypeOf(function))`.
+        // The arguments by their type, `std.meta.ArgsTuple(@TypeOf(function))`.
         var call_buffer: [1]Ast.Node.Index = undefined;
         const tuple = tree.fullCall(&call_buffer, param.type_expr orelse return false) orelse return false;
         // The function the tuple's type is made by, as `spawned` reads a callee.
@@ -1832,6 +1831,31 @@ fn stdMember(c: *Context, decl: Facts.Decl, list: List, names: []const []const u
     return false;
 }
 
+/// Whether a literal's field named `name` is one of `list`'s links, should the literal be a list
+/// of that kind or its node: the field std's list type or its node type declares by that name
+/// is a link (a list's `first`, `last`; a node's `next`, `prev`), by declaration. Where std's
+/// types could not be read, it may be.
+fn linkNamed(c: *Context, list: List, name: []const u8) Context.Error!bool {
+    // The list's type, then its `Node`.
+    const paths: [2][]const u8 = switch (list) {
+        .doubly => .{ "DoublyLinkedList", "DoublyLinkedList.Node" },
+        .singly => .{ "SinglyLinkedList", "SinglyLinkedList.Node" },
+    };
+    for (paths, [_]bool{ false, true }) |path, node| {
+        const decls = switch (try Governed.declarations(c, "std", path)) {
+            .decls => |each| each,
+            .none => continue,
+            .unknown => return true,
+        };
+        for (decls) |found| {
+            const container = held(try c.facts.declaration(found)) orelse continue;
+            const field = c.facts.member(container, name) orelse continue;
+            if (try stdMember(c, field, list, if (node) &.{ "next", "prev" } else &.{ "first", "last" }, node)) return true;
+        }
+    }
+    return false;
+}
+
 fn joinSource(a: ?Source, b: Source) ?Source {
     const first = a orelse return b;
     if (first == .same) return b;
@@ -1962,9 +1986,7 @@ fn listsInPlace(c: *Context, list: List) Context.Error!bool {
                     const first = tree.firstToken(value);
                     if (first < 2 or tree.tokenTag(first - 2) != .identifier) continue;
                     const name = try Model.identifier(c.allocator, tree.tokenSlice(first - 2));
-                    const is_link = for ([_][]const u8{ "first", "last", "next", "prev" }) |link| {
-                        if (std.mem.eql(u8, name, link)) break true;
-                    } else false;
+                    const is_link = try linkNamed(c, list, name);
                     const plain = Facts.ungrouped(tree, value);
                     if (is_link and !Facts.isNull(tree, plain)) linked = true;
                 }
