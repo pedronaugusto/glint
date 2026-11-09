@@ -3813,6 +3813,362 @@ pub fn uncountedMake(c: *Context, file: Project.FileId, call: Ast.Node.Index) Co
     };
 }
 
+/// How a make forges a table's own id (`forgeries`): bits taken from other data.
+pub const Form = enum {
+    /// A conversion making the id itself, or a cast to it or to a pointer to it
+    /// (`uncountedMake`): what Taint's `uncounted_id` fact starts at.
+    conversion,
+    /// A `@bitCast` to a type that holds one.
+    bits,
+    /// A `@ptrCast`, `@ptrFromInt` or `@extern` to a pointer to memory that holds one, read as
+    /// that type from now on.
+    cast_to,
+    /// A `@ptrCast` of a pointer to memory that holds one to another type: what is written
+    /// through the result writes the id.
+    cast_from,
+    /// A union without a tag (bare, `extern`, `packed`) with a member that holds one: a store
+    /// to another member is read as it.
+    overlay,
+    /// An `extern` function or variable, or an exported function, whose types hold one: code
+    /// the run does not read makes it.
+    foreign,
+    /// An `asm` whose output holds one.
+    assembly,
+};
+
+/// One make that may forge `of`'s id, or any table's (none): where it is written and how.
+pub const Forgery = struct {
+    file: Project.FileId,
+    node: Ast.Node.Index,
+    of: ?Facts.Container,
+    form: Form,
+    /// For one of any id: only of an id declared outside the program. Code outside the program
+    /// names the program's types only where the program binds them (a generic's reading), so
+    /// what does not resolve there, in no generic, is no type of the program's.
+    outside: bool = false,
+    why: []const u8 = "",
+};
+
+const Forgeries = struct { read: ?[]const Forgery = null };
+var debug_why: []const u8 = "";
+
+/// The table ids a type holds, in its own memory or behind a pointer it holds: `any` where a
+/// part of it does not resolve.
+const Held = struct {
+    any: bool = false,
+    /// Any id declared outside the program (`Forgery.outside`).
+    outside: bool = false,
+    owners: std.ArrayList(Facts.Container) = .empty,
+
+    fn add(ids: *Held, c: *Context, owner: Facts.Container) Context.Error!void {
+        for (ids.owners.items) |known| if (known.file == owner.file and known.scope == owner.scope) return;
+        try ids.owners.append(c.allocator, owner);
+    }
+};
+
+/// The table ids `value`, a type or a value of it, holds, into `ids` (`Held`).
+fn holders(c: *Context, value: Facts.Value, ids: *Held, seen: *std.ArrayList(Facts.Container), depth: usize) Context.Error!void {
+    if (ids.any) return;
+    if (depth > 64) {
+        ids.any = true;
+        return;
+    }
+    switch (value) {
+        // What this build does not compile, and Zig's own per-build values, hold none of the
+        // program's types.
+        .unknown => |why| if (why != .absent and why != .zig_own) {
+            ids.any = true;
+            debug_why = @tagName(why);
+        },
+        .primitive, .scalar, .error_set, .function, .fn_type => {},
+        .pointer => |pointer| try holders(c, pointer.child.*, ids, seen, depth + 1),
+        .array, .optional, .error_union => |inner| try holders(c, inner.*, ids, seen, depth + 1),
+        .alternatives => |each| for (each) |one| try holders(c, one, ids, seen, depth + 1),
+        .reified => |built| try holders(c, built.fields.*, ids, seen, depth + 1),
+        .reflected, .literal => {
+            ids.any = true;
+            debug_why = @tagName(value);
+        },
+        .container, .instance => |k| {
+            if (ownerOf(c, k)) |owner| {
+                if (try isTable(c, owner)) try ids.add(c, owner);
+                return;
+            }
+            for (seen.items) |known| if (known.file == k.file and known.scope == k.scope and known.made_by == k.made_by) return;
+            try seen.append(c.allocator, k);
+            for (try c.facts.fieldsOf(k)) |index| try holders(c, try c.facts.memberOf(k, .{ .file = k.file, .index = index }), ids, seen, depth + 1);
+        },
+    }
+}
+
+/// What a conversion's result is read into, as a type or a value of it, under `outer`: unknown
+/// where nothing names it, a number where it is another conversion's backing integer.
+fn readInto(c: *Context, file: Project.FileId, node: Ast.Node.Index, outer: ?*const Facts.Env) Context.Error!Facts.Value {
+    return switch ((try destined(c, file, node, outer)) orelse return .{ .unknown = .unresolved }) {
+        .named => |type_node| try typeNamed(c, type_node, outer),
+        .assigned => |lhs| if (outer) |env| try c.facts.resolveBound(env, file, lhs) else try c.facts.resolve(file, lhs),
+        .field => |decl| try c.facts.declaration(decl),
+        .backing, .shifted => .scalar,
+    };
+}
+
+/// The memory a pointer points at, an array's element for the array: what a cast between two
+/// pointers to it leaves as it is. None for what is no pointer.
+fn pointee(value: Facts.Value) ?Facts.Value {
+    var at = value;
+    while (at == .optional) at = at.optional.*;
+    if (at != .pointer) return null;
+    at = at.pointer.child.*;
+    while (at == .array) at = at.array.*;
+    return at;
+}
+
+/// Whether two pointers point at memory of one type: a cast between them changes the pointer's
+/// size or qualifiers alone.
+fn oneMemory(a: Facts.Value, b: Facts.Value) bool {
+    const from = pointee(a) orelse return false;
+    const to = pointee(b) orelse return false;
+    return switch (from) {
+        .container, .instance => |k| switch (to) {
+            .container, .instance => |other| k.file == other.file and k.scope == other.scope and k.made_by == other.made_by and k.symbolic == other.symbolic,
+            else => false,
+        },
+        .primitive => |name| to == .primitive and std.mem.eql(u8, name, to.primitive),
+        else => false,
+    };
+}
+
+const Site = struct { file: Project.FileId, node: Ast.Node.Index, form: Form };
+
+/// What the make at `site` holds in one reading of the function it is in (none: as written).
+fn heldIn(c: *Context, site: Site, outer: ?*const Facts.Env, ids: *Held) Context.Error!void {
+    const tree = &c.project.at(site.file).file.tree;
+    var seen: std.ArrayList(Facts.Container) = .empty;
+    switch (site.form) {
+        .conversion, .overlay, .foreign => unreachable, // unreachable: `forgeries` reads these where they are written
+        .bits, .cast_to => try holders(c, try readInto(c, site.file, site.node, outer), ids, &seen, 0),
+        .cast_from => {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, site.node, &buffer);
+            if (args.len == 0) return;
+            var operand = Facts.ungrouped(tree, args[args.len - 1]);
+            // A cast of alignment or qualifiers hands on the pointer it is given.
+            while (formAt(tree, operand) == .builtin and leavesType(tree.tokenSlice(tree.nodeMainToken(operand)))) {
+                var inner: [2]Ast.Node.Index = undefined;
+                const given = Facts.builtinArgs(tree, operand, &inner);
+                if (given.len == 0) break;
+                operand = Facts.ungrouped(tree, given[given.len - 1]);
+            }
+            const from = if (outer) |env| try c.facts.resolveBound(env, site.file, operand) else try c.facts.resolve(site.file, operand);
+            if (oneMemory(from, try readInto(c, site.file, site.node, outer))) return;
+            try holders(c, from, ids, &seen, 0);
+        },
+        .assembly => {
+            const full = tree.fullAsm(site.node) orelse return;
+            for (full.outputs) |output| {
+                const type_node = tree.nodeData(output).opt_node_and_token[0].unwrap() orelse continue;
+                try holders(c, if (outer) |env| try c.facts.resolveBound(env, site.file, type_node) else try c.facts.resolve(site.file, type_node), ids, &seen, 0);
+            }
+        },
+    }
+}
+
+/// What the make at `site` holds: as written where that resolves, else in each reading the run
+/// compiles its function in. A generic nothing compiled binds holds nothing; a reading that
+/// cannot be made, or a make at a container's level that does not resolve, may hold any.
+/// Memory `std.mem.Allocator`'s own functions hand out or take back holds no value yet, so a
+/// cast there, or in a function only they bind in that reading, forges nothing.
+fn heldAt(c: *Context, site: Site, ids: *Held) Context.Error!void {
+    const raw = try allocatorFile(c);
+    if (raw == site.file) return;
+    var direct: Held = .{};
+    try heldIn(c, site, null, &direct);
+    if (!direct.any) {
+        for (direct.owners.items) |owner| try ids.add(c, owner);
+        return;
+    }
+    if (try unbound(c, site.file, site.node)) {
+        for (direct.owners.items) |owner| try ids.add(c, owner);
+        ids.outside = true;
+        return;
+    }
+    const function = c.facts.functionHolding(site.file, site.node) orelse {
+        ids.any = true;
+        debug_why = "no-function";
+        return;
+    };
+    const readings = (try c.facts.instantiatedReadings(function)) orelse {
+        ids.any = true;
+        debug_why = "readings-null";
+        return;
+    };
+    for (readings) |reading| {
+        const env = reading orelse {
+            ids.any = true;
+            debug_why = if (readings.len == 1) "sole-reading-null" else "a-reading-null";
+            return;
+        };
+        if (raw) |hands_out| if (try c.facts.boundOnlyFrom(function, env, hands_out)) continue;
+        try heldIn(c, site, env, ids);
+    }
+}
+
+/// Whether `node` is written outside the program and in no generic: in no function Zig
+/// analyzes once per instantiation (`Facts.instantiated`). What does not resolve there is no
+/// type of the program's (`Forgery.outside`).
+fn unbound(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    if (try Program.owns(c, file)) return false;
+    const function = c.facts.functionHolding(file, node) orelse return true;
+    return !c.facts.instantiated(function);
+}
+
+/// The file that is `std.mem.Allocator`, by its declaration; none where the run has none.
+fn allocatorFile(c: *Context) Context.Error!?Project.FileId {
+    for (((try Governed.declarations(c, "std", "mem.Allocator")).orNull()) orelse return null) |each| {
+        switch (try c.facts.declaration(each)) {
+            .container => |k| if (c.project.at(k.file).model.scopes[@backingInt(k.scope)].kind == .file) return k.file,
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Every make in what the run reads, std as the program, that may forge a table's own id
+/// (`Form`): the run's answer by type, where the flow to a position does not tell (`sealed`).
+/// A value of an id's type comes only from a make, so a type none of these names holds only
+/// ids counted over its table. This holds for initialized memory: `undefined` and memory
+/// `std.mem.Allocator` hands out hold no value yet and make none, and a read of either before
+/// a write is A019's. A make in test code is none.
+pub fn forgeries(c: *Context) Context.Error![]const Forgery {
+    const memo = try c.facts.memo(Forgeries);
+    if (memo.read) |known| return known;
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
+    var found: std.ArrayList(Forgery) = .empty;
+    if (try declaresIds(c)) for (c.project.sources) |*source| {
+        const file = source.id;
+        const tree = &source.file.tree;
+        for (0..tree.nodes.len) |i| {
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            var ids: Held = .{};
+            var form: Form = undefined;
+            switch (formAt(tree, node)) {
+                .builtin => {
+                    const name = tree.tokenSlice(tree.nodeMainToken(node));
+                    const counts = std.mem.eql(u8, name, "@fromBackingInt") or std.mem.eql(u8, name, "@enumFromInt");
+                    const bits = std.mem.eql(u8, name, "@bitCast");
+                    const cast = std.mem.eql(u8, name, "@ptrCast");
+                    if (!counts and !bits and !cast and !std.mem.eql(u8, name, "@ptrFromInt") and !std.mem.eql(u8, name, "@extern")) continue;
+                    if (try c.inTestCodeOf(file, tree.nodeMainToken(node))) continue;
+                    if ((counts or bits or cast) and try uncountedMake(c, file, node)) {
+                        const of: ?Facts.Container = switch (try madeOf(c, file, node, !counts)) {
+                            .id => |owner| owner,
+                            .other, .unknown => null,
+                        };
+                        try found.append(c.allocator, .{ .file = file, .node = node, .form = .conversion, .of = of, .outside = of == null and try unbound(c, file, node), .why = if (of != null) "" else why: {
+                            if (c.facts.functionHolding(file, node)) |function| {
+                                if (try c.facts.instantiatedReadings(function)) |readings| {
+                                    for (readings) |reading| if (reading == null) break :why if (readings.len == 1) "sole-reading-null" else "a-reading-null";
+                                    break :why "unknown-in-reading";
+                                } else break :why "readings-null";
+                            } else break :why "no-function";
+                        } });
+                        if (counts) continue;
+                    }
+                    if (counts) continue;
+                    form = if (bits) .bits else .cast_to;
+                    try heldAt(c, .{ .file = file, .node = node, .form = form }, &ids);
+                    if (cast) {
+                        try note(c, &found, file, node, form, ids);
+                        ids = .{};
+                        form = .cast_from;
+                        try heldAt(c, .{ .file = file, .node = node, .form = form }, &ids);
+                    }
+                },
+                .@"asm" => {
+                    if (tree.fullAsm(node) == null or try c.inTestCodeOf(file, tree.nodeMainToken(node))) continue;
+                    form = .assembly;
+                    try heldAt(c, .{ .file = file, .node = node, .form = form }, &ids);
+                },
+                else => {
+                    var buffer: [2]Ast.Node.Index = undefined;
+                    var seen: std.ArrayList(Facts.Container) = .empty;
+                    if (tree.fullContainerDecl(&buffer, node)) |declared| {
+                        if (tree.tokenTag(declared.ast.main_token) != .keyword_union) continue;
+                        if (declared.layout_token == null and (declared.ast.enum_token != null or declared.ast.arg != .none)) continue;
+                        if (try c.inTestCodeOf(file, declared.ast.main_token)) continue;
+                        form = .overlay;
+                        for (source.model.declarations) |decl| {
+                            if (decl.kind != .field or source.model.scopes[@backingInt(decl.scope)].node != node) continue;
+                            const field_type = (source.model.containerField(tree, decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
+                            try holders(c, try c.facts.resolve(file, field_type), &ids, &seen, 0);
+                        }
+                        try settle(c, file, node, &ids);
+                    } else if (tree.fullFnProto(buffer[0..1], node)) |proto| {
+                        const token = proto.extern_export_inline_token orelse continue;
+                        if (tree.tokenTag(token) != .keyword_extern and tree.tokenTag(token) != .keyword_export) continue;
+                        form = .foreign;
+                        if (proto.ast.return_type.unwrap()) |result| try holders(c, try c.facts.resolve(file, result), &ids, &seen, 0);
+                        var it = proto.iterate(tree);
+                        while (it.next()) |param| if (param.type_expr) |type_node| try holders(c, try c.facts.resolve(file, type_node), &ids, &seen, 0);
+                        try settle(c, file, node, &ids);
+                    } else if (tree.fullVarDecl(node)) |variable| {
+                        const token = variable.extern_export_token orelse continue;
+                        if (tree.tokenTag(token) != .keyword_extern) continue;
+                        form = .foreign;
+                        try holders(c, try c.facts.resolve(file, variable.ast.type_node.unwrap() orelse continue), &ids, &seen, 0);
+                        try settle(c, file, node, &ids);
+                    } else continue;
+                },
+            }
+            try note(c, &found, file, node, form, ids);
+        }
+    };
+    memo.read = found.items;
+    for (found.items) |each| {
+        if (each.outside) continue;
+        const tree = &c.project.at(each.file).file.tree;
+        const where = tree.tokenLocation(0, tree.nodeMainToken(each.node));
+        std.debug.print("FORGERY {s}:{d} {s} {s} {s}\n", .{ c.project.at(each.file).input.name, where.line + 1, @tagName(each.form), each.why, if (each.of) |owner| blk: {
+            const owner_tree = &c.project.at(owner.file).file.tree;
+            break :blk owner_tree.tokenSlice(owner_tree.firstToken(c.project.at(owner.file).model.scopes[@backingInt(owner.scope)].node) -| 2);
+        } else if (each.outside) "OUTSIDE" else "ANY" });
+    }
+    return found.items;
+}
+
+/// A declaration's types read as written: what does not resolve outside the program, in no
+/// generic, is none of the program's (`unbound`).
+fn settle(c: *Context, file: Project.FileId, node: Ast.Node.Index, ids: *Held) Context.Error!void {
+    if (!ids.any or !try unbound(c, file, node)) return;
+    ids.any = false;
+    ids.outside = true;
+}
+
+/// Each id `ids` names as a forgery at `node`, or one of any id.
+fn note(c: *Context, found: *std.ArrayList(Forgery), file: Project.FileId, node: Ast.Node.Index, form: Form, ids: Held) Context.Error!void {
+    if (ids.any) return found.append(c.allocator, .{ .file = file, .node = node, .form = form, .of = null, .why = debug_why });
+    if (ids.outside) try found.append(c.allocator, .{ .file = file, .node = node, .form = form, .of = null, .outside = true });
+    for (ids.owners.items) |owner| try found.append(c.allocator, .{ .file = file, .node = node, .form = form, .of = owner });
+}
+
+/// Whether the id positioning `memory` at `index` (`ownTable`) is of a type nothing in the run
+/// may forge (`forgeries`); with `beyond_flow`, nothing but the conversions Taint's
+/// `uncounted_id` fact follows to each position.
+pub fn sealed(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: Ast.Node.Index, beyond_flow: bool) Context.Error!bool {
+    const owner = (try ownIndex(c, file, index, memory)) orelse return false;
+    for (try forgeries(c)) |each| {
+        if (beyond_flow and each.form == .conversion) continue;
+        const of = each.of orelse {
+            if (each.outside and try Program.owns(c, owner.file)) continue;
+            return false;
+        };
+        if (of.file == owner.file and of.scope == owner.scope) return false;
+    }
+    return true;
+}
+
 /// The container whose own id `id` may be, by its structure alone: `id` is an enum with a
 /// backing integer whose one member is `_` (no named value, so none is made without a
 /// conversion), declared directly in that container, whatever it is named. Only a candidate:
@@ -3869,7 +4225,7 @@ fn madeOf(c: *Context, file: Project.FileId, call: Ast.Node.Index, pointed: bool
     // A type only a binding decides: what each binding the run compiles makes it. One of a
     // generic nothing compiled binds makes nothing; one that does not resolve stays unknown.
     const function = c.facts.functionHolding(file, call) orelse return .unknown;
-    for ((try c.facts.compiledReadings(function)) orelse return .unknown) |reading| {
+    for ((try c.facts.instantiatedReadings(function)) orelse return .unknown) |reading| {
         const made = try madeIn(c, file, call, pointed, reading orelse return .unknown);
         if (made != .other) return made;
     }

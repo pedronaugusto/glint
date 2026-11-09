@@ -1540,7 +1540,13 @@ fn within(c: *Context, node: Ast.Node.Index, param: Ast.Node.Index) bool {
 /// calls into it, as any sink is.
 fn unprovenIndex(c: *Context, flow: Taint.Fact, rule: Rule, node: Ast.Node.Index, memory: Ast.Node.Index) Context.Error!bool {
     if (!try Range.ownTable(c, c.file, node, memory)) return false;
-    if (try Taint.levelAt(c, try Taint.get(c, Danger.uncounted_ids), c.file, node) == .clean) return true;
+    switch (try Taint.levelAt(c, try Taint.get(c, Danger.uncounted_ids), c.file, node)) {
+        // No conversion the fact follows reaches it: proven where no other make forges the type.
+        .clean => if (try Range.sealed(c, c.file, node, memory, true)) return true,
+        // The flow does not tell: the type's answer for the whole run.
+        .unknown => if (try Range.sealed(c, c.file, node, memory, false)) return true,
+        .data, .number => {},
+    }
     if (flow.flow.recording != null) return false;
     const level = try Taint.levelAt(c, flow, c.file, node);
     const tree = &c.project.at(c.file).file.tree;

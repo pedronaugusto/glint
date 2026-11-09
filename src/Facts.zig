@@ -10799,7 +10799,24 @@ pub fn functionHolding(self: *const Facts, file: Project.FileId, node: Ast.Node.
 /// once that one is decided (as `comptimeTruth`'s `open_met`), so it is the same in any order.
 pub fn compiledReadings(self: *Facts, function: Decl) ResolveError!?[]const ?*const Env {
     if (!self.genericFunction(function)) return &.{null};
-    const read = try self.memo(BoundInRun);
+    return self.readingsBound(function, false);
+}
+
+/// `compiledReadings`, a member of a type function's container read as a generic is: Zig
+/// analyzes it once per instantiation of its container (`instantiated`) and only where it is
+/// used, so each reading is a compiled call's, the container's bindings with it. Its one
+/// reading where Zig analyzes it once.
+pub fn instantiatedReadings(self: *Facts, function: Decl) ResolveError!?[]const ?*const Env {
+    if (!self.instantiated(function)) return &.{null};
+    return self.readingsBound(function, true);
+}
+
+/// `BoundInRun` for `instantiatedReadings`, whose answers for a generic differ where a caller
+/// is a member.
+const BoundMembers = struct { of: BoundInRun = .{} };
+
+fn readingsBound(self: *Facts, function: Decl, comptime members: bool) ResolveError!?[]const ?*const Env {
+    const read: *BoundInRun = if (members) &(try self.memo(BoundMembers)).of else try self.memo(BoundInRun);
     if (read.map.get(function)) |state| switch (state) {
         // One being read (a generic that binds itself) binds nothing of its own yet.
         .reading => |position| {
@@ -10818,7 +10835,7 @@ pub fn compiledReadings(self: *Facts, function: Decl) ResolveError!?[]const ?*co
     try read.map.put(self.gpa, function, .{ .reading = position });
     var found: std.ArrayList(?*const Env) = .empty;
     sites: for (sites) |site| {
-        const outer_readings: []const ?*const Env = if (try self.functionAround(site.file, site.holder)) |outer| (try self.compiledReadings(outer)) orelse &.{null} else &.{null};
+        const outer_readings: []const ?*const Env = if (try self.functionAround(site.file, site.holder)) |outer| (if (members) try self.instantiatedReadings(outer) else try self.compiledReadings(outer)) orelse &.{null} else &.{null};
         for (outer_readings) |outer| {
             if (!try self.reachedUnder(outer, site.file, site.holder)) continue;
             const reading = try self.readingFrom(site.file, site.call, function, outer);
@@ -10838,6 +10855,23 @@ pub fn compiledReadings(self: *Facts, function: Decl) ResolveError!?[]const ?*co
         if (read.lowest >= position) read.lowest = std.math.maxInt(usize);
     } else _ = read.map.remove(function);
     return found.items;
+}
+
+/// Whether every compiled call that binds `function` to `reading` (one of `instantiatedReadings`)
+/// is written in `file`, and some is: what the reading does it does for that file's code alone.
+pub fn boundOnlyFrom(self: *Facts, function: Decl, reading: *const Env, file: Project.FileId) ResolveError!bool {
+    const sites = (try self.scanCallSites(function, .program, .aliases)) orelse return false;
+    var some = false;
+    for (sites) |site| {
+        const outer_readings: []const ?*const Env = if (try self.functionAround(site.file, site.holder)) |outer| (try self.instantiatedReadings(outer)) orelse &.{null} else &.{null};
+        for (outer_readings) |outer| {
+            if (!try self.reachedUnder(outer, site.file, site.holder)) continue;
+            if (try self.readingFrom(site.file, site.call, function, outer) != reading) continue;
+            if (site.file != file) return false;
+            some = true;
+        }
+    }
+    return some;
 }
 
 /// What a rule writes at a generic's body that `boundInRun` says nothing compiled binds.
