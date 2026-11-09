@@ -76,8 +76,8 @@ fn deadDoors(self: *Context) Context.Error!void {
     defer self.file = root;
     var door: std.ArrayList(Facts.Decl) = .empty;
     for (rules.door) |entry| if (entry.reference.declaration()) |decl| try door.append(self.allocator, try throughAliases(self, decl));
-    var live: std.AutoHashMapUnmanaged(Facts.Decl, void) = .empty;
-    var seen: std.AutoHashMapUnmanaged(Facts.Decl, void) = .empty;
+    var live: std.ArrayList(Facts.Decl) = .empty;
+    var seen: std.ArrayList(Facts.Decl) = .empty;
     var pending: std.ArrayList(Facts.Decl) = .empty;
     var uncertain = false;
     const here = PackageRules.Identity.of(self.project, root);
@@ -93,13 +93,14 @@ fn deadDoors(self: *Context) Context.Error!void {
         for (sites.items) |site| {
             if (try inLintRules(self, site.node) or declared.entries[site.index - self.config.disallowed.len].root != root) continue;
             const holder = (try holderOf(self, source.id, site.node)) orelse continue;
-            if ((try seen.getOrPut(self.allocator, holder)).found_existing) continue;
+            if (among(seen.items, holder)) continue;
+            try seen.append(self.allocator, holder);
             try pending.append(self.allocator, holder);
         }
     }
     self.file = root;
     while (pending.pop()) |at| {
-        if (among(door.items, at)) try live.put(self.allocator, at, {});
+        if (among(door.items, at)) try live.append(self.allocator, at);
         if (self.facts.budgetSpent()) {
             uncertain = true;
             break;
@@ -109,7 +110,8 @@ fn deadDoors(self: *Context) Context.Error!void {
             .judged => {},
             .unknown => uncertain = true,
             .holders => |holders| for (holders) |user| {
-                if ((try seen.getOrPut(self.allocator, user)).found_existing) continue;
+                if (among(seen.items, user)) continue;
+                try seen.append(self.allocator, user);
                 try pending.append(self.allocator, user);
             },
         }
@@ -117,7 +119,7 @@ fn deadDoors(self: *Context) Context.Error!void {
     const tree = &self.project.at(root).file.tree;
     for (rules.door) |entry| {
         const decl = try throughAliases(self, entry.reference.declaration() orelse continue);
-        if (live.contains(decl) or entry.file != root) continue;
+        if (among(live.items, decl) or entry.file != root) continue;
         if (uncertain) {
             try self.undecided(.P006, tree.tokenStart(tree.firstToken(entry.node)), .unresolved, "a .door entry that may reach no call its package replaces: a call on the way does not resolve, or the budget did not read it to its end");
         } else try self.at(.P006, tree.firstToken(entry.node), "lint_rules: this .door entry reaches no call the package replaces: list only the functions that do the replaced work themselves");
@@ -224,17 +226,17 @@ fn unpublished(self: *Context, root: Project.FileId) Context.Error!bool {
     const reached = memo.reached orelse blk: {
         const marks = try self.facts.gpa.alloc(bool, self.project.sources.len);
         @memset(marks, false);
+        // The walk's own list is the rule's memory, gone with the check.
         var pending: std.ArrayList(Project.FileId) = .empty;
-        defer pending.deinit(self.facts.gpa);
         for (try PackageRules.roots(self.facts)) |each| {
             if (marks[@backingInt(each)]) continue;
             marks[@backingInt(each)] = true;
-            try pending.append(self.facts.gpa, each);
+            try pending.append(self.allocator, each);
         }
         while (pending.pop()) |at| for (self.project.imports) |edge| {
             if (edge.from != at or !edge.in.inProgram() or marks[@backingInt(edge.target)]) continue;
             marks[@backingInt(edge.target)] = true;
-            try pending.append(self.facts.gpa, edge.target);
+            try pending.append(self.allocator, edge.target);
         };
         memo.reached = marks;
         break :blk marks;
@@ -306,7 +308,7 @@ fn usersOf(self: *Context, decl: Facts.Decl) Context.Error!Users {
     const model = &self.project.at(decl.file).model;
     const record = model.declarations[@backingInt(decl.index)];
     if (record.exported) return .judged;
-    if (record.public and try self.facts.onSurface(decl.file, record.scope) and !try keptInside(self, decl)) return .judged;
+    if (record.public and try self.facts.onSurface(decl.file, record.scope) and !try keptInside(self, decl, record)) return .judged;
     var found: std.ArrayList(Facts.Decl) = .empty;
     if (record.kind == .function) {
         if (try handedOn(self, decl)) return .judged;
@@ -327,53 +329,57 @@ fn usersOf(self: *Context, decl: Facts.Decl) Context.Error!Users {
 }
 
 /// `keptInside`'s reading of each file's namespace, once per run.
-const Namespaces = struct { map: std.AutoHashMapUnmanaged(Project.FileId, ?[]const []const u8) = .empty };
+const Namespaces = struct { read: std.ArrayList(Namespace) = .empty };
+const Namespace = struct { file: Project.FileId, handed: ?[]const Facts.Decl };
 
 /// Whether the top-level function `decl`, `pub` though it is, can be named by no one outside its
 /// package: its file's namespace never leaves, and no code of the package hands the function on.
 /// A `pub fn` of an internal file is public to the package's other files alone, so its callers
 /// are all in the program and the door's walk goes on through them.
-fn keptInside(self: *Context, decl: Facts.Decl) Context.Error!bool {
-    const model = &self.project.at(decl.file).model;
-    const record = model.declarations[@backingInt(decl.index)];
-    if (record.kind != .function or record.exported or record.scope != model.root()) return false;
+fn keptInside(self: *Context, decl: Facts.Decl, record: Model.Declaration) Context.Error!bool {
+    if (record.kind != .function or record.exported or record.scope != self.project.at(decl.file).model.root()) return false;
     const memo = try self.facts.memo(Namespaces);
-    const handed = memo.map.get(decl.file) orelse blk: {
-        const read = try namespaceMembers(self, decl.file);
-        try memo.map.put(self.facts.gpa, decl.file, read);
-        break :blk read;
+    const handed: ?[]const Facts.Decl = for (memo.read.items) |known| {
+        if (known.file == decl.file) break known.handed;
+    } else read: {
+        const members = try namespaceMembers(self, decl.file);
+        try memo.read.append(self.facts.gpa, .{ .file = decl.file, .handed = members });
+        break :read members;
     };
-    for (handed orelse return false) |name| if (std.mem.eql(u8, name, record.name)) return false;
+    const members: []const Facts.Decl = handed orelse return false;
+    for (members) |member| if (member.file == decl.file and member.index == decl.index) return false;
     return true;
 }
 
-/// The members of `file`'s namespace the program uses other than by calling them, where the
-/// namespace stays among the files that import it: each `@import` of it is read at once as a
-/// member (`@import("sys.zig").f()`) or held by a private constant only ever read as one
-/// (`sys.f()`). Null where it may leave: a file a module roots, a file that is itself a type (top-level
-/// fields, whose `pub` methods any holder of a value calls), a file naming itself (`@This()`), or
-/// any other use of an import, which may publish it (`pub const sys = ...`, `const s2 = sys;`,
-/// an `if` choosing it).
-fn namespaceMembers(self: *Context, file: Project.FileId) Context.Error!?[]const []const u8 {
+/// The members of `file`'s namespace the program uses other than by calling them, each by its
+/// declaration, where the namespace stays among the files that import it: each `@import` of it
+/// (read by the file it resolves to) is read at once as a member (`@import("sys.zig").f()`) or
+/// held by a private constant only ever read as one (`sys.f()`). Null where it may leave: a
+/// file a module roots, a file that is itself a type (top-level fields, whose `pub` methods any
+/// holder of a value calls), a file naming itself (`@This()`), an import whose name is
+/// computed, or any other use of an import, which may publish it (`pub const sys = ...`,
+/// `const s2 = sys;`, an `if` choosing it).
+fn namespaceMembers(self: *Context, file: Project.FileId) Context.Error!?[]const Facts.Decl {
     if (std.mem.findScalar(Project.FileId, try PackageRules.roots(self.facts), file) != null) return null;
     if (namesItself(self.project, file)) return null;
-    var handed: std.ArrayList([]const u8) = .empty;
+    var handed: std.ArrayList(Facts.Decl) = .empty;
     for (self.project.imports) |edge| {
         if (edge.target != file or !edge.in.inProgram()) continue;
         const model = &self.project.at(edge.from).model;
         const tree = &self.project.at(edge.from).file.tree;
         for (model.import_nodes) |node| {
-            var buffer: [2]Ast.Node.Index = undefined;
-            const args = Facts.builtinArgs(tree, node, &buffer);
-            if (args.len != 1 or tree.nodeTag(args[0]) != .string_literal) return null;
-            const spelling = std.zig.string_literal.parseAlloc(self.allocator, tree.tokenSlice(tree.nodeMainToken(args[0]))) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.InvalidLiteral => return null,
+            const imported: Facts.Container = switch (try self.facts.resolve(edge.from, node)) {
+                .container => |k| k,
+                // An import no edge of the build resolves is not the edge to this file; one whose
+                // name is computed may be.
+                .unknown => |why| if (why == .computed_import) return null else continue,
+                .alternatives => return null,
+                else => continue,
             };
-            if (!std.mem.eql(u8, spelling, edge.spelling)) continue;
+            if (imported.file != file) continue;
             const parent = model.parentOf(node) orelse return null;
-            if (tree.nodeTag(parent) == .field_access) {
-                try noteMember(self, edge.from, parent, &handed);
+            if (Facts.accesses.formOf(tree.nodeTag(parent)) == .member) {
+                try noteMember(self, imported, edge.from, parent, &handed);
                 continue;
             }
             const holder = privateConstantOf(model, tree, parent, node) orelse return null;
@@ -381,33 +387,39 @@ fn namespaceMembers(self: *Context, file: Project.FileId) Context.Error!?[]const
                 if (Facts.accesses.formOf(tag) != .leaf) continue;
                 const leaf: Ast.Node.Index = @fromBackingInt(@intCast(i));
                 const ref = model.reference(leaf) orelse continue;
-                if (ref.declaration != holder or tree.nodeMainToken(leaf) == model.declarations[@backingInt(holder)].token) continue;
+                if (ref.declaration != holder.id or tree.nodeMainToken(leaf) == holder.token) continue;
                 const over = model.parentOf(leaf) orelse return null;
-                if (tree.nodeTag(over) != .field_access or tree.nodeData(over).node_and_token[0] != leaf) return null;
-                try noteMember(self, edge.from, over, &handed);
+                if (Facts.accesses.formOf(tree.nodeTag(over)) != .member or tree.nodeData(over).node_and_token[0] != leaf) return null;
+                try noteMember(self, imported, edge.from, over, &handed);
             }
         }
     }
     return handed.items;
 }
 
-/// Adds the name of the member read at `access`, unless the read is a call of it.
-fn noteMember(self: *Context, file: Project.FileId, access: Ast.Node.Index, handed: *std.ArrayList([]const u8)) Context.Error!void {
+/// Adds the declaration of `namespace` the member read at `access` names (`Facts.member`: what
+/// Zig finds there by that name), unless the read is a call of it. A member the namespace does
+/// not declare is no function of it.
+fn noteMember(self: *Context, namespace: Facts.Container, file: Project.FileId, access: Ast.Node.Index, handed: *std.ArrayList(Facts.Decl)) Context.Error!void {
     if (try Facts.accesses.useOf(self.facts, file, access) == .callee) return;
     const tree = &self.project.at(file).file.tree;
-    try handed.append(self.facts.gpa, tree.tokenSlice(tree.nodeData(access).node_and_token[1]));
+    const name = try self.facts.memberName(tree.tokenSlice(tree.nodeData(access).node_and_token[1]));
+    try handed.append(self.facts.gpa, self.facts.member(namespace, name) orelse return);
 }
 
 /// The private declaration `declaration_node` writes, whose whole value is `value`.
-fn privateConstantOf(model: *const Model, tree: *const Ast, declaration_node: Ast.Node.Index, value: Ast.Node.Index) ?Model.Declaration.Id {
+fn privateConstantOf(model: *const Model, tree: *const Ast, declaration_node: Ast.Node.Index, value: Ast.Node.Index) ?Held {
     const written = tree.fullVarDecl(declaration_node) orelse return null;
     if (written.ast.init_node.unwrap() != value) return null;
     for (model.declarations, 0..) |decl, i| {
         if (decl.node != declaration_node or decl.kind != .variable) continue;
-        return if (decl.public or decl.exported) null else @fromBackingInt(@intCast(i));
+        return if (decl.public or decl.exported) null else .{ .id = @fromBackingInt(@intCast(i)), .token = decl.token };
     }
     return null;
 }
+
+/// A declaration and the token that names it.
+const Held = struct { id: Model.Declaration.Id, token: Ast.TokenIndex };
 
 /// Whether `file` declares a field at its top level or names its own namespace (`@This()` in no
 /// container of its own).
@@ -415,16 +427,18 @@ fn namesItself(project: *const Project, file: Project.FileId) bool {
     const model = &project.at(file).model;
     const tree = &project.at(file).file.tree;
     for (model.declarations) |decl| if (decl.kind == .field and decl.scope == model.root()) return true;
-    for (tree.nodes.items(.tag), 0..) |tag, i| switch (tag) {
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@This")) continue;
-            var at = model.scopeOf(tree.nodeMainToken(node));
-            while (model.scopes[@backingInt(at)].kind != .container and model.scopes[@backingInt(at)].kind != .file) at = model.scopes[@backingInt(at)].parent orelse break;
-            if (model.scopes[@backingInt(at)].kind == .file) return true;
-        },
-        else => {},
-    };
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (Facts.accesses.formOf(tag) != .builtin) continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        if (!Facts.isBuiltin(tree, node, "@This")) continue;
+        // In no container the file declares, it names the file.
+        var at = model.parentOf(node);
+        const inside = while (at) |parent| : (at = model.parentOf(parent)) {
+            var buffer: [2]Ast.Node.Index = undefined;
+            if (tree.fullContainerDecl(&buffer, parent) != null and model.parentOf(parent) != null) break true;
+        } else false;
+        if (!inside) return true;
+    }
     return false;
 }
 
