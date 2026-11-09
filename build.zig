@@ -36,7 +36,6 @@ pub fn dev(b: *std.Build, tools: type) void {
     const module = package.module("glint");
     const executable = package.artifact("glint");
     const aegis_dependency = p.dependency("aegis", .{ .target = target, .optimize = optimize });
-    const aegis = aegis_dependency.module("aegis");
     const portable = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
     const portable_tokens = b.createModule(.{ .root_source_file = p.path("src/Token.zig"), .target = portable, .optimize = .small });
     const portable_contract = b.addObject(.{ .name = "token-portable", .root_module = b.createModule(.{
@@ -48,15 +47,34 @@ pub fn dev(b: *std.Build, tools: type) void {
     b.step("check-token-portable", "Compile the std-only token API at a different pointer width").dependOn(&portable_contract.step);
     const test_step = b.step("test", "Run selected contract tests and benchmark smoke");
     const check = b.step("check", "Compile CLI and tests");
-    // The contract tests, in a few roots that compile and run as parallel steps.
-    const test_imports = [_]std.Build.Module.Import{
-        .{ .name = "aegis", .module = aegis },
+    // The contract tests, in a few roots that compile and run as parallel steps. The two whose
+    // every test runs the whole analysis many times (the danger rules' and the pack's) are
+    // ReleaseSafe with their glint where `-Doptimize` is Debug, as the soundness suite's glint
+    // is: Debug costs them about 10 times the time, and ReleaseSafe keeps every safety check,
+    // assertion and the testing allocator's leak check. The light roots stay in `-Doptimize`,
+    // where they compile in a fraction of the time. A mode asked of `-Doptimize` other than
+    // Debug is kept, and `-Dunit-optimize` chooses for the heavy two.
+    const unit_optimize = b.option(std.lang.Optimize, "unit-optimize", "The mode the danger rules' and the pack's unit tests and their glint are built in (default: ReleaseSafe where -Doptimize is Debug, else -Doptimize's)") orelse if (optimize == .debug) .safe else optimize;
+    const unit_package = b.dependency("glint", .{ .target = target, .optimize = unit_optimize });
+    const unit_module = unit_package.module("glint");
+    const unit_aegis_dependency = unit_package.builder.dependency("aegis", .{ .target = target, .optimize = unit_optimize });
+    const heavy_imports = [_]std.Build.Module.Import{
+        .{ .name = "aegis", .module = unit_aegis_dependency.module("aegis") },
+        .{ .name = "glint", .module = unit_module },
+        .{ .name = "aegis_sources", .module = aegisSources(b, p, unit_module, unit_aegis_dependency, target) },
+        .{ .name = "shakedown", .module = b.dependency("shakedown", .{ .target = target, .optimize = unit_optimize }).module("shakedown") },
+    };
+    const light_imports = [_]std.Build.Module.Import{
+        .{ .name = "aegis", .module = aegis_dependency.module("aegis") },
         .{ .name = "glint", .module = module },
         .{ .name = "aegis_sources", .module = aegisSources(b, p, module, aegis_dependency, target) },
         .{ .name = "shakedown", .module = b.dependency("shakedown", .{ .target = target, .optimize = optimize }).module("shakedown") },
     };
-    for ([_][]const u8{ "src/tests.zig", "src/test_danger.zig", "src/test_pack.zig" }) |root| {
-        const tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = p.path(root), .target = target, .optimize = optimize, .imports = &test_imports }), .filters = if (filter) |f| &.{f} else &.{} });
+    const Root = struct { path: []const u8, heavy: bool };
+    for ([_]Root{ .{ .path = "src/tests.zig", .heavy = false }, .{ .path = "src/test_danger.zig", .heavy = true }, .{ .path = "src/test_pack.zig", .heavy = true } }) |root| {
+        const mode = if (root.heavy) unit_optimize else optimize;
+        const imports: []const std.Build.Module.Import = if (root.heavy) &heavy_imports else &light_imports;
+        const tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = p.path(root.path), .target = target, .optimize = mode, .imports = imports }), .filters = if (filter) |f| &.{f} else &.{} });
         test_step.dependOn(&b.addRunArtifact(tests).step);
         check.dependOn(&tests.step);
     }
