@@ -82,30 +82,21 @@ fn failure(kind: usize) []const u8 {
 /// Which of the streams `node`'s value is, a pointer to one read the same; null where it is
 /// none of them.
 fn kindOf(c: *Context, ks: *const Kinds, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Kind {
-    var value = try c.facts.resolve(file, node);
-    if (value == .pointer) value = value.pointer.child.*;
-    const held = switch (value) {
-        .instance, .container => |k| k,
-        .unknown => return .unresolved,
-        // A choice is the one stream every part is; parts of two kinds, or a part not known, may
-        // be either; parts none of which is a stream, none.
-        .alternatives => |parts| {
-            var found: ?Kind = null;
-            for (parts) |part| {
-                const one = (try kindOfValue(ks, part)) orelse continue;
-                if (one == .unresolved) return .unresolved;
-                if (found) |known| if (!std.meta.eql(known, one)) return .unresolved;
-                found = one;
-            }
-            return found;
-        },
-        else => return null,
-    };
-    for (ks.each, 0..) |each, at| {
-        const k = each orelse continue;
-        if (k.file == held.file and k.scope == held.scope) return .{ .known = at };
+    const value = try c.facts.resolve(file, node);
+    const held = if (value == .pointer) value.pointer.child.* else value;
+    // A choice is the one stream every part is; parts of two kinds, or a part not known, may
+    // be either; parts none of which is a stream, none.
+    if (held == .alternatives) {
+        var found: ?Kind = null;
+        for (held.alternatives) |part| {
+            const one = (try kindOfValue(ks, part)) orelse continue;
+            if (one == .unresolved) return .unresolved;
+            if (found) |known| if (!std.meta.eql(known, one)) return .unresolved;
+            found = one;
+        }
+        return found;
     }
-    return if (ks.unknown) .unresolved else null;
+    return kindOfValue(ks, value);
 }
 
 /// `kindOf` of one part of a choice.
@@ -187,10 +178,6 @@ const Place = struct {
 
     fn node(p: *const Place) Ast.Node.Index {
         return p.nodes[p.len];
-    }
-
-    fn last(p: *const Place) ?[]const u8 {
-        return if (p.len == 0) null else p.names[p.len - 1];
     }
 
     fn parent(p: Place) Place {
