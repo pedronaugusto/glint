@@ -123,7 +123,7 @@ fn foreign(c: *Context, rule: Rule, resources: []const ?Facts.Container) Context
     const tree = &c.project.at(c.file).file.tree;
     for (tree.nodes.items(.tag), 0..) |_, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        if (c.inTest(tree.nodeMainToken(node)) or !Danger.atRuntime(c, node)) continue;
+        if (c.inTest(tree.nodeMainToken(node)) or !try Danger.atRuntime(c, node)) continue;
         if (try fieldAccess(c, tree, node)) |access| {
             const name_token = access.token;
             const receiver_value = try c.facts.resolve(c.file, access.receiver);
@@ -2114,7 +2114,7 @@ pub fn lockOrder(c: *Context, rule: Rule) Context.Error!void {
     const model = &c.project.at(c.file).model;
     var taken: std.ArrayList(Taken) = .empty;
     for (try Facts.calls.in(c.facts, c.file)) |*call| {
-        if (c.inTest(tree.nodeMainToken(call.node)) or !Danger.atRuntime(c, call.node) or typeOnly(tree, model, call.node)) continue;
+        if (c.inTest(tree.nodeMainToken(call.node)) or !try Danger.atRuntime(c, call.node) or typeOnly(tree, model, call.node)) continue;
         const function = enclosingFunction(model, tree, call.node) orelse continue;
         // A call that does not resolve may take a guard: held as one, it is judged as one.
         const lock: Lock, const maybe: ?Facts.Unknown = switch (try acquisitionOf(c, c.file, call, 0)) {
@@ -4355,7 +4355,7 @@ pub fn borrowsStored(c: *Context, rule: Rule) Context.Error!void {
         const node = site.node;
         const value = site.value orelse continue;
         if (try Facts.accesses.memberRead(c.facts, c.file, site.target orelse continue) == null) continue;
-        if (c.inTest(tree.nodeMainToken(node)) or !Danger.atRuntime(c, node)) continue;
+        if (c.inTest(tree.nodeMainToken(node)) or !try Danger.atRuntime(c, node)) continue;
         const what = (try borrow(c, tree, namespaces, value)) orelse continue;
         if (try settled(c, node, value)) continue;
         try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("a borrow of a std container's storage ({s}) stored in a field: the next growth moves it; aegis handle keys or scope references stay valid", .{what}));

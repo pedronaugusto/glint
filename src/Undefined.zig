@@ -212,7 +212,7 @@ pub fn reads(c: *Context, rule: Rule, follows: *const fn (*Context, Model.Declar
         const variable = tree.fullVarDecl(decl.node) orelse continue;
         if (tree.tokenTag(variable.ast.mut_token) != .keyword_var) continue;
         const init = variable.ast.init_node.unwrap() orelse continue;
-        if (!Danger.atRuntime(c, decl.node)) continue;
+        if (!try Danger.atRuntime(c, decl.node)) continue;
         // An array of no elements has no memory to leave undefined.
         if (variable.ast.type_node.unwrap()) |kind| if (try c.facts.arrayType(c.file, kind)) |array_type| if (array_type.length) |length| if ((try Range.constantValue(c, array_type.file, length)) == 0) continue;
         const block = model.parentOf(decl.node) orelse continue;
