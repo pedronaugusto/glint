@@ -124,6 +124,10 @@ pub const Options = struct {
     /// Where the files are read: a store several projects share reads each file once, std's
     /// among them. Null: the project reads its own.
     store: ?*Store = null,
+    /// Where `store` is null: a frozen store the project's own reads first, through a const
+    /// pointer, so that nothing is written to it; what it lacks the project's own store reads.
+    /// Several projects, one after another or at once, share it.
+    base: ?*const Store = null,
 };
 
 /// Files read once and shared by every project made with this store: what a file means on its
@@ -134,11 +138,29 @@ pub const Options = struct {
 pub const Store = struct {
     gpa: std.mem.Allocator,
     entries: std.AutoHashMapUnmanaged(u64, std.ArrayList(*Entry)) = .empty,
+    /// A frozen store read before this one, through a const pointer: what it holds is never
+    /// read again, and this store keeps only what it lacks.
+    base: ?*const Store = null,
 
     const Entry = struct { file: File, model: Model, limits: File.Limits, lowering: bool, kind: File.Kind };
 
     pub fn init(gpa: std.mem.Allocator) Store {
         return .{ .gpa = gpa };
+    }
+
+    /// A store that reads `base` first and writes nothing to it.
+    pub fn over(gpa: std.mem.Allocator, base: *const Store) Store {
+        return .{ .gpa = gpa, .base = base };
+    }
+
+    /// The file this store or its base read before from `bytes` so, if one did: a lookup only.
+    fn find(self: *const Store, bytes: []const u8, limits: File.Limits, lowering: bool, kind: File.Kind) ?*const Entry {
+        if (self.base) |base| if (base.find(bytes, limits, lowering, kind)) |entry| return entry;
+        const list = self.entries.get(std.hash.Wyhash.hash(0, bytes)) orelse return null;
+        for (list.items) |entry| {
+            if (entry.kind == kind and entry.lowering == lowering and std.meta.eql(entry.limits, limits) and std.mem.eql(u8, entry.file.source, bytes)) return entry;
+        }
+        return null;
     }
 
     pub fn deinit(self: *Store) void {
@@ -157,11 +179,9 @@ pub const Store = struct {
     /// The file `bytes` are, read as `kind` under `limits`: the one this store read before from
     /// the same bytes so, or one read now. The same bytes read as Zig and as ZON are two files.
     fn read(self: *Store, bytes: []const u8, limits: File.Limits, lowering: bool, kind: File.Kind) (File.InitError || Model.InitError)!*const Entry {
+        if (self.find(bytes, limits, lowering, kind)) |entry| return entry;
         const found = try self.entries.getOrPut(self.gpa, std.hash.Wyhash.hash(0, bytes));
         if (!found.found_existing) found.value_ptr.* = .empty;
-        for (found.value_ptr.items) |entry| {
-            if (entry.kind == kind and entry.lowering == lowering and std.meta.eql(entry.limits, limits) and std.mem.eql(u8, entry.file.source, bytes)) return entry;
-        }
         const entry = try self.gpa.create(Entry);
         errdefer self.gpa.destroy(entry);
         entry.file = try File.initWithLowering(self.gpa, bytes, limits, lowering, kind);
@@ -190,7 +210,7 @@ pub fn init(gpa: std.mem.Allocator, inputs: []const Input, imports: []const Impo
     errdefer arena.deinit();
     const a = arena.allocator();
     const own: ?*Store = if (options.store == null) try a.create(Store) else null;
-    if (own) |store| store.* = .init(gpa);
+    if (own) |store| store.* = if (options.base) |base| .over(gpa, base) else .init(gpa);
     errdefer if (own) |store| store.deinit();
     const store = options.store orelse own.?;
     const sources = try a.alloc(Source, inputs.len);
@@ -464,4 +484,19 @@ test "a ZON input is read as ZON, and the same bytes as Zig are another file" {
     var again = try init(std.testing.allocator, &.{.{ .name = "b.zon", .bytes = bytes, .kind = .zon }}, &.{}, .{ .store = &store });
     defer again.deinit();
     try std.testing.expectEqual(project.sources[0].file, again.sources[0].file);
+}
+
+test "a project over a base reads what the base holds from it and leaves the base as it was" {
+    var base: Store = .init(std.testing.allocator);
+    defer base.deinit();
+    const held = "const a = 1;";
+    var first = try init(std.testing.allocator, &.{.{ .name = "a.zig", .bytes = held }}, &.{}, .{ .store = &base });
+    first.deinit();
+    try std.testing.expectEqual(1, base.entries.count());
+    var project = try init(std.testing.allocator, &.{ .{ .name = "a.zig", .bytes = held }, .{ .name = "b.zig", .bytes = "const b = 2;" } }, &.{}, .{ .base = &base });
+    defer project.deinit();
+    // The held file is the base's own; the other is the project's, and the base holds no more.
+    try std.testing.expectEqual(&base.entries.get(std.hash.Wyhash.hash(0, held)).?.items[0].file, project.sources[0].file);
+    try std.testing.expect(project.sources[1].file != project.sources[0].file);
+    try std.testing.expectEqual(1, base.entries.count());
 }

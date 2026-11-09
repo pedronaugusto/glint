@@ -4,10 +4,170 @@
 //! importing file's path. A module aegis's build binds (std, builtin, a test's) stays unmapped;
 //! a file spelling the tree lacks is an error, so the inputs cannot drift from the revision.
 const std = @import("std");
+const builtin = @import("builtin");
 const glint = @import("glint");
 const Project = glint.Project;
 
-const sources = @import("aegis_tree").files;
+const tree = @import("aegis_tree");
+const sources = tree.files;
+
+/// The aegis files read once per test binary (`-Dunit-shared`, build.zig's `aegis_tree.shared`):
+/// a store every project made here reads first, through a const pointer, and its own store reads
+/// only what the base lacks (the consumer, a revised file, the extra sources). The base is built
+/// on first use from memory of its own and then frozen: it allocates no more, the OS makes its
+/// pages read-only, and a blake3 fingerprint of its bytes is taken. A write into it ends the run
+/// where it is made; `expectBaseFrozen` compares the fingerprint, once per run in each root's
+/// test, and before every project made over the base in the proof run (`-Dunit-proof`).
+const Base = struct {
+    store: ?*const Project.Store = null,
+    /// The pages the base is in, each from the page allocator. The list itself is not among
+    /// them, so it stays writable.
+    chunks: std.ArrayList([]u8) = .empty,
+    /// The bytes taken in the last chunk.
+    used: usize = 0,
+    frozen: bool = false,
+    print: [32]u8 = undefined,
+
+    const chunk_bytes = 4 * 1024 * 1024;
+    const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+
+    fn allocator(self: *Base) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn unfrozen(self: *const Base) void {
+        if (self.frozen) @panic("aegis_sources: the shared base was asked for memory after it was frozen");
+    }
+
+    /// Bump allocation: from the last chunk where the bytes fit, else from a new one.
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
+        const self: *Base = @ptrCast(@alignCast(context));
+        self.unfrozen();
+        if (self.chunks.items.len != 0) {
+            const last = self.chunks.items[self.chunks.items.len - 1];
+            const start = alignment.forward(@intFromPtr(last.ptr) + self.used) - @intFromPtr(last.ptr);
+            if (start <= last.len and len <= last.len - start) {
+                self.used = start + len;
+                return last.ptr + start;
+            }
+        }
+        const wanted = std.math.add(usize, len, alignment.toByteUnits()) catch return null;
+        const size = std.mem.alignForward(usize, @max(chunk_bytes, wanted), std.heap.pageSize());
+        const chunk = std.heap.page_allocator.alloc(u8, size) catch return null;
+        self.chunks.append(std.heap.page_allocator, chunk) catch {
+            std.heap.page_allocator.free(chunk);
+            return null;
+        };
+        const start = alignment.forward(@intFromPtr(chunk.ptr)) - @intFromPtr(chunk.ptr);
+        self.used = start + len;
+        return chunk.ptr + start;
+    }
+
+    /// Whether `memory` is the last allocation made: the one that may grow, or be given back.
+    fn tail(self: *const Base, memory: []u8) ?[]u8 {
+        if (self.chunks.items.len == 0) return null;
+        const chunk = self.chunks.items[self.chunks.items.len - 1];
+        const start = @intFromPtr(memory.ptr);
+        if (start < @intFromPtr(chunk.ptr) or start + memory.len != @intFromPtr(chunk.ptr) + self.used) return null;
+        return chunk;
+    }
+
+    /// The last allocation grows or shrinks in place; any other only shrinks, keeping its bytes.
+    fn resize(context: *anyopaque, memory: []u8, _: std.mem.Alignment, new_len: usize, _: usize) bool {
+        const self: *Base = @ptrCast(@alignCast(context));
+        self.unfrozen();
+        const chunk = self.tail(memory) orelse return new_len <= memory.len;
+        const start = @intFromPtr(memory.ptr) - @intFromPtr(chunk.ptr);
+        if (new_len > chunk.len - start) return false;
+        self.used = start + new_len;
+        return true;
+    }
+
+    fn remap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        return if (resize(context, memory, alignment, new_len, ret_addr)) memory.ptr else null;
+    }
+
+    /// The last allocation is given back; any other stays until the binary ends.
+    fn free(context: *anyopaque, memory: []u8, _: std.mem.Alignment, _: usize) void {
+        const self: *Base = @ptrCast(@alignCast(context));
+        self.unfrozen();
+        if (self.tail(memory) != null) self.used -= memory.len;
+    }
+
+    fn freeze(self: *Base) error{Unprotected}!void {
+        self.frozen = true;
+        for (self.chunks.items) |chunk| try readOnly(chunk);
+        self.print = self.fingerprint();
+    }
+
+    fn fingerprint(self: *const Base) [32]u8 {
+        var hash: std.crypto.hash.Blake3 = .init(.{});
+        for (self.chunks.items) |chunk| hash.update(chunk);
+        var out: [32]u8 = undefined;
+        hash.final(&out);
+        return out;
+    }
+
+    fn check(self: *const Base) error{SharedBaseChanged}!void {
+        if (!std.mem.eql(u8, &self.fingerprint(), &self.print)) return error.SharedBaseChanged;
+    }
+
+    /// Makes `chunk`'s pages read-only: mprotect on Linux (its system call, as a test binary
+    /// there links no libc) and where libc declares it (Darwin, the BSDs, illumos, Haiku),
+    /// NtProtectVirtualMemory on Windows. A target with neither (WASI, freestanding) has the
+    /// fingerprint alone.
+    fn readOnly(chunk: []u8) error{Unprotected}!void {
+        switch (builtin.os.tag) {
+            .linux => if (std.os.linux.errno(std.os.linux.mprotect(chunk.ptr, chunk.len, .{ .READ = true })) != .SUCCESS) return error.Unprotected,
+            .windows => {
+                const windows = std.os.windows;
+                var address: ?*anyopaque = chunk.ptr;
+                var size: usize = chunk.len;
+                var old: windows.PAGE = undefined;
+                if (windows.ntdll.NtProtectVirtualMemory(windows.GetCurrentProcess(), &address, &size, .{ .READONLY = true }, &old) != .SUCCESS) return error.Unprotected;
+            },
+            else => if (comptime std.c.PROT != void) {
+                if (std.c.mprotect(@ptrCast(@alignCast(chunk.ptr)), chunk.len, .{ .READ = true }) != 0) return error.Unprotected;
+            },
+        }
+    }
+};
+
+var base: Base = .{};
+
+/// The shared base, built on first use: every aegis file, read as a project reads it by default.
+fn shared() !*const Project.Store {
+    if (base.store) |store| {
+        if (tree.proof) try base.check();
+        return store;
+    }
+    const a = base.allocator();
+    const store = try a.create(Project.Store);
+    store.* = .init(a);
+    var inputs: [sources.len + 1]Project.Input = undefined;
+    inputs[0] = .{ .name = "consumer", .bytes = "" };
+    for (sources, 1..) |source, i| inputs[i] = aegisInput(source);
+    const mapped = try imports(std.heap.page_allocator);
+    defer std.heap.page_allocator.free(mapped);
+    var built = try Project.init(std.heap.page_allocator, &inputs, mapped, .{ .store = store });
+    built.deinit();
+    try base.freeze();
+    base.store = store;
+    return store;
+}
+
+/// The options every project here is made with: over the shared base where there is one.
+fn options() !Project.Options {
+    return if (tree.shared) .{ .base = try shared() } else .{};
+}
+
+/// Fails where the shared base's bytes are not those it was frozen with; built first where no
+/// test has yet. Nothing to check where `-Dunit-shared=false`.
+pub fn expectBaseFrozen() !void {
+    if (!tree.shared) return;
+    _ = try shared();
+    try base.check();
+}
 
 /// The input index of aegis's source `name`: the consumer is input 0, aegis's sources follow.
 fn input(comptime name: []const u8) u32 {
@@ -64,7 +224,7 @@ pub fn project(gpa: std.mem.Allocator, consumer: []const u8) !glint.Project {
     for (sources, 1..) |source, i| inputs[i] = aegisInput(source);
     const mapped = try imports(gpa);
     defer gpa.free(mapped);
-    return Project.init(gpa, &inputs, mapped, .{});
+    return Project.init(gpa, &inputs, mapped, try options());
 }
 
 /// `project`, with a second source of the program's own, imported by the consumer as `lib`
@@ -91,7 +251,7 @@ fn withLib(gpa: std.mem.Allocator, consumer: []const u8, lib: []const u8, select
     @memcpy(all[0..mapped.len], mapped);
     all[mapped.len] = .{ .from = 0, .spelling = "lib", .target = lib_file };
     all[mapped.len + 1] = .{ .from = lib_file, .spelling = "aegis", .target = root };
-    return Project.init(gpa, &inputs, all, .{});
+    return Project.init(gpa, &inputs, all, try options());
 }
 
 /// A source of another module beside aegis's, such as a fixture standing for std, in the
@@ -149,7 +309,7 @@ pub fn projectRevised(gpa: std.mem.Allocator, consumer: []const u8, name: []cons
     if (!revised) return error.FileNotFound;
     const mapped = try imports(gpa);
     defer gpa.free(mapped);
-    return Project.init(gpa, &inputs, mapped, .{});
+    return Project.init(gpa, &inputs, mapped, try options());
 }
 
 /// `project`, with `extra` sources after aegis's, none of them selected, and their imports.
@@ -195,7 +355,7 @@ pub fn projectAs(gpa: std.mem.Allocator, consumer: []const u8, as: Consumer, ext
     if (std_target) |target| for (all[mapped.len + extra_imports.len ..], 1..) |*edge, from| {
         edge.* = .{ .from = @intCast(from), .spelling = "std", .target = first + target };
     };
-    return Project.init(gpa, inputs, all, .{});
+    return Project.init(gpa, inputs, all, try options());
 }
 
 /// An aegis source as a caller states it: not selected, a file of aegis's package.

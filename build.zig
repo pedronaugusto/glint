@@ -63,10 +63,16 @@ pub fn dev(b: *std.Build, tools: type) void {
     const unit_safe = b.option(bool, "unit-safe", "Build the danger rules' and the pack's unit tests on the soundness suite's glint, in -Dsoundness-optimize (default: where -Doptimize is Debug), else on -Doptimize's") orelse (optimize == .debug);
     const unit_module = if (unit_safe) soundness_package.module("glint") else module;
     const unit_optimize = if (unit_safe) soundness_optimize else optimize;
+    // Each test binary reads aegis's files once, into a store frozen read-only that every
+    // project it makes reads first (ci/aegis_sources.zig).
+    const harness: Harness = .{
+        .shared = b.option(bool, "unit-shared", "The contract tests read aegis's files once per binary, into a frozen read-only store (default: true)") orelse true,
+        .proof = b.option(bool, "unit-proof", "Check the shared store's fingerprint before every project made over it, not once per binary") orelse false,
+    };
     const light_imports = [_]std.Build.Module.Import{
         .{ .name = "aegis", .module = aegis_dependency.module("aegis") },
         .{ .name = "glint", .module = module },
-        .{ .name = "aegis_sources", .module = aegisSources(b, p, module, aegis_dependency, target) },
+        .{ .name = "aegis_sources", .module = aegisSources(b, p, module, aegis_dependency, target, harness) },
         .{ .name = "shakedown", .module = shakedown },
     };
     // The heavy roots' aegis is the one their glint imports, so that a value of one is a value
@@ -74,7 +80,7 @@ pub fn dev(b: *std.Build, tools: type) void {
     const heavy_imports = [_]std.Build.Module.Import{
         .{ .name = "aegis", .module = unit_module.import_table.get("aegis") orelse @panic("glint's module imports aegis") },
         .{ .name = "glint", .module = unit_module },
-        .{ .name = "aegis_sources", .module = aegisSources(b, p, unit_module, aegis_dependency, target) },
+        .{ .name = "aegis_sources", .module = aegisSources(b, p, unit_module, aegis_dependency, target, harness) },
         .{ .name = "shakedown", .module = shakedown },
     };
     // The first root is light, the others heavy.
@@ -240,13 +246,18 @@ fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.l
     module.addImport("aegis", aegis_dependency.module("aegis"));
     module.addImport("ensign", p.dependency("ensign", .{ .target = target, .optimize = optimize }).module("ensign"));
     module.addImport("release", release(p));
-    return b.allocator.dupe(std.Build.Module.Import, &.{ .{ .name = "glint", .module = module }, .{ .name = "aegis_sources", .module = aegisSources(b, p, module, aegis_dependency, target) } }) catch @panic("OOM");
+    return b.allocator.dupe(std.Build.Module.Import, &.{ .{ .name = "glint", .module = module }, .{ .name = "aegis_sources", .module = aegisSources(b, p, module, aegis_dependency, target, .{}) } }) catch @panic("OOM");
 }
+
+/// How `ci/aegis_sources.zig` makes its projects: `shared`, over one store per binary that holds
+/// aegis's files, frozen read-only; `proof`, checking that store before every project. The
+/// benchmark reads every file each time, as a program's run does.
+const Harness = struct { shared: bool = false, proof: bool = false };
 
 /// The pinned aegis revision's whole `src/` tree, embedded as sources to analyze: a generated
 /// `aegis_tree` module lists each file by its path in aegis's package, read from the tree, so a
 /// file aegis adds is embedded too and `ci/aegis_sources.zig` derives each import from it.
-fn aegisSources(b: *std.Build, p: *std.Build, glint: *std.Build.Module, aegis_dependency: *std.Build.Dependency, target: std.Build.ResolvedTarget) *std.Build.Module {
+fn aegisSources(b: *std.Build, p: *std.Build, glint: *std.Build.Module, aegis_dependency: *std.Build.Dependency, target: std.Build.ResolvedTarget, harness: Harness) *std.Build.Module {
     const sources = b.createModule(.{ .root_source_file = p.path("ci/aegis_sources.zig"), .target = target });
     sources.addImport("glint", glint);
     const paths = treeSources(b, aegis_dependency.builder) catch |err| std.debug.panic("aegis src/: {t}", .{err});
@@ -256,6 +267,7 @@ fn aegisSources(b: *std.Build, p: *std.Build, glint: *std.Build.Module, aegis_de
     out.writeAll("pub const files = [_]struct { name: []const u8, bytes: [:0]const u8 }{\n") catch @panic("OOM");
     for (paths) |path| out.print("    .{{ .name = \"src/{s}\", .bytes = @embedFile(\"aegis/{s}\") }},\n", .{ path, path }) catch @panic("OOM");
     out.writeAll("};\n") catch @panic("OOM");
+    out.print("pub const shared = {};\npub const proof = {};\n", .{ harness.shared, harness.proof }) catch @panic("OOM");
     const tree = b.createModule(.{ .root_source_file = b.addWriteFiles().add("aegis_tree.zig", listing.written()), .target = target });
     for (paths) |path| tree.addAnonymousImport(b.fmt("aegis/{s}", .{path}), .{ .root_source_file = aegis_dependency.path(b.fmt("src/{s}", .{path})), .target = target });
     sources.addImport("aegis_tree", tree);
