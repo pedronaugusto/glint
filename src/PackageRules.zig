@@ -694,6 +694,7 @@ const Reader = struct {
                 try r.problem(file, node, .unresolved);
                 return .unresolved;
             },
+            .alternatives => unreachable, // unreachable: valueParts gives no choice as a part
             else => {},
         };
         if (found.items.len == 0) {
