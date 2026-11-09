@@ -4781,20 +4781,24 @@ fn countDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Inde
     const model = &c.project.at(f.file).model;
     const at = Facts.ungrouped(tree, node);
     if (depth > 8) return dep(c, flow, function, at);
-    switch (tree.nodeTag(at)) {
-        .number_literal, .char_literal => return .{},
-        .field_access => if (std.mem.eql(u8, tree.tokenSlice(tree.lastToken(at)), "len") and try c.facts.memoryField(f.file, at) != .field) return .{},
-        .add, .sub, .mul, .div, .mod, .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .shl, .shr, .bit_and, .bit_or, .bit_xor => {
+    if (try c.facts.literalOf(f.file, at)) |literal| switch (literal) {
+        .number, .char => return .{},
+        else => {},
+    };
+    switch (formAt(tree, at)) {
+        // A slice's or an array's own `len`: a holder that does not resolve shows none.
+        .member => if (try c.facts.languageField(f.file, at) == .len) return .{},
+        .operator => if (Facts.accesses.operatorOf(tree.nodeTag(at)) != null) {
             const lhs, const rhs = tree.nodeData(at).node_and_node;
             return (try countDep(c, flow, function, lhs, depth + 1)).join(c.allocator, try countDep(c, flow, function, rhs, depth + 1));
         },
-        .@"if", .if_simple => {
+        .@"if" => {
             const choice = tree.fullIf(at).?; // unreachable: tagged an if
             var out = try countDep(c, flow, function, choice.ast.then_expr, depth + 1);
             if (choice.ast.else_expr.unwrap()) |other| out = try out.join(c.allocator, try countDep(c, flow, function, other, depth + 1));
             return out;
         },
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+        .builtin => {
             const name = tree.tokenSlice(tree.nodeMainToken(at));
             const passes_through = std.mem.eql(u8, name, "@min") or std.mem.eql(u8, name, "@max") or std.mem.eql(u8, name, "@intCast") or std.mem.eql(u8, name, "@truncate") or std.mem.eql(u8, name, "@as");
             if (passes_through) {
@@ -4807,11 +4811,14 @@ fn countDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Inde
                 return out;
             }
         },
-        .identifier => if (model.reference(at)) |ref| if (ref.declaration) |d| {
-            const record = model.declarations[@backingInt(d)];
-            if (record.kind == .variable and f.position(d) == null) if (tree.fullVarDecl(record.node)) |variable| {
-                if (tree.tokenTag(variable.ast.mut_token) == .keyword_const) if (variable.ast.init_node.unwrap()) |init| return countDep(c, flow, function, init, depth + 1);
-            };
+        .leaf => switch (try c.facts.definition(f.file, at)) {
+            .decl => |decl| if (decl.file == f.file) {
+                const record = model.declarations[@backingInt(decl.index)];
+                if (record.kind == .variable and f.position(decl.index) == null) if (tree.fullVarDecl(record.node)) |variable| {
+                    if (tree.tokenTag(variable.ast.mut_token) == .keyword_const) if (variable.ast.init_node.unwrap()) |init| return countDep(c, flow, function, init, depth + 1);
+                };
+            },
+            .none, .unknown => {},
         },
         else => {},
     }
@@ -5149,7 +5156,7 @@ fn openUnit(c: *Context) Context.Error!*OpenUnit {
     var named = false;
     for (c.project.imports) |edge| {
         const target = unit.in_unit[@backingInt(edge.target)] orelse continue;
-        const by_name = std.mem.eql(u8, edge.spelling, "std");
+        const by_name = std.mem.eql(u8, edge.spelling, Project.std_module);
         if (by_name) root = target;
         const from = unit.in_unit[@backingInt(edge.from)] orelse continue;
         named = named or by_name;
@@ -5157,7 +5164,7 @@ fn openUnit(c: *Context) Context.Error!*OpenUnit {
     }
     // std's module may import itself by its name: where no file of std does, its root does, so
     // std alone knows its files (`Facts.outside`) as a program importing it does.
-    if (!named) if (root) |file| try imports.append(gpa, .{ .from = @backingInt(file), .spelling = "std", .target = @backingInt(file) });
+    if (!named) if (root) |file| try imports.append(gpa, .{ .from = @backingInt(file), .spelling = Project.std_module, .target = @backingInt(file) });
     unit.project = Project.init(gpa, inputs.items, imports.items, .{ .store = c.project.store }) catch |err| std.debug.panic("summary cross-check: std alone does not make a project: {t}", .{err});
     unit.facts = try gpa.create(Facts);
     unit.facts.* = .{ .project = &unit.project, .gpa = gpa, .open_world = true };
@@ -5492,10 +5499,13 @@ fn boundParameter(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Nod
     const f = flow.functions.items[@backingInt(function)];
     const tree = &c.project.at(f.file).file.tree;
     const at = Facts.ungrouped(tree, node);
-    switch (tree.nodeTag(at)) {
-        .identifier => {
+    switch (formAt(tree, at)) {
+        .leaf => {
             const model = &c.project.at(f.file).model;
-            const d = (model.reference(at) orelse return null).declaration orelse return null;
+            const d = switch (try c.facts.definition(f.file, at)) {
+                .decl => |decl| if (decl.file == f.file) decl.index else return null,
+                .none, .unknown => return null,
+            };
             const index = f.position(d) orelse return null;
             const declared = model.declarations[@backingInt(d)];
             return switch (try c.facts.resolve(f.file, declared.node)) {
@@ -5503,10 +5513,15 @@ fn boundParameter(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Nod
                 else => null,
             };
         },
-        .add, .sub, .mul, .div, .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat => {
+        .operator => {
+            const operator = Facts.accesses.operatorOf(tree.nodeTag(at)) orelse return null;
+            switch (operator.op) {
+                .add, .sub, .mul, .div => {},
+                else => return null,
+            }
             const lhs, const rhs = tree.nodeData(at).node_and_node;
-            if (tree.nodeTag(Facts.ungrouped(tree, rhs)) == .number_literal) return boundIdentifier(c, flow, function, lhs);
-            if (tree.nodeTag(Facts.ungrouped(tree, lhs)) == .number_literal) return boundIdentifier(c, flow, function, rhs);
+            if (try numberLiteral(c, f.file, rhs)) return boundIdentifier(c, flow, function, lhs);
+            if (try numberLiteral(c, f.file, lhs)) return boundIdentifier(c, flow, function, rhs);
             return null;
         },
         else => return null,
@@ -5516,8 +5531,14 @@ fn boundParameter(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Nod
 /// `boundParameter` of a bare name: one constant adjustment at most.
 fn boundIdentifier(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Context.Error!?usize {
     const tree = &c.project.at(flow.functions.items[@backingInt(function)].file).file.tree;
-    if (tree.nodeTag(Facts.ungrouped(tree, node)) != .identifier) return null;
+    if (formAt(tree, Facts.ungrouped(tree, node)) != .leaf) return null;
     return boundParameter(c, flow, function, node);
+}
+
+/// Whether `node` is a number written in place.
+fn numberLiteral(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    const literal = (try c.facts.literalOf(file, node)) orelse return false;
+    return literal == .number;
 }
 
 /// Whether a primitive type's name is an integer's: `usize`, `isize`, `u8`, `i32`, ...

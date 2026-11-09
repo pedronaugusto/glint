@@ -41,6 +41,10 @@ pub const TokenId = aegis.id.Id(struct {}, u32);
 /// A source handle that cannot silently identify a replacement snapshot.
 pub const Handle = struct { file: FileId, snapshot: u64 };
 /// Explicit source data. `name` is a diagnostic label; `stem` is Zig file-struct naming input.
+/// The name Zig binds to its standard library in every module, which no build module can take:
+/// the one spelling std's files are known by (`Facts.outside`).
+pub const std_module = "std";
+
 pub const Input = struct {
     name: []const u8,
     bytes: []const u8,

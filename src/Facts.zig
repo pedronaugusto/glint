@@ -843,7 +843,7 @@ pub fn outside(self: *Facts) ResolveError!*const Outside {
     if (found.built) return found;
     found.built = true;
     found.project = self.project;
-    for (self.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, "std")) try found.std_files.put(self.gpa, @backingInt(mapping.target), {});
+    for (self.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, Project.std_module)) try found.std_files.put(self.gpa, @backingInt(mapping.target), {});
     try self.reach(&found.std_files, .standard);
     for (self.project.sources) |*source| if (self.knownFile(source.id)) try found.known_files.put(self.gpa, @backingInt(source.id), {});
     return found;
@@ -872,7 +872,7 @@ fn reach(self: *Facts, files: *FileSet, from: enum { standard, library }) Resolv
         growing = false;
         for (self.project.imports) |mapping| {
             if (!files.contains(@backingInt(mapping.from)) or files.contains(@backingInt(mapping.target))) continue;
-            if (from == .library and (std.mem.eql(u8, mapping.spelling, "std") or std.mem.eql(u8, mapping.spelling, "builtin") or std.mem.eql(u8, mapping.spelling, "root"))) continue;
+            if (from == .library and (std.mem.eql(u8, mapping.spelling, Project.std_module) or std.mem.eql(u8, mapping.spelling, "builtin") or std.mem.eql(u8, mapping.spelling, "root"))) continue;
             try files.put(self.gpa, @backingInt(mapping.target), {});
             growing = true;
         }
@@ -3082,7 +3082,7 @@ fn unknownWithin(value: Value) bool {
 /// project maps std.
 fn stdMember(self: *Facts, path: []const []const u8) ResolveError!Value {
     const root = for (self.project.imports) |mapping| {
-        if (std.mem.eql(u8, mapping.spelling, "std")) break mapping.target;
+        if (std.mem.eql(u8, mapping.spelling, Project.std_module)) break mapping.target;
     } else return .{ .unknown = .missing_mapping };
     var value: Value = .{ .container = self.rootOf(root) };
     for (path) |name| value = try self.memberValue(value, name);
@@ -4468,7 +4468,7 @@ fn reachAll(self: *Facts, found: *Analysis) ResolveError!void {
         if (try self.program(source.id)) try self.enterFile(found, &next, source.id);
     }
     // Every compilation analyzes std's root, which reaches `start` (`comptime { _ = start; }`).
-    for (self.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, "std")) try self.enterFile(found, &next, mapping.target);
+    for (self.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, Project.std_module)) try self.enterFile(found, &next, mapping.target);
     // Each reading is a unit on a budget of its own; what it reads is memoized for the others.
     var cache: std.AutoHashMapUnmanaged(Ast.Node.Index, bool) = .empty;
     defer cache.deinit(self.gpa);
