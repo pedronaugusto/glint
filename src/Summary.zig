@@ -314,7 +314,8 @@ pub const Reader = struct {
     fn container(self: *Reader) ReadError!Facts.Container {
         const file = try self.source();
         const scope = try self.number();
-        if (scope >= self.facts.project.at(file).model.scopes.len) return error.Malformed;
+        const scopes = self.facts.project.at(file).model.scopes;
+        if (scope >= scopes.len) return error.Malformed;
         const symbolic = try self.flag();
         return .{ .file = file, .scope = @fromBackingInt(scope), .symbolic = symbolic, .made_by = try self.made() };
     }
@@ -322,7 +323,8 @@ pub const Reader = struct {
     fn decl(self: *Reader) ReadError!Decl {
         const file = try self.source();
         const index = try self.number();
-        if (index >= self.facts.project.at(file).model.declarations.len) return error.Malformed;
+        const declarations = self.facts.project.at(file).model.declarations;
+        if (index >= declarations.len) return error.Malformed;
         return .{ .file = file, .index = @fromBackingInt(index) };
     }
 
@@ -603,7 +605,8 @@ pub fn readAccesses(r: *Reader) ReadError!*accesses.File {
 fn readShape(r: *Reader) ReadError!Shape {
     const file = try r.source();
     const scope = try r.number();
-    if (scope >= r.facts.project.at(file).model.scopes.len) return error.Malformed;
+    const scopes = r.facts.project.at(file).model.scopes;
+    if (scope >= scopes.len) return error.Malformed;
     return .{ .file = file, .scope = @fromBackingInt(scope) };
 }
 

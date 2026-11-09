@@ -10771,6 +10771,22 @@ pub fn boundInRun(self: *Facts, function: Decl) ResolveError!?bool {
     return readings.len != 0;
 }
 
+/// The function whose body holds `node`, by its declaration; null at container level.
+pub fn functionHolding(self: *const Facts, file: Project.FileId, node: Ast.Node.Index) ?Decl {
+    const model = &self.project.at(file).model;
+    const tree = &self.project.at(file).file.tree;
+    var at = model.parentOf(node);
+    while (at) |parent| : (at = model.parentOf(parent)) {
+        if (tree.nodeTag(parent) != .fn_decl) continue;
+        for (model.declarations, 0..) |decl, i| {
+            if (decl.kind != .function) continue;
+            if (decl.node == parent or model.parentOf(decl.node) == parent) return .{ .file = file, .index = @fromBackingInt(@intCast(i)) };
+        }
+        return null;
+    }
+    return null;
+}
+
 /// The readings the run compiles `function` in: its one reading where it is no generic (Zig's
 /// one definition, `genericFunction`: a `comptime`, `type` or `anytype` parameter), else
 /// one per binding a compiled call of it makes (`readingFrom`), each call asked in a reading
@@ -10781,7 +10797,7 @@ pub fn boundInRun(self: *Facts, function: Decl) ResolveError!?bool {
 /// be no call a run judges (`judgedAtBindings`). Generics that call each other are bound only by
 /// a call from outside them: an answer that met one further out still being read is asked again
 /// once that one is decided (as `comptimeTruth`'s `open_met`), so it is the same in any order.
-fn compiledReadings(self: *Facts, function: Decl) ResolveError!?[]const ?*const Env {
+pub fn compiledReadings(self: *Facts, function: Decl) ResolveError!?[]const ?*const Env {
     if (!self.genericFunction(function)) return &.{null};
     const read = try self.memo(BoundInRun);
     if (read.map.get(function)) |state| switch (state) {

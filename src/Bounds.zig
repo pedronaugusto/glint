@@ -41,7 +41,6 @@ const spellsName = Range.spellsName;
 const Program = @import("Program.zig");
 const Facts = @import("Facts.zig");
 const Governed = @import("Governed.zig");
-const aegis = @import("aegis");
 
 const Error = Context.Error;
 
@@ -696,7 +695,7 @@ fn candidatesIn(c: *Context, file: Project.FileId, proofs: *std.ArrayList(Proof)
     var fields: std.ArrayList(Sibling) = .empty;
     for (model.declarations, 0..) |record, d| {
         if (record.kind != .field) continue;
-        const decl: Facts.Decl = .{ .file = file, .index = @fromBackingInt(aegis.int.cast(u32, d) catch continue) };
+        const decl: Facts.Decl = .{ .file = file, .index = @fromBackingInt(@intCast(d)) };
         const full = model.containerField(tree, record.node) orelse continue;
         const type_node = full.ast.type_expr.unwrap() orelse continue;
         const slice = if (tree.fullPtrType(type_node)) |pointer| pointer.size == .slice else false;

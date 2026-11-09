@@ -3876,6 +3876,39 @@ test "A009 reads the type a conversion makes through its call's binding and a br
     try std.testing.expectEqual(@as(usize, 0), peer.undecided);
 }
 
+test "A009 counts an id made from a number checked below its table's length, and not one checked against a table a call gives" {
+    const head =
+        \\const std = @import("std");
+        \\const Entry = struct { name: u8, pub const Id = enum(u32) { _ }; };
+        \\const Table = struct {
+        \\    entries: []Entry,
+        \\    fn at(t: *const Table, id: Entry.Id) u8 { return t.entries[@backingInt(id)].name; }
+        \\    fn get(t: *const Table) []Entry { return t.entries; }
+        \\};
+        \\pub fn f(r: *std.Io.Reader, t: *Table) !u8 {
+        \\    const n = try r.takeInt(u32, 0);
+        \\
+    ;
+    const guarded = try run(pack.untrusted_input, head ++
+        \\    const entries = t.entries;
+        \\    if (n >= entries.len) return error.Malformed;
+        \\    const id: Entry.Id = @fromBackingInt(n);
+        \\    return t.at(id);
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), guarded.findings);
+    try std.testing.expectEqual(@as(usize, 0), guarded.undecided);
+    // A call may give another table each time: its length bounds this one's position in nothing.
+    const called = try run(pack.untrusted_input, head ++
+        \\    if (n >= t.get().len) return error.Malformed;
+        \\    const id: Entry.Id = @fromBackingInt(n);
+        \\    return t.at(id);
+        \\}
+    );
+    try std.testing.expectEqualSlices(u32, &.{11}, called.lines[0..called.findings]);
+    try std.testing.expectEqual(@as(usize, 1), called.undecided);
+}
+
 test "A009 decides a table's own id at each position: an uncounted make leaves undecided only the positions it reaches" {
     const head =
         \\const std = @import("std");

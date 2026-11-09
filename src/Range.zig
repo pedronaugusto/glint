@@ -1496,7 +1496,14 @@ const Destination = union(enum) {
     shifted: Ast.Node.Index,
 };
 
-fn destined(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Destination {
+/// Whether a builtin's result takes its type from where it goes, its operand's being only a
+/// pointer of another alignment or qualifiers.
+fn leavesType(name: []const u8) bool {
+    for ([_][]const u8{ "@alignCast", "@constCast", "@volatileCast", "@addrSpaceCast" }) |through| if (std.mem.eql(u8, name, through)) return true;
+    return false;
+}
+
+fn destined(c: *Context, file: Project.FileId, node: Ast.Node.Index, outer: ?*const Facts.Env) Context.Error!?Destination {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
     var at = node;
@@ -1522,6 +1529,8 @@ fn destined(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
                 var buffer: [2]Ast.Node.Index = undefined;
                 const args = Facts.builtinArgs(tree, parent, &buffer);
                 if (std.mem.eql(u8, name, "@fromBackingInt") or std.mem.eql(u8, name, "@enumFromInt")) return if (args.len == 1) .{ .backing = parent } else null;
+                // A cast of a pointer's alignment or qualifiers leaves its type to where it goes.
+                if (args.len != 0 and args[args.len - 1] == at and leavesType(name)) continue;
                 if (!std.mem.eql(u8, name, "@as")) return null;
                 if (args.len != 2 or args[1] != at) return null;
                 return .{ .named = .{ .file = file, .node = args[0] } };
@@ -1561,7 +1570,7 @@ fn destined(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
                     return .{ .named = .{ .file = file, .node = variable.ast.type_node.unwrap() orelse return null } };
                 }
                 var call_buffer: [1]Ast.Node.Index = undefined;
-                if (tree.fullCall(&call_buffer, parent)) |call| return argument(c, file, call, at);
+                if (tree.fullCall(&call_buffer, parent)) |call| return argument(c, file, call, at, outer);
                 var init_buffer: [2]Ast.Node.Index = undefined;
                 if (tree.fullStructInit(&init_buffer, parent)) |_| return .{ .field = (try field(c, file, parent, at)) orelse return null };
                 return null;
@@ -1573,8 +1582,8 @@ fn destined(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
 
 /// The integer type a conversion's result is read into.
 fn destination(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16) Context.Error!?Int {
-    return switch ((try destined(c, file, node)) orelse return null) {
-        .named => |type_node| switch (integer(try typeNamed(c, type_node), pointer)) {
+    return switch ((try destined(c, file, node, null)) orelse return null) {
+        .named => |type_node| switch (integer(try typeNamed(c, type_node, null), pointer)) {
             .int => |int| int,
             else => null,
         },
@@ -1604,8 +1613,8 @@ const Backing = struct {
 };
 
 fn backed(c: *Context, file: Project.FileId, call: Ast.Node.Index, pointer: u16) Context.Error!?Backing {
-    var made = switch ((try destined(c, file, call)) orelse return null) {
-        .named => |type_node| try typeNamed(c, type_node),
+    var made = switch ((try destined(c, file, call, null)) orelse return null) {
+        .named => |type_node| try typeNamed(c, type_node, null),
         .assigned => |lhs| try c.facts.resolve(file, lhs),
         .field => |decl| try c.facts.declaration(decl),
         .backing, .shifted => return null,
@@ -1672,7 +1681,7 @@ pub fn fills(c: *Context, file: Project.FileId, call: Ast.Node.Index, operand: A
 }
 
 /// Where the parameter `arg` is given to declares its type, where the call resolves.
-fn argument(c: *Context, file: Project.FileId, call: Ast.full.Call, arg: Ast.Node.Index) Context.Error!?Destination {
+fn argument(c: *Context, file: Project.FileId, call: Ast.full.Call, arg: Ast.Node.Index, outer: ?*const Facts.Env) Context.Error!?Destination {
     const tree = &c.project.at(file).file.tree;
     const position_of = std.mem.findScalar(Ast.Node.Index, call.ast.params, arg) orelse return null;
     const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
@@ -1694,14 +1703,15 @@ fn argument(c: *Context, file: Project.FileId, call: Ast.full.Call, arg: Ast.Nod
     var index: usize = 0;
     while (it.next()) |param| : (index += 1) {
         if (index != position_of + skip) continue;
-        return .{ .named = .{ .file = decl.file, .node = param.type_expr orelse return null, .env = try c.facts.bind(file, call, decl, null) } };
+        return .{ .named = .{ .file = decl.file, .node = param.type_expr orelse return null, .env = try c.facts.bind(file, call, decl, outer) } };
     }
     return null;
 }
 
-/// The type a destination's type expression names, under the call's binding where it has one.
-fn typeNamed(c: *Context, type_node: @FieldType(Destination, "named")) Context.Error!Facts.Value {
-    const env = type_node.env orelse return c.facts.resolve(type_node.file, type_node.node);
+/// The type a destination's type expression names, under the call's binding where it has one,
+/// else under `outer`, the reading of the function it is written in.
+fn typeNamed(c: *Context, type_node: @FieldType(Destination, "named"), outer: ?*const Facts.Env) Context.Error!Facts.Value {
+    const env = type_node.env orelse outer orelse return c.facts.resolve(type_node.file, type_node.node);
     return c.facts.resolveBound(env, type_node.file, type_node.node);
 }
 
@@ -3788,8 +3798,9 @@ fn isTable(c: *Context, owner: Facts.Container) Context.Error!bool {
 /// Whether `call` makes a table's own id other than by counting the table's entries: a
 /// `@fromBackingInt` or `@enumFromInt` making one whose operand `countsEntries` does not show
 /// within, a `@bitCast` or `@ptrCast` making one, or a conversion whose type does not resolve
-/// where the program has such ids (`madeOf`). The source of Taint's `uncounted_id` fact. A make
-/// in test code is none: a test's ids reach no proof of the program's own.
+/// where the program has such ids (`madeOf`), whichever file it is in: std's generics make the
+/// program's ids where the program binds them to one. The source of Taint's `uncounted_id` fact. A
+/// make in test code is none: a test's ids reach no proof of the program's own.
 pub fn uncountedMake(c: *Context, file: Project.FileId, call: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
     const counts = Facts.isBuiltin(tree, call, "@fromBackingInt") or Facts.isBuiltin(tree, call, "@enumFromInt");
@@ -3853,9 +3864,23 @@ pub fn madeId(c: *Context, file: Project.FileId, call: Ast.Node.Index) Context.E
 /// to a pointer to an id). An id is a table's only where its ids index a table of their
 /// container (`isTable`).
 fn madeOf(c: *Context, file: Project.FileId, call: Ast.Node.Index, pointed: bool) Context.Error!Made {
-    var made = switch ((try destined(c, file, call)) orelse return .unknown) {
-        .named => |type_node| try typeNamed(c, type_node),
-        .assigned => |lhs| try c.facts.resolve(file, lhs),
+    const direct = try madeIn(c, file, call, pointed, null);
+    if (direct != .unknown) return direct;
+    // A type only a binding decides: what each binding the run compiles makes it. One of a
+    // generic nothing compiled binds makes nothing; one that does not resolve stays unknown.
+    const function = c.facts.functionHolding(file, call) orelse return .unknown;
+    for ((try c.facts.compiledReadings(function)) orelse return .unknown) |reading| {
+        const made = try madeIn(c, file, call, pointed, reading orelse return .unknown);
+        if (made != .other) return made;
+    }
+    return .other;
+}
+
+/// `madeOf` under `outer`, one reading of the function the conversion is in (none, as written).
+fn madeIn(c: *Context, file: Project.FileId, call: Ast.Node.Index, pointed: bool, outer: ?*const Facts.Env) Context.Error!Made {
+    var made = switch ((try destined(c, file, call, outer)) orelse return .unknown) {
+        .named => |type_node| try typeNamed(c, type_node, outer),
+        .assigned => |lhs| if (outer) |env| try c.facts.resolveBound(env, file, lhs) else try c.facts.resolve(file, lhs),
         .field => |decl| try c.facts.declaration(decl),
         .backing, .shifted => return .other,
     };

@@ -247,7 +247,7 @@ fn unpublished(self: *Context, root: Project.FileId) Context.Error!bool {
 /// What holds `node`: the function whose body it is in, or else the container-level declaration
 /// it is written in (a constant, a variable, an `extern` prototype); null at no declaration.
 fn holderOf(self: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Facts.Decl {
-    if (enclosingFunction(self.project, file, node)) |function| return function;
+    if (self.facts.functionHolding(file, node)) |function| return function;
     const model = &self.project.at(file).model;
     var at: ?Ast.Node.Index = node;
     while (at) |each| : (at = model.parentOf(each)) {
@@ -573,20 +573,4 @@ fn inTestBlock(project: *const Project, file: Project.FileId, node: Ast.Node.Ind
     var at = model.parentOf(node);
     while (at) |parent| : (at = model.parentOf(parent)) if (tree.nodeTag(parent) == .test_decl) return true;
     return false;
-}
-
-/// The function whose body holds `node`, by its declaration; null at container level.
-fn enclosingFunction(project: *const Project, file: Project.FileId, node: Ast.Node.Index) ?Facts.Decl {
-    const model = &project.at(file).model;
-    const tree = &project.at(file).file.tree;
-    var at = model.parentOf(node);
-    while (at) |parent| : (at = model.parentOf(parent)) {
-        if (tree.nodeTag(parent) != .fn_decl) continue;
-        for (model.declarations, 0..) |decl, i| {
-            if (decl.kind != .function) continue;
-            if (decl.node == parent or model.parentOf(decl.node) == parent) return .{ .file = file, .index = @fromBackingInt(@intCast(i)) };
-        }
-        return null;
-    }
-    return null;
 }
