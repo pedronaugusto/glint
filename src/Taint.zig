@@ -4793,7 +4793,7 @@ fn countDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Inde
             return (try countDep(c, flow, function, lhs, depth + 1)).join(c.allocator, try countDep(c, flow, function, rhs, depth + 1));
         },
         .@"if" => {
-            const choice = tree.fullIf(at).?; // unreachable: tagged an if
+            const choice = tree.fullIf(at) orelse return dep(c, flow, function, at);
             var out = try countDep(c, flow, function, choice.ast.then_expr, depth + 1);
             if (choice.ast.else_expr.unwrap()) |other| out = try out.join(c.allocator, try countDep(c, flow, function, other, depth + 1));
             return out;
