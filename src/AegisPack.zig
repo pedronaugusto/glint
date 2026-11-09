@@ -1585,9 +1585,6 @@ fn boundBy(c: *Context, tree: *const Ast, call: Facts.calls.Call, rule: Rule, fu
     // Which parameters take a type: a binding of one is a type the call writes.
     var types: [64]bool = @splat(false);
     var values: [64]bool = @splat(false);
-    // An argument left undecided is one site of the binding, however many of the generic's
-    // copies read it: reported once, at its first.
-    var undecided_at: [64]bool = @splat(false);
     var count: usize = 0;
     var it = proto.iterate(written);
     while (it.next()) |param| : (count += 1) {
@@ -1601,105 +1598,114 @@ fn boundBy(c: *Context, tree: *const Ast, call: Facts.calls.Call, rule: Rule, fu
     // The generic's casts this binding makes an aegis scalar's: one finding at the binding,
     // naming each, however many of the generic's paths and instances reach it.
     var casts: std.ArrayList(Report.Span) = .empty;
-    for (made) |copy| {
-        // A cast by a parameter's type is A004's; a copy A002's, an acquisition A003's.
-        if ((copy.kind == .cast) != (rule == scalar)) continue;
-        if (copy.kind != .cast and (copy.kind == .made) != (rule == cleanup)) continue;
+    for (args, 0..) |argument, position| {
+        if (position == count) break;
         // The receiver is bound as written, never a type or a value the call writes for it.
-        if ((receiver and copy.position == 0) or copy.position >= args.len) continue;
-        if (!types[copy.position] and !values[copy.position]) continue;
-        const argument = args[copy.position];
+        if ((receiver and position == 0) or (!types[position] and !values[position])) continue;
         // A parameter of a generic this call is in, passed on: decided where that is bound.
         if (c.facts.fromParameter(c.file, argument)) continue;
-        // A parameter the generic moves into storage (`out.* = x`): the argument moves there
-        // where it is made in place, or is a local nothing holds beside the call (`moved`); a
-        // live local read again, or one passed on each pass of a loop, is copied.
-        if (copy.kind == .moved) {
-            const parts = try c.facts.copiedParts(c.file, argument);
-            var moves = parts.deep == null;
-            for (parts.places) |place| if (try moved(c, argument, place, false) != .yes) {
-                moves = false;
-            };
-            if (moves) continue;
-        }
-        // What the generic passes on of the argument (what calling it returns, what it points
-        // to), read with this call's bindings; else the argument, plain data as written (a type
-        // of numbers, and pointers or arrays of them, or a value of one) or as it resolves.
-        const value = if (copy.source != null)
-            (try c.facts.boundCopy(call, function, copy)) orelse continue
-        else if (copy.crowded)
-            Facts.Value{ .unknown = .budget }
-        else if (if (types[copy.position]) try plainType(c, c.file, argument, 0) else try plainValue(c, c.file, argument, 0))
-            continue
-        else
-            try c.facts.resolve(c.file, argument);
-        if (copy.kind == .cast) {
-            // The library's own generics are its safe types' internals.
-            if (try c.inLibrary(Contract.library, copy.site.file)) continue;
-            // A scalar's integer read out (`raw()`, `@backingInt`, the bits of its value) is
-            // its exit, as in a function of no generic: the binding makes it a finding only
-            // where that integer is operated on (`readOutOperated`).
-            if (readOut(c, copy) and !try readOutOperated(c, copy.site.file, copy.site.node, 0)) continue;
-            switch (try perBuild(c, try instanceOf(c, value))) {
-                .owner => |k| if (k == .scalar) {
-                    const span = c.spanOf(copy.site.file, c.project.at(copy.site.file).file.tree.nodeMainToken(copy.site.node));
-                    for (casts.items) |known| {
-                        if (known.file == span.file and known.start == span.start) break;
-                    } else try casts.append(c.allocator, span);
-                },
-                .other => {},
-                .unknown => if (!bindingTyped(value) and !undecided_at[copy.position]) {
-                    undecided_at[copy.position] = true;
-                    try c.undecided(scalar, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a generic that casts integers by its parameter's type is bound to a type that does not resolve");
-                },
+        // An argument left undecided is one site of the binding, however many of the
+        // generic's copies read it: reported once, at its first.
+        var reported = false;
+        for (made) |copy| {
+            if (copy.position != position) continue;
+            // A cast by a parameter's type is A004's; a copy A002's, an acquisition A003's.
+            if ((copy.kind == .cast) != (rule == scalar)) continue;
+            if (copy.kind != .cast and (copy.kind == .made) != (rule == cleanup)) continue;
+            // A parameter the generic moves into storage (`out.* = x`): the argument moves there
+            // where it is made in place, or is a local nothing holds beside the call (`moved`); a
+            // live local read again, or one passed on each pass of a loop, is copied.
+            if (copy.kind == .moved) {
+                const parts = try c.facts.copiedParts(c.file, argument);
+                var moves = parts.deep == null;
+                for (parts.places) |place| if (try moved(c, argument, place, false) != .yes) {
+                    moves = false;
+                };
+                if (moves) continue;
             }
-            continue;
-        }
-        // A pointer type: its copies are aliases, which A002 leaves out.
-        if (pointerShaped(value) == true) continue;
-        // A type argument stands for its values.
-        const bound = try instanceOf(c, value);
-        if (copy.kind == .made) {
-            const site = c.project.at(copy.site.file).file;
-            const line = site.line(site.tree.tokenStart(site.tree.firstToken(copy.site.node))) + 1;
-            const owner = try madeOwner(c, call, function, copy, bound);
-            switch (owner) {
-                .owner => |k| if (owes(k)) try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unsupported, try c.allocator.print("this binding makes an owner of what {s}:{d} acquires by the generic's type parameter; its cleanup is not walked per binding", .{ c.project.at(copy.site.file).input.name, line })),
-                .other => {},
-                .unknown => if (!bindingTyped(bound) and !undecided_at[copy.position]) {
-                    undecided_at[copy.position] = true;
-                    try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a generic that acquires by its type parameter is bound to a type that does not resolve");
-                },
+            // What the generic passes on of the argument (what calling it returns, what it points
+            // to), read with this call's bindings; else the argument, plain data as written (a type
+            // of numbers, and pointers or arrays of them, or a value of one) or as it resolves.
+            const value = if (copy.source != null)
+                (try c.facts.boundCopy(call, function, copy)) orelse continue
+            else if (copy.crowded)
+                Facts.Value{ .unknown = .budget }
+            else if (if (types[position]) try plainType(c, c.file, argument, 0) else try plainValue(c, c.file, argument, 0))
+                continue
+            else
+                try c.facts.resolve(c.file, argument);
+            if (copy.kind == .cast) {
+                // The library's own generics are its safe types' internals.
+                if (try c.inLibrary(Contract.library, copy.site.file)) continue;
+                // A scalar's integer read out (`raw()`, `@backingInt`, the bits of its value) is
+                // its exit, as in a function of no generic: the binding makes it a finding only
+                // where that integer is operated on (`readOutOperated`).
+                if (readOut(c, copy) and !try readOutOperated(c, copy.site.file, copy.site.node, 0)) continue;
+                switch (try perBuild(c, try instanceOf(c, value))) {
+                    .owner => |k| if (k == .scalar) {
+                        const span = c.spanOf(copy.site.file, c.project.at(copy.site.file).file.tree.nodeMainToken(copy.site.node));
+                        for (casts.items) |known| {
+                            if (known.file == span.file and known.start == span.start) break;
+                        } else try casts.append(c.allocator, span);
+                    },
+                    .other => {},
+                    .unknown => if (!bindingTyped(value)) try undecidedOnce(c, &reported, scalar, tree.tokenStart(tree.nodeMainToken(node)), "a generic that casts integers by its parameter's type is bound to a type that does not resolve"),
+                }
+                continue;
             }
-            continue;
-        }
-        switch (try copied(c, bound, 0)) {
-            .owner => |k| if (copiedOwner(k)) {
+            // A pointer type: its copies are aliases, which A002 leaves out.
+            if (pointerShaped(value) == true) continue;
+            // A type argument stands for its values.
+            const bound = try instanceOf(c, value);
+            if (copy.kind == .made) {
                 const site = c.project.at(copy.site.file).file;
-                const detail = try c.allocator.print("this binding makes a recognized owner of a generic's parameter, which {s}:{d} copies; a duplicated owner requires explicit transfer", .{ c.project.at(copy.site.file).input.name, site.line(site.tree.tokenStart(site.tree.firstToken(copy.site.node))) + 1 });
-                try c.at(copies, tree.nodeMainToken(node), detail);
-                return true;
-            },
-            .other => {},
-            .unknown => if (!bindingTyped(bound) and !undecided_at[copy.position]) {
-                undecided_at[copy.position] = true;
-                try c.undecided(copies, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a generic that copies its parameter is bound to a type that does not resolve");
-            },
+                const line = site.line(site.tree.tokenStart(site.tree.firstToken(copy.site.node))) + 1;
+                const owner = try madeOwner(c, call, function, copy, bound);
+                switch (owner) {
+                    .owner => |k| if (owes(k)) try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unsupported, try c.allocator.print("this binding makes an owner of what {s}:{d} acquires by the generic's type parameter; its cleanup is not walked per binding", .{ c.project.at(copy.site.file).input.name, line })),
+                    .other => {},
+                    .unknown => if (!bindingTyped(bound)) try undecidedOnce(c, &reported, cleanup, tree.tokenStart(tree.nodeMainToken(node)), "a generic that acquires by its type parameter is bound to a type that does not resolve"),
+                }
+                continue;
+            }
+            switch (try copied(c, bound, 0)) {
+                .owner => |k| if (copiedOwner(k)) {
+                    const site = c.project.at(copy.site.file).file;
+                    const detail = try c.allocator.print("this binding makes a recognized owner of a generic's parameter, which {s}:{d} copies; a duplicated owner requires explicit transfer", .{ c.project.at(copy.site.file).input.name, site.line(site.tree.tokenStart(site.tree.firstToken(copy.site.node))) + 1 });
+                    try c.at(copies, tree.nodeMainToken(node), detail);
+                    return true;
+                },
+                .other => {},
+                .unknown => if (!bindingTyped(bound)) try undecidedOnce(c, &reported, copies, tree.tokenStart(tree.nodeMainToken(node)), "a generic that copies its parameter is bound to a type that does not resolve"),
+            }
         }
     }
-    if (casts.items.len == 0) return false;
+    return castsReported(c, tree, node, casts.items);
+}
+
+/// `boundBy`'s `casts` of a binding at `node`, reported as one finding naming each: whether there
+/// were any.
+fn castsReported(c: *Context, tree: *const Ast, node: Ast.Node.Index, casts: []const Report.Span) Context.Error!bool {
+    if (casts.len == 0) return false;
     var named: std.ArrayList(u8) = .empty;
-    for (casts.items, 0..) |span, i| {
-        if (i != 0) try named.appendSlice(c.allocator, if (i + 1 == casts.items.len) " and " else ", ");
+    for (casts, 0..) |span, i| {
+        if (i != 0) try named.appendSlice(c.allocator, if (i + 1 == casts.len) " and " else ", ");
         try named.print(c.allocator, "{s}:{d}", .{ c.project.at(span.file).input.name, span.line });
     }
-    const message = if (casts.items.len == 1)
+    const message = if (casts.len == 1)
         try c.allocator.print("this binding makes the integer {s} makes or reads by the generic's type an aegis scalar's, outside its checked construction and arithmetic", .{named.items})
     else
         try c.allocator.print("this binding makes the integers {s} make or read by the generic's type aegis scalars', outside their checked construction and arithmetic", .{named.items});
     const at = tree.tokenToSpan(tree.nodeMainToken(node));
-    try c.emitRelated(scalar, at.start, at.end, message, casts.items);
+    try c.emitRelated(scalar, at.start, at.end, message, casts);
     return true;
+}
+
+/// Reports `rule`'s undecided binding of an argument at `at`, where `reported` says none has been.
+fn undecidedOnce(c: *Context, reported: *bool, rule: Rule, at: u32, detail: []const u8) Context.Error!void {
+    if (reported.*) return;
+    reported.* = true;
+    try c.undecided(rule, at, .unresolved, detail);
 }
 
 fn checkCopies(c: *Context) Context.Error!void {

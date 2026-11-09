@@ -1741,17 +1741,16 @@ fn crowdedIn(self: *Facts, env: *const Env, function: Decl, position: usize, cop
     if (memory.found.get(key)) |kept| return kept;
     // A step the walk holds, being read or read in a cycle not yet closed, adds nothing new
     // here: what it reaches, the cycle's first step reads.
-    if (walk.held.get(here)) |at| {
-        walk.low = @min(walk.low, at);
+    for (walk.stack.items) |held| if (std.meta.eql(held.step, here)) {
+        walk.low = @min(walk.low, held.at);
         return null;
-    }
+    };
     if (self.remaining == 0) return self.spent();
     self.remaining -= 1;
     const mine = walk.count;
     walk.count += 1;
     const base = walk.stack.items.len;
     try walk.stack.append(self.gpa, .{ .step = here, .at = mine });
-    try walk.held.put(self.gpa, here, mine);
     const outer_low = walk.low;
     const was_short = self.short;
     const met = self.open_met;
@@ -1770,10 +1769,7 @@ fn crowdedIn(self: *Facts, env: *const Env, function: Decl, position: usize, cop
     const closed = walk.low >= mine;
     if (closed) {
         const whole = self.remaining != 0 and self.short == was_short and self.open_met == met and !self.wideSince(wide);
-        for (walk.stack.items[base..]) |held| {
-            if (whole) try memory.found.put(self.gpa, .{ .step = held.step, .kind = copy.kind, .site = copy.site, .source = copy.source.?, .assumed = self.assumed }, found);
-            _ = walk.held.remove(held.step);
-        }
+        if (whole) for (walk.stack.items[base..]) |held| try memory.found.put(self.gpa, .{ .step = held.step, .kind = copy.kind, .site = copy.site, .source = copy.source.?, .assumed = self.assumed }, found);
         walk.stack.items.len = base;
         walk.low = outer_low;
     } else walk.low = @min(outer_low, walk.low);
@@ -1824,12 +1820,11 @@ const Crowded = struct {
 };
 
 /// One crowded copy's walk from a binding: the steps it holds, being read or read in a cycle
-/// not yet closed, in the order they were begun, each with that order, and the same steps by
-/// step (`held`), so one is found without looking through them all; how many it has begun; and
-/// the earliest a route was cut at since the step being read began.
+/// not yet closed, in the order they were begun, each with that order (as many as the generics
+/// passing it on nest, so found by looking); how many it has begun; and the earliest a route
+/// was cut at since the step being read began.
 const CrowdedWalk = struct {
     stack: std.ArrayList(struct { step: CrowdedStep, at: usize }) = .empty,
-    held: std.AutoHashMapUnmanaged(CrowdedStep, usize) = .empty,
     count: usize = 0,
     low: usize = std.math.maxInt(usize),
 };
