@@ -4726,6 +4726,10 @@ fn peerSites(c: *Context, flow: *Flow, file: Project.FileId, callee: Callee, out
         // number the fact reached through std's writes or a branch are written, never the
         // writer. One that may hold a writer only through what does not resolve (an
         // allocator's opaque state) is no writer shown: unknown at most.
+        // An allocating writer's bytes go into memory its allocator hands out, which no peer
+        // reads: written into, it holds what it is given (`outsideWrites`), judged where those
+        // bytes are written again.
+        if (try allocatingWriter(c, file, arg, 0)) continue;
         const held = try writerHold(c, flow, try c.facts.resolve(file, arg), 0);
         if (held == .none) continue;
         const writer_level = try levelIn(c, flow, file, arg, flow.masks.peer_writer);
@@ -4737,6 +4741,52 @@ fn peerSites(c: *Context, flow: *Flow, file: Project.FileId, callee: Callee, out
     if (writer == .clean) return;
     const decided = writer.reaches(.data) and callee.kind != .none;
     for (callee.args, 0..) |arg, position| if (!taken.has(position)) try writtenParts(c, file, callee, arg, position, decided, out);
+}
+
+/// Whether `node` is the writer of a `std.Io.Writer.Allocating` (by its declaration), as each
+/// expression it comes from gives it: `&a.writer` of an instance, through the one value each
+/// local `const` naming it holds.
+fn allocatingWriter(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!bool {
+    if (depth > 4) return false;
+    const written_by = switch (try accesses.valuesOf(c.facts, file, node)) {
+        .leaves => |each| each,
+        .unknown => return false,
+    };
+    if (written_by.len == 0) return false;
+    const tree = &c.project.at(file).file.tree;
+    for (written_by) |leaf| {
+        if (tree.nodeTag(leaf) == .identifier) {
+            const named = switch (try c.facts.definition(file, leaf)) {
+                .decl => |decl| decl,
+                .none, .unknown => return false,
+            };
+            // Only a variable is given values (`givenTo`): any other declaration answers null.
+            if (named.file != file) return false;
+            const given = (try c.facts.givenTo(named, false)) orelse return false;
+            if (given.len != 1 or !try allocatingWriter(c, file, given[0].node, depth + 1)) return false;
+            continue;
+        }
+        if (formAt(tree, leaf) != .address_of) return false;
+        const field = Facts.ungrouped(tree, tree.nodeData(leaf).node);
+        const step = (try accesses.memberRead(c.facts, file, field)) orelse return false;
+        if (!std.mem.eql(u8, step.name orelse return false, "writer")) return false;
+        if (!try allocatingInstance(c, try c.facts.resolve(file, step.receiver orelse return false))) return false;
+    }
+    return true;
+}
+
+/// Whether `value` is an instance of `std.Io.Writer.Allocating`, by its declaration.
+fn allocatingInstance(c: *Context, value: Facts.Value) Context.Error!bool {
+    if (value != .instance) return false;
+    const decls = switch (try Governed.declarations(c, "std", "Io.Writer.Allocating")) {
+        .decls => |each| each,
+        .none, .unknown => return false,
+    };
+    for (decls) |decl| switch (try c.facts.declaration(decl)) {
+        .container => |k| if (k.file == value.instance.file and k.scope == value.instance.scope) return true,
+        else => {},
+    };
+    return false;
 }
 
 /// The parameters a function may be handed its writer by, by position, the receiver first: a
