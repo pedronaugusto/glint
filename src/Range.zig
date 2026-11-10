@@ -1022,7 +1022,12 @@ fn takesType(c: *Context, file: Project.FileId, callee: Ast.Node.Index, at: usiz
     while (params.next()) |param| : (k += 1) {
         if (k != at + @intFromBool(bound_receiver)) continue;
         const kind = param.type_expr orelse return true;
-        return c.facts.typeIsType(function.file, kind);
+        // A parameter's type that does not resolve may be `type`.
+        return switch (try c.facts.resolve(function.file, kind)) {
+            .primitive => |name| std.mem.eql(u8, name, "type"),
+            .unknown, .alternatives => true,
+            else => false,
+        };
     }
     // A variadic `extern`'s or one past the list: nothing known.
     return true;
@@ -1049,6 +1054,12 @@ fn typeShapes(c: *Context, memo: *Given, value: Facts.Value, depth: u8) Context.
         .optional, .array, .error_union => |inner| try typeShapes(c, memo, inner.*, depth + 1),
         .alternatives => |each| for (each) |one| try typeShapes(c, memo, one, depth + 1),
         .reified => memo.any = true,
+        // A field whose type does not resolve may hold any container, but for what Zig itself
+        // declares or a name the program does not have.
+        .unknown => |why| switch (why) {
+            .zig_own, .absent => {},
+            else => memo.any = true,
+        },
         else => {},
     }
 }
@@ -3264,6 +3275,13 @@ fn structured(c: *Context, file: Project.FileId, root: Ast.Node.Index) Context.E
 /// its address taken (`&x`, `&x.f`, a slice of an array), a method whose receiver is a pointer
 /// called on it, a capture binding a pointer into it (`if (x) |*p|`), or memory code the program
 /// does not hold writes (an `asm` output naming it, an `extern`). Found once per declaration.
+///
+/// Kept for the run whoever asked first and on whatever budget, which is sound by how the
+/// writes are found, not by this memo: `Facts.accesses` walks each file's syntax whole (a
+/// walk that fails keeps nothing, `writesOf`), and a target or a holder it cannot resolve, for
+/// want of budget as for any other reason, is itself a site of every place it may name (`open`,
+/// `covered`, a member on a holder that does not resolve). A cut can only add sites, and a
+/// site this reads as addressed; none ends the scan with "not addressed".
 const Addressed = struct { map: std.AutoHashMapUnmanaged(struct { Project.FileId, Model.Declaration.Id }, bool) = .empty };
 
 /// Whether the memory `memory` names may hold a length no build checks: one written in place
