@@ -15,7 +15,7 @@
 //! never read as fewer facts.
 const std = @import("std");
 
-pub const magic = "GLFACTS\x00".*;
+pub const magic: [8]u8 = "GLFACTS\x00".*;
 pub const version: u32 = 1;
 
 /// No value, body or file: the id a field holds where it names none.
@@ -248,7 +248,7 @@ pub const Builder = struct {
     /// The file's bytes, owned by the caller. Fields are written as the host has them: the
     /// format is little-endian and so is every host the exporter runs on (checked here).
     pub fn finish(self: *const Builder) std.mem.Allocator.Error![]u8 {
-        comptime std.debug.assert(@import("builtin").cpu.arch.endian() == .little);
+        if (comptime std.mem.nativeToLittle(u32, 1) != 1) @compileError("the facts format is little-endian and is written as the host holds it");
         const end: End = .{ .files = @intCast(self.files.items.len), .values = @intCast(self.values.items.len), .bodies = @intCast(self.bodies.items.len), .results = @intCast(self.results.items.len) };
         const parts = [_]struct { tag: Tag, count: usize, bytes: []const u8 }{
             .{ .tag = .strings, .count = self.strings.items.len, .bytes = self.strings.items },
@@ -298,7 +298,7 @@ pub fn canonical(gpa: std.mem.Allocator, from: *const Builder) CanonicalError!Bu
         each.* = @intCast(i);
         path.* = try canon.textOf(file.path);
     }
-    std.mem.sort(u32, file_order, @as([]const []const u8, file_paths), lessByText);
+    try sortByText(arena, file_order, file_paths);
     canon.file_new = try arena.alloc(u32, files.len);
     for (file_order, 0..) |old, new| {
         canon.file_new[old] = @intCast(new);
@@ -314,7 +314,7 @@ pub fn canonical(gpa: std.mem.Allocator, from: *const Builder) CanonicalError!Bu
         each.* = @intCast(i);
         key.* = try canon.bodyKey(@intCast(i), 0);
     }
-    std.mem.sort(u32, body_order, @as([]const []const u8, keys), lessByText);
+    try sortByText(arena, body_order, keys);
     canon.body_new = try arena.alloc(u32, bodies.len);
     for (body_order, 0..) |old, new| canon.body_new[old] = @intCast(new);
 
@@ -326,7 +326,7 @@ pub fn canonical(gpa: std.mem.Allocator, from: *const Builder) CanonicalError!Bu
         each.* = @intCast(i);
         key.* = try canon.textOf(entry.key);
     }
-    std.mem.sort(u32, config_order, @as([]const []const u8, config_keys), lessByText);
+    try sortByText(arena, config_order, config_keys);
     for (config_order) |old| try canon.out.config.append(gpa, .{ .key = try canon.out.text(config_keys[old]), .value = try canon.out.text(try canon.textOf(config[old].value)) });
 
     // Values in the order the bodies, so ordered, first name them.
@@ -361,6 +361,38 @@ pub fn canonical(gpa: std.mem.Allocator, from: *const Builder) CanonicalError!Bu
         });
     }
     return canon.out;
+}
+
+/// `order` (positions into `texts`) sorted by their texts, equal texts in the order given: a
+/// merge sort of its own, bottom up, so every comparison is a call this file makes.
+fn sortByText(arena: std.mem.Allocator, order: []u32, texts: []const []const u8) std.mem.Allocator.Error!void {
+    const spare = try arena.alloc(u32, order.len);
+    var from: []u32 = order;
+    var to: []u32 = spare;
+    var width: usize = 1;
+    while (width < order.len) : (width *= 2) {
+        var start: usize = 0;
+        while (start < order.len) : (start += 2 * width) {
+            const middle = @min(start + width, order.len);
+            const end = @min(start + 2 * width, order.len);
+            var left = start;
+            var right = middle;
+            var at = start;
+            while (at < end) : (at += 1) {
+                if (left < middle and (right >= end or !lessByText(texts, from[right], from[left]))) {
+                    to[at] = from[left];
+                    left += 1;
+                } else {
+                    to[at] = from[right];
+                    right += 1;
+                }
+            }
+        }
+        const swapped = from;
+        from = to;
+        to = swapped;
+    }
+    if (from.ptr != order.ptr) @memcpy(order, from);
 }
 
 fn lessByText(texts: []const []const u8, x: u32, y: u32) bool {

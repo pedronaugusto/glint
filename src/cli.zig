@@ -16,6 +16,8 @@ const release = @import("release");
 /// The most a compiled-facts file may hold. A budget from its measured size comes with the
 /// exporter (designs/glint-compiled-facts.md (q)).
 const compiled_facts_limit = 1024 * 1024 * 1024;
+/// The most compiled-facts files one run reads: one per declared configuration.
+const compiled_facts_files = 64;
 
 const Module = struct { name: []const u8, path: []const u8 };
 const Options = struct {
@@ -467,22 +469,19 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     const importer = if (configured.aegis == .imported) try AegisPack.importer(gpa, &project) else null;
     if (importer != null) try packOn(a, &config, definitions);
     // Each facts file is read whole, as untrusted input, and kept or refused whole (`Compiled`).
+    if (configured.compiled_facts.len > compiled_facts_files) return error.FileBudgetExceeded;
     const given = try a.alloc(Compiled.Given, configured.compiled_facts.len);
     for (given, configured.compiled_facts) |*each, path| each.* = .{ .path = path, .bytes = try aegis.own.readFile(io, std.Io.Dir.cwd(), path, a, .fromRaw(compiled_facts_limit)) };
     // A file's records are charged at most one per four bytes of its limit, its smallest record.
     const compiled = try Compiled.init(a, &project, given, .{ .records = compiled_facts_limit / 4 });
     // A refused file holds nothing and the run goes on without it; why is said beside the report.
-    var any_refused = false;
     for (compiled.files) |each| switch (each.read) {
         .kept => {},
         .refused => |why| {
-            try problems.print("glint: compiled facts: {s}: ", .{each.path});
-            try Compiled.describe(why, problems);
-            try problems.writeAll("\n");
-            any_refused = true;
+            const said = Compiled.words(why);
+            try problems.writeAll(try std.mem.concat(a, u8, &.{ "glint: compiled facts: ", each.path, ": ", said.lead, said.name, said.tail, "\n" }));
         },
     };
-    if (any_refused) try problems.flush();
     var report = try Runner.runConfigured(gpa, &project, config, .{ .project_rules = project_rules, .io = io, .summary_check = configured.summary_check, .summary_records = configured.summary_records, .compiled = if (given.len == 0) null else &compiled });
     defer report.deinit();
     record.outcome = .output_failure;

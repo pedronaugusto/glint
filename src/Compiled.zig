@@ -38,9 +38,9 @@ pub fn init(gpa: std.mem.Allocator, project: *const Project, given: []const Give
 }
 
 fn readOne(gpa: std.mem.Allocator, project: *const Project, bytes: []const u8, limits: compiled_read.Limits) std.mem.Allocator.Error!@FieldType(Outcome, "read") {
-    const records = compiled_read.read(gpa, .init(bytes), limits) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => |refusal| return .{ .refused = .{ .malformed = refusal } },
+    const records = switch (try compiled_read.read(gpa, .init(bytes), limits)) {
+        .kept => |kept| kept,
+        .refused => |refusal| return .{ .refused = .{ .malformed = refusal } },
     };
     if (stale(project, &records)) |name| return .{ .refused = .{ .stale = name } };
     return .{ .kept = records };
@@ -61,12 +61,14 @@ fn stale(project: *const Project, records: *const compiled_read.Records) ?[]cons
     return null;
 }
 
-/// Why `why` refused a file, in words, to `w`.
-pub fn describe(why: Why, w: *std.Io.Writer) std.Io.Writer.Error!void {
-    switch (why) {
-        .malformed => |refusal| try w.print("not a compiled-facts file this glint reads ({s}): its configuration has no compiled facts", .{compiled_read.refusalText(refusal)}),
-        .stale => |name| try w.print("exported from another {s} than the run reads: its configuration has no compiled facts", .{name}),
-    }
+/// Why a file was refused, in words: `lead`, `name`, `tail` read in that order.
+pub const Words = struct { lead: []const u8, name: []const u8, tail: []const u8 };
+
+pub fn words(why: Why) Words {
+    return switch (why) {
+        .malformed => |refusal| .{ .lead = "not a compiled-facts file this glint reads (", .name = compiled_read.refusalText(refusal), .tail = "): its configuration has no compiled facts" },
+        .stale => |name| .{ .lead = "exported from another ", .name = name, .tail = " than the run reads: its configuration has no compiled facts" },
+    };
 }
 
 test "a facts file is kept whole or refused whole: malformed, or stale against a source of the run" {
@@ -79,10 +81,10 @@ test "a facts file is kept whole or refused whole: malformed, or stale against a
 
     var hash: [32]u8 = @splat(0);
     std.crypto.hash.sha2.Sha256.hash(text, &hash, .{});
-    var fresh: compiled_read.format.Builder = .{ .gpa = gpa };
+    var fresh: @import("facts_format.zig").Builder = .{ .gpa = gpa };
     try fresh.files.append(gpa, .{ .path = try fresh.text("src/root.zig"), .hash = hash });
     try fresh.files.append(gpa, .{ .path = try fresh.text("std/mem.zig"), .hash = @splat(1) });
-    var old: compiled_read.format.Builder = .{ .gpa = gpa };
+    var old: @import("facts_format.zig").Builder = .{ .gpa = gpa };
     try old.files.append(gpa, .{ .path = try old.text("src/root.zig"), .hash = @splat(2) });
 
     const compiled = try Compiled.init(gpa, &project, &.{
@@ -94,8 +96,7 @@ test "a facts file is kept whole or refused whole: malformed, or stale against a
     try std.testing.expectEqualStrings("fresh.facts", compiled.files[0].path);
     try std.testing.expectEqual(@as(usize, 2), compiled.files[0].read.kept.files.len);
     try std.testing.expectEqualStrings("src/root.zig", compiled.files[1].read.refused.stale);
-    try std.testing.expectEqual(error.NotAFactsFile, compiled.files[2].read.refused.malformed);
-    var words: std.Io.Writer.Allocating = .init(gpa);
-    try describe(compiled.files[2].read.refused, &words.writer);
-    try std.testing.expectEqualStrings("not a compiled-facts file this glint reads (not a facts file): its configuration has no compiled facts", words.written());
+    try std.testing.expectEqual(compiled_read.Refusal.not_a_facts_file, compiled.files[2].read.refused.malformed);
+    const said = words(compiled.files[2].read.refused);
+    try std.testing.expectEqualStrings("not a compiled-facts file this glint reads (not a facts file): its configuration has no compiled facts", try std.mem.concat(gpa, u8, &.{ said.lead, said.name, said.tail }));
 }
