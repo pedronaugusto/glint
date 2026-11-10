@@ -235,14 +235,16 @@ fn heldSecret(c: *Context, types: []const SecretType, value: Facts.Value) Contex
 }
 
 /// Whether a value is unknown only as a generic's binding gives it, no call a run judges
-/// binding it (`Facts.boundByCallers`): through what holds it by value.
+/// binding it (`Facts.boundByCallers`): through what holds it by value. Chosen per build,
+/// where some part (`Facts.valueParts`) is.
 fn unjudged(value: Facts.Value) bool {
-    var current = value;
-    while (true) current = switch (current) {
-        .array, .optional, .error_union => |inner| inner.*,
-        .unknown => |why| return why == .generic,
-        else => return false,
-    };
+    for (Facts.valueParts(&value)) |part| if (switch (part) {
+        .array, .optional, .error_union => |inner| unjudged(inner.*),
+        .unknown => |why| why == .generic,
+        .alternatives => true, // a choice, never a part (valueParts): it may be one
+        else => false,
+    }) return true;
+    return false;
 }
 
 /// What a declaration known only as the program compiles holds, as A007 and A008 judge it: on
@@ -279,14 +281,21 @@ fn typeConstant(c: *Context, decl: Model.Declaration) Context.Error!bool {
     if (tree.tokenTag(variable.ast.mut_token) != .keyword_const or variable.ast.type_node != .none) return false;
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, variable.ast.init_node.unwrap() orelse return false) orelse return false;
-    const function = switch (try c.facts.resolve(c.file, call.ast.fn_expr)) {
-        .function => |function| function,
-        else => return false,
-    };
-    const source = c.project.at(function.file);
-    var proto_buffer: [1]Ast.Node.Index = undefined;
-    const proto = source.file.tree.fullFnProto(&proto_buffer, source.model.declarations[@backingInt(function.index)].node) orelse return false;
-    return c.facts.typeIsType(function.file, proto.ast.return_type.unwrap() orelse return false);
+    // Chosen per build, a type where every part (`Facts.valueParts`) calls such a function.
+    const callee = try c.facts.resolve(c.file, call.ast.fn_expr);
+    const parts = Facts.valueParts(&callee);
+    for (parts) |part| {
+        const function = switch (part) {
+            .function => |function| function,
+            .alternatives => return false, // a choice, never a part (valueParts): not known
+            else => return false,
+        };
+        const source = c.project.at(function.file);
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = source.file.tree.fullFnProto(&proto_buffer, source.model.declarations[@backingInt(function.index)].node) orelse return false;
+        if (!try c.facts.typeIsType(function.file, proto.ast.return_type.unwrap() orelse return false)) return false;
+    }
+    return parts.len != 0;
 }
 
 /// Whether a declaration holds state as the program runs: a field, a parameter, a function's
@@ -330,15 +339,17 @@ fn unjudgedFields(c: *Context, found: Facts.Container) Context.Error![]const Fac
 }
 
 /// Whether a field of a made container is typed only with its call's bindings: its template
-/// reads it as a generic's, or as known only as the program compiles.
+/// reads it as a generic's, or as known only as the program compiles. Chosen per build, where
+/// some part (`Facts.valueParts`) is.
 fn madeField(found: Facts.Container, declared: Facts.Value) bool {
     if (found.made_by == null) return false;
-    var current = declared;
-    while (true) current = switch (current) {
-        .array, .optional, .error_union => |inner| inner.*,
-        .unknown => |why| return why == .generic or why == .comptime_dependent,
-        else => return false,
-    };
+    for (Facts.valueParts(&declared)) |part| if (switch (part) {
+        .array, .optional, .error_union => |inner| madeField(found, inner.*),
+        .unknown => |why| why == .generic or why == .comptime_dependent,
+        .alternatives => true, // a choice, never a part (valueParts): it may be one
+        else => false,
+    }) return true;
+    return false;
 }
 
 /// Whether a container declares a tuple's field, which no declaration judges.
@@ -403,20 +414,25 @@ fn secretBindings(c: *Context, rule: Rule, types: []const SecretType) Context.Er
                     } else false;
                     const kept: Governed.Is = if (made) .yes else try holdsParameter(c, function, parameter);
                     if (kept == .no) continue;
-                    const bound: Facts.Value = switch (try c.facts.resolve(c.file, argument)) {
-                        .container => |container| .{ .instance = container },
-                        .unknown => |why| .{ .unknown = why },
-                        else => continue,
-                    };
-                    switch (kept) {
-                        .yes => try boundSecret(c, rule, types, argument, bound),
-                        .no => {},
-                        // The enclosing generic's own parameter is judged at its bindings.
-                        .unknown => if (switch (try heldSecret(c, types, bound)) {
-                            .no => false,
-                            .unknown => |why| why != .generic,
-                            .yes => true,
-                        }) try c.undecided(rule, tree.tokenStart(tree.firstToken(argument)), .unsupported, "a generic names its type parameter where A008 does not read whether it holds a value of it: binding it to std's secret material may hold that by value"),
+                    // Chosen per build, each part (`Facts.valueParts`) bound.
+                    const given = try c.facts.resolve(c.file, argument);
+                    for (Facts.valueParts(&given)) |part| {
+                        const bound: Facts.Value = switch (part) {
+                            .container => |container| .{ .instance = container },
+                            .unknown => |why| .{ .unknown = why },
+                            .alternatives => .{ .unknown = .unsupported }, // a choice, never a part (valueParts): not known
+                            else => continue,
+                        };
+                        switch (kept) {
+                            .yes => try boundSecret(c, rule, types, argument, bound),
+                            .no => {},
+                            // The enclosing generic's own parameter is judged at its bindings.
+                            .unknown => if (switch (try heldSecret(c, types, bound)) {
+                                .no => false,
+                                .unknown => |why| why != .generic,
+                                .yes => true,
+                            }) try c.undecided(rule, tree.tokenStart(tree.firstToken(argument)), .unsupported, "a generic names its type parameter where A008 does not read whether it holds a value of it: binding it to std's secret material may hold that by value"),
+                        }
                     }
                     continue;
                 }
@@ -1202,13 +1218,26 @@ fn aegisName(c: *Context, edits: *std.ArrayList(Report.Edit)) Context.Error!?[]c
     var std_import: ?Ast.TokenIndex = null;
     for (model.declarations, 0..) |decl, d| {
         if (decl.kind != .variable or model.scopes[@backingInt(decl.scope)].kind != .file) continue;
-        const container = switch (try c.facts.declaration(.{ .file = c.file, .index = @fromBackingInt(@intCast(d)) })) {
-            .container => |container| container,
-            else => continue,
-        };
-        if (c.project.at(container.file).model.scopes[@backingInt(container.scope)].node != .root) continue;
-        if (std.mem.findScalar(Project.FileId, roots, container.file) != null) return decl.name;
-        if (try c.facts.standard(container.file)) std_import = decl.token;
+        // An import chosen per build names aegis, or std, where every part
+        // (`Facts.valueParts`) is that package's file.
+        const imported = try c.facts.declaration(.{ .file = c.file, .index = @fromBackingInt(@intCast(d)) });
+        const parts = Facts.valueParts(&imported);
+        if (parts.len == 0) continue;
+        var aegis = true;
+        var standard = true;
+        for (parts) |part| {
+            const container = switch (part) {
+                .container => |container| container,
+                .alternatives => break, // a choice, never a part (valueParts): neither known
+                else => break,
+            };
+            if (c.project.at(container.file).model.scopes[@backingInt(container.scope)].node != .root) break;
+            if (std.mem.findScalar(Project.FileId, roots, container.file) == null) aegis = false;
+            if (!try c.facts.standard(container.file)) standard = false;
+        } else {
+            if (aegis) return decl.name;
+            if (standard) std_import = decl.token;
+        }
     }
     return insertAegis(c, std_import, edits);
 }
@@ -1545,11 +1574,12 @@ fn namesSyncMember(c: *Context, found: []const Governed.Governed, name: []const 
     for (found) |g| for (g.decls) |decl| {
         const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
         const held = if (record.kind == .function) try c.facts.template(decl) orelse continue else try c.facts.declaration(decl);
-        const container = switch (held) {
-            .container => |each| each,
-            else => continue,
+        // Chosen per build, where some part (`Facts.valueParts`) names it.
+        for (Facts.valueParts(&held)) |part| switch (part) {
+            .container => |container| if (c.facts.member(container, name) != null or c.facts.declaresTag(container, name)) return true,
+            .alternatives => return true, // a choice, never a part (valueParts): it may name one
+            else => {},
         };
-        if (c.facts.member(container, name) != null or c.facts.declaresTag(container, name)) return true;
     };
     return false;
 }
@@ -1573,9 +1603,14 @@ fn syncType(c: *Context, found: []const Governed.Governed, value: Facts.Value) C
                 const whole = model.parentOf(record.node) orelse record.node;
                 const scope = model.scopes[@backingInt(held.scope)];
                 if (scope.first >= tree.firstToken(whole) and scope.last <= tree.lastToken(whole)) return g.index;
-            } else switch (try c.facts.declaration(decl)) {
-                .container => |sync| if (sync.file == held.file and sync.scope == held.scope) return g.index,
-                else => {},
+            } else {
+                // Declared per build, where some part (`Facts.valueParts`) is it.
+                const declared = try c.facts.declaration(decl);
+                for (Facts.valueParts(&declared)) |part| switch (part) {
+                    .container => |sync| if (sync.file == held.file and sync.scope == held.scope) return g.index,
+                    .alternatives => return g.index, // a choice, never a part (valueParts): it may be one
+                    else => {},
+                };
             }
         },
         else => {},
@@ -1591,9 +1626,16 @@ fn borrowed(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
     switch (try Facts.accesses.useOf(c.facts, c.file, node)) {
-        .member => |access| return switch (try c.facts.resolve(c.file, access)) {
-            .function, .container, .error_set, .primitive, .fn_type => true,
-            else => false,
+        // Chosen per build, no value where every part (`Facts.valueParts`) is none.
+        .member => |access| {
+            const member = try c.facts.resolve(c.file, access);
+            const parts = Facts.valueParts(&member);
+            for (parts) |part| switch (part) {
+                .function, .container, .error_set, .primitive, .fn_type => {},
+                .alternatives => return false, // a choice, never a part (valueParts): not known
+                else => return false,
+            };
+            return parts.len != 0;
         },
         // The type itself, or what its constructor makes (`std.atomic.Value(u32)`), compared.
         .compared => return true,

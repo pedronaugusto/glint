@@ -520,11 +520,15 @@ fn namedByField(c: *Context, decl: Model.Declaration.Id) Context.Error!bool {
         var buffer: [2]Ast.Node.Index = undefined;
         const args = Facts.builtinArgs(tree, node, &buffer);
         if (args.len != 2) continue;
-        switch (try c.facts.resolve(c.file, args[0])) {
-            .container, .instance => |container| if (container.file != c.file or container.scope != record.scope) continue,
-            .unknown => {},
-            else => continue,
-        }
+        // C, in some build's part (`Facts.valueParts`), or one not known.
+        const subject = try c.facts.resolve(c.file, args[0]);
+        const may = for (Facts.valueParts(&subject)) |part| switch (part) {
+            .container, .instance => |container| if (container.file == c.file and container.scope == record.scope) break true,
+            .unknown => break true,
+            .alternatives => break true, // a choice, never a part (valueParts): it may be C
+            else => {},
+        } else false;
+        if (!may) continue;
         if (try namedBy(c, c.file, args[1], record.name)) return true;
     }
     return false;
@@ -558,7 +562,7 @@ fn installs(c: *Context, reference: Ast.Node.Index, field: Field, through: u8) C
                 const path = try Facts.accesses.pathOf(c.facts, c.file, store.target orelse return false);
                 if (path.steps.len < 2 or path.steps[0].kind != .field) return false;
                 if (!std.mem.eql(u8, path.steps[0].name orelse return false, field.name)) return false;
-                if (!isParent(path.steps[0].holder orelse return false, field.parent)) return false;
+                if (!alwaysParent(path.steps[0].holder orelse return false, field.parent)) return false;
                 return field.parent.file == c.file;
             },
             .initializes => |holder| {
@@ -803,14 +807,17 @@ const Follow = struct {
         return false;
     }
 
-    /// Whether a value is a pointer to the interface, or an optional one.
+    /// Whether a value is a pointer to the interface, or an optional one, in every build: each
+    /// part (`Facts.valueParts`) is.
     fn pointer(f: *const Follow, value: Facts.Value) bool {
-        const to = switch (value) {
-            .pointer => |to| to.child.*,
-            .optional => |inner| return f.pointer(inner.*),
-            else => return false,
-        };
-        return if (held(to)) |container| same(container, f.kind) else false;
+        const parts = Facts.valueParts(&value);
+        for (parts) |part| if (!switch (part) {
+            .pointer => |to| if (held(to.child.*)) |container| same(container, f.kind) else false,
+            .optional => |inner| f.pointer(inner.*),
+            .alternatives => false, // a choice, never a part (valueParts): not known
+            else => false,
+        }) return false;
+        return parts.len != 0;
     }
 
     /// `p.name`: a part of the interface, read or written; or a method called with it, which
@@ -1027,16 +1034,26 @@ const Carry = struct {
         return k.holds(value, depth);
     }
 
-    /// Whether a value is a C, a pointer to one, or holds them.
+    /// Whether a value is a C, a pointer to one, or holds them. Chosen per build, it carries
+    /// where some part (`Facts.valueParts`) does, whole only where every part is whole.
     fn holds(k: *Carry, value: Facts.Value, depth: u8) Context.Error!?Shape {
         if (depth == 32) return .held;
-        return switch (value) {
-            .instance => |container| if (same(container, k.field.parent)) .whole else null,
-            .pointer => |inner| try k.holds(inner.child.*, depth + 1),
-            .optional, .error_union => |inner| try k.holds(inner.*, depth + 1),
-            .array => |element| if (try k.holds(element.*, depth + 1) != null) .held else null,
-            else => null,
-        };
+        var carried = false;
+        var whole = true;
+        for (Facts.valueParts(&value)) |choice| {
+            const one: ?Shape = switch (choice) {
+                .instance => |container| if (same(container, k.field.parent)) .whole else null,
+                .pointer => |inner| try k.holds(inner.child.*, depth + 1),
+                .optional, .error_union => |inner| try k.holds(inner.*, depth + 1),
+                .array => |element| if (try k.holds(element.*, depth + 1) != null) .held else null,
+                .alternatives => .held, // a choice, never a part (valueParts): it may hold one
+                else => null,
+            };
+            if (one == null) whole = false else carried = true;
+            if (one == .held) whole = false;
+        }
+        if (!carried) return null;
+        return if (whole) .whole else .held;
     }
 
     /// The call `call_node` given a carrier as `argument`: the callee's parameter it is
@@ -1072,15 +1089,22 @@ const Carry = struct {
     /// carrier among them handed to its parameter there.
     fn spawned(k: *Carry, file: Project.FileId, function: Ast.Node.Index, args: []const Ast.Node.Index, from_program: bool) Context.Error!Verdict {
         const c = k.c;
-        const decl = switch (try c.facts.resolve(file, function)) {
-            .function => |each| each,
-            else => return .undecided,
-        };
+        // Chosen per build, each function a part (`Facts.valueParts`) names.
+        const callees = try c.facts.resolve(file, function);
+        const parts = Facts.valueParts(&callees);
+        if (parts.len == 0) return .undecided;
         var verdict: Verdict = .shown;
-        for (args, 0..) |argument, at| {
-            const shape = (try k.carries(file, argument, 0)) orelse continue;
-            verdict = worst(verdict, try k.parameter(decl, at, shape, from_program));
-            if (verdict == .open) return .open;
+        for (parts) |choice| {
+            const decl = switch (choice) {
+                .function => |each| each,
+                .alternatives => return .undecided, // a choice, never a part (valueParts): not known
+                else => return .undecided,
+            };
+            for (args, 0..) |argument, at| {
+                const shape = (try k.carries(file, argument, 0)) orelse continue;
+                verdict = worst(verdict, try k.parameter(decl, at, shape, from_program));
+                if (verdict == .open) return .open;
+            }
         }
         return verdict;
     }
@@ -1748,7 +1772,7 @@ fn nodeSource(c: *Context, file: Project.FileId, node: Ast.Node.Index, field: Fi
         const path = try Facts.accesses.pathOf(c.facts, file, place);
         if (path.steps.len < 2 or path.steps[0].kind != .field) return null;
         if (!std.mem.eql(u8, path.steps[0].name orelse return null, field.name)) return null;
-        if (!isParent(path.steps[0].holder orelse return null, field.parent)) return null;
+        if (!alwaysParent(path.steps[0].holder orelse return null, field.parent)) return null;
         return .any;
     };
     switch (tree.nodeTag(at)) {
@@ -1868,11 +1892,7 @@ fn joinSource(a: ?Source, b: Source) ?Source {
 /// The declaration a list expression names: a field or a variable, never a parameter or
 /// anything that does not resolve, where `list` is that list's type.
 fn listOf(c: *Context, file: Project.FileId, receiver: Ast.Node.Index, list: List) Context.Error!?Source {
-    const value = try c.facts.resolve(file, receiver);
-    const container = held(value) orelse switch (value) {
-        .pointer => |to| held(to.child.*) orelse return null,
-        else => return null,
-    };
+    const container = listHolder(try c.facts.resolve(file, receiver)) orelse return null;
     if (try isList(c, container, "", list) != .yes) return null;
     const decl = switch (try c.facts.definition(file, receiver)) {
         .decl => |d| d,
@@ -1905,10 +1925,12 @@ fn insertsOnlyParents(c: *Context, field: Field, list: List, source: Source) Con
         const of = (try receiverKind(c, use.file, receiver, list)) orelse continue;
         // Named on the type (`std.DoublyLinkedList.append`): a function value that may insert
         // anything, wherever it is called.
-        switch (try c.facts.resolve(use.file, receiver)) {
+        const named = try c.facts.resolve(use.file, receiver);
+        for (Facts.valueParts(&named)) |part| switch (part) {
             .container => return false,
+            .alternatives => return false, // a choice, never a part (valueParts): it may be the type
             else => {},
-        }
+        };
         const call_node = switch (try Facts.accesses.useOf(c.facts, use.file, use.node)) {
             .callee => |call| call,
             else => return false,
@@ -2001,12 +2023,7 @@ fn listsInPlace(c: *Context, list: List) Context.Error!bool {
                 .leaf, .member, .deref, .array_access, .unwrap_optional => {},
                 else => continue,
             }
-            const value = try c.facts.resolve(file, node);
-            const container = switch (value) {
-                .instance => |container| container,
-                else => continue,
-            };
-            if (try isList(c, container, "", list) == .no and try isList(c, container, "Node", list) == .no) continue;
+            if (!try mayBeList(c, try c.facts.resolve(file, node), list, false)) continue;
             // In place: its address, a member of it, a whole write to it.
             const parent = model.parentOf(node) orelse return false;
             switch (try Facts.accesses.useOf(c.facts, file, node)) {
@@ -2028,12 +2045,7 @@ fn listsInPlace(c: *Context, list: List) Context.Error!bool {
         // A parameter of either by value is a copy of what its caller gives.
         for (model.declarations) |decl| {
             if (decl.kind != .parameter) continue;
-            const declared = decl.node;
-            const container = switch (try c.facts.resolve(file, declared)) {
-                .container, .instance => |container| container,
-                else => continue,
-            };
-            if (try isList(c, container, "", list) != .no or try isList(c, container, "Node", list) != .no) return false;
+            if (try mayBeList(c, try c.facts.resolve(file, decl.node), list, true)) return false;
         }
         // A local of either initialised from a place, not a literal.
         for (model.declarations) |decl| {
@@ -2042,27 +2054,69 @@ fn listsInPlace(c: *Context, list: List) Context.Error!bool {
             const init = Facts.ungrouped(tree, variable.ast.init_node.unwrap() orelse continue);
             var literal_buffer: [2]Ast.Node.Index = undefined;
             if (tree.fullStructInit(&literal_buffer, init) != null) continue;
-            const container = switch (try c.facts.resolve(file, init)) {
-                .instance => |container| container,
-                else => continue,
-            };
-            if (try isList(c, container, "", list) != .no or try isList(c, container, "Node", list) != .no) return false;
+            if (try mayBeList(c, try c.facts.resolve(file, init), list, false)) return false;
         }
     }
     return true;
+}
+
+/// Whether some build's part of `value` (`Facts.valueParts`) may be a list or node of `list`'s
+/// kind: an instance of one, or with `types` the type itself, or one `isList` does not know.
+fn mayBeList(c: *Context, value: Facts.Value, list: List, comptime types: bool) Context.Error!bool {
+    for (Facts.valueParts(&value)) |part| {
+        const container = switch (part) {
+            .instance => |container| container,
+            .container => |container| if (types) container else continue,
+            .alternatives => return true, // a choice, never a part (valueParts): it may be one
+            else => continue,
+        };
+        if (try isList(c, container, "", list) != .no or try isList(c, container, "Node", list) != .no) return true;
+    }
+    return false;
+}
+
+/// The container a list expression's value is, or a single pointer points at: the one every
+/// build's part (`Facts.valueParts`) is, else none known.
+fn listHolder(value: Facts.Value) ?Facts.Container {
+    if (held(value)) |container| return container;
+    var found: ?Facts.Container = null;
+    for (Facts.valueParts(&value)) |part| {
+        const one = switch (part) {
+            .pointer => |to| held(to.child.*),
+            .alternatives => null, // a choice, never a part (valueParts): none known
+            else => null,
+        } orelse return null;
+        if (found) |known| if (!same(known, one)) return null;
+        found = one;
+    }
+    return found;
 }
 
 const Receiver = enum { list, node, unknown };
 
 /// What a receiver is, of `list`'s kind: the list, its node, or (not resolving) either; null
 /// for anything else.
+/// Chosen per build, the kind every part (`Facts.valueParts`) is; parts that differ may be either.
 fn receiverKind(c: *Context, file: Project.FileId, receiver: Ast.Node.Index, list: List) Context.Error!?Receiver {
     const value = try c.facts.resolve(file, receiver);
-    if (value == .unknown) return .unknown;
-    const container = held(value) orelse switch (value) {
-        .pointer => |to| held(to.child.*),
-        else => null,
-    } orelse return null;
+    const parts = Facts.valueParts(&value);
+    var kind: ?Receiver = null;
+    for (parts, 0..) |part, at| {
+        const one = try partKind(c, part, list);
+        if (at != 0 and one != kind) return .unknown;
+        kind = one;
+    }
+    return kind;
+}
+
+fn partKind(c: *Context, part: Facts.Value, list: List) Context.Error!?Receiver {
+    const container = switch (part) {
+        .unknown => return .unknown,
+        .container, .instance => |container| container,
+        .pointer => |to| held(to.child.*) orelse return null,
+        .alternatives => return .unknown, // a choice, never a part (valueParts): either
+        else => return null,
+    };
     const whole = try isList(c, container, "", list);
     if (whole == .yes) return .list;
     const node = try isList(c, container, "Node", list);
@@ -2141,20 +2195,37 @@ fn resultType(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.E
     return .{ .unknown = .unresolved };
 }
 
-/// The container a single-item pointer type points at.
+/// The container a single-item pointer type points at: the one every build's part
+/// (`Facts.valueParts`) points at, else none known.
 fn pointee(value: Facts.Value) ?Facts.Container {
-    return switch (value) {
-        .pointer => |to| held(to.child.*),
-        .optional, .error_union => |inner| pointee(inner.*),
-        else => null,
-    };
+    var found: ?Facts.Container = null;
+    for (Facts.valueParts(&value)) |part| {
+        const one = switch (part) {
+            .pointer => |to| held(to.child.*),
+            .optional, .error_union => |inner| pointee(inner.*),
+            .alternatives => null, // a choice, never a part (valueParts): none known
+            else => null,
+        } orelse return null;
+        if (found) |known| if (!same(known, one)) return null;
+        found = one;
+    }
+    return found;
 }
 
+/// The container a value is, as a type or an instance of it: the one every build's part
+/// (`Facts.valueParts`) is, else none known.
 fn held(value: Facts.Value) ?Facts.Container {
-    return switch (value) {
-        .container, .instance => |container| container,
-        else => null,
-    };
+    var found: ?Facts.Container = null;
+    for (Facts.valueParts(&value)) |part| {
+        const one = switch (part) {
+            .container, .instance => |container| container,
+            .alternatives => return null, // a choice, never a part (valueParts): none known
+            else => return null,
+        };
+        if (found) |known| if (!same(known, one)) return null;
+        found = one;
+    }
+    return found;
 }
 
 fn same(a: Facts.Container, b: Facts.Container) bool {
@@ -2176,12 +2247,29 @@ fn otherThan(value: Facts.Value, holder: Facts.Container) bool {
     };
 }
 
+/// Whether a value may be a C or a pointer to one: some build's part (`Facts.valueParts`) is.
+/// For a reader that passes over what is not one.
 fn isParent(value: Facts.Value, parent: Facts.Container) bool {
-    return switch (value) {
+    for (Facts.valueParts(&value)) |part| if (switch (part) {
         .container, .instance => |container| same(container, parent),
         .pointer => |to| isParent(to.child.*, parent),
+        .alternatives => true, // a choice, never a part (valueParts): it may be one
         else => false,
-    };
+    }) return true;
+    return false;
+}
+
+/// Whether a value is a C or a pointer to one in every build: each part (`Facts.valueParts`)
+/// is. For a reader that shows nothing of what is not one.
+fn alwaysParent(value: Facts.Value, parent: Facts.Container) bool {
+    const parts = Facts.valueParts(&value);
+    for (parts) |part| if (!switch (part) {
+        .container, .instance => |container| same(container, parent),
+        .pointer => |to| alwaysParent(to.child.*, parent),
+        .alternatives => false, // a choice, never a part (valueParts): not known
+        else => false,
+    }) return false;
+    return parts.len != 0;
 }
 
 fn containerLevel(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
