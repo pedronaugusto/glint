@@ -467,3 +467,25 @@ test "the aegis pack is on where a file's import of aegis resolves to aegis, and
     try std.testing.expect(std.mem.find(u8, only, "aegis pack") == null);
     try std.testing.expect(std.mem.find(u8, only, "A019: ") != null);
 }
+
+test "--compiled-facts: a file that is no facts file is refused with its reason beside the report, and the run goes on as without it" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "input.zig", .data = "pub const value = 1;" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "junk.facts", .data = "not a facts file" });
+    const input = try resultPath(a, &tmp, "input.zig");
+    defer a.free(input);
+    const facts = try resultPath(a, &tmp, "junk.facts");
+    defer a.free(facts);
+    var plain: std.Io.Writer.Allocating = .init(a);
+    defer plain.deinit();
+    try std.testing.expectEqual(@as(u8, 0), try cli.execute(a, std.testing.io, &.{ "glint", input }, &plain.writer, &quiet.writer));
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    var problems: std.Io.Writer.Allocating = .init(a);
+    defer problems.deinit();
+    try std.testing.expectEqual(@as(u8, 0), try cli.execute(a, std.testing.io, &.{ "glint", "--compiled-facts", facts, input }, &output.writer, &problems.writer));
+    try std.testing.expectEqualStrings(plain.written(), output.written());
+    try std.testing.expect(std.mem.find(u8, problems.written(), "junk.facts: not a compiled-facts file this glint reads (not_a_facts_file)") != null);
+}

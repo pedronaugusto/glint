@@ -139,6 +139,8 @@ pub const Body = extern struct {
     /// For a call analysed in place: the body holding the call, and the call's instruction.
     caller: u32 = none,
     call: u32 = none,
+    /// Which visit of `call` within the caller it is, from 0.
+    call_visit: u32 = 0,
     /// A comptime call's result.
     result: u32 = none,
     /// Its results: a run of the `results` section, in the order of (instruction, visit).
@@ -292,6 +294,22 @@ pub const View = struct {
         for (view.values) |each| {
             try view.checkText(each.text);
             try view.checkRun(each.list);
+            const shape = shapeOf(little(each.kind));
+            inline for (.{ .{ shape.a, each.a }, .{ shape.b, each.b }, .{ shape.c, each.c } }) |field| switch (field[0]) {
+                .number => {},
+                .value => try view.checkValue(field[1]),
+                .file => if (little(field[1]) != none and little(field[1]) >= view.files.len) return error.id_out_of_range,
+                .body => if (little(field[1]) != none and little(field[1]) >= view.bodies.len) return error.id_out_of_range,
+            };
+            const numbers = view.run(each.list);
+            switch (shape.list) {
+                .numbers, .texts => {},
+                .values => for (numbers) |n| try view.checkValue(n),
+                .fields => {
+                    var at: usize = 2;
+                    while (at < numbers.len) : (at += 3) try view.checkValue(numbers[at]);
+                },
+            }
         }
         for (view.bodies) |each| {
             if (little(each.file) >= view.files.len) return error.id_out_of_range;
@@ -414,6 +432,259 @@ pub const Builder = struct {
     }
 };
 
+/// What a `Value`'s fields hold, by kind: which are values, files or bodies (ids `canonical`
+/// renumbers) and which are numbers it keeps.
+const Field = enum { number, value, file, body };
+const Listed = enum { numbers, values, texts, fields };
+const Shape = struct { a: Field = .number, b: Field = .number, c: Field = .number, list: Listed = .numbers };
+
+fn shapeOf(kind: u32) Shape {
+    const known: Value.Kind = @fromBackingInt(kind);
+    return switch (known) {
+        .unwritten, .simple_type, .int_type, .simple, .enum_literal => .{},
+        .pointer_type, .optional_type, .array_type, .vector_type => .{ .a = .value },
+        .error_union_type => .{ .a = .value, .b = .value },
+        .error_set_type => .{ .list = .texts },
+        .function_type => .{ .a = .value, .list = .values },
+        .declared_type => .{ .a = .file, .list = .fields },
+        .tuple_type => .{ .list = .values },
+        .int, .float, .err, .bytes => .{ .a = .value },
+        .enum_tag => .{ .a = .value },
+        .aggregate => .{ .a = .value, .list = .values },
+        .slice, .union_value => .{ .a = .value, .b = .value, .c = .value },
+        .pointer, .optional => .{ .a = .value, .b = .value },
+        .function => .{ .a = .file, .c = .body },
+        // A kind this version does not know: its fields are kept as numbers.
+        _ => .{},
+    };
+}
+
+/// The same facts in the one order every exporter run of the same sources and configuration
+/// gives: files by path, bodies by their function (file, declaration), kind, arguments and
+/// caller, each body's results as they are, values and text in the order that walk first names
+/// them. An exporter appends records as its analysis meets them and writes `canonical` of
+/// them, so analysis order never shows in the bytes. `view` is checked (`View.init`).
+pub fn canonical(gpa: std.mem.Allocator, view: *const View) std.mem.Allocator.Error![]u8 {
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var canon: Canon = .{ .arena = arena, .view = view, .out = .{ .gpa = arena } };
+
+    // Files by path.
+    const file_order = try arena.alloc(u32, view.files.len);
+    for (file_order, 0..) |*each, i| each.* = @intCast(i);
+    std.mem.sort(u32, file_order, view, struct {
+        fn less(v: *const View, x: u32, y: u32) bool {
+            return std.mem.order(u8, v.string(v.files[x].path), v.string(v.files[y].path)) == .lt;
+        }
+    }.less);
+    canon.file_new = try arena.alloc(u32, view.files.len);
+    for (file_order, 0..) |old, new| {
+        canon.file_new[old] = @intCast(new);
+        try canon.out.files.append(arena, .{ .path = try canon.out.text(view.string(view.files[old].path)), .hash = view.files[old].hash });
+    }
+
+    // Bodies by key; equal keys keep the order given.
+    canon.body_keys = try arena.alloc(?[]const u8, view.bodies.len);
+    @memset(canon.body_keys, null);
+    const body_order = try arena.alloc(u32, view.bodies.len);
+    for (body_order, 0..) |*each, i| {
+        each.* = @intCast(i);
+        _ = try canon.bodyKey(@intCast(i), 0);
+    }
+    std.mem.sort(u32, body_order, &canon, struct {
+        fn less(c: *const Canon, x: u32, y: u32) bool {
+            return switch (std.mem.order(u8, c.body_keys[x].?, c.body_keys[y].?)) {
+                .lt => true,
+                .gt => false,
+                .eq => x < y,
+            };
+        }
+    }.less);
+    canon.body_new = try arena.alloc(u32, view.bodies.len);
+    for (body_order, 0..) |old, new| canon.body_new[old] = @intCast(new);
+
+    // Config by key.
+    const config_order = try arena.alloc(u32, view.config.len);
+    for (config_order, 0..) |*each, i| each.* = @intCast(i);
+    std.mem.sort(u32, config_order, view, struct {
+        fn less(v: *const View, x: u32, y: u32) bool {
+            return std.mem.order(u8, v.string(v.config[x].key), v.string(v.config[y].key)) == .lt;
+        }
+    }.less);
+    for (config_order) |old| try canon.out.config.append(arena, .{ .key = try canon.out.text(view.string(view.config[old].key)), .value = try canon.out.text(view.string(view.config[old].value)) });
+
+    // Values in the order the bodies, so ordered, first name them.
+    canon.value_new = try arena.alloc(u32, view.values.len);
+    @memset(canon.value_new, none);
+    for (body_order) |old| {
+        const body = view.bodies[old];
+        const arguments = try arena.alloc(u32, view.run(body.arguments).len);
+        for (arguments, view.run(body.arguments)) |*to, from| to.* = try canon.value(from);
+        const results_start: u32 = @intCast(canon.out.results.items.len);
+        for (view.resultsOf(body)) |result| try canon.out.results.append(arena, .{
+            .instruction = result.instruction,
+            .visit = result.visit,
+            .value = try canon.value(result.value),
+            .type = try canon.value(result.type),
+            .callee = if (result.callee == Result.runtime_callee) Result.runtime_callee else try canon.value(result.callee),
+        });
+        try canon.out.bodies.append(arena, .{
+            .kind = body.kind,
+            .file = canon.file_new[body.file],
+            .declaration = body.declaration,
+            .arguments = try canon.out.list(arguments),
+            .caller = if (body.caller == none) none else canon.body_new[body.caller],
+            .call = body.call,
+            .call_visit = body.call_visit,
+            .result = try canon.value(body.result),
+            .results_start = results_start,
+            .results_len = body.results_len,
+        });
+    }
+    // A value no body names (the exporter wrote it and dropped its use) is not kept.
+    const bytes = try canon.out.finish();
+    defer arena.free(bytes);
+    return gpa.dupe(u8, bytes);
+}
+
+const Canon = struct {
+    arena: std.mem.Allocator,
+    view: *const View,
+    out: Builder,
+    file_new: []u32 = &.{},
+    body_new: []u32 = &.{},
+    value_new: []u32 = &.{},
+    body_keys: []?[]const u8 = &.{},
+
+    /// The new id of the value `old`, written with everything it names the first time it is
+    /// asked. Its slot is taken before its fields are read, so a type that names itself ends.
+    fn value(self: *Canon, old: u32) std.mem.Allocator.Error!u32 {
+        if (old == none) return none;
+        if (self.value_new[old] != none) return self.value_new[old];
+        const from = self.view.values[old];
+        const new: u32 = @intCast(self.out.values.items.len);
+        self.value_new[old] = new;
+        try self.out.values.append(self.arena, .{ .kind = from.kind });
+        const shape = shapeOf(from.kind);
+        const made: Value = .{
+            .kind = from.kind,
+            .a = try self.field(shape.a, from.a),
+            .b = try self.field(shape.b, from.b),
+            .c = try self.field(shape.c, from.c),
+            .text = try self.out.text(self.view.string(from.text)),
+            .list = try self.listed(shape.list, self.view.run(from.list)),
+        };
+        self.out.values.items[new] = made;
+        return new;
+    }
+
+    fn field(self: *Canon, kind: Field, old: u32) std.mem.Allocator.Error!u32 {
+        if (old == none) return none;
+        return switch (kind) {
+            .number => old,
+            .value => self.value(old),
+            .file => if (old < self.file_new.len) self.file_new[old] else none,
+            .body => if (old < self.body_new.len) self.body_new[old] else none,
+        };
+    }
+
+    fn listed(self: *Canon, kind: Listed, old: []align(1) const u32) std.mem.Allocator.Error!Run {
+        const made = try self.arena.alloc(u32, old.len);
+        @memcpy(made, old);
+        switch (kind) {
+            .numbers => {},
+            .values => for (made) |*each| {
+                each.* = try self.value(each.*);
+            },
+            // Each name as a `Text`'s start and length: written again in this order.
+            .texts => {
+                var at: usize = 0;
+                while (at + 2 <= made.len) : (at += 2) {
+                    const text = try self.out.text(self.name(made[at], made[at + 1]));
+                    made[at] = text.start;
+                    made[at + 1] = text.len;
+                }
+            },
+            // Three numbers a field: its name's start and length, its type's value.
+            .fields => {
+                var at: usize = 0;
+                while (at + 3 <= made.len) : (at += 3) {
+                    const text = try self.out.text(self.name(made[at], made[at + 1]));
+                    made[at] = text.start;
+                    made[at + 1] = text.len;
+                    made[at + 2] = try self.value(made[at + 2]);
+                }
+            },
+        }
+        return self.out.list(made);
+    }
+
+    /// A name a list holds as a start and a length: empty where they are not within the text.
+    fn name(self: *const Canon, start: u32, len: u32) []const u8 {
+        const strings = self.view.strings;
+        if (start > strings.len or len > strings.len - start) return "";
+        return strings[start..][0..len];
+    }
+
+    /// What orders a body: its function's file and declaration, its kind, each argument by
+    /// structure, and for a call analysed in place its caller's key, the call and its visit.
+    fn bodyKey(self: *Canon, old: u32, depth: u8) std.mem.Allocator.Error![]const u8 {
+        if (self.body_keys[old]) |known| return known;
+        const body = self.view.bodies[old];
+        var key: std.ArrayList(u8) = .empty;
+        try key.appendSlice(self.arena, self.view.string(self.view.files[body.file].path));
+        try key.print(self.arena, "\x00{x:0>8}\x00{x:0>8}\x00", .{ body.declaration, body.kind });
+        for (self.view.run(body.arguments)) |argument| {
+            try self.valueKey(&key, argument, 0);
+            try key.append(self.arena, 0);
+        }
+        if (body.caller != none and body.caller != old and depth < 64) {
+            try key.appendSlice(self.arena, try self.bodyKey(body.caller, depth + 1));
+            try key.print(self.arena, "\x00{x:0>8}\x00{x:0>8}", .{ body.call, body.call_visit });
+        }
+        self.body_keys[old] = key.items;
+        return key.items;
+    }
+
+    /// A value by structure, never by id. A declared type and a function are their
+    /// declaration's file and instruction: what they name in turn is not followed, so a type
+    /// that names itself ends.
+    fn valueKey(self: *Canon, key: *std.ArrayList(u8), old: u32, depth: u8) std.mem.Allocator.Error!void {
+        if (old == none) return key.appendSlice(self.arena, "-");
+        if (depth > 32) return key.appendSlice(self.arena, "...");
+        const from = self.view.values[old];
+        const shape = shapeOf(from.kind);
+        try key.print(self.arena, "({x}:{s}", .{ from.kind, self.view.string(from.text) });
+        const known: Value.Kind = @fromBackingInt(from.kind);
+        const leaf = known == .declared_type or known == .function;
+        inline for (.{ .{ shape.a, from.a }, .{ shape.b, from.b }, .{ shape.c, from.c } }) |each| {
+            try key.append(self.arena, ' ');
+            switch (each[0]) {
+                .number, .body => try key.print(self.arena, "{x}", .{each[1]}),
+                .file => try key.appendSlice(self.arena, if (each[1] < self.view.files.len) self.view.string(self.view.files[each[1]].path) else "-"),
+                .value => try self.valueKey(key, each[1], depth + 1),
+            }
+        }
+        if (!leaf) {
+            const numbers = self.view.run(from.list);
+            switch (shape.list) {
+                .numbers => for (numbers) |n| try key.print(self.arena, " {x}", .{n}),
+                .values => for (numbers) |n| {
+                    try key.append(self.arena, ' ');
+                    try self.valueKey(key, n, depth + 1);
+                },
+                .texts, .fields => {
+                    const step: usize = if (shape.list == .texts) 2 else 3;
+                    var at: usize = 0;
+                    while (at + step <= numbers.len) : (at += step) try key.print(self.arena, " {s}", .{self.name(numbers[at], numbers[at + 1])});
+                },
+            }
+        }
+        try key.append(self.arena, ')');
+    }
+};
+
 test "a facts file written is read back, record for record" {
     const gpa = std.testing.allocator;
     var builder: Builder = .{ .gpa = gpa };
@@ -493,4 +764,78 @@ test "a facts file cut short, of another version, or naming what it does not hol
     defer gpa.free(bytes);
     try std.testing.expectError(error.Refused, View.init(bytes, &refusal));
     try std.testing.expectEqual(Refusal.results_out_of_order, refusal);
+}
+
+test "canonical: the same facts appended in another order give the same bytes" {
+    const gpa = std.testing.allocator;
+    var bytes: [2][]u8 = undefined;
+    for (&bytes, 0..) |*out, way| {
+        var b: Builder = .{ .gpa = gpa };
+        defer b.deinit();
+        // Two files, a type that names itself through a pointer, two instances of one generic
+        // and an inline call in one of them; `way` 1 appends everything the other way round.
+        const paths = [_][]const u8{ "src/a.zig", "src/b.zig" };
+        const file_of = if (way == 0) [_]u32{ 0, 1 } else [_]u32{ 1, 0 };
+        for (0..2) |i| {
+            const which = if (way == 0) i else 1 - i;
+            try b.files.append(gpa, .{ .path = try b.text(paths[which]), .hash = @splat(@intCast(which)) });
+        }
+        try b.config.append(gpa, .{ .key = try b.text(if (way == 0) "target" else "zig_version"), .value = try b.text(if (way == 0) "aarch64-macos" else "0.17.0") });
+        try b.config.append(gpa, .{ .key = try b.text(if (way == 0) "zig_version" else "target"), .value = try b.text(if (way == 0) "0.17.0" else "aarch64-macos") });
+        // Values: u8, a declared Node with a field `next: ?*Node`, the pointer and the optional.
+        var ids: [4]u32 = undefined; // u8, node, pointer, optional
+        const order = if (way == 0) [_]usize{ 0, 1, 2, 3 } else [_]usize{ 3, 2, 1, 0 };
+        for (order, 0..) |which, at| ids[which] = @intCast(at);
+        for (order) |which| switch (which) {
+            0 => try b.values.append(gpa, .{ .kind = @backingInt(Value.Kind.int_type), .a = 8, .b = 0 }),
+            1 => {
+                const field_name = try b.text("next");
+                try b.values.append(gpa, .{ .kind = @backingInt(Value.Kind.declared_type), .a = file_of[0], .b = 40, .c = 0, .text = try b.text("Node"), .list = try b.list(&.{ field_name.start, field_name.len, ids[3] }) });
+            },
+            2 => try b.values.append(gpa, .{ .kind = @backingInt(Value.Kind.pointer_type), .a = ids[1], .b = 0, .c = 0 }),
+            3 => try b.values.append(gpa, .{ .kind = @backingInt(Value.Kind.optional_type), .a = ids[2] }),
+            else => unreachable,
+        };
+        // Bodies: f(u8) and f(Node) in a.zig, and an inline call inside f(Node).
+        const bodies = if (way == 0) [_]usize{ 0, 1, 2 } else [_]usize{ 2, 1, 0 };
+        var body_id: [3]u32 = undefined;
+        for (bodies, 0..) |which, at| body_id[which] = @intCast(at);
+        for (bodies) |which| {
+            const start: u32 = @intCast(b.results.items.len);
+            switch (which) {
+                0 => {
+                    try b.results.append(gpa, .{ .instruction = 12, .visit = 0, .type = ids[0] });
+                    try b.bodies.append(gpa, .{ .kind = 0, .file = file_of[0], .declaration = 10, .arguments = try b.list(&.{ids[0]}), .results_start = start, .results_len = 1 });
+                },
+                1 => {
+                    try b.results.append(gpa, .{ .instruction = 12, .visit = 0, .type = ids[2] });
+                    try b.results.append(gpa, .{ .instruction = 13, .visit = 0, .value = ids[1] });
+                    try b.bodies.append(gpa, .{ .kind = 0, .file = file_of[0], .declaration = 10, .arguments = try b.list(&.{ids[1]}), .results_start = start, .results_len = 2 });
+                },
+                2 => try b.bodies.append(gpa, .{ .kind = 1, .file = file_of[1], .declaration = 7, .caller = body_id[1], .call = 13, .call_visit = 0, .results_start = start, .results_len = 0 }),
+                else => unreachable,
+            }
+        }
+        const raw = try b.finish();
+        defer gpa.free(raw);
+        var refusal: Refusal = undefined;
+        const view = try View.init(raw, &refusal);
+        out.* = try canonical(gpa, &view);
+    }
+    defer for (bytes) |each| gpa.free(each);
+    try std.testing.expectEqualSlices(u8, bytes[0], bytes[1]);
+    // And it reads back: files by path, the generic's two instances together, the inline call after its function.
+    var refusal: Refusal = undefined;
+    const view = try View.init(bytes[0], &refusal);
+    try std.testing.expectEqualStrings("src/a.zig", view.string(view.files[0].path));
+    try std.testing.expectEqual(@as(usize, 3), view.bodies.len);
+    try std.testing.expectEqual(@as(u32, 0), view.bodies[0].file);
+    try std.testing.expectEqual(@as(u32, 0), view.bodies[1].file);
+    try std.testing.expectEqual(@as(u32, 1), view.bodies[2].file);
+    try std.testing.expect(view.bodies[2].caller < 2);
+    try std.testing.expectEqual(@as(usize, 4), view.values.len);
+    // Canonical of canonical is itself.
+    const again = try canonical(gpa, &view);
+    defer gpa.free(again);
+    try std.testing.expectEqualSlices(u8, bytes[0], again);
 }
