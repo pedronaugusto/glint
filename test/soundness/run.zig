@@ -172,9 +172,12 @@ pub fn main(init: std.process.Init) !void {
         if (!passes and !job.listed and compiles) try w.print("{s}/{s}: {t}, where a {t} must be {s}\n", .{ column.rule, job.path, verdict, job.role, if (job.role == .hole) "flagged or undecided" else "clean" });
     }
 
-    // The matrix: per cell its holes and twins, `.` where it has neither.
+    // The matrix: per cell its holes and twins, `.` where it has neither. Streaming, not
+    // positional: a stdout that is a file the build's other output goes to (a gate's log) is
+    // written on from where it stands, where a positional writer writes from offset 0, over
+    // what is there, a failing step's message among it.
     var out_buffer: [4096]u8 = undefined;
-    var out = std.Io.File.stdout().writer(io, &out_buffer);
+    var out = std.Io.File.stdout().writerStreaming(io, &out_buffer);
     const o = &out.interface;
     try o.print("{s:<13}", .{"row"});
     for (columns.items) |column| try o.print(" {s:<5}", .{column.rule});
