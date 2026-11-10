@@ -3061,8 +3061,9 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
     }
     if (std.mem.eql(u8, name, "@as") and args.len == 2) {
         const named = try self.resolveIn(env, file, args[0]);
-        // A type, or types, held as a value: what they are is the operand.
-        if (holdsTypes(named)) return self.resolveIn(env, file, args[1]);
+        // A type, or types, held as a value: what they are is the operand. Types in some
+        // build and not in another: not known.
+        if (holdsTypes(named) orelse return typesUnknown(named)) return self.resolveIn(env, file, args[1]);
         return self.instance(named);
     }
     if (try self.memoryBuiltin(env, file, name, args)) |value| return value;
@@ -3206,14 +3207,42 @@ pub fn integerType(value: Value, pointer: u16) IntegerType {
     }
 }
 
+/// The container a method's receiver is, or with `pointer` one points at, in the one reading
+/// every part (`valueParts`) gives it: the same type, made by the same call; else none.
+fn receiverHolder(value: Value, comptime pointer: bool) ?Container {
+    var found: ?Container = null;
+    for (valueParts(&value)) |part| {
+        const one = switch (part) {
+            .instance, .container => |c| c,
+            .pointer => |p| (if (pointer) receiverHolder(p.child.*, false) else null) orelse return null,
+            .alternatives => return null, // a choice, never a part (valueParts): none known
+            else => return null,
+        };
+        if (found) |known| if (known.file != one.file or known.scope != one.scope or known.made_by != one.made_by) return null;
+        found = one;
+    }
+    return found;
+}
+
 /// Whether a declared type holds types as values: `type`, `[N]type`, `[]const type`, `?type`.
-fn holdsTypes(value: Value) bool {
-    return switch (value) {
+/// Chosen per build, what every part (`valueParts`) agrees on; null where parts differ or one
+/// is not known, which each caller reads in the direction that clears nothing.
+fn holdsTypes(value: Value) ?bool {
+    var each: Join = .{};
+    for (valueParts(&value)) |part| each.add(part, switch (part) {
         .primitive => |name| std.mem.eql(u8, name, "type"),
         .pointer => |inner| holdsTypes(inner.child.*),
         .array, .optional => |inner| holdsTypes(inner.*),
+        .alternatives => null, // a choice, never a part (valueParts): not known
         else => false,
-    };
+    });
+    return each.agreed();
+}
+
+/// What a reader that takes `value` for a type answers where `holdsTypes` does not know: the
+/// value's own unknown, else one this does not read.
+fn typesUnknown(value: Value) Value {
+    return if (value == .unknown) value else .{ .unknown = .unsupported };
 }
 
 /// A type built from `types`, a list of its fields' types (an array of them, a pointer to one,
@@ -7424,7 +7453,8 @@ pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
         const mutable = tree.tokenTag(variable.ast.mut_token) == .keyword_var;
         if (variable.ast.type_node.unwrap()) |t| {
             const type_value = try self.resolve(decl.file, t);
-            if (!holdsTypes(type_value)) {
+            // Types in some build and not in another: not known (past here, it holds types).
+            if (!(holdsTypes(type_value) orelse return typesUnknown(type_value))) {
                 const typed = try self.instance(type_value);
                 // A function or a pointer to one: which, its initializer's and every store's.
                 if (!callable(typed)) return typed;
@@ -7440,7 +7470,8 @@ pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
             if (!mutable) return initial;
             // A `var` that holds types (`comptime var X: type = S;`) is each type it is given,
             // wherever it is read: one declaration, several types over its life.
-            const declared_types = if (variable.ast.type_node.unwrap()) |t| holdsTypes(try self.resolve(decl.file, t)) else false;
+            // Written, its type holds types: one that does not, or not known, returned above.
+            const declared_types = if (variable.ast.type_node.unwrap()) |t| holdsTypes(try self.resolve(decl.file, t)) orelse true else false;
             if (declared_types or try self.holdsTypeValue(initial, 0) or (variable.ast.type_node == .none and mayBeType(initial) and self.compileTime(decl) and !try self.initIsValue(decl.file, value, 0))) {
                 const given = (try self.givenValues(decl)) orelse return .{ .unknown = .unresolved };
                 return self.choose(given);
@@ -7490,11 +7521,14 @@ fn holdsTypeValue(self: *Facts, value: Value, depth: u8) ResolveError!bool {
 /// array, an optional, an error union or a function type, which an unannotated `var` may hold
 /// as a type (`var X = []const u8;` in a type function Zig runs at compile time, with no
 /// `comptime` of its own). `initIsValue` tells a value apart.
+/// Chosen per build, where some part (`valueParts`) may be one.
 fn mayBeType(value: Value) bool {
-    return switch (value) {
+    for (valueParts(&value)) |part| if (switch (part) {
         .primitive, .pointer, .array, .optional, .error_union, .fn_type => true,
+        .alternatives => true, // a choice, never a part (valueParts): it may be one
         else => false,
-    };
+    }) return true;
+    return false;
 }
 
 /// Whether a `var` is one Zig evaluates at compile time, where alone it may hold a type
@@ -7598,7 +7632,7 @@ fn initIsValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: 
 
 /// Whether a type is known and holds no types as values: what a value of it never is, a type.
 fn knownValueType(value: Value) bool {
-    return value != .unknown and value != .alternatives and !holdsTypes(value);
+    return value != .unknown and value != .alternatives and holdsTypes(value) == false;
 }
 
 /// Whether `value` is a function or a pointer to one, by its identity or its type: what a call
@@ -8998,21 +9032,30 @@ pub fn literalDeclaration(self: *Facts, file: Project.FileId, node: Ast.Node.Ind
         const call = tree.fullCall(&buffer, parent) orelse break :called null;
         break :called if (call.ast.fn_expr == node) parent else null;
     };
-    var holder = try self.literalType(file, call_node orelse node);
-    while (true) holder = switch (holder) {
-        .pointer => |inner| inner.child.*,
-        .optional, .error_union => |inner| inner.*,
-        .alternatives => break,
-        else => break,
-    };
-    const container = switch (holder) {
-        .container, .instance => |c| c,
-        .unknown => |why| return .{ .unknown = why },
-        // No type a declaration could be a member of: an anonymous literal, a number; for a
-        // call's place, the function it names is not known.
-        else => return if (call_node != null) .{ .unknown = .unresolved } else .none,
-    };
-    return .of(self.member(container, name));
+    return self.placeMember(try self.literalType(file, call_node orelse node), name, call_node != null);
+}
+
+/// The member `name` of the type a literal's place gives, `holder`, through an optional, an
+/// error union and a pointer. Chosen per build, the one every part (`valueParts`) names; parts
+/// that name different ones, or one and none, are not known.
+fn placeMember(self: *Facts, holder: Value, name: []const u8, in_call: bool) Named {
+    var named: ?Named = null;
+    for (valueParts(&holder)) |part| {
+        const one: Named = switch (part) {
+            .pointer => |inner| self.placeMember(inner.child.*, name, in_call),
+            .optional, .error_union => |inner| self.placeMember(inner.*, name, in_call),
+            .container, .instance => |c| .of(self.member(c, name)),
+            .unknown => |why| .{ .unknown = why },
+            .alternatives => .{ .unknown = .unsupported }, // a choice, never a part (valueParts): not known
+            // No type a declaration could be a member of: an anonymous literal, a number; for a
+            // call's place, the function it names is not known.
+            else => if (in_call) .{ .unknown = .unresolved } else .none,
+        };
+        if (named) |known| {
+            if (!std.meta.eql(known, one)) return .{ .unknown = .unsupported };
+        } else named = one;
+    }
+    return named orelse if (in_call) .{ .unknown = .unresolved } else .none;
 }
 
 /// Follows only declaration aliases, keeping the final declaration's provenance.
@@ -9665,24 +9708,25 @@ fn evaluateCall(self: *Facts, env: ?*const Env, file: Project.FileId, call: Ast.
     // A method called on a value takes that value as its first parameter.
     if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
         const receiver = try self.resolveIn(env, file, tree.nodeData(call.ast.fn_expr).node_and_token[0]);
-        const holder: ?Container = switch (receiver) {
-            .instance, .container => |c| c,
-            .pointer => |p| switch (p.child.*) {
-                .instance, .container => |c| c,
-                .alternatives => null,
-                else => null,
-            },
-            .alternatives => null,
-            else => null,
-        };
-        if (holder) |h| if (h.made_by) |made| {
+        if (receiverHolder(receiver, true)) |h| if (h.made_by) |made| {
             outer = try self.madeEnv(made);
         };
-        const on_value = switch (receiver) {
-            .instance => true,
-            .pointer => |p| p.child.* == .instance,
-            else => false,
-        };
+        // Chosen per build, a value where every part (`valueParts`) is one: parts that differ
+        // bind the arguments at different places, not known.
+        const parts = valueParts(&receiver);
+        var some = false;
+        var every = true;
+        for (parts) |part| {
+            const one = switch (part) {
+                .instance => true,
+                .pointer => |p| p.child.* == .instance,
+                .alternatives => return .{ .unknown = .unsupported }, // a choice, never a part (valueParts): not known
+                else => false,
+            };
+            if (one) some = true else every = false;
+        }
+        if (some and !every) return .{ .unknown = .unsupported };
+        const on_value = some;
         if (on_value) {
             try args.append(self.gpa, receiver);
             try truths.append(self.gpa, null);
@@ -10213,7 +10257,8 @@ fn readBound(self: *Facts, e: *const Env, file: Project.FileId, node: Ast.Node.I
                 const variable = tree.fullVarDecl(record.node) orelse return self.resolve(file, node);
                 if (variable.ast.type_node.unwrap()) |t| {
                     const type_value = try self.resolveIn(env_here, file, t);
-                    if (!holdsTypes(type_value)) return self.instance(type_value);
+                    // Types in some build and not in another: not known.
+                    if (!(holdsTypes(type_value) orelse return typesUnknown(type_value))) return self.instance(type_value);
                     // An array of types written element by element (`types[len] = ?F;`).
                     if (type_value == .array and tree.tokenTag(variable.ast.mut_token) == .keyword_var) if (variable.ast.init_node.unwrap()) |init| if (isUndefined(tree, init))
                         return self.writtenElements(env_here, file, index, self.scopeNode(r.function));

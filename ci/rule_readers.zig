@@ -93,10 +93,6 @@ const switches = [_]Allowed{
     .{ .file = "src/DangerShapes.zig", .function = "neverReturns", .reason = "pending: glint-b" },
     .{ .file = "src/DangerShapes.zig", .function = "pointsAtGuard", .reason = "pending: glint-b" },
     .{ .file = "src/DangerShapes.zig", .function = "writtenThrough", .reason = "pending: glint-b" },
-    .{ .file = "src/Facts.zig", .function = "evaluateCall", .reason = "pending: glint-c" },
-    .{ .file = "src/Facts.zig", .function = "holdsTypes", .reason = "pending: glint-c" },
-    .{ .file = "src/Facts.zig", .function = "literalDeclaration", .reason = "pending: glint-c" },
-    .{ .file = "src/Facts.zig", .function = "mayBeType", .reason = "pending: glint-c" },
 };
 
 fn checkSwitches(context: *glint.RuleContext, list: []const Allowed) glint.RuleContext.Error!void {
