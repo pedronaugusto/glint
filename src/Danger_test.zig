@@ -11409,3 +11409,81 @@ test "A009 reads a call's exits apart where its callee has few: an exit the call
         \\}
     , 1);
 }
+
+/// The findings of `rule` in `program`, as `line * 4096 + column` in report order, with the
+/// rules of `selected` on.
+fn findingsAmong(rule: glint.Rule, selected: []const glint.Rule, program: []const u8, out: *std.ArrayList(u64)) !void {
+    var project = try sources.projectAs(std.testing.allocator, program, .{}, &std_files, &std_imports);
+    defer project.deinit();
+    var selections: [pack.rules.len]glint.Config.Selection = undefined;
+    for (selected, 0..) |each, i| selections[i] = .{ .rule = each, .level = .report };
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = selections[0..selected.len] }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    for (report.diagnostics) |d| if (d.rule == rule) try out.append(std.testing.allocator, @as(u64, d.span.line) * 4096 + d.span.column);
+    std.mem.sort(u64, out.items, {}, std.sort.asc(u64));
+}
+
+test "a rule's findings are the same alone and beside every other rule: no answer kept for the run is what the first asker's depth or order left of it" {
+    // `width`'s greatest return read first through a chain of calls and casts (`first`), then at
+    // a switch's prongs (`pick`): the product fits either way. A list grown by input, an index
+    // from input and an unreachable input chooses give the other rules a finding each.
+    const program =
+        \\const std = @import("std");
+        \\const Kind = enum { short, long };
+        \\fn w0(kind: Kind) usize { return switch (kind) { .short => 20, .long => 32 }; }
+        \\fn w1(kind: Kind) usize { return w0(kind); }
+        \\fn w2(kind: Kind) usize { return w1(kind); }
+        \\fn w3(kind: Kind) usize { return w2(kind); }
+        \\fn w4(kind: Kind) usize { return w3(kind); }
+        \\fn w5(kind: Kind) usize { return w4(kind); }
+        \\fn w6(kind: Kind) usize { return w5(kind); }
+        \\fn w7(kind: Kind) usize { return w6(kind); }
+        \\fn w8(kind: Kind) usize { return w7(kind); }
+        \\fn w9(kind: Kind) usize { return w8(kind); }
+        \\fn w10(kind: Kind) usize { return w9(kind); }
+        \\pub fn first(r: *std.Io.Reader) !usize {
+        \\    const a = try r.takeInt(u8, 0);
+        \\    return @as(usize, a) + @as(usize, @as(usize, @as(usize, w10(.short))));
+        \\}
+        \\pub fn pick(r: *std.Io.Reader) !usize {
+        \\    const width: usize = switch (try r.takeInt(u8, 0)) {
+        \\        1 => w10(.short),
+        \\        2 => w10(.long),
+        \\        else => return error.Invalid,
+        \\    };
+        \\    return 2 * width;
+        \\}
+        \\pub fn grown(gpa: std.mem.Allocator, r: *std.Io.Reader, table: []const u8) !u8 {
+        \\    const n = try r.takeInt(u32, 0);
+        \\    const held = try gpa.alloc(u8, n);
+        \\    defer gpa.free(held);
+        \\    if (n == 7) unreachable;
+        \\    return table[n] + @as(u8, @intCast(n * 3));
+        \\}
+    ;
+    const all = [_]glint.Rule{ pack.untrusted_input, pack.integers, pack.bounded_work, pack.contracts };
+    var every: [pack.rules.len]glint.Rule = undefined;
+    for (pack.rules, 0..) |each, i| every[i] = each.definition.id;
+    var some: usize = 0;
+    for (all) |rule| {
+        var alone: std.ArrayList(u64) = .empty;
+        defer alone.deinit(std.testing.allocator);
+        try findingsAmong(rule, &.{rule}, program, &alone);
+        var four: std.ArrayList(u64) = .empty;
+        defer four.deinit(std.testing.allocator);
+        try findingsAmong(rule, &all, program, &four);
+        var beside: std.ArrayList(u64) = .empty;
+        defer beside.deinit(std.testing.allocator);
+        try findingsAmong(rule, &every, program, &beside);
+        try std.testing.expectEqualSlices(u64, alone.items, four.items);
+        try std.testing.expectEqualSlices(u64, alone.items, beside.items);
+        some += alone.items.len;
+    }
+    // The fixture gives the rules something to disagree on.
+    try std.testing.expect(some >= 4);
+    // The chain's product fits, read alone: A010 names nothing in `first` or `pick`.
+    var integers: std.ArrayList(u64) = .empty;
+    defer integers.deinit(std.testing.allocator);
+    try findingsAmong(pack.integers, &.{pack.integers}, program, &integers);
+    for (integers.items) |at| try std.testing.expect(at / 4096 > 25);
+}

@@ -583,7 +583,7 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
             var buffer: [1]Ast.Node.Index = undefined;
             const call = tree.fullCall(&buffer, node).?; // unreachable: a call's form holds calls
             return switch (try c.facts.resolve(file, call.ast.fn_expr)) {
-                .function => |decl| (try extreme(c, file, decl, call, pointer)) orelse (try readCount(c, file, decl, call)) orelse returned(c, decl, pointer, next),
+                .function => |decl| (try extreme(c, file, decl, call, pointer)) orelse (try readCount(c, file, decl, call)) orelse returned(c, decl, pointer),
                 // A choice of functions bounds nothing here: not known.
                 .alternatives => null,
                 else => null,
@@ -679,7 +679,7 @@ fn readCount(c: *Context, file: Project.FileId, decl: Facts.Decl, call: Ast.full
 /// the widest of its `return`s, each read in its body.
 const Returns = struct { map: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, ?Magnitude) = .empty };
 
-fn returned(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!?Magnitude {
+fn returned(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!?Magnitude {
     // What it keeps in its memo stays for the run.
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
@@ -704,7 +704,10 @@ fn returned(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Erro
         const token = tree.nodeMainToken(node);
         if (token < first or token > last or enclosing(tree, model, node) != function) continue;
         const value = tree.nodeData(node).opt_node.unwrap() orelse continue;
-        out = wider(out, try bound(c, decl.file, value, pointer, depth));
+        // Read from its own body, at no depth: what is kept answers every caller, so it is
+        // never what the first one's depth left of it. A chain of calls ends at the memo (a
+        // function being read is unbounded), each function read once.
+        out = wider(out, try bound(c, decl.file, value, pointer, 0));
         if (out == null) break;
     }
     try memo.map.put(c.allocator, key, out);
@@ -866,10 +869,10 @@ fn constant(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Erro
     const model = &c.project.at(decl.file).model;
     const tree = &c.project.at(decl.file).file.tree;
     const record = model.declarations[@backingInt(decl.index)];
-    if (record.kind == .field) return stored(c, decl, pointer, depth);
+    if (record.kind == .field) return stored(c, decl, pointer);
     if (record.kind != .variable) return null;
     const variable = tree.fullVarDecl(record.node) orelse return null;
-    if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return assigned(c, decl, pointer, depth);
+    if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return assigned(c, decl, pointer);
     const init = variable.ast.init_node.unwrap() orelse return null;
     return bound(c, decl.file, init, pointer, depth);
 }
@@ -880,7 +883,7 @@ fn constant(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Erro
 /// whose address is taken, is unknown.
 const Assigned = struct { map: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, ?Magnitude) = .empty };
 
-fn assigned(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!?Magnitude {
+fn assigned(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!?Magnitude {
     // What it keeps in its memo stays for the run.
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
@@ -907,7 +910,8 @@ fn assigned(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Erro
                     out = null;
                     continue;
                 };
-                if (!try empty(c, decl.file, value)) out = wider(out, try bound(c, decl.file, value, pointer, depth));
+                // Read where it is given, at no depth: what is kept answers every reader (`returned`).
+                if (!try empty(c, decl.file, value)) out = wider(out, try bound(c, decl.file, value, pointer, 0));
             },
             .update, .covered, .address, .open => out = null,
             .read => {},
@@ -1122,7 +1126,7 @@ pub fn presenceable(c: *Context, decl: Facts.Decl) Context.Error!bool {
     return true;
 }
 
-fn stored(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!?Magnitude {
+fn stored(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!?Magnitude {
     // What it keeps in its memo stays for the run.
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
@@ -1148,7 +1152,8 @@ fn stored(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!
                 // A whole value of the struct (`s = t`, or one that holds it) carries what the
                 // stores that made it gave the field.
                 if (site.reach == .holder or site.reach == .unresolved) if (wholeValue(try c.facts.resolve(site.file, value))) continue;
-                if (!try empty(c, site.file, value)) out = wider(out, try bound(c, site.file, value, pointer, depth));
+                // Read where it is stored, at no depth: what is kept answers every reader (`returned`).
+                if (!try empty(c, site.file, value)) out = wider(out, try bound(c, site.file, value, pointer, 0));
             },
             .update, .covered, .open => out = null,
             // A pointer to the field writes it wherever it goes; one to a whole value writes
