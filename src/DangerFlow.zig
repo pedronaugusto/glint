@@ -1683,6 +1683,36 @@ const Quiet = struct {
     }
 };
 
+/// `passedSinks`' list as it composes it: the positions of each holder's sinks in the order
+/// they were added, and the first position of each sink by its holder, its site and its
+/// message.
+const Composed = struct {
+    by_holder: std.AutoHashMapUnmanaged(u32, std.ArrayList(usize)) = .empty,
+    first: std.HashMapUnmanaged(Key, usize, KeyContext, std.hash_map.default_max_load_percentage) = .empty,
+
+    const Key = struct { holder: u32, at: Taint.Site, message: []const u8 };
+    const KeyContext = struct {
+        pub fn hash(_: KeyContext, key: Key) u64 {
+            var hasher = std.hash.Wyhash.init(key.holder);
+            std.hash.autoHash(&hasher, key.at.file);
+            std.hash.autoHash(&hasher, key.at.node);
+            hasher.update(key.message);
+            return hasher.final();
+        }
+        pub fn eql(_: KeyContext, a: Key, b: Key) bool {
+            return a.holder == b.holder and a.at.file == b.at.file and a.at.node == b.at.node and std.mem.eql(u8, a.message, b.message);
+        }
+    };
+
+    fn add(self: *Composed, gpa: std.mem.Allocator, one: Taint.PassedSink, position: usize) std.mem.Allocator.Error!void {
+        const of_holder = try self.by_holder.getOrPut(gpa, one.holder);
+        if (!of_holder.found_existing) of_holder.value_ptr.* = .empty;
+        try of_holder.value_ptr.append(gpa, position);
+        const known = try self.first.getOrPut(gpa, .{ .holder = one.holder, .at = one.at, .message = one.message });
+        if (!known.found_existing) known.value_ptr.* = position;
+    }
+};
+
 /// The sinks `check` reads in the function `callee` of `file`, a file the run does not select,
 /// and through the calls it makes, each with what it takes from `callee`'s parameters
 /// (`Taint.PassedSink`). `check` runs over the file with its reports kept from the run and only
@@ -1747,6 +1777,11 @@ fn passedSinks(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (*C
         seen = calls.items.len;
         fresh = next;
     }
+    // The list by holder, and each sink's first entry by holder, site and message: a scan of
+    // the list for each of them, at each sink of each call of each round, made the composing
+    // cubic in the sinks a large dependency holds.
+    var composed: Composed = .{};
+    for (list.items, 0..) |one, position| try composed.add(c.allocator, one, position);
     var changed = true;
     while (changed) {
         changed = false;
@@ -1754,16 +1789,17 @@ fn passedSinks(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (*C
             const reached = Taint.functionOf(c, flow, call.decl) orelse continue;
             const caller = Taint.functionKey(flow, file, call.node) orelse continue;
             const generic = c.facts.hasGenericParameter(call.decl);
-            var at: usize = 0;
-            while (at < list.items.len) : (at += 1) {
-                const one = list.items[at];
-                if (one.holder != reached) continue;
+            // Read by position: an entry added below for this holder (a function that calls
+            // itself) is read in the same pass, as the list's own order read it.
+            var nth: usize = 0;
+            while (true) : (nth += 1) {
+                const of_holder = composed.by_holder.get(reached) orelse break;
+                if (nth >= of_holder.items.len) break;
+                const one = list.items[of_holder.items[nth]];
                 const through = try Taint.throughCall(c, flow, file, call.node, one.given);
                 const given = (try Taint.givenThrough(c, flow, file, call.node, one.given)) orelse (try Taint.givenAt(c, flow, file, call.node)) orelse Taint.Dep{};
                 const undecided = one.undecided or generic or through == null or Taint.throughUnknown(flow, through.?);
-                const held = for (list.items) |*entry| {
-                    if (entry.holder == caller and entry.at.file == one.at.file and entry.at.node == one.at.node and std.mem.eql(u8, entry.message, one.message)) break entry;
-                } else null;
+                const held: ?*Taint.PassedSink = if (composed.first.get(.{ .holder = caller, .at = one.at, .message = one.message })) |position| &list.items[position] else null;
                 if (held) |entry| {
                     if (try Taint.joinInto(c.allocator, &entry.given, given)) changed = true;
                     if (undecided and !entry.undecided) {
@@ -1780,6 +1816,7 @@ fn passedSinks(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (*C
                     }
                 } else {
                     try list.append(c.allocator, .{ .at = one.at, .holder = caller, .given = given, .least = one.least, .message = one.message, .undecided = undecided, .own_input = one.own_input, .own_error = one.own_error });
+                    try composed.add(c.allocator, list.items[list.items.len - 1], list.items.len - 1);
                     changed = true;
                 }
             }
