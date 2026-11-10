@@ -1392,17 +1392,34 @@ fn bindingTyped(value: Facts.Value) bool {
 /// paths are not walked per binding.
 fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule) Context.Error!void {
     const call = (try Facts.calls.at(c.facts, c.file, node)) orelse return;
-    // The callee's name as written: a name (`f(x)`) or a member (`x.f()`, `T.f(x)`).
+    // The callee as written, where a finding is reported: a name (`f(x)`) or a member (`x.f()`,
+    // `T.f(x)`).
     const path = try Facts.accesses.pathOf(c.facts, c.file, call.callee_expr);
-    const name_token, const name = switch (path.steps[0].kind) {
-        .root => root: {
-            const ref = c.project.at(c.file).model.reference(path.steps[0].node) orelse return;
-            break :root .{ ref.token, try Model.identifier(c.allocator, tree.tokenSlice(ref.token)) };
-        },
-        .field => .{ tree.lastToken(path.steps[0].node), path.steps[0].name orelse return },
+    const name_token = switch (path.steps[0].kind) {
+        .root => (c.project.at(c.file).model.reference(path.steps[0].node) orelse return).token,
+        .field => if (path.steps[0].name == null) return else tree.lastToken(path.steps[0].node),
         .index, .slice, .unwrap, .deref => return,
     };
-    switch (try c.facts.copiesBy(name)) {
+    // What the callee does with its parameters, by what it resolves to: each function it may
+    // call (an alias is the function it names). One that does not resolve, called as a member
+    // (`x.f()` on a holder of no known type), is any function of the run so named, joined over
+    // all of them; called by a name (`f(x)`, `f` a value of no known function), it may be any.
+    const copying: Facts.Copies = switch (call.callee) {
+        .function => |function| try c.facts.copiesOf(function),
+        .choice => |each| joined: {
+            var some: Facts.Copies = .none;
+            for (each) |function| switch (try c.facts.copiesOf(function)) {
+                .none => {},
+                .moves => if (some == .none) {
+                    some = .moves;
+                },
+                .copies => break :joined .copies,
+            };
+            break :joined some;
+        },
+        .any => if (path.steps[0].kind == .field) try c.facts.copiesNamed(c.file, path.steps[0].node) else .copies,
+    };
+    switch (copying) {
         .none => return,
         // A generic that only moves a parameter into storage copies for A002 alone, and only
         // what does not move at the call.

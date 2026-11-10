@@ -48,9 +48,8 @@ settled: std.ArrayList(Assumptions) = .empty,
 assumed: ?Assumptions.Id = null,
 /// What each generic function copies of its parameters' values, found once (`parameterCopies`).
 copies: ?std.AutoHashMapUnmanaged(Decl, []const ParameterCopy) = null,
-/// The names those functions are declared under, for a quick look before a callee is resolved:
-/// what the functions so named do with the values given (`copiesBy`).
-copier_names: std.StringHashMapUnmanaged(Copies) = .empty,
+/// Whether the run holds every file its programs may be built of (`runHeld`), found once.
+run_held: ?bool = null,
 /// The places the copies `directCopies` finds in a value chosen or wrapped read, each with
 /// its copy's declaration: a copy its bindings decide (`boundAtBinding`).
 bound_places: std.AutoHashMapUnmanaged(struct { site: Key, place: Ast.Node.Index }, Decl) = .empty,
@@ -71,8 +70,10 @@ type_returns: std.AutoHashMapUnmanaged(Decl, []const Ast.Node.Index) = .empty,
 /// union of their arguments, or null when the function is reachable from outside or taken
 /// other than by a call.
 callers: std.AutoHashMapUnmanaged(Decl, ?Value) = .empty,
-/// The names some container in the project declares as `comptime` fields, found once.
-comptime_fields: ?std.StringHashMapUnmanaged(void) = null,
+/// The names some container in the run declares as `comptime` fields, found once: the
+/// candidates a member of a holder of no known type may be (`comptimeField`).
+comptime_fields: std.StringHashMapUnmanaged(void) = .empty,
+comptime_fields_built: bool = false,
 /// The declarations the program dereferences (`p.*`), found per file once.
 dereferences: std.AutoHashMapUnmanaged(Decl, void) = .empty,
 dereferences_found: std.AutoHashMapUnmanaged(Project.FileId, void) = .empty,
@@ -87,7 +88,8 @@ lasting: std.AutoHashMapUnmanaged(usize, *anyopaque) = .empty,
 /// the same whoever asks.
 short: bool = false,
 /// Every member access in the program's files, by the member's name, found once (`memberUses`).
-member_uses: ?std.StringHashMapUnmanaged(std.ArrayList(Key)) = null,
+member_uses: std.StringHashMapUnmanaged(std.ArrayList(Key)) = .empty,
+member_uses_built: bool = false,
 /// For each field that holds a function pointer, the functions the program stores in it
 /// (`storedFunctions`), or null where a store may not be seen; and those being read.
 stored: std.AutoHashMapUnmanaged(Decl, ?Value) = .empty,
@@ -362,7 +364,6 @@ pub fn deinit(self: *Facts) void {
     self.truths_open.deinit(self.gpa);
     self.settled.deinit(self.gpa);
     if (self.copies) |*found| found.deinit(self.gpa);
-    self.copier_names.deinit(self.gpa);
     self.bound_places.deinit(self.gpa);
     self.cast_sites.deinit(self.gpa);
     self.conditional_files.deinit(self.gpa);
@@ -371,7 +372,7 @@ pub fn deinit(self: *Facts) void {
     self.type_returns.deinit(self.gpa);
     self.at_bindings.deinit(self.gpa);
     self.callers.deinit(self.gpa);
-    if (self.comptime_fields) |*names| names.deinit(self.gpa);
+    self.comptime_fields.deinit(self.gpa);
     self.dereferences.deinit(self.gpa);
     self.dereferences_found.deinit(self.gpa);
     self.* = undefined;
@@ -779,36 +780,86 @@ fn findCopies(self: *Facts) ResolveError!void {
         }
     }
     self.copies = found;
-    var it = found.iterator();
-    while (it.next()) |entry| {
-        const name = self.project.at(entry.key_ptr.file).model.declarations[@backingInt(entry.key_ptr.index)].name;
-        const kind: Copies = for (entry.value_ptr.*) |copy| {
-            if (copy.kind != .moved) break .copies;
-        } else .moves;
-        // Functions of one name: the one that copies decides.
-        const slot = try self.copier_names.getOrPut(self.gpa, name);
-        if (!slot.found_existing or kind == .copies) slot.value_ptr.* = kind;
-    }
     if (self.check_records) |check| try check.copies(self, &self.copies.?);
 }
 
-/// What a function named `name` may do with a generic parameter's values.
+/// What a function may do with a generic parameter's values.
 pub const Copies = enum {
-    /// No function so named copies one.
+    /// It copies none.
     none,
-    /// Those so named only move a parameter's value into storage (`ParameterCopy.kind ==
-    /// .moved`): what a call gives is copied there only where the argument does not move at
-    /// the call.
+    /// It only moves a parameter's value into storage (`ParameterCopy.kind == .moved`): what a
+    /// call gives is copied there only where the argument does not move at the call.
     moves,
-    /// Some function so named copies one.
+    /// It copies one.
     copies,
 };
 
-/// What some function named `name` does with a generic parameter's values: one answer, so a
-/// reader cannot take a mover for a function that copies nothing.
-pub fn copiesBy(self: *Facts, name: []const u8) ResolveError!Copies {
+/// What `function` does with a generic parameter's values, by its declaration: one answer, so a
+/// reader cannot take a mover for a function that copies nothing. A function known by its
+/// spelling alone is no answer: an alias (`const g = copier;`) calls what it names.
+pub fn copiesOf(self: *Facts, function: Decl) ResolveError!Copies {
+    const made = try self.parameterCopies(function);
+    if (made.len == 0) return .none;
+    for (made) |copy| if (copy.kind != .moved) return .copies;
+    return .moves;
+}
+
+/// What a function called as the member access `access` (`x.f`) of a holder whose type does not
+/// resolve may do with a generic parameter's values: Zig looks the member up by name in whatever
+/// type the holder is, so the candidates are the run's functions so named, each read by its
+/// declaration (`copiesOf`) and joined over all of them: it copies where one does, moves where
+/// one moves and none copies. A holder whose type may be one the run does not hold
+/// (`holderOutside`) may copy.
+pub fn copiesNamed(self: *Facts, file: Project.FileId, access: Ast.Node.Index) ResolveError!Copies {
+    if (try self.holderOutside(file, access)) return .copies;
+    const tree = &self.project.at(file).file.tree;
+    const name = try self.memberName(tree.tokenSlice(tree.nodeData(access).node_and_token[1]));
     if (self.copies == null) try self.findCopies();
-    return self.copier_names.get(name) orelse .none;
+    const found = self.copies orelse return .copies;
+    var joined: Copies = .none;
+    var it = found.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.len == 0) continue;
+        if (!std.mem.eql(u8, self.project.at(entry.key_ptr.file).model.declarations[@backingInt(entry.key_ptr.index)].name, name)) continue;
+        switch (try self.copiesOf(entry.key_ptr.*)) {
+            .none => {},
+            .moves => joined = .moves,
+            .copies => return .copies,
+        }
+    }
+    return joined;
+}
+
+/// Whether the holder of the member access `access` (`x.name`, a `field_access`) may have a type the run
+/// does not hold, so that no join over the run's declarations so named answers for it: the run
+/// holds a file it cannot parse (`runHeld`); the holder is no member access read here; or its
+/// resolution stopped at a module the run lacks (a file it cannot parse, an import no mapping
+/// gives or whose name is computed), or at a generic's parameter that calls outside the run
+/// bind (`.generic`: a function handed out, whose consumer may bind a type no run of the library
+/// holds). A holder unresolved for any other reason has its type in the run.
+fn holderOutside(self: *Facts, file: Project.FileId, access: Ast.Node.Index) ResolveError!bool {
+    if (!self.runHeld()) return true;
+    const tree = &self.project.at(file).file.tree;
+    if (tree.nodeTag(access) != .field_access) return true;
+    return switch (try self.resolve(file, tree.nodeData(access).node_and_token[0])) {
+        .unknown => |why| switch (why) {
+            .invalid_front_end, .missing_mapping, .computed_import, .generic => true,
+            .unresolved, .comptime_dependent, .cycle, .budget, .unsupported, .absent, .zig_own, .erased_field => false,
+        },
+        .alternatives => false, // a choice of known values (`choose` keeps no unknown in one): each in the run
+        else => false,
+    };
+}
+/// Whether the run holds every file it was given: each one parsed. Where one is not, a
+/// declaration found by its name alone (a member of a holder of no known type) may be one it
+/// never read. Found once.
+pub fn runHeld(self: *Facts) bool {
+    if (self.run_held) |known| return known;
+    const held = for (self.project.sources) |*source| {
+        if (source.file.status != .parsed) break false;
+    } else true;
+    self.run_held = held;
+    return held;
 }
 
 fn syntaxOf(self: *const Facts, file: Project.FileId) *const Ast {
@@ -8524,10 +8575,14 @@ pub fn memo(self: *Facts, comptime T: type) ResolveError!*T {
 }
 
 /// The member accesses (`x.name`) in the program's files (`program`) that spell `name`, each a
-/// `field_access` node: an index built once, for rules that follow one member across files.
+/// `field_access` node: an index built once, for rules that follow one member across files. It
+/// is the candidates, never an answer: a member is reached only by its spelling (or `@field`,
+/// `fieldUses`), and every consumer reads each site by resolution (its receiver, its definition
+/// or its callee) before it counts it as the declaration it follows.
 pub fn memberUses(self: *Facts, name: []const u8) ResolveError![]const Key {
-    if (self.member_uses == null) {
-        var index: std.StringHashMapUnmanaged(std.ArrayList(Key)) = .empty;
+    if (!self.member_uses_built) {
+        // The field's own table, filled whole before it is kept: one cut short is never asked.
+        var index: @TypeOf(self.member_uses) = .empty;
         for (self.project.sources) |*source| {
             if (!try self.program(source.id)) continue;
             const file = source.id;
@@ -8542,8 +8597,9 @@ pub fn memberUses(self: *Facts, name: []const u8) ResolveError![]const Key {
             }
         }
         self.member_uses = index;
+        self.member_uses_built = true;
     }
-    return if (self.member_uses.?.get(name)) |list| list.items else &.{};
+    return if (self.member_uses.get(name)) |list| list.items else &.{};
 }
 
 /// A `@field` in the program's files (`fieldUses`): the call, its holder (the first argument),
@@ -10979,7 +11035,7 @@ fn scanCallSites(self: *Facts, function: Decl, callers: Callers, follow: Follow)
     const name = self.project.at(function.file).file.tree.tokenSlice(name_token);
     // std's or aegis's code may call it on a value the program hands it: callers no scan of the
     // program sees.
-    if (record.public and try self.calledOutside(name)) return null;
+    if (record.public and try self.calledOutside(function, name)) return null;
     var sites: std.ArrayList(CallSite) = .empty;
     for (self.project.sources) |*source| {
         const file = source.file;
@@ -11219,13 +11275,29 @@ fn fieldCalls(self: *Facts, field: Decl, function: Decl, sites: *std.ArrayList(C
 }
 
 /// The field a struct literal's `.name = v` sets, by the type Zig gives the literal where it is
-/// written (`literalType`) and its fields (`heldFields`).
+/// written (`literalType`) and its fields (`heldFields`). A type chosen per build sets one field
+/// only where every part (`valueParts`) is a container whose field so named is that one; parts
+/// that differ, or one that is no container, set none known (null).
 fn storedField(self: *Facts, file: Project.FileId, literal: Ast.Node.Index, name: Ast.TokenIndex) ResolveError!?Decl {
-    const container = switch (try self.literalType(file, literal)) {
-        .container => |container| container,
-        else => return null,
-    };
+    const typed = try self.literalType(file, literal);
     const spelled = try Model.identifier(self.gpa, self.project.at(file).file.tree.tokenSlice(name));
+    var found: ?Decl = null;
+    for (valueParts(&typed)) |choice| {
+        const container = switch (choice) {
+            .container => |container| container,
+            .alternatives => return null, // a choice, never a part: none known
+            else => return null,
+        };
+        const decl = (try self.fieldSpelled(container, spelled)) orelse return null;
+        if (found) |one| {
+            if (!std.meta.eql(one, decl)) return null;
+        } else found = decl;
+    }
+    return found;
+}
+
+/// The field of `container` declared as `spelled`, as Zig looks a literal's field up in its type.
+fn fieldSpelled(self: *Facts, container: Container, spelled: []const u8) ResolveError!?Decl {
     for (try self.heldFields(container)) |field| {
         const decl = field.decl orelse continue;
         if (std.mem.eql(u8, self.project.at(decl.file).model.declarations[@backingInt(decl.index)].name, spelled)) return decl;
@@ -11291,8 +11363,13 @@ fn mayHoldContainer(self: *Facts, value: Value, file: Project.FileId, scope: Mod
 /// `name` of the program's: a call through a member so spelled, or through `@field` with a name
 /// that is so spelled or computed, on a receiver that does not resolve to a container of its own
 /// (a generic's type parameter, `anytype`), as `HashMap` calls its context's `hash`. A call in
-/// code no compilation of the program analyzes (`analyzedAt`) calls nothing.
-fn calledOutside(self: *Facts, name: []const u8) ResolveError!bool {
+/// code no compilation of the program analyzes (`analyzedAt`) calls nothing. The candidates
+/// are every call so spelled, each receiver read by resolution (`mayBeProgram`), joined over
+/// all of them: it may be called where one may call it. Where the run does not hold every file
+/// (`runHeld`), outside code it never read may call it. The answer is kept by `function`, the
+/// declaration so named that is asked of.
+fn calledOutside(self: *Facts, function: Decl, name: []const u8) ResolveError!bool {
+    if (!self.runHeld()) return true;
     const found = try self.memo(OutsideCalls);
     if (!found.built) {
         found.built = true;
@@ -11329,7 +11406,7 @@ fn calledOutside(self: *Facts, name: []const u8) ResolveError!bool {
             }
         }
     }
-    if (found.verdicts.get(name)) |known| return known;
+    if (found.verdicts.get(function)) |known| return known;
     const wide = self.wide;
     var any = false;
     const named = if (found.by_name.get(name)) |list| list.items else &.{};
@@ -11341,7 +11418,7 @@ fn calledOutside(self: *Facts, name: []const u8) ResolveError!bool {
         if (try self.mayBeProgram(try self.resolve(receiver.file, receiver.node))) any = true;
         if (any) break;
     };
-    if (!self.wideSince(wide)) try found.verdicts.put(self.gpa, name, any);
+    if (!self.wideSince(wide)) try found.verdicts.put(self.gpa, function, any);
     return any;
 }
 const OutsideCalls = struct {
@@ -11350,7 +11427,8 @@ const OutsideCalls = struct {
     by_name: std.StringHashMapUnmanaged(std.ArrayList(Key)) = .empty,
     /// The receivers of calls through `@field` with a computed name: any name.
     computed: std.ArrayList(Key) = .empty,
-    verdicts: std.StringHashMapUnmanaged(bool) = .empty,
+    /// Each function asked of, by its declaration: whether code outside the program may call it.
+    verdicts: std.AutoHashMapUnmanaged(Decl, bool) = .empty,
 };
 
 /// Whether a value may be the program's: it does not resolve, or reaches a container of a
@@ -11539,7 +11617,7 @@ fn runtimeValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth:
         .grouped_expression => return self.runtimeValue(file, tree.nodeData(node).node_and_token[0], depth + 1),
         .field_access => {
             const data = tree.nodeData(node).node_and_token;
-            if (try self.comptimeField(try self.memberName(tree.tokenSlice(data[1])))) return false;
+            if (try self.comptimeField(file, node)) return false;
             return self.runtimeValue(file, data[0], depth + 1);
         },
         .identifier => {
@@ -11598,23 +11676,36 @@ fn typeKeyword(tree: *const Ast, node: Ast.Node.Index) bool {
     return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "type");
 }
 
-/// Whether any container in the project declares a `comptime` field named `name`.
-fn comptimeField(self: *Facts, name: []const u8) ResolveError!bool {
-    if (self.comptime_fields == null) {
-        var names: std.StringHashMapUnmanaged(void) = .empty;
+/// Whether the member `node` (`x.name`) may be a `comptime` field: the field it resolves to is
+/// one. Where it does not resolve (a holder of no known type), Zig looks it up by name in
+/// whatever type the holder is: the candidates are the run's fields so named, each read by its
+/// declaration and joined over all of them, so it is runtime only where every one is, and may
+/// be `comptime` where the run does not hold every file (`runHeld`).
+fn comptimeField(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
+    switch (try self.definition(file, node)) {
+        .decl => |decl| {
+            const source = self.project.at(decl.file);
+            const field = source.model.containerField(&source.file.tree, self.scopeNode(decl)) orelse return false;
+            return field.comptime_token != null;
+        },
+        .none, .unknown => {},
+    }
+    if (try self.holderOutside(file, node)) return true;
+    if (!self.comptime_fields_built) {
+        // The field's own table, filled whole before it is kept: one cut short is never asked.
+        var names: @TypeOf(self.comptime_fields) = .empty;
         for (self.project.sources) |*source| {
-            const file = source.file;
-            const model = &source.model;
-            if (file.status != .parsed) continue;
-            for (model.declarations) |d| {
+            for (source.model.declarations) |d| {
                 if (d.kind != .field) continue;
-                const field = model.containerField(&file.tree, d.node) orelse continue;
+                const field = source.model.containerField(&source.file.tree, d.node) orelse continue;
                 if (field.comptime_token != null) try names.put(self.gpa, d.name, {});
             }
         }
         self.comptime_fields = names;
+        self.comptime_fields_built = true;
     }
-    return self.comptime_fields.?.contains(name);
+    const tree = &self.project.at(file).file.tree;
+    return self.comptime_fields.contains(try self.memberName(tree.tokenSlice(tree.nodeData(node).node_and_token[1])));
 }
 
 /// Whether the call `parent` makes through the member access `node` cannot be `function`:
@@ -16665,6 +16756,47 @@ test "a function's value in a private alias or table is followed for every reade
     try std.testing.expectEqual(@as(usize, 3), (try facts.callSites(a)).?.len);
     try std.testing.expect(try facts.escapes(c) and try facts.handedOut(c));
     try std.testing.expect(try facts.escapes(d) and try facts.handedOut(d));
+}
+
+/// Whether `run`, a private function of `text`, escapes in a run of `text` and, where given, a
+/// file `broken.zig` of `broken`.
+fn runEscapes(text: []const u8, broken: ?[]const u8) !bool {
+    const inputs = [_]Project.Input{ .{ .name = "root", .bytes = text }, .{ .name = "broken.zig", .bytes = broken orelse "" } };
+    var project = try Project.init(std.testing.allocator, if (broken == null) inputs[0..1] else inputs[0..], &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const run = facts.member(facts.rootOf(project.sources[0].id), "run") orelse return error.TestUnexpectedResult;
+    return facts.escapes(run);
+}
+
+test "a member of a holder of no known type is read over every field the run declares so named, and a file the run cannot parse may declare one" {
+    // `q.run`, not called: a value's field where `q` is a value the program holds at run time.
+    // `q` is `p.missing`, a member `Plain` does not declare: a field of the value `p` unless
+    // some field the run declares so named is `comptime` (`Kept.missing`), so `q` may be a
+    // type or a namespace whose `run` is the function itself, used other than by a call.
+    const uses =
+        \\const Plain = struct { run: u8 };
+        \\fn run(x: u8) u8 {
+        \\    return x;
+        \\}
+        \\pub fn f(x: u8) u8 {
+        \\    return run(x);
+        \\}
+        \\pub fn g(p: *const Plain) u8 {
+        \\    const q = p.missing;
+        \\    return q.run;
+        \\}
+        \\
+    ;
+    const kept = "const Kept = struct { comptime missing: u8 = 0 };\n";
+    try std.testing.expect(try runEscapes(uses ++ kept, null));
+    // No field so named is `comptime`: `q` is a value, `q.run` its field, and `run` is called alone.
+    try std.testing.expect(!try runEscapes(uses, null));
+    // A file the run was given that does not parse may declare one: not known as a value's.
+    try std.testing.expect(try runEscapes(uses, "const Kept = struct { comptime missing: u8 = 0 };\nfn ("));
 }
 
 test "a parameter's type has a length where it is or holds memory that has one" {

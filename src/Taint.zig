@@ -4960,11 +4960,16 @@ fn countDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Inde
         for (each) |element| out = try out.join(c.allocator, try countDep(c, flow, function, element, depth + 1));
         return out;
     }
-    // Memory is no count: a slice, a pointer or an array repeats nothing by its value.
-    switch (try c.facts.resolve(f.file, at)) {
-        .pointer, .array, .function, .fn_type => return .{},
-        else => {},
-    }
+    // Memory is no count: a slice, a pointer or an array repeats nothing by its value. Chosen
+    // per build, it is memory only where every part (`Facts.valueParts`) is.
+    const resolved = try c.facts.resolve(f.file, at);
+    var memory: Facts.Join = .{};
+    for (Facts.valueParts(&resolved)) |part| memory.add(part, switch (part) {
+        .pointer, .array, .function, .fn_type => true,
+        .alternatives => null, // a choice, never a part: not known as memory
+        else => false,
+    });
+    if (memory.all() == true) return .{};
     return dep(c, flow, function, at);
 }
 
@@ -5656,10 +5661,16 @@ fn boundParameter(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Nod
             };
             const index = f.position(d) orelse return null;
             const declared = model.declarations[@backingInt(d)];
-            return switch (try c.facts.resolve(f.file, declared.node)) {
-                .primitive => |name| if (integerName(name)) index else null,
-                else => null,
-            };
+            // Declared per build, an integer where some part (`Facts.valueParts`) is: the loop
+            // repeats by it in that build.
+            const resolved = try c.facts.resolve(f.file, declared.node);
+            var integer: Facts.Join = .{};
+            for (Facts.valueParts(&resolved)) |part| integer.add(part, switch (part) {
+                .primitive => |name| integerName(name),
+                .alternatives => null, // a choice, never a part: not known as an integer
+                else => false,
+            });
+            return if (integer.any() == true) index else null;
         },
         .operator => {
             const operator = Facts.accesses.operatorOf(tree.nodeTag(at)) orelse return null;
