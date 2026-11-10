@@ -4394,6 +4394,26 @@ test "A018 finds an error's name written to a peer, not to another writer" {
     , 1);
 }
 
+test "A018 reads no error's text from a side of a catch that never gives a value, and from one that does" {
+    const head =
+        \\const std = @import("std");
+        \\fn listed() ![]const u8 { return "a"; }
+        \\fn fail(err: anyerror) noreturn { @panic(@errorName(err)); }
+        \\pub fn reply(stream: std.Io.net.Stream) !void {
+        \\    var buf: [64]u8 = undefined;
+        \\    var w = stream.writer(&buf);
+        \\
+    ;
+    const tail =
+        \\    try w.print("{s}", .{name});
+        \\}
+    ;
+    try expect(pack.diagnostics, head ++ "    const name = listed() catch |err| fail(err);\n" ++ tail, 0);
+    try expect(pack.diagnostics, head ++ "    const name = listed() catch |err| @panic(@errorName(err));\n" ++ tail, 0);
+    try expect(pack.diagnostics, head ++ "    const name = listed() catch |err| @errorName(err);\n" ++ tail, 1);
+    try expect(pack.diagnostics, head ++ "    const name = listed() catch |err| return err;\n" ++ tail, 0);
+}
+
 test "A018 takes as the writer only a value whose type may hold one: a peer writer's bytes handed to std are written, never the writer" {
     // warp's Index.build: an allocation's bytes the writer fact reached through std's calls,
     // handed to an `anytype` parameter beside other values, read as a peer's writer.

@@ -2284,9 +2284,17 @@ fn dep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Co
             // shifted to a table's bits).
             return try (try dep(c, flow, function, lhs)).join(c.allocator, try dep(c, flow, function, rhs));
         },
-        .concatenation, .@"orelse", .@"catch" => {
+        .concatenation => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             return try (try dep(c, flow, function, lhs)).join(c.allocator, try dep(c, flow, function, rhs));
+        },
+        .@"orelse", .@"catch" => {
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            const value = try dep(c, flow, function, lhs);
+            // A side that never gives a value holds none of what it is given
+            // (`catch |err| std.debug.panic("{t}", .{err})`, `catch |err| return err`).
+            if (try givesNoValue(c, f.file, rhs)) return value;
+            return try value.join(c.allocator, try dep(c, flow, function, rhs));
         },
         .builtin => return builtinDep(c, flow, function, node),
         .@"if" => {
@@ -2327,6 +2335,47 @@ fn dep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Co
     if (try literalDep(c, flow, function, node)) |out| return out;
     if (try resolveCall(c, flow, f.file, node)) |callee| return result(c, flow, function, callee);
     return composed(c, flow, function, node);
+}
+
+/// Whether `node` gives no value: each expression it comes from leaves the function or never
+/// returns (`return`, `continue`, `unreachable`, `@panic`, `@trap`, a call of a function
+/// declared `noreturn`); none where its forms are not read.
+fn givesNoValue(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    switch (c.project.at(file).file.tree.nodeTag(node)) {
+        .@"return", .@"continue", .unreachable_literal => return true,
+        else => {},
+    }
+    const given = switch (try accesses.valuesOf(c.facts, file, node)) {
+        .leaves => |each| each,
+        .unknown => return false,
+    };
+    const tree = &c.project.at(file).file.tree;
+    for (given) |leaf| switch (tree.nodeTag(leaf)) {
+        .@"return", .@"continue", .unreachable_literal => {},
+        else => if (!Facts.isBuiltin(tree, leaf, "@panic") and !Facts.isBuiltin(tree, leaf, "@trap") and !try callsNoReturn(c, file, leaf)) return false,
+    };
+    return given.len != 0;
+}
+
+/// Whether `node` is a call each function it may call declares its result `noreturn`.
+fn callsNoReturn(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    const call = (try Facts.calls.at(c.facts, file, node)) orelse return false;
+    const callees: []const Facts.Decl = switch (call.callee) {
+        .function => |*one| one[0..1],
+        .choice => |each| each,
+        .any => return false,
+    };
+    for (callees) |callee| {
+        const target = &c.project.at(callee.file).file.tree;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = target.fullFnProto(&buffer, fnDecl(c, callee) orelse return false) orelse return false;
+        const declared = proto.ast.return_type.unwrap() orelse return false;
+        switch (try c.facts.resolve(callee.file, declared)) {
+            .primitive => |name| if (!std.mem.eql(u8, name, "noreturn")) return false,
+            else => return false,
+        }
+    }
+    return callees.len != 0;
 }
 
 /// What a name holds: a parameter's own slots, a global's facts, a local's; and an error's
