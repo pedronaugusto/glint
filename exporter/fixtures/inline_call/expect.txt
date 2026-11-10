@@ -1,0 +1,5 @@
+2	body inline_call inline_call.twice() in inline_call.entry results=some
+0	body function inline_call.twice(
+1	body function inline_call.plain() results=some
+1	  calls fn inline_call.plain x1
+1	canonical yes

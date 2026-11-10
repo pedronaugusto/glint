@@ -1,0 +1,4 @@
+1	body function fn_pointer.one() results=some
+1	body function fn_pointer.two() results=some
+1	  calls (runtime pointer) x1
+1	canonical yes

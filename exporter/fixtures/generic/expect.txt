@@ -1,0 +1,5 @@
+1	body function generic.id(u8, -) results=some
+1	body function generic.id(u16, -) results=some
+1	body function generic.entry() results=some
+1	  calls fn generic.id x2
+1	canonical yes
