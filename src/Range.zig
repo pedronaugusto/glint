@@ -2875,9 +2875,16 @@ fn keptAcross(c: *Context, file: Project.FileId, compared: Ast.Node.Index, condi
     var places: Places = .{ .rename = try calleeReceiver(c, file, compared, condition) };
     try places.gather(c, file, compared, 0);
     const exposed = places.exposed();
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const form = accesses.formOf(tag);
+    // Every token the region holds lies between the condition and the use or inside a loop
+    // around the use: the nodes read are those of that span.
+    var span_first = from;
+    var span_last = to;
+    for (around.constItems()) |loop| {
+        span_first = @min(span_first, tree.firstToken(loop));
+        span_last = @max(span_last, tree.lastToken(loop));
+    }
+    for (try actingWithin(c, file, span_first, span_last)) |node| {
+        const form = accesses.formOf(tree.nodeTag(node));
         switch (form) {
             .assign, .compound_assign, .destructure => {
                 if (!region.holds(tree.nodeMainToken(node)) or apart(c, file, node, use, condition)) continue;
@@ -2982,11 +2989,8 @@ fn varies(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error
     const tree = &c.project.at(file).file.tree;
     const first = tree.firstToken(node);
     const last = tree.lastToken(node);
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (accesses.formOf(tag) != .call) continue;
-        const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const token = tree.nodeMainToken(at);
-        if (token < first or token > last) continue;
+    for (try actingWithin(c, file, first, last)) |at| {
+        if (accesses.formOf(tree.nodeTag(at)) != .call) continue;
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, at).?; // unreachable: a call's form holds calls
         const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
@@ -3581,6 +3585,51 @@ fn position(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
     return indexes(c, file, node, null);
 }
 
+/// Per file, the nodes a bound's proof looks for (an index or a slice, a call or a builtin's,
+/// a store, an address taken, an `asm`) in source order by main token, found once for the run: syntax
+/// alone, so the same whoever asks and whatever budget is left. `indexes`, `varies` and
+/// `keptAcross` are asked at every bound of every summary; a scan of the file's nodes for each
+/// made their cost the file's size times the bounds asked.
+const Acting = struct { by_file: std.AutoHashMapUnmanaged(Project.FileId, []const Ast.Node.Index) = .empty };
+
+/// `acting`'s nodes whose main token lies in `first..last`, both ends included.
+fn actingWithin(c: *Context, file: Project.FileId, first: Ast.TokenIndex, last: Ast.TokenIndex) Context.Error![]const Ast.Node.Index {
+    const tree = &c.project.at(file).file.tree;
+    const sites = try acting(c, file);
+    var low: usize = 0;
+    var high: usize = sites.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        if (tree.nodeMainToken(sites[mid]) < first) low = mid + 1 else high = mid;
+    }
+    var end = low;
+    while (end < sites.len and tree.nodeMainToken(sites[end]) <= last) end += 1;
+    return sites[low..end];
+}
+
+fn acting(c: *Context, file: Project.FileId) Context.Error![]const Ast.Node.Index {
+    if ((try c.facts.memo(Acting)).by_file.get(file)) |known| return known;
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
+    const tree = &c.project.at(file).file.tree;
+    var found: std.ArrayList(Ast.Node.Index) = .empty;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        switch (accesses.formOf(tag)) {
+            .array_access, .slice, .call, .builtin, .assign, .compound_assign, .destructure, .address_of, .@"asm" => try found.append(c.allocator, @fromBackingInt(@intCast(i))),
+            else => {},
+        }
+    }
+    const Order = struct {
+        fn before(of: *const Ast, a: Ast.Node.Index, b: Ast.Node.Index) bool {
+            return of.nodeMainToken(a) < of.nodeMainToken(b);
+        }
+    };
+    std.mem.sort(Ast.Node.Index, found.items, tree, Order.before);
+    try (try c.facts.memo(Acting)).by_file.put(c.allocator, file, found.items);
+    return found.items;
+}
+
 /// Whether the function holding `node` indexes or slices memory with it (`memory` alone,
 /// where given).
 fn indexes(c: *Context, file: Project.FileId, node: Ast.Node.Index, memory: ?Ast.Node.Index) Context.Error!bool {
@@ -3593,12 +3642,9 @@ fn indexes(c: *Context, file: Project.FileId, node: Ast.Node.Index, memory: ?Ast
     };
     const first = tree.firstToken(function);
     const last = tree.lastToken(function);
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const form = accesses.formOf(tag);
+    for (try actingWithin(c, file, first, last)) |at| {
+        const form = accesses.formOf(tree.nodeTag(at));
         if (form != .array_access and form != .slice) continue;
-        const token = tree.nodeMainToken(at);
-        if (token < first or token > last) continue;
         const into, const bounds: [2]?Ast.Node.Index = if (form == .array_access) blk: {
             const operands = tree.nodeData(at).node_and_node;
             break :blk .{ operands[0], .{ operands[1], null } };
