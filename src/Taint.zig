@@ -2370,10 +2370,11 @@ fn callsNoReturn(c: *Context, file: Project.FileId, node: Ast.Node.Index) Contex
         var buffer: [1]Ast.Node.Index = undefined;
         const proto = target.fullFnProto(&buffer, fnDecl(c, callee) orelse return false) orelse return false;
         const declared = proto.ast.return_type.unwrap() orelse return false;
-        switch (try c.facts.resolve(callee.file, declared)) {
-            .primitive => |name| if (!std.mem.eql(u8, name, "noreturn")) return false,
-            else => return false,
-        }
+        // Each type a build may declare it is `noreturn`; a part not known is no proof.
+        const typed_as = try c.facts.resolve(callee.file, declared);
+        var every: Facts.Join = .{};
+        for (Facts.valueParts(&typed_as)) |part| every.add(part, part == .primitive and std.mem.eql(u8, part.primitive, "noreturn"));
+        if (every.all() != true) return false;
     }
     return callees.len != 0;
 }
@@ -4743,9 +4744,9 @@ fn peerSites(c: *Context, flow: *Flow, file: Project.FileId, callee: Callee, out
     for (callee.args, 0..) |arg, position| if (!taken.has(position)) try writtenParts(c, file, callee, arg, position, decided, out);
 }
 
-/// Whether `node` is the writer of a `std.Io.Writer.Allocating` (by its declaration), as each
-/// expression it comes from gives it: `&a.writer` of an instance, through the one value each
-/// local `const` naming it holds.
+/// Whether `node` is the writer of a `std.Io.Writer.Allocating`, as each expression it comes
+/// from gives it: `&a.writer`, the member that resolves to that type's `writer` field (by its
+/// declaration's origin, `writerField`), or a name, through the one value its variable holds.
 fn allocatingWriter(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!bool {
     if (depth > 4) return false;
     const written_by = switch (try accesses.valuesOf(c.facts, file, node)) {
@@ -4755,37 +4756,47 @@ fn allocatingWriter(c: *Context, file: Project.FileId, node: Ast.Node.Index, dep
     if (written_by.len == 0) return false;
     const tree = &c.project.at(file).file.tree;
     for (written_by) |leaf| {
-        if (tree.nodeTag(leaf) == .identifier) {
-            const named = switch (try c.facts.definition(file, leaf)) {
+        if (formAt(tree, leaf) == .address_of) {
+            const member = switch (try c.facts.definition(file, Facts.ungrouped(tree, tree.nodeData(leaf).node))) {
                 .decl => |decl| decl,
                 .none, .unknown => return false,
             };
-            // Only a variable is given values (`givenTo`): any other declaration answers null.
-            if (named.file != file) return false;
-            const given = (try c.facts.givenTo(named, false)) orelse return false;
-            if (given.len != 1 or !try allocatingWriter(c, file, given[0].node, depth + 1)) return false;
+            if (!try writerField(c, member)) return false;
             continue;
         }
-        if (formAt(tree, leaf) != .address_of) return false;
-        const field = Facts.ungrouped(tree, tree.nodeData(leaf).node);
-        const step = (try accesses.memberRead(c.facts, file, field)) orelse return false;
-        if (!std.mem.eql(u8, step.name orelse return false, "writer")) return false;
-        if (!try allocatingInstance(c, try c.facts.resolve(file, step.receiver orelse return false))) return false;
+        const named = switch (try c.facts.definition(file, leaf)) {
+            .decl => |decl| decl,
+            .none, .unknown => return false,
+        };
+        // Only a variable is given values (`givenTo`): any other declaration answers null.
+        if (named.file != file) return false;
+        const given = (try c.facts.givenTo(named, false)) orelse return false;
+        if (given.len != 1 or !try allocatingWriter(c, file, given[0].node, depth + 1)) return false;
     }
     return true;
 }
 
-/// Whether `value` is an instance of `std.Io.Writer.Allocating`, by its declaration.
-fn allocatingInstance(c: *Context, value: Facts.Value) Context.Error!bool {
-    if (value != .instance) return false;
-    const decls = switch (try Governed.declarations(c, "std", "Io.Writer.Allocating")) {
+/// Whether `member` is std's `Io.Writer.Allocating.writer` field, by its declaration's origin
+/// beside each of std's (`Governed.declarations`, read once per run). One whose origin does not
+/// resolve is none shown.
+fn writerField(c: *Context, member: Facts.Decl) Context.Error!bool {
+    const fields = switch (try Governed.declarations(c, "std", "Io.Writer.Allocating.writer")) {
         .decls => |each| each,
         .none, .unknown => return false,
     };
-    for (decls) |decl| switch (try c.facts.declaration(decl)) {
-        .container => |k| if (k.file == value.instance.file and k.scope == value.instance.scope) return true,
-        else => {},
+    const origin = switch (try c.facts.origin(member)) {
+        .decl => |found| found,
+        .none => member,
+        .unknown => return false,
     };
+    for (fields) |field| {
+        const std_origin = switch (try c.facts.origin(field)) {
+            .decl => |found| found,
+            .none => field,
+            .unknown => continue,
+        };
+        if (std_origin.file == origin.file and std_origin.index == origin.index) return true;
+    }
     return false;
 }
 
