@@ -112,6 +112,7 @@
     ]
   ],
   "shipped": {
+    "ci/layer_files.zig": "build.zig imports it for the lists of rule-side sources, so a consumer's build of glint reads it.",
     "docs": "Lasting model, rule, completion and adopter contracts in docs/design.md are linked from README.",
     "examples": "Standalone project-owned rule and CLI entry used by adopters with the public build helper."
   }
