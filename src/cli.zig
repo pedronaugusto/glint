@@ -469,10 +469,20 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     // Each facts file is read whole, as untrusted input, and kept or refused whole (`Compiled`).
     const given = try a.alloc(Compiled.Given, configured.compiled_facts.len);
     for (given, configured.compiled_facts) |*each, path| each.* = .{ .path = path, .bytes = try aegis.own.readFile(io, std.Io.Dir.cwd(), path, a, .fromRaw(compiled_facts_limit)) };
-    const compiled = try Compiled.init(a, &project, given);
+    // A file's records are charged at most one per four bytes of its limit, its smallest record.
+    const compiled = try Compiled.init(a, &project, given, .{ .records = compiled_facts_limit / 4 });
     // A refused file holds nothing and the run goes on without it; why is said beside the report.
-    for (compiled.refused) |each| try problems.print("glint: compiled facts: {s}: {s}\n", .{ each.path, try Compiled.reason(a, each.why) });
-    if (compiled.refused.len != 0) try problems.flush();
+    var any_refused = false;
+    for (compiled.files) |each| switch (each.read) {
+        .kept => {},
+        .refused => |why| {
+            try problems.print("glint: compiled facts: {s}: ", .{each.path});
+            try Compiled.describe(why, problems);
+            try problems.writeAll("\n");
+            any_refused = true;
+        },
+    };
+    if (any_refused) try problems.flush();
     var report = try Runner.runConfigured(gpa, &project, config, .{ .project_rules = project_rules, .io = io, .summary_check = configured.summary_check, .summary_records = configured.summary_records, .compiled = if (given.len == 0) null else &compiled });
     defer report.deinit();
     record.outcome = .output_failure;

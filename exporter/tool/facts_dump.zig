@@ -3,9 +3,11 @@
 //! order: bodies in the file's canonical order by name, each with its comptime arguments by
 //! structure, its caller, how many results it has and what it calls. A function instance's
 //! `__anon_N`/`__func_N` suffix is dropped. Bodies of files outside the directory of the root
-//! (std's) are left out unless `--all` is given.
+//! (std's) are left out unless `--all` is given. The file is read by glint's own reader
+//! (src/compiled_read.zig), so what it refuses the dump refuses.
 const std = @import("std");
-const format = @import("format");
+const reader = @import("reader");
+const format = reader.format;
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.arena.allocator();
@@ -21,14 +23,23 @@ pub fn main(init: std.process.Init) !void {
     var buffer: [1 << 16]u8 = undefined;
     var out = std.Io.File.stdout().writer(io, &buffer);
     const w = &out.interface;
-    var refusal: format.Refusal = undefined;
-    const view = format.View.init(bytes, &refusal) catch {
-        try w.print("refused {t}\n", .{refusal});
+    const records = reader.read(gpa, .init(bytes), .{}) catch |err| {
+        try w.print("refused {t}\n", .{err});
         try w.flush();
         return;
     };
+    const view: View = .{ .records = &records, .config = records.config, .files = records.files, .values = records.values, .bodies = records.bodies };
     // It is canonical: writing it again changes nothing.
-    const again = try format.canonical(gpa, &view);
+    var builder: format.Builder = .{ .gpa = gpa };
+    try builder.strings.appendSlice(gpa, records.strings);
+    try builder.extra.appendSlice(gpa, records.extra);
+    try builder.config.appendSlice(gpa, records.config);
+    try builder.files.appendSlice(gpa, records.files);
+    try builder.values.appendSlice(gpa, records.values);
+    try builder.bodies.appendSlice(gpa, records.bodies);
+    try builder.results.appendSlice(gpa, records.results);
+    const ordered = try format.canonical(gpa, &builder);
+    const again = try ordered.finish();
     try w.print("canonical {s}\n", .{if (std.mem.eql(u8, again, bytes)) "yes" else "NO"});
 
     var root_directory: []const u8 = "";
@@ -40,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
         try w.print("config {s}={s}\n", .{ key, view.string(each.value) });
     }
     const names = try gpa.alloc([]const u8, view.bodies.len);
-    for (names, view.bodies) |*name, body| name.* = functionName(&view, body.file, body.declaration);
+    for (names, view.bodies) |*name, body| name.* = if (body.function == format.none) "(unnamed)" else plain(view.string(view.values[body.function].text));
 
     var lines: std.ArrayList([]const u8) = .empty;
     for (view.bodies, 0..) |body, id| {
@@ -55,7 +66,10 @@ pub fn main(init: std.process.Init) !void {
             try writeValue(l, &view, argument, 0);
         }
         try l.writeAll(")");
-        if (body.caller != format.none) try l.print(" in {s}", .{names[body.caller]});
+        if (body.caller != format.none) {
+            try l.print(" in {s} at ", .{names[body.caller]});
+            try writeCallSite(l, &view, view.bodies[body.caller], body.call, body.call_visit);
+        }
         try l.print(" results={s}", .{if (body.results_len == 0) "none" else "some"});
         // What it calls, each callee once with its count, in name order.
         var callees: std.ArrayList([]const u8) = .empty;
@@ -104,16 +118,48 @@ fn plain(name: []const u8) []const u8 {
     return name;
 }
 
-/// The name of the function declared at (`file`, `declaration`): a `function` value's.
-fn functionName(view: *const format.View, file: u32, declaration: u32) []const u8 {
-    for (view.values) |value| {
-        if (value.kind != @backingInt(format.Value.Kind.function)) continue;
-        if (value.a == file and value.b == declaration) return plain(view.string(value.text));
+/// The records as the dump reads them: every id among them was checked by the reader.
+const View = struct {
+    records: *const reader.Records,
+    config: []const format.Config = &.{},
+    files: []const format.File = &.{},
+    values: []const format.Value = &.{},
+    bodies: []const format.Body = &.{},
+
+    fn string(view: *const View, text: format.Text) []const u8 {
+        return view.records.string(text) orelse "";
     }
-    return "(unnamed)";
+    fn run(view: *const View, list: format.Run) []const u32 {
+        return view.records.run(list) orelse &.{};
+    }
+    fn resultsOf(view: *const View, body: format.Body) []const format.Result {
+        return view.records.resultsOf(body) orelse &.{};
+    }
+};
+
+/// Where a call analysed in place was made, without ZIR numbers: what the caller's result at
+/// its call (instruction and visit) is. The call's own result is the inlined body's (`runtime`
+/// or the value it folded to); a key on another instruction shows that one's instead (an
+/// argument's call, `no result`), so a fixture tells a wrong key from a right one.
+fn writeCallSite(w: *std.Io.Writer, view: *const View, caller: format.Body, call: u32, visit: u32) std.Io.Writer.Error!void {
+    for (view.resultsOf(caller)) |result| {
+        if (result.instruction != call or result.visit != visit) continue;
+        if (result.callee == format.Result.runtime_callee) return w.writeAll("call (runtime pointer)");
+        if (result.callee != format.none) {
+            try w.writeAll("call ");
+            return writeValue(w, view, result.callee, 0);
+        }
+        if (result.value != format.none) return writeValue(w, view, result.value, 0);
+        if (result.type != format.none) {
+            try w.writeAll("runtime ");
+            return writeValue(w, view, result.type, 0);
+        }
+        return w.writeAll("runtime");
+    }
+    return w.writeAll("no result");
 }
 
-fn writeValue(w: *std.Io.Writer, view: *const format.View, id: u32, depth: u8) std.Io.Writer.Error!void {
+fn writeValue(w: *std.Io.Writer, view: *const View, id: u32, depth: u8) std.Io.Writer.Error!void {
     if (id == format.none) return w.writeAll("-");
     if (depth > 8) return w.writeAll("...");
     const value = view.values[id];

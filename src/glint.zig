@@ -30,6 +30,7 @@ test {
     _ = Fix;
     _ = @import("Facts.zig");
     _ = @import("facts_format.zig");
+    _ = @import("compiled_read.zig");
     _ = @import("Compiled.zig");
     _ = @import("PackageRules.zig");
     _ = @import("Summary.zig");

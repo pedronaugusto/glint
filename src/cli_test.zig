@@ -487,5 +487,5 @@ test "--compiled-facts: a file that is no facts file is refused with its reason 
     defer problems.deinit();
     try std.testing.expectEqual(@as(u8, 0), try cli.execute(a, std.testing.io, &.{ "glint", "--compiled-facts", facts, input }, &output.writer, &problems.writer));
     try std.testing.expectEqualStrings(plain.written(), output.written());
-    try std.testing.expect(std.mem.find(u8, problems.written(), "junk.facts: not a compiled-facts file this glint reads (not_a_facts_file)") != null);
+    try std.testing.expect(std.mem.find(u8, problems.written(), "junk.facts: not a compiled-facts file this glint reads (not a facts file)") != null);
 }
