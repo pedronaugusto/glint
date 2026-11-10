@@ -1742,12 +1742,12 @@ fn crowdedIn(self: *Facts, env: *const Env, function: Decl, position: usize, cop
     // A site the walk holds, being read or read in a cycle not yet closed. In one binding it
     // adds nothing new here: what it reaches, the cycle's first step reads. In another it is
     // growth, a generic recursing with new arguments each pass (strand's `emit`): each pass
-    // would be a new step, so it is not unrolled: not known here, as past the budget.
+    // would be a new step, so it is not unrolled: unsupported, whatever the budget, so kept as
+    // every answer the walk closes is, and read once for the run.
     for (walk.stack.items) |held| if (std.meta.eql(held.step.function, function) and held.step.position == position) {
         if (!sameInstantiation(held.step.env, env, 0)) {
-            self.open_met += 1;
-            self.short = true;
-            return .{ .unknown = .budget };
+            walk.grown = @min(walk.grown, held.at);
+            return .{ .unknown = .unsupported };
         }
         walk.low = @min(walk.low, held.at);
         return null;
@@ -1760,6 +1760,8 @@ fn crowdedIn(self: *Facts, env: *const Env, function: Decl, position: usize, cop
     const base = walk.stack.items.len;
     try walk.stack.append(self.gpa, .{ .step = here, .at = mine });
     const outer_low = walk.low;
+    const outer_grown = walk.grown;
+    walk.grown = std.math.maxInt(usize);
     const was_short = self.short;
     const met = self.open_met;
     const wide = self.wide;
@@ -1773,14 +1775,18 @@ fn crowdedIn(self: *Facts, env: *const Env, function: Decl, position: usize, cop
     // where the run's budget ran out, in it or in a unit it asked (`short`), holds what the
     // budget left it; one that met a query in progress (`open_met`: a resolution past its
     // depth, a cycle), what the asker's stack left it; one read wider than the analysis gives
-    // (`wideSince`), more than it holds: each is this asker's answer, and none of it is kept.
+    // (`wideSince`), more than it holds; one that grew against a step read before it (a site
+    // re-entered in another binding, past the component), what that step's binding left it,
+    // where entered elsewhere it may read whole: each is this asker's answer, and none of it
+    // is kept. Growth inside the component is its own, whoever asks: kept.
     const closed = walk.low >= mine;
     if (closed) {
-        const whole = self.remaining != 0 and self.short == was_short and self.open_met == met and !self.wideSince(wide);
+        const whole = walk.grown >= mine and self.remaining != 0 and self.short == was_short and self.open_met == met and !self.wideSince(wide);
         if (whole) for (walk.stack.items[base..]) |held| try memory.found.put(self.gpa, .{ .step = held.step, .kind = copy.kind, .site = copy.site, .source = copy.source.?, .assumed = self.assumed }, found);
         walk.stack.items.len = base;
         walk.low = outer_low;
     } else walk.low = @min(outer_low, walk.low);
+    walk.grown = @min(outer_grown, walk.grown);
     return found;
 }
 
@@ -1835,6 +1841,9 @@ const CrowdedWalk = struct {
     stack: std.ArrayList(struct { step: CrowdedStep, at: usize }) = .empty,
     count: usize = 0,
     low: usize = std.math.maxInt(usize),
+    /// The earliest step a site re-entered in another binding was held at, since the step
+    /// being read began (`crowdedIn`'s growth).
+    grown: usize = std.math.maxInt(usize),
 };
 
 /// Whether two copies are of one write: the same site, kind and source.
@@ -18165,7 +18174,7 @@ test "a crowded copy's walk is bounded by the run's budget alone: 80 generics pa
     }
 }
 
-test "a crowded copy's walk answers unknown where a generic re-enters itself with new arguments each pass, at once and not by the stack, and leaves the budget to the rest of the run" {
+test "a crowded copy's walk answers unknown where a generic re-enters itself with new arguments each pass, at once and not by the stack, and keeps it: asked again it reads nothing anew" {
     // strand's `emit` and its helpers: each round of two generics binds a new type, so no
     // step repeats.
     const source =
@@ -18231,9 +18240,113 @@ test "a crowded copy's walk answers unknown where a generic re-enters itself wit
         if (copy.source != null and copy.source.?.node == clone and copy.crowded) break copy;
     } else return error.TestUnexpectedResult;
     const found = (try facts.boundCopy(call, generic, crowded)) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(Unknown.budget, found.unknown);
-    try std.testing.expect(facts.short);
+    try std.testing.expectEqual(Unknown.unsupported, found.unknown);
+    try std.testing.expect(!facts.short);
     try std.testing.expect(facts.remaining > 45_000);
+    // Kept: asked again, the walk reads nothing anew.
+    const left = facts.remaining;
+    const again = (try facts.boundCopy(call, generic, crowded)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(Unknown.unsupported, again.unknown);
+    try std.testing.expect((try facts.memo(Crowded)).found.count() > 0);
+    try std.testing.expect(left - facts.remaining < 50);
+}
+
+test "a crowded copy's growth answer is kept only for the component it grew in: a site entered under another that re-enters with a new binding reads whole when entered on its own, the same whichever is asked first" {
+    const source =
+        \\fn dup(comptime T: type, v: T) T {
+        \\    return T.clone(v);
+        \\}
+        \\fn Wrap(comptime T: type) type {
+        \\    return struct {
+        \\        inner: T,
+        \\        fn clone(w: @This()) @This() {
+        \\            return w;
+        \\        }
+        \\    };
+        \\}
+        \\fn a(comptime T: type, v: T, n: u8) T {
+        \\    switch (@typeInfo(T)) {
+        \\        .@"enum" => switch (n) {
+        \\            0 => return dup(T, v),
+        \\            1 => return dup(T, v),
+        \\            2 => return dup(T, v),
+        \\            3 => return dup(T, v),
+        \\            else => return b(T, v, n),
+        \\        },
+        \\        else => return dup(T, v),
+        \\    }
+        \\}
+        \\fn b(comptime T: type, v: T, n: u8) T {
+        \\    switch (n) {
+        \\        0 => return dup(T, v),
+        \\        1 => return dup(T, v),
+        \\        2 => return dup(T, v),
+        \\        3 => return dup(T, v),
+        \\        else => return a(Wrap(T), undefined, n),
+        \\    }
+        \\}
+        \\const E = enum {
+        \\    a,
+        \\    fn clone(e: E) E {
+        \\        return e;
+        \\    }
+        \\};
+        \\pub fn main() void {
+        \\    _ = a(E, .a, 0);
+        \\    _ = b(E, .a, 0);
+        \\}
+        \\
+    ;
+    const Run = struct {
+        project: Project,
+        arena: std.heap.ArenaAllocator,
+        facts: Facts,
+
+        fn init(run: *@This()) !void {
+            run.project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+            run.arena = .init(std.testing.allocator);
+            run.facts = .{ .project = &run.project, .gpa = run.arena.allocator(), .remaining = 50_000 };
+        }
+
+        fn deinit(run: *@This()) void {
+            run.facts.deinit();
+            run.arena.deinit();
+            run.project.deinit();
+        }
+
+        fn ask(run: *@This(), text: []const u8) !Value {
+            const tree = &run.project.sources[0].file.tree;
+            const file = run.project.sources[0].id;
+            const call_node = for (0..tree.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (std.mem.eql(u8, tree.getNodeSource(at), text)) break at;
+            } else unreachable; // unreachable: main makes each call
+            const clone = for (0..tree.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (std.mem.eql(u8, tree.getNodeSource(at), "T.clone(v)")) break at;
+            } else unreachable; // unreachable: dup clones
+            const call = (try calls.at(&run.facts, file, call_node)).?;
+            const generic = call.callee.function;
+            const crowded = for (try run.facts.parameterCopies(generic)) |copy| {
+                if (copy.source != null and copy.source.?.node == clone and copy.crowded) break copy;
+            } else return error.TestUnexpectedResult;
+            return (try run.facts.boundCopy(call, generic, crowded)) orelse error.TestUnexpectedResult;
+        }
+    };
+    // `b` on its own reads whole: the `a` it enters takes `Wrap(E)` to the prong that copies,
+    // and re-enters nothing.
+    var alone: Run = undefined;
+    try alone.init();
+    defer alone.deinit();
+    const b_alone = try alone.ask("b(E, .a, 0)");
+    try std.testing.expect(b_alone != .unknown);
+    // `a` first: it grows, re-entered with `Wrap(E)`, and answers unknown; `b`, read inside
+    // it, keeps none of that, and asked next reads as it does alone.
+    var a_first: Run = undefined;
+    try a_first.init();
+    defer a_first.deinit();
+    try std.testing.expectEqual(Unknown.unsupported, (try a_first.ask("a(E, .a, 0)")).unknown);
+    try std.testing.expect(sameValue(b_alone, try a_first.ask("b(E, .a, 0)")));
 }
 
 test "a crowded copy's answer is kept per set of settled assumptions: asked under another set it is read again, never given the one kept under the first" {
