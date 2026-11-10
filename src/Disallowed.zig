@@ -300,7 +300,8 @@ fn among(door: []const Facts.Decl, decl: Facts.Decl) bool {
 
 /// What holds each use of `decl`: for a function, each call's holder (`Facts.programCallSites`);
 /// for another container-level declaration, each reference's, in its own file (a private one's
-/// only uses). Judged where any code may use it: a function handed on as a value, an exported
+/// only uses), and for a private function handed only to functions of the package that just call
+/// it, each hander (`handedOn`). Judged where any code may use it: a function handed on as a value, an exported
 /// function, a public function its package's outside can name (`keptInside`), a public declaration that is no function, or a use held by
 /// no declaration (a test's). Unknown where a call that may be of it does not resolve.
 const Users = union(enum) { holders: []const Facts.Decl, judged, unknown };
@@ -311,9 +312,30 @@ fn usersOf(self: *Context, decl: Facts.Decl) Context.Error!Users {
     if (record.public and try self.facts.onSurface(decl.file, record.scope) and !try keptInside(self, decl, record)) return .judged;
     var found: std.ArrayList(Facts.Decl) = .empty;
     if (record.kind == .function) {
-        if (try handedOn(self, decl)) return .judged;
+        switch (try handedOn(self, decl)) {
+            .no => {},
+            .judged => return .judged,
+            // Its uses are its own file's, each a call or a hand to a function that calls it:
+            // what holds each use is what uses it.
+            .by_handers => {
+                if (record.public) return .judged;
+                const tree = &self.project.at(decl.file).file.tree;
+                for (tree.nodes.items(.tag), 0..) |tag, i| {
+                    if (Facts.accesses.formOf(tag) != .leaf) continue;
+                    const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                    const ref = model.reference(node) orelse continue;
+                    if (ref.declaration != decl.index or tree.nodeMainToken(node) == record.token) continue;
+                    if (ref.unknown == .literal_context or inTestBlock(self.project, decl.file, node)) continue;
+                    try found.append(self.allocator, (try holderOf(self, decl.file, node)) orelse return .judged);
+                }
+                return .{ .holders = found.items };
+            },
+        }
         const calls = (try self.facts.programCallSites(decl)) orelse return .unknown;
-        for (calls) |call| try found.append(self.allocator, (try holderOf(self, call.file, call.holder)) orelse return .judged);
+        for (calls) |call| {
+            if (inTestBlock(self.project, call.file, call.holder)) continue;
+            try found.append(self.allocator, (try holderOf(self, call.file, call.holder)) orelse return .judged);
+        }
         return .{ .holders = found.items };
     }
     if (record.public) return .judged;
@@ -323,6 +345,7 @@ fn usersOf(self: *Context, decl: Facts.Decl) Context.Error!Users {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const ref = model.reference(node) orelse continue;
         if (ref.declaration != decl.index or tree.nodeMainToken(node) == record.token) continue;
+        if (ref.unknown == .literal_context or inTestBlock(self.project, decl.file, node)) continue;
         try found.append(self.allocator, (try holderOf(self, decl.file, node)) orelse return .judged);
     }
     return .{ .holders = found.items };
@@ -354,7 +377,8 @@ fn keptInside(self: *Context, decl: Facts.Decl, record: Model.Declaration) Conte
 /// The members of `file`'s namespace the program uses other than by calling them, each by its
 /// declaration, where the namespace stays among the files that import it: each `@import` of it
 /// (read by the file it resolves to) is read at once as a member (`@import("sys.zig").f()`) or
-/// held by a private constant only ever read as one (`sys.f()`). Null where it may leave: a
+/// held by a private constant only ever read as one (`sys.f()`), or discarded where it is
+/// written (`_ = @import("sys.zig");`). Null where it may leave: a
 /// file a module roots, a file that is itself a type (top-level fields, whose `pub` methods any
 /// holder of a value calls), a file naming itself (`@This()`), an import whose name is
 /// computed, or any other use of an import, which may publish it (`pub const sys = ...`,
@@ -378,6 +402,9 @@ fn namespaceMembers(self: *Context, file: Project.FileId) Context.Error!?[]const
             };
             if (imported.file != file) continue;
             const parent = model.parentOf(node) orelse return null;
+            // An import discarded where it is written (`_ = @import("sys.zig");`, a root naming
+            // its files to have them analyzed) goes nowhere: no use of the namespace.
+            if (try Facts.accesses.useOf(self.facts, edge.from, node) == .discarded) continue;
             if (Facts.accesses.formOf(tree.nodeTag(parent)) == .member) {
                 try noteMember(self, imported, edge.from, parent, &handed);
                 continue;
@@ -389,6 +416,8 @@ fn namespaceMembers(self: *Context, file: Project.FileId) Context.Error!?[]const
                 const ref = model.reference(leaf) orelse continue;
                 if (ref.declaration != holder.id or tree.nodeMainToken(leaf) == holder.token) continue;
                 const over = model.parentOf(leaf) orelse return null;
+                // `_ = sys;` goes nowhere, as the import discarded does.
+                if (try Facts.accesses.useOf(self.facts, edge.from, leaf) == .discarded) continue;
                 if (Facts.accesses.formOf(tree.nodeTag(over)) != .member or tree.nodeData(over).node_and_token[0] != leaf) return null;
                 try noteMember(self, imported, edge.from, over, &handed);
             }
@@ -442,22 +471,88 @@ fn namesItself(project: *const Project, file: Project.FileId) bool {
     return false;
 }
 
-/// Whether the function `decl` is used in its own file other than by a call of it: handed on as a
-/// value (`&helper`, `.{ .hook = helper }`), so whoever holds it may call it.
-fn handedOn(self: *Context, decl: Facts.Decl) Context.Error!bool {
+/// How the function `decl` is used in its own file other than by a call of it. `judged`: handed
+/// on as a value (`&helper`, `.{ .hook = helper }`), so whoever holds it may call it.
+/// `by_handers`: each such use only hands it to a function of the package that does nothing
+/// with it but call it (`onlyCalls`), so the function that hands it is the one that uses it. A
+/// use in test code is none of the program's.
+const HandedOn = enum { no, by_handers, judged };
+fn handedOn(self: *Context, decl: Facts.Decl) Context.Error!HandedOn {
     const model = &self.project.at(decl.file).model;
     const record = model.declarations[@backingInt(decl.index)];
     const tree = &self.project.at(decl.file).file.tree;
+    var answer: HandedOn = .no;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (Facts.accesses.formOf(tag) != .leaf) continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const ref = model.reference(node) orelse continue;
         if (ref.declaration != decl.index or tree.nodeMainToken(node) == record.token) continue;
+        if (ref.unknown == .literal_context or inTestBlock(self.project, decl.file, node)) continue;
         switch (try Facts.accesses.useOf(self.facts, decl.file, node)) {
             .callee => {},
-            else => return true,
+            else => {
+                var open: std.ArrayList(Facts.Decl) = .empty;
+                if (!try onlyCalls(self, decl.file, node, &open)) return .judged;
+                answer = .by_handers;
+            },
         }
     }
+    return answer;
+}
+
+/// Whether the use at `node` of a function's value, by its name or by a `comptime` parameter
+/// that holds it, does nothing with it but call it: a call of it (`f(x)`, `@call(m, f, args)`),
+/// or handing it to a `comptime` parameter of a function of the same package, every use of
+/// which does the same. A `comptime` parameter is no value at run time: it
+/// is stored nowhere a later call could take it from. Judged until proved: a parameter met
+/// again while it is being read (`open`) is not proved, and stored, returned or given anywhere
+/// else it is not.
+fn onlyCalls(self: *Context, file: Project.FileId, node: Ast.Node.Index, open: *std.ArrayList(Facts.Decl)) Context.Error!bool {
+    const tree = &self.project.at(file).file.tree;
+    switch (try Facts.accesses.useOf(self.facts, file, node)) {
+        .callee => return true,
+        .builtin_argument => |at| return at.position == 1 and Facts.isBuiltin(tree, at.call, "@call"),
+        .argument => |at| {
+            var buffer: [1]Ast.Node.Index = undefined;
+            const call = tree.fullCall(&buffer, at.call) orelse return false;
+            const taker: Facts.Decl = switch (try self.facts.resolve(file, call.ast.fn_expr)) {
+                .function => |found| found,
+                .alternatives => return false,
+                else => return false,
+            };
+            // A method called on a value takes the value first.
+            const first: usize = if (Facts.accesses.formOf(tree.nodeTag(call.ast.fn_expr)) != .member) 0 else switch (try self.facts.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
+                .container => 0,
+                .instance, .pointer => 1,
+                .alternatives => return false,
+                else => return false,
+            };
+            if (!PackageRules.Identity.of(self.project, taker.file).eql(PackageRules.Identity.of(self.project, file))) return false;
+            const parameter = self.facts.parameterAt(taker, at.position + first) orelse return false;
+            for (open.items) |known| if (std.meta.eql(known, parameter)) return false;
+            try open.append(self.allocator, parameter);
+            defer _ = open.pop();
+            const taker_tree = &self.project.at(taker.file).file.tree;
+            const taker_model = &self.project.at(taker.file).model;
+            for (taker_tree.nodes.items(.tag), 0..) |tag, i| {
+                if (Facts.accesses.formOf(tag) != .leaf) continue;
+                const use: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                const ref = taker_model.reference(use) orelse continue;
+                if (ref.declaration != parameter.index or ref.unknown == .literal_context) continue;
+                if (!self.facts.comptimeParameter(taker.file, use) or !try onlyCalls(self, taker.file, use, open)) return false;
+            }
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// Whether `node` is written in a `test` block.
+fn inTestBlock(project: *const Project, file: Project.FileId, node: Ast.Node.Index) bool {
+    const model = &project.at(file).model;
+    const tree = &project.at(file).file.tree;
+    var at = model.parentOf(node);
+    while (at) |parent| : (at = model.parentOf(parent)) if (tree.nodeTag(parent) == .test_decl) return true;
     return false;
 }
 
