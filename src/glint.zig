@@ -29,6 +29,8 @@ test {
     _ = @import("Runner.zig");
     _ = Fix;
     _ = @import("Facts.zig");
+    _ = @import("facts_format.zig");
+    _ = @import("Compiled.zig");
     _ = @import("PackageRules.zig");
     _ = @import("Summary.zig");
     _ = @import("accesses_test.zig");

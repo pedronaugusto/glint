@@ -55,6 +55,8 @@ pub const Options = struct {
     summary_check: bool = false,
     /// std's size summaries answered by std's open-world records (`Facts.read_records`).
     summary_records: bool = false,
+    /// The run's compiled facts (`Facts.compiled`), which must outlive the run.
+    compiled: ?*const @import("Compiled.zig") = null,
 };
 pub const FileConfig = struct { file: Project.FileId, config: rules.Config };
 
@@ -82,7 +84,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     }
     try validateRules(config, definitions);
     const known = try knownRules(a, definitions);
-    var runner: Runner = .{ .a = a, .project = project, .config = config, .base = config, .files = options.files, .definitions = definitions, .facts = .{ .project = project, .gpa = a, .backing = gpa, .known = Contract.package, .role_names = try roleNames(a, options.project_rules), .remaining = config.fact_budget, .check_records = if (options.summary_check) &Summary.check else null, .read_records = options.summary_records } };
+    var runner: Runner = .{ .a = a, .project = project, .config = config, .base = config, .files = options.files, .definitions = definitions, .facts = .{ .project = project, .gpa = a, .backing = gpa, .known = Contract.package, .role_names = try roleNames(a, options.project_rules), .remaining = config.fact_budget, .check_records = if (options.summary_check) &Summary.check else null, .read_records = options.summary_records, .compiled = options.compiled } };
     defer runner.facts.deinit();
     var metrics: std.ArrayList(Report.Metrics.File) = .empty;
     var total: Report.Metrics.Counts = .{};

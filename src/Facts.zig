@@ -105,6 +105,10 @@ edges_compiled: std.AutoHashMapUnmanaged(usize, bool) = .empty,
 /// as one; the functions and container-level constants by name; and the budget of resolutions
 /// that reading spends, its own as a fact of the whole run.
 file_parts: std.AutoHashMapUnmanaged(Project.FileId, *const FileParts) = .empty,
+/// The run's compiled facts (`Compiled`): the compiler's own analysis of each declared
+/// configuration, where facts files were given. None reads them yet; a query will ask them
+/// before its own reading, and their absence decides nothing.
+compiled: ?*const @import("Compiled.zig") = null,
 remaining: usize = 100_000,
 /// Whether this Facts is the one building the analysis (`analysis`): it reads each declaration
 /// as one a compilation may analyze, in any reading.
