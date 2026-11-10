@@ -3927,9 +3927,12 @@ fn oneMemory(a: Facts.Value, b: Facts.Value) bool {
     return switch (from) {
         .container, .instance => |k| switch (to) {
             .container, .instance => |other| k.file == other.file and k.scope == other.scope and k.made_by == other.made_by and k.symbolic == other.symbolic,
+            // A choice may be another type: the cast counts.
+            .alternatives => false,
             else => false,
         },
         .primitive => |name| to == .primitive and std.mem.eql(u8, name, to.primitive),
+        .alternatives => false,
         else => false,
     };
 }
@@ -4020,6 +4023,8 @@ fn allocatorFile(c: *Context) Context.Error!?Project.FileId {
     for (((try Governed.declarations(c, "std", "mem.Allocator")).orNull()) orelse return null) |each| {
         switch (try c.facts.declaration(each)) {
             .container => |k| if (c.project.at(k.file).model.scopes[@backingInt(k.scope)].kind == .file) return k.file,
+            // A choice names no one file: no memory is read as the allocator's.
+            .alternatives => {},
             else => {},
         }
     }
