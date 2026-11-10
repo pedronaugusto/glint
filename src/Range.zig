@@ -3741,14 +3741,15 @@ fn ownIndex(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: As
 /// The run's table ids: the containers whose ids index a table of their values somewhere in the
 /// program (`ownIndex`), and for each whether every make of its ids is shown counted.
 const TableIds = struct {
-    indexed: ?[]const Facts.Container = null,
+    /// The list itself, which owns its storage: what is read of it is its items.
+    indexed: ?std.ArrayList(Facts.Container) = null,
     counted: std.AutoHashMapUnmanaged(struct { Project.FileId, Model.Scope.Id }, bool) = .empty,
 };
 
 /// The containers whose own ids index a table of their values somewhere in the program.
 fn tableOwners(c: *Context) Context.Error![]const Facts.Container {
     const memo = try c.facts.memo(TableIds);
-    if (memo.indexed) |known| return known;
+    if (memo.indexed) |known| return known.items;
     // What it keeps in its memo stays for the run.
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
@@ -3766,7 +3767,7 @@ fn tableOwners(c: *Context) Context.Error![]const Facts.Container {
             } else try found.append(c.allocator, owner);
         }
     }
-    memo.indexed = found.items;
+    memo.indexed = found;
     return found.items;
 }
 
