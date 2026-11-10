@@ -328,8 +328,10 @@ pub const Pointer = struct { child: *const Value, size: ?Size };
 pub const Size = std.builtin.Type.Pointer.Size;
 pub const ResolveError = Model.InitError;
 /// A type built from its fields' types, the type itself or a value of it as `container` and
-/// `instance` are.
-pub const Reified = struct { fields: *const Value, value: bool = false };
+/// `instance` are. `names`: the type whose own field list its names are, written whole
+/// (`@Struct(.., @typeInfo(T).@"struct".field_names, ..)`, `reifiedNames`), so a name drawn
+/// from that list is one of its fields; null where its names are any other list.
+pub const Reified = struct { fields: *const Value, value: bool = false, names: ?Container = null };
 
 /// A pointer to `child` of `size` (`Pointer`).
 pub fn pointerTo(self: *Facts, child: Value, size: ?Size) ResolveError!Value {
@@ -2917,6 +2919,43 @@ fn builtinField(self: *Facts, file: Project.FileId, args: []const Ast.Node.Index
     return null;
 }
 
+/// `@field(holder, name)` in the reading `env`, where `name` is drawn from a type's own field
+/// list as written (`inline for (@typeInfo(T).@"struct".field_names) |name|`, `namesOf`, never
+/// a `var` list nor one sliced, joined or computed) and that type is one container the program
+/// declares in the reading: the choice, one per pass, of what each of its field names reads on
+/// the holder, each its own value (`Keep(T)`'s `@field(k.held, name)` over `T`'s names).
+/// Unknown where the holder is a choice or a name does not resolve on it, the whole read, never
+/// the rest decided; null where the name is not drawn so or the type is not one container.
+fn fieldsNamedIn(self: *Facts, env: *const Env, file: Project.FileId, holder: Ast.Node.Index, name: Ast.Node.Index) ResolveError!?Value {
+    const names = (try self.namesOf(file, name, 0)) orelse return null;
+    if (self.namesVar(file, self.throughConsts(file, names.subject))) return null;
+    const subject = oneType(try self.resolveIn(env, file, names.subject)) orelse return null;
+    if (subject.symbolic) return null;
+    const fields = self.fieldNames(subject);
+    if (fields.len == 0) return null;
+    const lhs = try self.resolveIn(env, file, holder);
+    const held = if (lhs == .pointer) lhs.pointer.child.* else lhs;
+    switch (held) {
+        .container, .instance => {},
+        // A holder chosen per build: the whole read is not known.
+        .alternatives => return .{ .unknown = .comptime_dependent },
+        // A type built from this very list of names (`Partial(T)`'s): each name is one of its
+        // fields, whose types it holds as a choice.
+        .reified => |built| {
+            const names_of = built.names orelse return .{ .unknown = .comptime_dependent };
+            if (!std.meta.eql(names_of, subject)) return .{ .unknown = .comptime_dependent };
+            return try self.instance(built.fields.*);
+        },
+        else => return .{ .unknown = .comptime_dependent },
+    }
+    const each = try self.gpa.alloc(Value, fields.len);
+    for (fields, each) |field, *out| {
+        out.* = try self.fieldOf(lhs, field);
+        if (out.* == .unknown) return out.*;
+    }
+    return try self.choose(each);
+}
+
 /// The pointer casts that keep what a pointer points at: Zig changes only its alignment,
 /// qualifiers or address space, as the result type gives them.
 pub const pointee_keeping = [_][]const u8{ "@alignCast", "@constCast", "@volatileCast", "@addrSpaceCast" };
@@ -3008,6 +3047,7 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
         if (std.mem.eql(u8, name, "@hasDecl")) return .scalar;
         // In a reading, the holder and a name it binds (`hasFn`'s `@field(T, name)`).
         if (env != null) if (try self.nameIn(env, file, args[1], 0)) |known| return self.fieldOf(try self.resolveIn(env, file, args[0]), known);
+        if (env) |reading| if (try self.fieldsNamedIn(reading, file, args[0], args[1])) |value| return value;
         if (try self.builtinField(file, args)) |value| return value;
         return .{ .unknown = .comptime_dependent };
     }
@@ -3033,7 +3073,13 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
     for (pointee_keeping) |cast| if (std.mem.eql(u8, name, cast) and args.len == 1) return self.resolveIn(env, file, args[0]);
     // A type built from its fields' types: `@Struct(layout, backing, names, types, attributes)`,
     // `@Union(layout, tag, names, types, attributes)`, `@Tuple(types)`.
-    if ((std.mem.eql(u8, name, "@Struct") or std.mem.eql(u8, name, "@Union")) and args.len == 5) return self.reified(try self.resolveIn(env, file, args[3]));
+    if ((std.mem.eql(u8, name, "@Struct") or std.mem.eql(u8, name, "@Union")) and args.len == 5) {
+        const built = try self.reified(try self.resolveIn(env, file, args[3]));
+        if (built != .reified) return built;
+        var named = built.reified;
+        named.names = try self.reifiedNames(env, file, args[2]);
+        return .{ .reified = named };
+    }
     if (std.mem.eql(u8, name, "@Tuple") and args.len == 1) return self.reified(try self.resolveIn(env, file, args[0]));
     // `@Pointer(size, attributes, child, sentinel)`: a pointer to `child` of the size it names.
     if (std.mem.eql(u8, name, "@Pointer") and args.len == 4) {
@@ -3190,6 +3236,33 @@ fn reified(self: *Facts, types: Value) ResolveError!Value {
 }
 fn reifiedEach(self: *Facts, types: Value, _: void) ResolveError!Value {
     return self.reified(types);
+}
+
+/// The one type every part of `value` (`valueParts`) is: the same container, made by the same
+/// call; else none.
+fn oneType(value: Value) ?Container {
+    var found: ?Container = null;
+    for (valueParts(&value)) |part| {
+        const one = switch (part) {
+            .container => |c| c,
+            .alternatives => return null, // a choice, never a part (valueParts): none known
+            else => return null,
+        };
+        if (found) |known| if (known.file != one.file or known.scope != one.scope or known.made_by != one.made_by) return null;
+        found = one;
+    }
+    return found;
+}
+
+/// The type whose own field names `node`, a reified type's names argument, is: its type
+/// information's `field_names` written whole, in place or through constants (`listOf`), that
+/// type one container the program declares, read in `env`. Null for a `var` list, a slice, a
+/// join, a literal list or anything else.
+fn reifiedNames(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Container {
+    const names = (try self.listOf(file, node, "field_names", 0)) orelse return null;
+    if (self.namesVar(file, self.throughConsts(file, names.subject))) return null;
+    const subject = oneType(try self.resolveIn(env, file, names.subject)) orelse return null;
+    return if (subject.symbolic) null else subject;
 }
 
 /// `@FieldType(T, name)`: the type of `T`'s field `name`; for a name computed at compile
@@ -7080,7 +7153,7 @@ pub fn sameValue(a: Value, b: Value) bool {
             if (!sameValue(one, other)) break false;
         } else true,
         .reflected => |r| r.at == b.reflected.at and sameValue(r.of.*, b.reflected.of.*),
-        .reified => |r| r.value == b.reified.value and sameValue(r.fields.*, b.reified.fields.*),
+        .reified => |r| r.value == b.reified.value and std.meta.eql(r.names, b.reified.names) and sameValue(r.fields.*, b.reified.fields.*),
         .primitive => |name| std.mem.eql(u8, name, b.primitive),
         // A type a call made is the one another call with the same arguments makes, wherever
         // each is kept (`sameMaking`).
@@ -7189,7 +7262,7 @@ fn same(a: Value, b: Value, depth: usize) bool {
         .unknown => false,
         .error_set, .scalar => true,
         .reflected => false,
-        .reified => |built| built.value == b.reified.value and same(built.fields.*, b.reified.fields.*, depth + 1),
+        .reified => |built| built.value == b.reified.value and std.meta.eql(built.names, b.reified.names) and same(built.fields.*, b.reified.fields.*, depth + 1),
         .fn_type => |key| std.meta.eql(key, b.fn_type),
         // One literal is one anonymous type; two literals are two.
         .literal => |l| std.meta.eql(l, b.literal),
@@ -7224,7 +7297,7 @@ fn identical(a: Value, b: Value, depth: usize) bool {
         } else true,
         .reflected => |r| r.at == b.reflected.at and identical(r.of.*, b.reflected.of.*, depth + 1),
         .literal => |l| std.meta.eql(l, b.literal),
-        .reified => |built| built.value == b.reified.value and identical(built.fields.*, b.reified.fields.*, depth + 1),
+        .reified => |built| built.value == b.reified.value and std.meta.eql(built.names, b.reified.names) and identical(built.fields.*, b.reified.fields.*, depth + 1),
         .fn_type => |key| std.meta.eql(key, b.fn_type),
     };
 }
@@ -8977,7 +9050,7 @@ const Instances = struct { of: std.AutoHashMapUnmanaged(InstanceKey, Value) = .e
 fn instance(self: *Facts, value: Value) ResolveError!Value {
     const key: InstanceKey = switch (value) {
         .container => |c| return .{ .instance = c },
-        .reified => |built| return .{ .reified = .{ .fields = built.fields, .value = true } },
+        .reified => |built| return .{ .reified = .{ .fields = built.fields, .value = true, .names = built.names } },
         // By the box and the pointer's size: one box may be held by two sizes of pointer.
         .pointer => |inner| .{ .parts = @intFromPtr(inner.child), .shape = 8 + if (inner.size) |size| @as(usize, @backingInt(size)) else 7 },
         .optional => |inner| .{ .parts = @intFromPtr(inner), .shape = 1 },
@@ -9119,7 +9192,7 @@ fn map(self: *Facts, value: Value, context: anytype, comptime f: fn (*Facts, Val
 fn typeOf(self: *Facts, value: Value, _: void) ResolveError!Value {
     return switch (value) {
         .instance => |c| .{ .container = c },
-        .reified => |built| .{ .reified = .{ .fields = built.fields } },
+        .reified => |built| .{ .reified = .{ .fields = built.fields, .names = built.names } },
         // A pointer's size is a `std.builtin.Type.Pointer.Size`.
         .reflected => |r| if (r.at == .size) self.stdMember(&.{ "builtin", "Type", "Pointer", "Size" }) else value,
         // A choice: each part's type (`map` gives each part alone).
@@ -10125,6 +10198,9 @@ fn readBound(self: *Facts, e: *const Env, file: Project.FileId, node: Ast.Node.I
                     }
                     return .{ .unknown = .comptime_dependent };
                 }
+                // A parameter of a function a reading encloses (`b` of `deinit(b: *@This())` in
+                // the container a type function makes), where no call of that function binds it.
+                if (try self.enclosedParameter(e, .{ .file = file, .index = index }, record)) |value| return value;
             }
             // A constant of this reading's function, or of one it is made in (`Elem` in
             // `MultiArrayList(T)`'s container, read by its `Slice.items`), read with that one.
@@ -10229,6 +10305,44 @@ fn enclosingReading(self: *const Facts, chain: ?*const Env, function: Decl) ?*co
         if (reading.function.file == function.file and self.enclosed(function.file, scope, self.scopeNode(reading.function))) return reading;
     }
     return null;
+}
+
+/// A parameter of a function some reading on `chain` encloses (`enclosingReading`), read as
+/// `resolve` reads a parameter with no binding, its written type taken in that reading: `b`
+/// of `deinit(b: *@This())` in `Box(T)`'s container is a pointer to the container that
+/// reading made. Null, which leaves it to `resolve`, for a comptime or `anytype` parameter, a
+/// type that names the function's own parameters (`x: U` of `comptime U: type`: no reading
+/// of the enclosing function binds it), one that is `type`, or one the reading does not decide.
+fn enclosedParameter(self: *Facts, chain: *const Env, parameter: Decl, record: Model.Declaration) ResolveError!?Value {
+    const tree = &self.project.at(parameter.file).file.tree;
+    if (record.token > 0 and tree.tokenTag(record.token - 1) == .keyword_comptime) return null;
+    const function = self.functionOf(parameter) orelse return null;
+    const reading = self.enclosingReading(chain, function) orelse return null;
+    const type_node = self.parameterTypeNode(parameter) orelse return null;
+    if (self.namesScope(parameter.file, type_node, record.scope)) return null;
+    const value = try self.resolveIn(reading, parameter.file, type_node);
+    if (value == .unknown or (value == .primitive and std.mem.eql(u8, value.primitive, "type"))) return null;
+    const typed = try self.instance(value);
+    // A function or a pointer to one: which, by its function's calls (`resolve`).
+    if (callable(typed)) return null;
+    return typed;
+}
+
+/// Whether `node` in `file` names a declaration of `scope` (a function's own parameter): a
+/// reference among its tokens to one of the declarations `scope` holds, each list read in order.
+fn namesScope(self: *const Facts, file: Project.FileId, node: Ast.Node.Index, scope: Model.Scope.Id) bool {
+    const tree = &self.project.at(file).file.tree;
+    const model = &self.project.at(file).model;
+    const first = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    for (model.references) |reference| {
+        if (reference.token < first or reference.token > last) continue;
+        const named = reference.declaration orelse continue;
+        for (model.declarations, 0..) |each, d| {
+            if (d == @backingInt(named) and each.scope == scope) return true;
+        }
+    }
+    return false;
 }
 
 /// The number a parameter named at `node` is bound to by `env`'s call, written there as a
@@ -10392,7 +10506,7 @@ fn declaredInFunction(model: *const Model, scope: Model.Scope.Id) bool {
 }
 
 /// The node a function's scope is recorded at: its declaration with a body, else its prototype.
-fn scopeNode(self: *const Facts, function: Decl) Ast.Node.Index {
+pub fn scopeNode(self: *const Facts, function: Decl) Ast.Node.Index {
     const model = &self.project.at(function.file).model;
     const proto = model.declarations[@backingInt(function.index)].node;
     const tree = &self.project.at(function.file).file.tree;
@@ -16986,6 +17100,239 @@ test "@This() in a made container's method is the container its reading made: it
     const value = try facts.resolveBound(env, file, node.of(tree, "list.items[0]"));
     const foo = try facts.resolve(file, node.of(tree, "Foo"));
     try std.testing.expect(value == .instance and foo == .container and value.instance.scope == foo.container.scope);
+}
+
+test "a parameter of a method in a type function's container reads its written type in the type function's reading, never one typed by the method's own parameters" {
+    const source =
+        \\const File = struct {
+        \\    handle: u32,
+        \\    fn close(file: File) void {
+        \\        _ = file;
+        \\    }
+        \\};
+        \\const Pipe = struct {
+        \\    fd: u32,
+        \\    fn close(pipe: Pipe) void {
+        \\        _ = pipe;
+        \\    }
+        \\};
+        \\fn Box(comptime T: type) type {
+        \\    return struct {
+        \\        v: T,
+        \\        fn deinit(b: *@This()) void {
+        \\            b.v.close();
+        \\        }
+        \\        fn put(comptime U: type, held: U) void {
+        \\            _ = held;
+        \\        }
+        \\    };
+        \\}
+        \\pub fn main() void {
+        \\    const box: Box(File) = undefined;
+        \\    const other: Box(Pipe) = undefined;
+        \\    _ = box;
+        \\    _ = other;
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    const file = project.sources[0].id;
+    const root = facts.rootOf(file);
+    const node = struct {
+        fn of(t: *const Ast, text: []const u8) Ast.Node.Index {
+            for (0..t.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (std.mem.eql(u8, t.getNodeSource(at), text)) return at;
+            }
+            unreachable;
+        }
+    };
+    var buffer: [1]Ast.Node.Index = undefined;
+    const env = try facts.bind(file, tree.fullCall(&buffer, node.of(tree, "Box(File)")).?, facts.member(root, "Box").?, null);
+    const file_type = try facts.resolve(file, node.of(tree, "File"));
+    try std.testing.expect(file_type == .container);
+    const close = facts.member(file_type.container, "close").?;
+    // In `Box(File)`'s reading, `b` points at the container that reading made: its `v` is a
+    // `File`, and what `b.v.close()` calls is `File.close`.
+    const bound = try facts.resolveBound(env, file, node.of(tree, "b.v.close"));
+    try std.testing.expect(bound == .function and std.meta.eql(bound.function, close));
+    // In `Box(Pipe)`'s, the same call is `Pipe.close`: each reading its own.
+    const pipe_env = try facts.bind(file, tree.fullCall(&buffer, node.of(tree, "Box(Pipe)")).?, facts.member(root, "Box").?, null);
+    const pipe_type = try facts.resolve(file, node.of(tree, "Pipe"));
+    try std.testing.expect(pipe_type == .container);
+    const pipe_bound = try facts.resolveBound(pipe_env, file, node.of(tree, "b.v.close"));
+    try std.testing.expect(pipe_bound == .function and std.meta.eql(pipe_bound.function, facts.member(pipe_type.container, "close").?));
+    // `held: U` names `put`'s own parameter, which no reading of `Box` binds: it stays as with
+    // none, never a `File`.
+    const held = try facts.resolveBound(env, file, node.of(tree, "held"));
+    try std.testing.expect(held != .instance or held.instance.scope != file_type.container.scope);
+    try std.testing.expectEqual(std.meta.activeTag(try facts.resolve(file, node.of(tree, "held"))), std.meta.activeTag(held));
+}
+
+test "@field over a type's own field_names in a reading is the choice of each member so named, unknown where the holder lacks one or the list is not written whole" {
+    const source =
+        \\const File = struct {
+        \\    handle: u32,
+        \\    fn close(file: File) void {
+        \\        _ = file;
+        \\    }
+        \\};
+        \\const Holds = struct { out: File, n: u32 };
+        \\const Other = struct { out: File };
+        \\fn Keep(comptime T: type) type {
+        \\    return struct {
+        \\        held: T,
+        \\        missing: Other,
+        \\        fn all(k: *@This()) void {
+        \\            inline for (@typeInfo(T).@"struct".field_names) |name| {
+        \\                const whole = @field(k.held, name);
+        \\                _ = whole;
+        \\            }
+        \\        }
+        \\        fn lacking(k: *@This()) void {
+        \\            inline for (@typeInfo(T).@"struct".field_names) |name| {
+        \\                const part = @field(k.missing, name);
+        \\                _ = part;
+        \\            }
+        \\        }
+        \\        fn sliced(k: *@This()) void {
+        \\            inline for (@typeInfo(T).@"struct".field_names[0..1]) |name| {
+        \\                const first = @field(k.*.held, name);
+        \\                _ = first;
+        \\            }
+        \\        }
+        \\    };
+        \\}
+        \\pub fn main() void {
+        \\    const kept: Keep(Holds) = undefined;
+        \\    _ = kept;
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    const file = project.sources[0].id;
+    const root = facts.rootOf(file);
+    const node = struct {
+        fn of(t: *const Ast, text: []const u8) Ast.Node.Index {
+            for (0..t.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (std.mem.eql(u8, t.getNodeSource(at), text)) return at;
+            }
+            unreachable;
+        }
+    };
+    var buffer: [1]Ast.Node.Index = undefined;
+    const env = try facts.bind(file, tree.fullCall(&buffer, node.of(tree, "Keep(Holds)")).?, facts.member(root, "Keep").?, null);
+    const file_type = try facts.resolve(file, node.of(tree, "File"));
+    try std.testing.expect(file_type == .container);
+    // Each of `Holds`' fields read on a `Holds`: a `File` among the choices, each its own.
+    const whole = try facts.resolveBound(env, file, node.of(tree, "@field(k.held, name)"));
+    try std.testing.expect(whole == .alternatives);
+    var found_file = false;
+    for (whole.alternatives) |part| {
+        if (part == .instance and part.instance.scope == file_type.container.scope) found_file = true;
+    }
+    try std.testing.expect(found_file);
+    // `Other` lacks `n`: the whole read is unknown, not the `out` it has.
+    try std.testing.expect(try facts.resolveBound(env, file, node.of(tree, "@field(k.missing, name)")) == .unknown);
+    // A list sliced from the names is not the type's whole list: undecided.
+    try std.testing.expect(try facts.resolveBound(env, file, node.of(tree, "@field(k.*.held, name)")) == .unknown);
+}
+
+test "@field over a type's own field_names on a type built from that very list reads its fields' types; one built from another list stays unknown" {
+    const source =
+        \\const File = struct {
+        \\    handle: u32,
+        \\    fn close(file: File) void {
+        \\        _ = file;
+        \\    }
+        \\};
+        \\const Holds = struct { out: File, n: u32 };
+        \\const Other = struct { out: File, n: u32 };
+        \\fn Partial(comptime T: type) type {
+        \\    const fields = @typeInfo(T).@"struct";
+        \\    var types: [fields.field_names.len]type = undefined;
+        \\    var len: usize = 0;
+        \\    for (fields.field_types) |F| {
+        \\        types[len] = ?F;
+        \\        len += 1;
+        \\    }
+        \\    const final_types = types[0..len].*;
+        \\    return @Struct(.auto, null, fields.field_names, &final_types, &@splat(.{}));
+        \\}
+        \\fn Spelled(comptime T: type) type {
+        \\    _ = T;
+        \\    return @Struct(.auto, null, &.{ "out", "n" }, &.{ ?File, ?u32 }, &@splat(.{}));
+        \\}
+        \\fn Keep(comptime T: type) type {
+        \\    return struct {
+        \\        partial: Partial(T),
+        \\        spelled: Spelled(T),
+        \\        other: Partial(Other),
+        \\        fn reads(k: *@This()) void {
+        \\            inline for (@typeInfo(T).@"struct".field_names) |name| {
+        \\                const a = @field(k.partial, name);
+        \\                const b = @field(k.spelled, name);
+        \\                const c = @field(k.other, name);
+        \\                _ = .{ a, b, c };
+        \\            }
+        \\        }
+        \\    };
+        \\}
+        \\pub fn main() void {
+        \\    const kept: Keep(Holds) = undefined;
+        \\    _ = kept;
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    const file = project.sources[0].id;
+    const root = facts.rootOf(file);
+    const node = struct {
+        fn of(t: *const Ast, text: []const u8) Ast.Node.Index {
+            for (0..t.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (std.mem.eql(u8, t.getNodeSource(at), text)) return at;
+            }
+            unreachable;
+        }
+        // Whether `value` is, or holds as a choice or an optional's payload, a value of `scope`.
+        fn carries(value: Value, scope: Model.Scope.Id) bool {
+            return switch (value) {
+                .instance => |c| c.scope == scope,
+                .optional => |inner| carries(inner.*, scope),
+                .alternatives => |each| for (each) |one| {
+                    if (carries(one, scope)) break true;
+                } else false,
+                else => false,
+            };
+        }
+    };
+    var buffer: [1]Ast.Node.Index = undefined;
+    const env = try facts.bind(file, tree.fullCall(&buffer, node.of(tree, "Keep(Holds)")).?, facts.member(root, "Keep").?, null);
+    const file_type = try facts.resolve(file, node.of(tree, "File"));
+    try std.testing.expect(file_type == .container);
+    // `Partial(Holds)` is built from `Holds`' own names: each of them is one of its fields.
+    const partial = try facts.resolveBound(env, file, node.of(tree, "@field(k.partial, name)"));
+    try std.testing.expect(partial != .unknown and node.carries(partial, file_type.container.scope));
+    // Built from a list spelled out, or from `Other`'s names: nothing says `Holds`' names are its.
+    try std.testing.expect(try facts.resolveBound(env, file, node.of(tree, "@field(k.spelled, name)")) == .unknown);
+    try std.testing.expect(try facts.resolveBound(env, file, node.of(tree, "@field(k.other, name)")) == .unknown);
 }
 
 test "a container a generic declares in its body is its reading's: its fields read that reading's bindings" {
