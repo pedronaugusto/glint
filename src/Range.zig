@@ -3613,21 +3613,33 @@ fn acting(c: *Context, file: Project.FileId) Context.Error![]const Ast.Node.Inde
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
     const tree = &c.project.at(file).file.tree;
-    var found: std.ArrayList(Ast.Node.Index) = .empty;
+    // Ordered by counting each token's nodes, then placing each node after those of the tokens
+    // before its own: no comparison, so no call the run cannot follow.
+    const starts = try c.allocator.alloc(usize, tree.tokens.len + 1);
+    defer c.allocator.free(starts);
+    @memset(starts, 0);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
-        switch (accesses.formOf(tag)) {
-            .array_access, .slice, .call, .builtin, .assign, .compound_assign, .destructure, .address_of, .@"asm" => try found.append(c.allocator, @fromBackingInt(@intCast(i))),
-            else => {},
-        }
+        if (acts(tag)) starts[tree.nodeMainToken(@fromBackingInt(@intCast(i))) + 1] += 1;
     }
-    const Order = struct {
-        fn before(of: *const Ast, a: Ast.Node.Index, b: Ast.Node.Index) bool {
-            return of.nodeMainToken(a) < of.nodeMainToken(b);
-        }
+    for (starts[1..], starts[0 .. starts.len - 1]) |*next, before| next.* += before;
+    const found = try c.allocator.alloc(Ast.Node.Index, starts[starts.len - 1]);
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (!acts(tag)) continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(node);
+        found[starts[token]] = node;
+        starts[token] += 1;
+    }
+    try (try c.facts.memo(Acting)).by_file.put(c.allocator, file, found);
+    return found;
+}
+
+/// Whether a node of this tag is one `acting` lists.
+fn acts(tag: Ast.Node.Tag) bool {
+    return switch (accesses.formOf(tag)) {
+        .array_access, .slice, .call, .builtin, .assign, .compound_assign, .destructure, .address_of, .@"asm" => true,
+        else => false,
     };
-    std.mem.sort(Ast.Node.Index, found.items, tree, Order.before);
-    try (try c.facts.memo(Acting)).by_file.put(c.allocator, file, found.items);
-    return found.items;
 }
 
 /// Whether the function holding `node` indexes or slices memory with it (`memory` alone,
