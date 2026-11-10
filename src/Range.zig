@@ -4018,9 +4018,16 @@ fn unbound(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Erro
     return !c.facts.instantiated(function);
 }
 
-/// The file that is `std.mem.Allocator`, by its declaration; none where the run has none.
+/// The file that is `std.mem.Allocator`, by its declaration; none where the run has none or
+/// its declaration does not resolve.
 fn allocatorFile(c: *Context) Context.Error!?Project.FileId {
-    for (((try Governed.declarations(c, "std", "mem.Allocator")).orNull()) orelse return null) |each| {
+    const declared = switch (try Governed.declarations(c, "std", "mem.Allocator")) {
+        .decls => |decls| decls,
+        // No allocator in the run, or one that does not resolve: no file's memory is read as
+        // handed out, so every cast there counts.
+        .none, .unknown => return null,
+    };
+    for (declared) |each| {
         switch (try c.facts.declaration(each)) {
             .container => |k| if (c.project.at(k.file).model.scopes[@backingInt(k.scope)].kind == .file) return k.file,
             // A choice names no one file: no memory is read as the allocator's.
