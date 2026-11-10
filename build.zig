@@ -77,13 +77,10 @@ pub fn dev(b: *std.Build, tools: type) void {
         .{ .name = "aegis_sources", .module = aegisSources(b, p, unit_module, aegis_dependency, target) },
         .{ .name = "shakedown", .module = shakedown },
     };
-    for ([_][]const u8{"src/tests.zig"}) |root| {
-        const tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = p.path(root), .target = target, .optimize = optimize, .imports = &light_imports }), .filters = if (filter) |f| &.{f} else &.{} });
-        test_step.dependOn(&b.addRunArtifact(tests).step);
-        check.dependOn(&tests.step);
-    }
-    for ([_][]const u8{ "src/test_danger.zig", "src/test_pack.zig" }) |root| {
-        const tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = p.path(root), .target = target, .optimize = unit_optimize, .imports = &heavy_imports }), .filters = if (filter) |f| &.{f} else &.{} });
+    // The first root is light, the others heavy.
+    for ([_][]const u8{ "src/tests.zig", "src/test_danger.zig", "src/test_pack.zig" }, 0..) |root, index| {
+        const heavy = index > 0;
+        const tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = p.path(root), .target = target, .optimize = if (heavy) unit_optimize else optimize, .imports = if (heavy) &heavy_imports else &light_imports }), .filters = if (filter) |f| &.{f} else &.{} });
         test_step.dependOn(&b.addRunArtifact(tests).step);
         check.dependOn(&tests.step);
     }
