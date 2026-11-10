@@ -325,7 +325,7 @@ fn usersOf(self: *Context, decl: Facts.Decl) Context.Error!Users {
                     const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
                     const ref = model.reference(node) orelse continue;
                     if (ref.declaration != decl.index or tree.nodeMainToken(node) == record.token) continue;
-                    if (ref.unknown == .literal_context or inTestBlock(self.project, decl.file, node)) continue;
+                    if (inTestBlock(self.project, decl.file, node) or try otherLiteral(self, decl, node, ref)) continue;
                     try found.append(self.allocator, (try holderOf(self, decl.file, node)) orelse return .judged);
                 }
                 return .{ .holders = found.items };
@@ -345,7 +345,7 @@ fn usersOf(self: *Context, decl: Facts.Decl) Context.Error!Users {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const ref = model.reference(node) orelse continue;
         if (ref.declaration != decl.index or tree.nodeMainToken(node) == record.token) continue;
-        if (ref.unknown == .literal_context or inTestBlock(self.project, decl.file, node)) continue;
+        if (inTestBlock(self.project, decl.file, node) or try otherLiteral(self, decl, node, ref)) continue;
         try found.append(self.allocator, (try holderOf(self, decl.file, node)) orelse return .judged);
     }
     return .{ .holders = found.items };
@@ -473,9 +473,10 @@ fn namesItself(project: *const Project, file: Project.FileId) bool {
 
 /// How the function `decl` is used in its own file other than by a call of it. `judged`: handed
 /// on as a value (`&helper`, `.{ .hook = helper }`), so whoever holds it may call it.
-/// `by_handers`: each such use only hands it to a function of the package that does nothing
-/// with it but call it (`onlyCalls`), so the function that hands it is the one that uses it. A
-/// use in test code is none of the program's.
+/// `by_handers`: each such use only hands it to a function outside the package, or to one of the
+/// package that does nothing with it but call it (`onlyCalls`), so the function that hands it
+/// is the one that uses it. A use in a test block is none: the door speaks for published code
+/// only, and a helper only tests reach is judged by nothing.
 const HandedOn = enum { no, by_handers, judged };
 fn handedOn(self: *Context, decl: Facts.Decl) Context.Error!HandedOn {
     const model = &self.project.at(decl.file).model;
@@ -487,7 +488,7 @@ fn handedOn(self: *Context, decl: Facts.Decl) Context.Error!HandedOn {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const ref = model.reference(node) orelse continue;
         if (ref.declaration != decl.index or tree.nodeMainToken(node) == record.token) continue;
-        if (ref.unknown == .literal_context or inTestBlock(self.project, decl.file, node)) continue;
+        if (inTestBlock(self.project, decl.file, node) or try otherLiteral(self, decl, node, ref)) continue;
         switch (try Facts.accesses.useOf(self.facts, decl.file, node)) {
             .callee => {},
             else => {
@@ -501,8 +502,9 @@ fn handedOn(self: *Context, decl: Facts.Decl) Context.Error!HandedOn {
 }
 
 /// Whether the use at `node` of a function's value, by its name or by a `comptime` parameter
-/// that holds it, does nothing with it but call it: a call of it (`f(x)`, `@call(m, f, args)`),
-/// or handing it to a `comptime` parameter of a function of the same package, every use of
+/// that holds it, leaves it used by the function that holds this use: a call of it (`f(x)`,
+/// `@call(m, f, args)`), a hand to a function outside the package (which cannot name a private
+/// function: that hand is its only route), or handing it to a `comptime` parameter of a function of the same package, every use of
 /// which does the same. A `comptime` parameter is no value at run time: it
 /// is stored nowhere a later call could take it from. Judged until proved: a parameter met
 /// again while it is being read (`open`) is not proved, and stored, returned or given anywhere
@@ -527,7 +529,9 @@ fn onlyCalls(self: *Context, file: Project.FileId, node: Ast.Node.Index, open: *
                 .alternatives => return false,
                 else => return false,
             };
-            if (!PackageRules.Identity.of(self.project, taker.file).eql(PackageRules.Identity.of(self.project, file))) return false;
+            // Code outside the package cannot name a private function: handed there, whatever
+            // that code does with it, the hand is its only route, and the hander caused it.
+            if (!PackageRules.Identity.of(self.project, taker.file).eql(PackageRules.Identity.of(self.project, file))) return true;
             const parameter = self.facts.parameterAt(taker, at.position + first) orelse return false;
             for (open.items) |known| if (std.meta.eql(known, parameter)) return false;
             try open.append(self.allocator, parameter);
@@ -545,6 +549,21 @@ fn onlyCalls(self: *Context, file: Project.FileId, node: Ast.Node.Index, open: *
         },
         else => return false,
     }
+}
+
+/// Whether the reference `ref` at `node`, which the model reads by its spelling, is an enum
+/// literal that cannot name `decl`: its place gives it a type that declares no member so named,
+/// or another one. A literal whose type does not resolve may be a decl literal of `decl`'s
+/// container (`const op: Op = .direct;`, `.make(x)`): a reference.
+fn otherLiteral(self: *Context, decl: Facts.Decl, node: Ast.Node.Index, ref: Model.Reference) Context.Error!bool {
+    if (ref.unknown != .literal_context) return false;
+    const tree = &self.project.at(decl.file).file.tree;
+    const name = try self.facts.memberName(tree.tokenSlice(tree.nodeMainToken(node)));
+    return switch (try self.facts.literalDeclaration(decl.file, node, name)) {
+        .none => true,
+        .decl => |named| !std.meta.eql(named, decl),
+        .unknown => false,
+    };
 }
 
 /// Whether `node` is written in a `test` block.
