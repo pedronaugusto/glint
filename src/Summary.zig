@@ -649,7 +649,8 @@ pub fn sameAccesses(a: *const accesses.File, b: *const accesses.File) bool {
     var through = a.through.iterator();
     while (through.next()) |entry| {
         const other = (b.through.get(entry.key_ptr.*) orelse return false).items;
-        if (!std.mem.eql(u8, std.mem.sliceAsBytes(entry.value_ptr.items), std.mem.sliceAsBytes(other))) return false;
+        if (entry.value_ptr.items.len != other.len) return false;
+        for (entry.value_ptr.items, other) |x, y| if (!std.meta.eql(x, y)) return false;
     }
     return sameSites(a.unresolved.items, b.unresolved.items) and sameSites(a.stores.items, b.stores.items);
 }
@@ -753,7 +754,8 @@ pub fn sameCopies(a: *const std.AutoHashMapUnmanaged(Decl, []const ParameterCopy
         if (other.len != entry.value_ptr.len) return false;
         for (entry.value_ptr.*, other) |x, y| {
             if (x.position != y.position or !std.meta.eql(x.site, y.site) or x.kind != y.kind or !std.meta.eql(x.source, y.source) or x.crowded != y.crowded) return false;
-            if (!std.mem.eql(u8, std.mem.sliceAsBytes(x.path), std.mem.sliceAsBytes(y.path))) return false;
+            if (x.path.len != y.path.len) return false;
+            for (x.path, y.path) |step, other_step| if (!std.meta.eql(step, other_step)) return false;
         }
     }
     return true;

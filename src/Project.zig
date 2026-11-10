@@ -369,7 +369,8 @@ pub fn token(self: *const Project, h: Handle, id: TokenId) QueryError!std.zig.As
 
 // Process-local identities are monotonic; allocator reuse cannot revive stale handles.
 const Identity = enum(u64) { _ };
-var last_identity: aegis.Atomic(Identity) = .init(@fromBackingInt(0));
+const no_identity: Identity = @fromBackingInt(0);
+var last_identity: aegis.Atomic(Identity) = .init(no_identity);
 fn nextIdentity() error{SnapshotLimit}!u64 {
     var previous = last_identity.load(.monotonic);
     while (true) {
