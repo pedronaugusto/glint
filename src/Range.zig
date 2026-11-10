@@ -4152,6 +4152,19 @@ pub fn sealed(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: 
     return true;
 }
 
+/// Whether a make the flow of values does not follow (any form but a conversion) names the id
+/// positioning `memory` at `index` by its own table: an overlay, a cast of memory that holds
+/// it, a foreign declaration. Where input goes through one, no fact of the value tells.
+pub fn forged(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: Ast.Node.Index) Context.Error!bool {
+    const owner = (try ownIndex(c, file, index, memory)) orelse return false;
+    for (try forgeries(c)) |each| {
+        if (each.form == .conversion) continue;
+        const of = each.of orelse continue;
+        if (of.file == owner.file and of.scope == owner.scope) return true;
+    }
+    return false;
+}
+
 /// The container whose own id `id` may be, by its structure alone: `id` is an enum with a
 /// backing integer whose one member is `_` (no named value, so none is made without a
 /// conversion), declared directly in that container, whatever it is named. Only a candidate:

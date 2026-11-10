@@ -1550,7 +1550,9 @@ fn unprovenIndex(c: *Context, flow: Taint.Fact, rule: Rule, node: Ast.Node.Index
     if (flow.flow.recording != null) return false;
     const level = try Taint.levelAt(c, flow, c.file, node);
     const tree = &c.project.at(c.file).file.tree;
-    if (level == .unknown or level.reaches(.data)) try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a table's own id positions it, and a make of that id not shown to count the table's entries may reach it: it may name no entry");
+    // A make of this id the flow does not follow (an overlay, a cast of its memory) hides what
+    // reaches the position: input's level there says nothing.
+    if (level == .unknown or level.reaches(.data) or try Range.forged(c, c.file, node, memory)) try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a table's own id positions it, and a make of that id not shown to count the table's entries may reach it: it may name no entry");
     return true;
 }
 
