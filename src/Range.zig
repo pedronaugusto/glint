@@ -3846,11 +3846,9 @@ pub const Forgery = struct {
     /// names the program's types only where the program binds them (a generic's reading), so
     /// what does not resolve there, in no generic, is no type of the program's.
     outside: bool = false,
-    why: []const u8 = "",
 };
 
 const Forgeries = struct { read: ?[]const Forgery = null };
-var debug_why: []const u8 = "";
 
 /// The table ids a type holds, in its own memory or behind a pointer it holds: `any` where a
 /// part of it does not resolve.
@@ -3878,7 +3876,6 @@ fn holders(c: *Context, value: Facts.Value, ids: *Held, seen: *std.ArrayList(Fac
         // program's types.
         .unknown => |why| if (why != .absent and why != .zig_own) {
             ids.any = true;
-            debug_why = @tagName(why);
         },
         .primitive, .scalar, .error_set, .function, .fn_type => {},
         .pointer => |pointer| try holders(c, pointer.child.*, ids, seen, depth + 1),
@@ -3887,7 +3884,6 @@ fn holders(c: *Context, value: Facts.Value, ids: *Held, seen: *std.ArrayList(Fac
         .reified => |built| try holders(c, built.fields.*, ids, seen, depth + 1),
         .reflected, .literal => {
             ids.any = true;
-            debug_why = @tagName(value);
         },
         .container, .instance => |k| {
             if (ownerOf(c, k)) |owner| {
@@ -3994,18 +3990,15 @@ fn heldAt(c: *Context, site: Site, ids: *Held) Context.Error!void {
     }
     const function = c.facts.functionHolding(site.file, site.node) orelse {
         ids.any = true;
-        debug_why = "no-function";
         return;
     };
     const readings = (try c.facts.instantiatedReadings(function)) orelse {
         ids.any = true;
-        debug_why = "readings-null";
         return;
     };
     for (readings) |reading| {
         const env = reading orelse {
             ids.any = true;
-            debug_why = if (readings.len == 1) "sole-reading-null" else "a-reading-null";
             return;
         };
         if (raw) |hands_out| if (try c.facts.boundOnlyFrom(function, env, hands_out)) continue;
@@ -4066,14 +4059,7 @@ pub fn forgeries(c: *Context) Context.Error![]const Forgery {
                             .id => |owner| owner,
                             .other, .unknown => null,
                         };
-                        try found.append(c.allocator, .{ .file = file, .node = node, .form = .conversion, .of = of, .outside = of == null and try unbound(c, file, node), .why = if (of != null) "" else why: {
-                            if (c.facts.functionHolding(file, node)) |function| {
-                                if (try c.facts.instantiatedReadings(function)) |readings| {
-                                    for (readings) |reading| if (reading == null) break :why if (readings.len == 1) "sole-reading-null" else "a-reading-null";
-                                    break :why "unknown-in-reading";
-                                } else break :why "readings-null";
-                            } else break :why "no-function";
-                        } });
+                        try found.append(c.allocator, .{ .file = file, .node = node, .form = .conversion, .of = of, .outside = of == null and try unbound(c, file, node) });
                         if (counts) continue;
                     }
                     if (counts) continue;
@@ -4125,17 +4111,9 @@ pub fn forgeries(c: *Context) Context.Error![]const Forgery {
             try note(c, &found, file, node, form, ids);
         }
     };
-    memo.read = found.items;
-    for (found.items) |each| {
-        if (each.outside) continue;
-        const tree = &c.project.at(each.file).file.tree;
-        const where = tree.tokenLocation(0, tree.nodeMainToken(each.node));
-        std.debug.print("FORGERY {s}:{d} {s} {s} {s}\n", .{ c.project.at(each.file).input.name, where.line + 1, @tagName(each.form), each.why, if (each.of) |owner| blk: {
-            const owner_tree = &c.project.at(owner.file).file.tree;
-            break :blk owner_tree.tokenSlice(owner_tree.firstToken(c.project.at(owner.file).model.scopes[@backingInt(owner.scope)].node) -| 2);
-        } else if (each.outside) "OUTSIDE" else "ANY" });
-    }
-    return found.items;
+    const read = try found.toOwnedSlice(c.allocator);
+    memo.read = read;
+    return read;
 }
 
 /// A declaration's types read as written: what does not resolve outside the program, in no
@@ -4148,7 +4126,7 @@ fn settle(c: *Context, file: Project.FileId, node: Ast.Node.Index, ids: *Held) C
 
 /// Each id `ids` names as a forgery at `node`, or one of any id.
 fn note(c: *Context, found: *std.ArrayList(Forgery), file: Project.FileId, node: Ast.Node.Index, form: Form, ids: Held) Context.Error!void {
-    if (ids.any) return found.append(c.allocator, .{ .file = file, .node = node, .form = form, .of = null, .why = debug_why });
+    if (ids.any) return found.append(c.allocator, .{ .file = file, .node = node, .form = form, .of = null });
     if (ids.outside) try found.append(c.allocator, .{ .file = file, .node = node, .form = form, .of = null, .outside = true });
     for (ids.owners.items) |owner| try found.append(c.allocator, .{ .file = file, .node = node, .form = form, .of = owner });
 }
