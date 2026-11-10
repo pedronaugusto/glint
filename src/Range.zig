@@ -3741,20 +3741,42 @@ pub fn ownTable(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory
 /// `@backingInt(id)` or `@intFromEnum(id)`, `id`'s type is an id the container declares
 /// (`ownerOf`), and `memory` holds that container's values (`[]T`, `[N]T`, `*[N]T`).
 fn ownIndex(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: Ast.Node.Index) Context.Error!?Facts.Container {
+    return switch (try indexOwner(c, file, index, memory)) {
+        .owner => |owner| owner,
+        // A position whose id or memory does not resolve is no table's own here: nothing
+        // clears it by its table.
+        .none, .unknown => null,
+    };
+}
+
+/// `ownIndex`, telling a position that is no table's own from one whose id or memory does not
+/// resolve: the second may be any table's, which the run's list of tables has to say
+/// (`TableIds.open`).
+const IndexOwner = union(enum) { owner: Facts.Container, none, unknown };
+
+fn indexOwner(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: Ast.Node.Index) Context.Error!IndexOwner {
     const tree = &c.project.at(file).file.tree;
     const at = bare(tree, index);
-    if (!Facts.isBuiltin(tree, at, "@backingInt") and !Facts.isBuiltin(tree, at, "@intFromEnum")) return null;
+    if (!Facts.isBuiltin(tree, at, "@backingInt") and !Facts.isBuiltin(tree, at, "@intFromEnum")) return .none;
     var buffer: [2]Ast.Node.Index = undefined;
     const args = Facts.builtinArgs(tree, at, &buffer);
-    if (args.len != 1) return null;
+    if (args.len != 1) return .none;
     const id = switch (try c.facts.resolve(file, args[0])) {
         .instance => |k| k,
-        .alternatives => return null,
-        else => return null,
+        // A choice of types, or a type that does not resolve, may be an id.
+        .alternatives, .unknown => return .unknown,
+        else => return .none,
     };
-    const owner = ownerOf(c, id) orelse return null;
-    const entries = (try elementOf(c, file, memory)) orelse return null;
-    return if (owner.file == entries.file and owner.scope == entries.scope) owner else null;
+    const owner = ownerOf(c, id) orelse return .none;
+    var entries = try c.facts.resolve(file, memory);
+    if (entries == .pointer) entries = entries.pointer.child.*;
+    if (entries == .array) entries = entries.array.*;
+    return switch (entries) {
+        .instance => |k| if (owner.file == k.file and owner.scope == k.scope) .{ .owner = owner } else .none,
+        // Memory that does not resolve may hold the owner's values.
+        .alternatives, .unknown => .unknown,
+        else => .none,
+    };
 }
 
 /// The run's table ids: the containers whose ids index a table of their values somewhere in the
@@ -3762,6 +3784,11 @@ fn ownIndex(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: As
 const TableIds = struct {
     /// The list itself, which owns its storage: what is read of it is its items.
     indexed: ?std.ArrayList(Facts.Container) = null,
+    /// Whether a position in the program reads an id as its integer where the id or the memory
+    /// does not resolve (`IndexOwner.unknown`), a resolution the budget cut short among them:
+    /// the list may then miss a table, so every id a container declares counts as one
+    /// (`isTable`). A table missed would leave its id's makes uncounted and clear its positions.
+    open: bool = false,
 };
 
 /// The containers whose own ids index a table of their values somewhere in the program.
@@ -3779,7 +3806,14 @@ fn tableOwners(c: *Context) Context.Error![]const Facts.Container {
         for (tree.nodes.items(.tag), 0..) |tag, i| {
             if (Facts.accesses.formOf(tag) != .array_access) continue;
             const memory, const index = tree.nodeData(@fromBackingInt(@intCast(i))).node_and_node;
-            const owner = (try ownIndex(c, file, index, memory)) orelse continue;
+            const owner = switch (try indexOwner(c, file, index, memory)) {
+                .owner => |owner| owner,
+                .none => continue,
+                .unknown => {
+                    memo.open = true;
+                    continue;
+                },
+            };
             for (found.items) |known| {
                 if (known.file == owner.file and known.scope == owner.scope) break;
             } else try found.append(c.allocator, owner);
@@ -3792,7 +3826,7 @@ fn tableOwners(c: *Context) Context.Error![]const Facts.Container {
 /// Whether `owner`'s ids index a table of its values somewhere in the program.
 fn isTable(c: *Context, owner: Facts.Container) Context.Error!bool {
     for (try tableOwners(c)) |known| if (known.file == owner.file and known.scope == owner.scope) return true;
-    return false;
+    return (try c.facts.memo(TableIds)).open;
 }
 
 /// Whether `call` makes a table's own id other than by counting the table's entries: a
@@ -4321,7 +4355,7 @@ fn entriesOf(c: *Context, file: Project.FileId, table: Ast.Node.Index, owner: Fa
 /// Whether the program has a table's own id (`tableOwners`): where none does, a conversion whose
 /// type does not resolve makes none.
 pub fn declaresIds(c: *Context) Context.Error!bool {
-    return (try tableOwners(c)).len != 0;
+    return (try tableOwners(c)).len != 0 or (try c.facts.memo(TableIds)).open;
 }
 
 /// Whether `index` is a remainder by `memory`'s length of a value at zero or above: `x %
