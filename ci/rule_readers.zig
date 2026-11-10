@@ -79,21 +79,7 @@ fn switched(comptime list: []const Allowed) [1]glint.ProjectRule {
 /// The switches still allowed, each by the function it is in: `pending: <owner>`, a site its
 /// owner converts to Facts' part readers (the list only shrinks), or `conservative: <why>; row:
 /// <test>`, a claim that its default is the safe answer for that function, proved by the row named.
-const switches = [_]Allowed{
-    .{ .file = "src/DangerShapes.zig", .function = "acquiresHandle", .reason = "pending: glint-b" },
-    .{ .file = "src/DangerShapes.zig", .function = "byPointer", .reason = "pending: glint-b" },
-    .{ .file = "src/DangerShapes.zig", .function = "byValue", .reason = "pending: glint-b" },
-    .{ .file = "src/DangerShapes.zig", .function = "choosesState", .reason = "pending: glint-b" },
-    .{ .file = "src/DangerShapes.zig", .function = "givenPointer", .reason = "pending: glint-b" },
-    .{ .file = "src/DangerShapes.zig", .function = "guardGiven", .reason = "pending: glint-b" },
-    .{ .file = "src/DangerShapes.zig", .function = "guardHeld", .reason = "pending: glint-b" },
-    .{ .file = "src/DangerShapes.zig", .function = "handedOn", .reason = "pending: glint-b" },
-    .{ .file = "src/DangerShapes.zig", .function = "implements", .reason = "pending: glint-b" },
-    .{ .file = "src/DangerShapes.zig", .function = "integer", .reason = "pending: glint-b" },
-    .{ .file = "src/DangerShapes.zig", .function = "neverReturns", .reason = "pending: glint-b" },
-    .{ .file = "src/DangerShapes.zig", .function = "pointsAtGuard", .reason = "pending: glint-b" },
-    .{ .file = "src/DangerShapes.zig", .function = "writtenThrough", .reason = "pending: glint-b" },
-};
+const switches = [_]Allowed{};
 
 fn checkSwitches(context: *glint.RuleContext, list: []const Allowed) glint.RuleContext.Error!void {
     const tree = try context.project.syntax(try context.source());

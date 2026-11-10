@@ -1850,25 +1850,36 @@ fn originKnown(c: *Context, decl: Facts.Decl) Context.Error!?Facts.Decl {
 /// Whether `node`, a call, acquires a std resource (`resource_paths`) by value: one it is not
 /// lent (`viewed`), as `dir.openFile` gives, for A003 to follow to its release.
 pub fn acquiresHandle(c: *Context, rule: Rule, node: Ast.Node.Index) Context.Error!bool {
+    const resources = try containersOf(c, rule, &resource_paths);
     const held = byValue(try c.facts.resolve(c.file, node)) orelse returned: {
-        // What std's own bodies give may not resolve: the callee's declared result does.
+        // What std's own bodies give may not resolve: the callee's declared result does. A
+        // callee chosen per build acquires where some part's (`Facts.valueParts`) result does.
         const tree = &c.project.at(c.file).file.tree;
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse return false;
-        const callee = switch (try c.facts.resolve(c.file, call.ast.fn_expr)) {
-            .function => |decl| (try originKnown(c, decl)) orelse {
-                try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "which function this call calls does not resolve: it may acquire a std resource by value");
+        const callees = try c.facts.resolve(c.file, call.ast.fn_expr);
+        for (Facts.valueParts(&callees)) |part| switch (part) {
+            .function => |decl| {
+                const callee = (try originKnown(c, decl)) orelse {
+                    try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "which function this call calls does not resolve: it may acquire a std resource by value");
+                    return false;
+                };
+                const target = &c.project.at(callee.file).file.tree;
+                var proto_buffer: [1]Ast.Node.Index = undefined;
+                const proto = target.fullFnProto(&proto_buffer, c.project.at(callee.file).model.declarations[@backingInt(callee.index)].node) orelse continue;
+                const written = proto.ast.return_type.unwrap() orelse continue;
+                const one = byValue(try c.facts.resolve(callee.file, written)) orelse continue;
+                if (find(resources, one) != null) break :returned one;
+            },
+            .alternatives => {
+                // A choice, never a part (valueParts): not known.
+                try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unsupported, "a choice of callees this does not read part by part: it may acquire a std resource by value");
                 return false;
             },
-            else => return false,
+            else => {},
         };
-        const target = &c.project.at(callee.file).file.tree;
-        var proto_buffer: [1]Ast.Node.Index = undefined;
-        const proto = target.fullFnProto(&proto_buffer, c.project.at(callee.file).model.declarations[@backingInt(callee.index)].node) orelse return false;
-        const written = proto.ast.return_type.unwrap() orelse return false;
-        break :returned byValue(try c.facts.resolve(callee.file, written)) orelse return false;
+        return false;
     };
-    const resources = try containersOf(c, rule, &resource_paths);
     if (find(resources, held) == null) return false;
     return !try viewed(c, resources, c.file, node, 0, null);
 }
@@ -1975,11 +1986,15 @@ fn implements(c: *Context, index: Model.Declaration.Id, maybe_vtable: ?Facts.Con
                 if (!std.mem.eql(u8, tree.tokenSlice(tree.lastToken(value)), decl.name)) continue;
                 const slot = c.facts.member(vtable, tree.tokenSlice(Model.initName(tree, value) orelse continue)) orelse continue;
                 if (c.project.at(slot.file).model.declarations[@backingInt(slot.index)].kind != .field) continue;
+                // Named per build, where some part (`Facts.valueParts`) names it.
                 const named = try c.facts.resolve(file, value);
-                const function = if (named == .pointer) named.pointer.child.* else named;
-                switch (function) {
-                    .function => |d| if (d.file == c.file and d.index == index) return true,
-                    else => {},
+                for (Facts.valueParts(&named)) |part| {
+                    const function = if (part == .pointer) part.pointer.child.* else part;
+                    switch (function) {
+                        .function => |d| if (d.file == c.file and d.index == index) return true,
+                        .alternatives => {}, // a pointer to a choice: none of it read as this one
+                        else => {},
+                    }
                 }
             }
         }
@@ -2134,10 +2149,15 @@ fn neverReturns(c: *Context, callee: Facts.Decl) Context.Error!bool {
     var buffer: [1]Ast.Node.Index = undefined;
     const proto = target.fullFnProto(&buffer, c.project.at(callee.file).model.declarations[@backingInt(callee.index)].node) orelse return false;
     const result = proto.ast.return_type.unwrap() orelse return false;
-    return switch (try c.facts.resolve(callee.file, result)) {
+    // Chosen per build, only where every part (`Facts.valueParts`) is `noreturn`.
+    const returned = try c.facts.resolve(callee.file, result);
+    const parts = Facts.valueParts(&returned);
+    for (parts) |part| if (!switch (part) {
         .primitive => |name| std.mem.eql(u8, name, "noreturn"),
+        .alternatives => false, // a choice, never a part (valueParts): not known
         else => false,
-    };
+    }) return false;
+    return parts.len != 0;
 }
 
 /// `callViewed` where the call is to `callee`, given `given` arguments.
@@ -2435,6 +2455,7 @@ const Bound = struct { statement: Ast.Node.Index, declaration: ?Model.Declaratio
 fn pointsAtGuard(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
     for (try c.facts.heldParts(c.allocator, try c.facts.resolve(file, node))) |part| switch (part) {
         .pointer => |to| if (try guardHeld(c, to.child.*) != .no) return true,
+        .alternatives => return true, // a choice, never a part (heldParts): it may point at one
         else => {},
     };
     return false;
@@ -2685,15 +2706,19 @@ fn handedOn(c: *Context, file: Project.FileId, call: *const Facts.calls.Call) Co
         .any => return false,
     };
     for (each) |choice| if (try stdAmong(c, choice, &.{ "Io.Future.await", "Io.Future.cancel" }) != .yes) return false;
-    const value = switch (try c.facts.resolve(file, holder)) {
-        .pointer => |inner| inner.child.*,
-        else => |other| other,
-    };
-    const made = switch (value) {
-        .instance, .container => |found| found.made_by orelse return false,
-        else => return false,
-    };
-    return try Governed.isStd(c, made.function, "Io.Future") == .yes;
+    // Chosen per build, a future only where every part (`Facts.valueParts`) is std's.
+    const resolved = try c.facts.resolve(file, holder);
+    const parts = Facts.valueParts(&resolved);
+    for (parts) |part| {
+        const value = if (part == .pointer) part.pointer.child.* else part;
+        const made = switch (value) {
+            .instance, .container => |found| found.made_by orelse return false,
+            .alternatives => return false, // a pointer to a choice: not known
+            else => return false,
+        };
+        if (try Governed.isStd(c, made.function, "Io.Future") != .yes) return false;
+    }
+    return parts.len != 0;
 }
 
 /// Whether a callee is a guard's release, each it may be: a `deinit` or `release` a guard's
@@ -2848,6 +2873,7 @@ fn givenPointer(c: *Context, file: Project.FileId, call: *const Facts.calls.Call
     };
     for (args) |arg| for (try c.facts.heldParts(c.allocator, try c.facts.resolve(file, arg))) |part| switch (part) {
         .pointer, .unknown => return true,
+        .alternatives => return true, // a choice, never a part (heldParts): it may be one
         else => {},
     };
     return false;
@@ -2869,6 +2895,7 @@ fn guardGiven(c: *Context, file: Project.FileId, call: *const Facts.calls.Call) 
             .plain, .ranked => return .{ .unknown = .unresolved },
         },
         .unknown => |why| return .{ .unknown = why },
+        .alternatives => return .{ .unknown = .unsupported }, // a choice, never a part (heldParts): not known
         else => {},
     };
     return .no;
@@ -3024,6 +3051,7 @@ fn guardHeld(c: *Context, value: Facts.Value) Context.Error!Guard {
             },
             .unknown => |why| return .{ .unknown = why },
         },
+        .alternatives => return .{ .unknown = .unsupported }, // a choice, never a part (heldParts): not known
         else => {},
     };
     return guard;
@@ -3253,6 +3281,8 @@ fn upper(word: []const u8) bool {
 fn integer(value: Facts.Value) ?[]const u8 {
     const name = switch (value) {
         .primitive => |name| name,
+        // Its callers read a choice part by part: a choice is no one integer type.
+        .alternatives => return null,
         else => return null,
     };
     if (std.mem.eql(u8, name, "usize") or std.mem.eql(u8, name, "isize")) return name;
@@ -3788,6 +3818,8 @@ fn choosesState(c: *Context, file: Project.FileId, node: Ast.Node.Index, state: 
     };
     const kind = switch (state) {
         .container, .instance => |k| k,
+        // A state chosen per build: its caller may choose it.
+        .alternatives => return true,
         else => return true,
     };
     for (choices) |choice| {
@@ -3798,11 +3830,14 @@ fn choosesState(c: *Context, file: Project.FileId, node: Ast.Node.Index, state: 
         var it = proto.iterate(callee_tree);
         while (it.next()) |param| {
             const written = param.type_expr orelse return true;
-            switch (try c.facts.resolve(decl.file, written)) {
+            // Typed per build, where some part (`Facts.valueParts`) is the state's type.
+            const typed = try c.facts.resolve(decl.file, written);
+            for (Facts.valueParts(&typed)) |part| switch (part) {
                 .container, .instance => |k| if (k.file == kind.file and k.scope == kind.scope) return true,
                 .unknown => return true,
+                .alternatives => return true, // a choice, never a part (valueParts): it may be
                 else => {},
-            }
+            };
         }
     }
     return false;
@@ -4090,11 +4125,18 @@ fn writtenThrough(c: *Context, file: Project.FileId, function: Ast.Node.Index, n
                     .capture => at = capturedBy(tree, model, record) orelse return .other,
                     .variable => {
                         const variable = tree.fullVarDecl(record.node) orelse return .other;
-                        const by_value = switch (try c.facts.resolve(file, root)) {
+                        // Chosen per build, by value only where every part (`Facts.valueParts`) is.
+                        const held = try c.facts.resolve(file, root);
+                        const held_parts = Facts.valueParts(&held);
+                        var by_value = held_parts.len != 0;
+                        for (held_parts) |part| if (!switch (part) {
                             .instance, .array, .optional, .literal, .reified => true,
                             // Its type as written where its value does not resolve.
                             .unknown => if (variable.ast.type_node.unwrap()) |written| tree.fullPtrType(written) == null and Facts.accesses.formOf(tree.nodeTag(written)) != .optional_type else false,
+                            .alternatives => false, // a choice, never a part (valueParts): not known
                             else => false,
+                        }) {
+                            by_value = false;
                         };
                         if (by_value) return if (returnsLocal(tree, model, function, d)) .made else .local;
                         // A pointer: what a constant one is made from.
@@ -4596,21 +4638,36 @@ fn find(containers: []const ?Facts.Container, held: Facts.Container) ?usize {
 }
 
 /// The container a value holds by value: through optionals, error unions and arrays, never a
-/// pointer, which borrows.
+/// pointer, which borrows. Chosen per build, the one every part (`Facts.valueParts`) holds.
 fn byValue(value: Facts.Value) ?Facts.Container {
-    return switch (value) {
-        .container, .instance => |k| k,
-        .optional, .error_union, .array => |inner| byValue(inner.*),
-        else => null,
-    };
+    var found: ?Facts.Container = null;
+    for (Facts.valueParts(&value)) |part| {
+        const one = switch (part) {
+            .container, .instance => |k| k,
+            .optional, .error_union, .array => |inner| byValue(inner.*),
+            .alternatives => null, // a choice, never a part (valueParts): none known
+            else => null,
+        } orelse return null;
+        if (found) |known| if (known.file != one.file or known.scope != one.scope) return null;
+        found = one;
+    }
+    return found;
 }
 
-/// The container a value is or points at.
+/// The container a value is or points at. Chosen per build, the one every part
+/// (`Facts.valueParts`) is or points at.
 fn byPointer(value: Facts.Value) ?Facts.Container {
-    return switch (value) {
-        .container, .instance => |k| k,
-        .pointer => |inner| byPointer(inner.child.*),
-        .optional => |inner| byPointer(inner.*),
-        else => null,
-    };
+    var found: ?Facts.Container = null;
+    for (Facts.valueParts(&value)) |part| {
+        const one = switch (part) {
+            .container, .instance => |k| k,
+            .pointer => |inner| byPointer(inner.child.*),
+            .optional => |inner| byPointer(inner.*),
+            .alternatives => null, // a choice, never a part (valueParts): none known
+            else => null,
+        } orelse return null;
+        if (found) |known| if (known.file != one.file or known.scope != one.scope) return null;
+        found = one;
+    }
+    return found;
 }
