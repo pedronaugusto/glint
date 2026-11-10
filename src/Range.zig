@@ -4111,9 +4111,9 @@ pub fn forgeries(c: *Context) Context.Error![]const Forgery {
             try note(c, &found, file, node, form, ids);
         }
     };
-    const kept = try found.toOwnedSlice(c.allocator);
-    memo.read = kept;
-    return kept;
+    const makes = try found.toOwnedSlice(c.allocator);
+    memo.read = makes;
+    return makes;
 }
 
 /// A declaration's types read as written: what does not resolve outside the program, in no
