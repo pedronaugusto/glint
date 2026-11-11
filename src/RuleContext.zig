@@ -41,6 +41,14 @@ pub const Sink = struct {
     coverage: *const fn (*Sink, Report.Coverage) Error!void,
     /// The configuration another selected file is checked with.
     config: *const fn (*Sink, Project.FileId) rules.Config,
+    /// Whether a finding of the rule at the offset would be suppressed, asked without using
+    /// a suppression: a rule that leaves a finding to another (D001's container for what it
+    /// holds) leaves it only where that one is reported. A sink that suppresses nothing says no.
+    suppresses: *const fn (*Sink, rules.Rule, u32) bool = suppressesNothing,
+
+    fn suppressesNothing(_: *Sink, _: rules.Rule, _: u32) bool {
+        return false;
+    }
 };
 /// Compiled rule. Metadata and callback are validated once before execution. `facts` are the
 /// flow facts its check asks (`Taint.get`), solved once for every rule that asks one. `roles` are
@@ -243,6 +251,13 @@ pub fn at(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.TokenIndex, m
     const span = tree.tokenToSpan(token);
     try self.emit(rule, span.start, span.end, message);
 }
+/// Whether a finding of `rule` at `token` would be suppressed (`Sink.suppresses`), the
+/// suppression left unused.
+pub fn suppressedAt(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.TokenIndex) Error!bool {
+    const tree = try self.project.syntax(try self.source());
+    if (token >= tree.tokens.len) return error.InvalidHandle;
+    return self.sink.suppresses(self.sink, rule, tree.tokenStart(token));
+}
 pub fn unknown(self: *RuleContext, rule: rules.Rule, node: std.zig.Ast.Node.Index, reason: Facts.Unknown) Error!void {
     const tree = try self.project.syntax(try self.source());
     if (@backingInt(node) >= tree.nodes.len) return error.InvalidHandle; // safe: reject compiler node indexes outside the frozen source.
@@ -381,9 +396,18 @@ fn functionDeclaration(tree: *const Ast, model: *const Model, scope: *const Mode
     return if (decl.kind == .function and decl.node == prototype) id else null;
 }
 
+/// A string literal's value; null where it does not decode.
+fn decoded(a: std.mem.Allocator, literal: []const u8) error{OutOfMemory}!?[]const u8 {
+    return std.zig.string_literal.parseAlloc(a, literal) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidLiteral => null,
+    };
+}
+
 /// Whether production code of `held` writes a `@field` whose name is computed: it may name any
-/// declaration of a type, a private function's too, without spelling it.
-fn computedField(held: *const Project.Source) bool {
+/// declaration of a type, a private function's too, without spelling it. A string literal names
+/// the one name it decodes to; one that does not decode is computed.
+fn computedField(a: std.mem.Allocator, held: *const Project.Source) error{OutOfMemory}!bool {
     const tree = &held.file.tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         switch (tag) {
@@ -394,7 +418,7 @@ fn computedField(held: *const Project.Source) bool {
         if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) continue;
         var buffer: [2]Ast.Node.Index = undefined;
         const args = Facts.builtinArgs(tree, node, &buffer);
-        if (args.len == 2 and tree.nodeTag(args[1]) == .string_literal) continue;
+        if (args.len == 2 and tree.nodeTag(args[1]) == .string_literal and try decoded(a, tree.tokenSlice(tree.nodeMainToken(args[1]))) != null) continue;
         if (inTestScope(held, tree.nodeMainToken(node))) continue;
         return true;
     }
@@ -418,7 +442,7 @@ fn testOnly(self: *RuleContext, memo: *TestOnly, function: Facts.Decl) Error!boo
         .asking, .not_only => return false,
         .only_tests => return true,
     }
-    if (computedField(held)) {
+    if (try computedField(self.allocator, held)) {
         entry.* = .not_only;
         return false;
     }
@@ -434,10 +458,9 @@ fn testOnly(self: *RuleContext, memo: *TestOnly, function: Facts.Decl) Error!boo
                 // `@"name"` is read as its name; any other identifier is its own spelling.
                 break :blk if (raw[0] == '@') std.mem.eql(u8, try Model.identifier(self.allocator, raw), decl.name) else std.mem.eql(u8, raw, decl.name);
             },
-            .string_literal => blk: {
-                const text = tree.tokenSlice(token);
-                break :blk text.len == decl.name.len + 2 and std.mem.eql(u8, text[1 .. text.len - 1], decl.name);
-            },
+            // A string by its value, as `@field` reads it (`Facts.fieldName`); one that does not
+            // decode may be any name.
+            .string_literal => if (try decoded(self.allocator, tree.tokenSlice(token))) |text| std.mem.eql(u8, text, decl.name) else true,
             else => false,
         };
         if (!spelled) continue;

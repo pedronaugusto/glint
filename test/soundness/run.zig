@@ -523,7 +523,12 @@ fn judge(gpa: std.mem.Allocator, io: std.Io, store: *glint.Project.Store, rule: 
     for (own) |file| if (std.mem.eql(u8, std.Io.Dir.path.basename(file), "module.zig")) try args.appendSlice(a, &.{ "--module", try std.fmt.allocPrint(a, "module={s}", .{file}) });
     try args.appendSlice(a, own);
     try args.append(a, job.absolute);
-    const status = try glint.cli.executeStored(gpa, io, args.items, &output.writer, &problems.writer, store);
+    // A suppression that would cover two findings stops the run, which glint's command line
+    // ends as an incomplete one (status 2, `main`): the case is read as that run is.
+    const status = glint.cli.executeStored(gpa, io, args.items, &output.writer, &problems.writer, store) catch |err| switch (err) {
+        error.AmbiguousSuppression => 2,
+        else => |e| return e,
+    };
     return verdictOf(output.written(), status, rule, job.before);
 }
 

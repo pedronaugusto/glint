@@ -23,6 +23,8 @@ const Candidate = struct {
     first: Ast.TokenIndex,
     last: Ast.TokenIndex,
     used: bool = false,
+    /// Unused, and its finding is not suppressed: reported.
+    reported: bool = false,
 
     /// A candidate of one check, made only as it is appended.
     const Id = enum(u32) { _ };
@@ -87,9 +89,11 @@ pub fn check(context: *Context) Context.Error!void {
     for (model.references) |reference| if (reference.declaration) |d| {
         if (model.declarations[@backingInt(d)].kind != .field) resolved[reference.token] = d;
     };
+    // A label (`blk: {`, `break :blk`) is of another namespace than declarations: no spelling.
+    const labels = try labelTokens(a, tree);
     for (0..tree.tokens.len) |t| {
         const token: Ast.TokenIndex = @intCast(t);
-        if (tree.tokenTag(token) != .identifier or declared[token] or fieldName(tree, token)) continue;
+        if (tree.tokenTag(token) != .identifier or declared[token] or labels[token] or fieldName(tree, token)) continue;
         if (resolved[token]) |d| if (candidates.resolvedUse(d, token)) continue;
         candidates.spelled(model, try Model.identifier(a, tree.tokenSlice(token)), token);
     }
@@ -121,11 +125,36 @@ pub fn check(context: *Context) Context.Error!void {
         }
     }
     if (undecided) return;
+    // A container's finding stands for what it holds only where it is reported: one suppressed
+    // there leaves its declarations' own findings.
+    for (candidates.list.items) |*candidate| {
+        if (!candidate.used) candidate.reported = !try context.suppressedAt(.D001, model.declarations[@backingInt(candidate.decl)].token);
+    }
     for (candidates.list.items) |candidate| {
         if (candidate.used or within(candidates.list.items, model, tree, candidate)) continue;
         const decl = model.declarations[@backingInt(candidate.decl)];
         try context.at(.D001, decl.token, try a.print("private declaration '{s}' is named nowhere in its file, the only place Zig lets it be used", .{decl.name}));
     }
+}
+
+/// The tokens that are labels, by the forms that write one: a labeled block's, loop's or
+/// `switch`'s label, and the label a `break` or `continue` names.
+fn labelTokens(a: std.mem.Allocator, tree: *const Ast) Context.Error![]const bool {
+    const labels = try a.alloc(bool, tree.tokens.len);
+    @memset(labels, false);
+    for (tree.nodes.items(.tag), 0..) |tag, n| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
+        const label: ?Ast.TokenIndex = switch (tag) {
+            .@"break", .@"continue" => tree.nodeData(node).opt_token_and_opt_node[0].unwrap(),
+            .block, .block_semicolon, .block_two, .block_two_semicolon => blk: {
+                const brace = tree.nodeMainToken(node);
+                break :blk if (brace >= 2 and tree.tokenTag(brace - 1) == .colon and tree.tokenTag(brace - 2) == .identifier) brace - 2 else null;
+            },
+            else => if (tree.fullWhile(node)) |loop| loop.label_token else if (tree.fullFor(node)) |loop| loop.label_token else if (tree.fullSwitch(node)) |choice| choice.label_token else null,
+        };
+        if (label) |token| labels[token] = true;
+    }
+    return labels;
 }
 
 /// A struct literal's field name (`.{ .name = x }`) names a field, never a declaration.
@@ -167,7 +196,7 @@ fn computed(context: *Context, candidates: []Candidate, model: *const Model, val
 fn within(candidates: []const Candidate, model: *const Model, tree: *const Ast, candidate: Candidate) bool {
     const decl = model.declarations[@backingInt(candidate.decl)];
     for (candidates) |outer| {
-        if (outer.used or outer.decl == candidate.decl) continue;
+        if (!outer.reported or outer.decl == candidate.decl) continue;
         if (model.declarations[@backingInt(outer.decl)].kind != .variable) continue;
         if (outer.first <= candidate.first and candidate.last <= outer.last and tree.firstToken(decl.node) > outer.first) return true;
     }

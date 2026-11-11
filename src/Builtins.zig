@@ -131,9 +131,18 @@ fn unusedImports(self: *Context) RunError!void {
     const tree = &source.file.tree;
     const model = &source.model;
     const declarations = model.declarations;
+    // A declaration literal (`.name`, a switch prong's `.name`) reaches a declaration only as a
+    // value of the type the literal is given, from that type's own declarations; an import of a
+    // file's namespace holds a type, of type `type`, which has none, so such a spelling is no use
+    // of it. A ZON import's data may be of any type: there it stays a use.
+    const literal_uses = try self.allocator.alloc(u32, declarations.len);
+    @memset(literal_uses, 0);
+    for (model.references) |reference| if (reference.declaration) |d| {
+        if (reference.unknown == .literal_context) literal_uses[@backingInt(d)] += 1;
+    };
     var indexes: std.ArrayList(Model.Declaration.Id) = .empty;
     for (declarations, 0..) |decl, index| {
-        if (decl.kind != .variable or decl.public or decl.exported or decl.references != 0) continue;
+        if (decl.kind != .variable or decl.public or decl.exported or decl.references != literal_uses[index]) continue;
         const value = tree.fullVarDecl(decl.node).?.ast.init_node.unwrap() orelse continue;
         // An `@import` written there is one, whatever module it names; any other value is one
         // by meaning: what it holds is another file's root, however it is reached (an alias of
@@ -142,6 +151,7 @@ fn unusedImports(self: *Context) RunError!void {
         // something else, is undecided.
         var buffer: [2]Ast.Node.Index = undefined;
         const written = Facts.builtinArgs(tree, value, &buffer).len == 1 and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "@import");
+        if (written and decl.references != 0 and Facts.importKind(tree, value) != .namespace) continue;
         if (!written) switch (importOf(self, try self.facts.declaration(.{ .file = self.file, .index = @fromBackingInt(@intCast(index)) }))) {
             .yes => {},
             .no => continue,
@@ -336,10 +346,17 @@ fn amendedPolicies(self: *Context) RunError!void {
             (if (loop.error_token != null) loop.ast.else_expr.unwrap() orelse continue else continue)
         else
             continue;
-        if (!try discards(self, handler, 0)) continue;
+        var memo: Handled = .empty;
+        const root: Walk = .{ .file = self.file, .first = tree.firstToken(handler), .last = tree.lastToken(handler), .memo = &memo };
+        const handled = try handling(self, root, handler, try takenOf(self, root, handler), 0);
+        if (handled == .acts) continue;
         if (tree.fullIf(node)) |branch| if (try refusalAsserted(self, tree, branch)) continue;
         if (try Discards.dropsNothing(self, node)) continue;
-        try self.at(.Z026, tree.nodeMainToken(node), "an error handler that discards the error; write a reason at this site");
+        switch (handled) {
+            .acts => unreachable, // unreachable: cleared above
+            .discards => try self.at(.Z026, tree.nodeMainToken(node), "an error handler that discards the error; write a reason at this site"),
+            .unknown => try self.undecided(.Z026, tree.tokenStart(tree.nodeMainToken(node)), .unsupported, "an error handler of a form not read: whether it does anything with the error is not known"),
+        }
     };
 }
 
@@ -400,48 +417,269 @@ fn jumpsBut(self: *Context, tree: *const Ast, statement: Ast.Node.Index) RunErro
     return false;
 }
 
-/// Whether an error's handler does nothing with it: an empty block, or one whose every
-/// statement is a discard (`_ = err`, `_ = @intFromError(err)`), a grouping of one, a `switch`
-/// whose every prong is one, or a call of the program's function whose body is empty
-/// (`ignore(err)`). A call whose callee may be any function does something, as it may.
-fn discards(self: *Context, written: Ast.Node.Index, depth: usize) RunError!bool {
-    if (depth == 8) return false;
-    const tree = &self.project.at(self.file).file.tree;
+/// What an error's handler does (`handling`). A handler is cleared only where it is read to do
+/// something: a form not read is not known, never cleared.
+const Handling = enum {
+    /// Nothing: an empty block, a discard (`_ = err`), a value of nothing (`{}`, `void{}`), a
+    /// value nobody takes, a call of the program's function that does nothing.
+    discards,
+    /// Something: a jump out of the handler, `unreachable` or `@panic`, a `try`, a store to a
+    /// place outside it, a call of a function that does something, one the program does not
+    /// hold or one whose callee may be any function (as it may), a value given in the error's
+    /// stead.
+    acts,
+    unknown,
+};
+
+/// The functions read while handlers are, each by how its result is taken; one being read is
+/// not known.
+const Handled = std.AutoHashMapUnmanaged(struct { Facts.Decl, Taken }, Handling);
+const HandledKey = @FieldType(Handled.KV, "key");
+
+/// Where a value goes: taken by what holds it, dropped (a statement, `_ = v`, a result nobody
+/// takes), or not known.
+const Taken = enum { kept, dropped, unknown };
+
+/// The code `handling` reads: the handler, or the body of a function it calls, in `file`, its
+/// tokens `first` to `last`, a jump inside which lands in it. In a body, `return v` gives the
+/// call's value, taken as `returned`.
+const Walk = struct {
+    file: Project.FileId,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+    body: bool = false,
+    returned: Taken = .unknown,
+    memo: *Handled,
+
+    fn inside(walk: Walk, tree: *const Ast, node: Ast.Node.Index) bool {
+        return tree.firstToken(node) >= walk.first and tree.lastToken(node) <= walk.last;
+    }
+};
+
+/// Where the value of `node` goes (`Facts.accesses.useOf`), through the forms that carry it on
+/// (parentheses, `catch`'s handler, a branch's or a `break`'s value); in a body, a `return`'s
+/// goes where the call's does.
+fn takenOf(self: *Context, walk: Walk, node: Ast.Node.Index) RunError!Taken {
+    var at = node;
+    for (0..64) |_| switch (try Facts.accesses.useOf(self.facts, walk.file, at)) {
+        .statement, .discarded => return .dropped,
+        .carried => |carried| at = carried.into,
+        .returned => return if (walk.body) walk.returned else .kept,
+        .unknown => return .unknown,
+        else => return .kept,
+    };
+    return .unknown;
+}
+
+/// The combination of what parts do, each run on some path: any that acts makes the whole act.
+fn joined(a: Handling, b: Handling) Handling {
+    if (a == .acts or b == .acts) return .acts;
+    if (a == .unknown or b == .unknown) return .unknown;
+    return .discards;
+}
+
+/// A value read with no effect of its own (a name, a literal, a member, `@errorName(err)`):
+/// given in the error's stead where it is taken, nothing where it is dropped.
+fn readValue(taken: Taken) Handling {
+    return switch (taken) {
+        .kept => .acts,
+        .dropped => .discards,
+        .unknown => .unknown,
+    };
+}
+
+/// What the code at `written` does where its value is `taken` (`Handling`), by its form.
+fn handling(self: *Context, walk: Walk, written: Ast.Node.Index, taken: Taken, depth: usize) RunError!Handling {
+    if (depth == 64) return .unknown;
+    const tree = &self.project.at(walk.file).file.tree;
+    const model = &self.project.at(walk.file).model;
     const node = Facts.ungrouped(tree, written);
+    if (try Facts.accesses.discardedBy(self.facts, walk.file, node)) |value| return if (inert(tree, value, 0)) .discards else handling(self, walk, value, .dropped, depth + 1);
+    if (try Facts.calls.at(self.facts, walk.file, node)) |call| return calledHandling(self, walk, call, taken, depth + 1);
     var buffer: [2]Ast.Node.Index = undefined;
     if (tree.blockStatements(&buffer, node)) |statements| {
-        for (statements) |statement| if (!try discards(self, statement, depth + 1)) return false;
-        return true;
+        // A labeled block's value is what its `break`s give, read at each.
+        var all: Handling = .discards;
+        for (statements) |statement| {
+            all = joined(all, try handling(self, walk, statement, .dropped, depth + 1));
+            if (all == .acts) return .acts;
+        }
+        return all;
     }
-    if (try Facts.accesses.discardedBy(self.facts, self.file, node)) |value| return inert(tree, value, 0);
-    switch (tree.nodeTag(node)) {
-        .@"switch", .switch_comma => {
-            const whole = tree.fullSwitch(node).?; // unreachable: tagged a switch
-            for (whole.ast.cases) |case| if (!try discards(self, tree.fullSwitchCase(case).?.ast.target_expr, depth + 1)) return false; // unreachable: a switch's cases are cases
-            return true;
+    switch (Facts.accesses.formOf(tree.nodeTag(node))) {
+        .@"break", .@"continue" => {
+            const target = Facts.accesses.breakTarget(tree, model, node) orelse return .unknown;
+            // Out of the handler: the jump is its answer.
+            if (!walk.inside(tree, target)) return .acts;
+            if (tree.nodeTag(node) == .@"continue") return .unknown;
+            const value = tree.nodeData(node).opt_token_and_opt_node[1].unwrap() orelse return .discards;
+            return handling(self, walk, value, try takenOf(self, walk, target), depth + 1);
         },
-        else => {},
+        .@"return" => {
+            if (!walk.body) return .acts;
+            const value = tree.nodeData(node).opt_node.unwrap() orelse return .discards;
+            return handling(self, walk, value, walk.returned, depth + 1);
+        },
+        .tried, .@"asm" => return .acts,
+        .leaf => {
+            const token = tree.nodeMainToken(node);
+            if (tree.tokenTag(token) == .keyword_unreachable) return .acts;
+            // `undefined` in the error's stead is no value given.
+            if (tree.tokenTag(token) == .identifier and std.mem.eql(u8, tree.tokenSlice(token), "undefined")) return .discards;
+            return readValue(taken);
+        },
+        .builtin => {
+            if (Facts.isBuiltin(tree, node, "@panic") or Facts.isBuiltin(tree, node, "@trap")) return .acts;
+            const args = Facts.builtinArgs(tree, node, &buffer);
+            if (Facts.isBuiltin(tree, node, "@as") and args.len == 2) return handling(self, walk, args[1], taken, depth + 1);
+            return if (inert(tree, node, 0)) readValue(taken) else .unknown;
+        },
+        .@"comptime", .@"nosuspend" => return handling(self, walk, tree.nodeData(node).node, taken, depth + 1),
+        .member => return parts(self, walk, &.{tree.nodeData(node).node_and_token[0]}, taken, depth),
+        .unwrap_optional => return parts(self, walk, &.{tree.nodeData(node).node_and_token[0]}, taken, depth),
+        .address_of, .deref => return parts(self, walk, &.{tree.nodeData(node).node}, taken, depth),
+        .comparison, .concatenation, .array_access => return parts(self, walk, &tree.nodeData(node).node_and_node, taken, depth),
+        // A prefix operator (`-x`, `!x`) is written before its one operand.
+        .operator, .logic => return if (tree.firstToken(node) == tree.nodeMainToken(node))
+            parts(self, walk, &.{tree.nodeData(node).node}, taken, depth)
+        else
+            parts(self, walk, &tree.nodeData(node).node_and_node, taken, depth),
+        .struct_literal => {
+            const literal = tree.fullStructInit(&buffer, node).?; // unreachable: the form is a struct literal's
+            if (literal.ast.fields.len == 0) if (literal.ast.type_expr.unwrap()) |written_type| {
+                // `T{}` of `void` is nothing; of another type, a value given.
+                const made = try self.facts.resolve(walk.file, written_type);
+                var nothing: Facts.Join = .{};
+                for (Facts.valueParts(&made)) |part| nothing.add(part, switch (part) {
+                    .primitive => |name| std.mem.eql(u8, name, "void"),
+                    .unknown, .alternatives => null, // not known; a choice, never a part (valueParts)
+                    else => false,
+                });
+                return switch (taken) {
+                    .dropped => .discards,
+                    .kept, .unknown => if (nothing.agreed()) |void_type| (if (void_type) .discards else readValue(taken)) else .unknown,
+                };
+            };
+            return parts(self, walk, literal.ast.fields, taken, depth);
+        },
+        .array_literal => return parts(self, walk, tree.fullArrayInit(&buffer, node).?.ast.elements, taken, depth), // unreachable: the form is an array literal's
+        .@"if", .@"switch", .@"while", .@"for", .for_range => return chosenHandling(self, walk, node, taken, depth),
+        .@"catch", .@"orelse" => return parts(self, walk, &tree.nodeData(node).node_and_node, taken, depth),
+        .variable => {
+            const variable = tree.fullVarDecl(node).?; // unreachable: the form is a variable's
+            const init = variable.ast.init_node.unwrap() orelse return .discards;
+            return handling(self, walk, init, .dropped, depth + 1);
+        },
+        .deferred => return handling(self, walk, tree.nodeData(node).node, .dropped, depth + 1),
+        .assign, .compound_assign => {
+            const target, const value = tree.nodeData(node).node_and_node;
+            // A store to a variable this code declares, by name, is its own; any other place is
+            // outside.
+            const declared = (model.reference(target) orelse return .acts).declaration orelse return .acts;
+            if (!walk.inside(tree, model.declarations[@backingInt(declared)].node)) return .acts;
+            return handling(self, walk, value, .dropped, depth + 1);
+        },
+        else => return .unknown,
     }
-    const call = (try Facts.calls.at(self.facts, self.file, node)) orelse return false;
-    const function = switch (call.callee) {
-        .function => |function| function,
-        .choice, .any => return false,
-    };
-    const callee_tree = &self.project.at(function.file).file.tree;
-    const record = self.project.at(function.file).model.declarations[@backingInt(function.index)];
-    if (record.kind != .function or !self.project.at(function.file).input.selected) return false;
+}
+
+/// What a choice or a loop does where its value is `taken`: its condition, operand or inputs
+/// read for what they do, each branch, prong or body, and its `else`.
+fn chosenHandling(self: *Context, walk: Walk, node: Ast.Node.Index, taken: Taken, depth: usize) RunError!Handling {
+    const tree = &self.project.at(walk.file).file.tree;
+    switch (Facts.accesses.formOf(tree.nodeTag(node))) {
+        .@"if" => {
+            const branch = tree.fullIf(node).?; // unreachable: the form is an if's
+            var all = try handling(self, walk, branch.ast.cond_expr, .dropped, depth + 1);
+            all = joined(all, try handling(self, walk, branch.ast.then_expr, taken, depth + 1));
+            if (branch.ast.else_expr.unwrap()) |otherwise| all = joined(all, try handling(self, walk, otherwise, taken, depth + 1));
+            return all;
+        },
+        .@"switch" => {
+            const choice = tree.fullSwitch(node).?; // unreachable: the form is a switch's
+            var all = try handling(self, walk, choice.ast.condition, .dropped, depth + 1);
+            for (choice.ast.cases) |case| {
+                all = joined(all, try handling(self, walk, tree.fullSwitchCase(case).?.ast.target_expr, taken, depth + 1)); // unreachable: a switch's cases are prongs
+                if (all == .acts) return .acts;
+            }
+            return all;
+        },
+        .@"while" => {
+            const loop = tree.fullWhile(node).?; // unreachable: the form is a while's
+            var all = try handling(self, walk, loop.ast.cond_expr, .dropped, depth + 1);
+            if (loop.ast.cont_expr.unwrap()) |next| all = joined(all, try handling(self, walk, next, .dropped, depth + 1));
+            all = joined(all, try handling(self, walk, loop.ast.then_expr, .dropped, depth + 1));
+            if (loop.ast.else_expr.unwrap()) |otherwise| all = joined(all, try handling(self, walk, otherwise, taken, depth + 1));
+            return all;
+        },
+        .@"for" => {
+            const loop = tree.fullFor(node).?; // unreachable: the form is a for's
+            var all = try parts(self, walk, loop.ast.inputs, .dropped, depth);
+            all = joined(all, try handling(self, walk, loop.ast.then_expr, .dropped, depth + 1));
+            if (loop.ast.else_expr.unwrap()) |otherwise| all = joined(all, try handling(self, walk, otherwise, taken, depth + 1));
+            return all;
+        },
+        .for_range => {
+            const end = tree.nodeData(node).node_and_opt_node;
+            return parts(self, walk, if (end[1].unwrap()) |last| &.{ end[0], last } else &.{end[0]}, .dropped, depth);
+        },
+        else => return .unknown,
+    }
+}
+
+/// What the parts of a value (a member's holder, an operator's operands, a literal's fields) do
+/// where the value is `taken`: given in the error's stead where it is kept; else what reading
+/// them does.
+fn parts(self: *Context, walk: Walk, each: []const Ast.Node.Index, taken: Taken, depth: usize) RunError!Handling {
+    if (taken == .kept) return .acts;
+    var all: Handling = if (taken == .unknown) .unknown else .discards;
+    for (each) |part| {
+        all = joined(all, try handling(self, walk, part, .dropped, depth + 1));
+        if (all == .acts) return .acts;
+    }
+    return all;
+}
+
+/// What a call does where its value is `taken`: its arguments, and the function it calls, read
+/// by its body where the program holds it. A function it does not hold does something; so does a
+/// call whose callee may be any function, as it may.
+fn calledHandling(self: *Context, walk: Walk, call: Facts.calls.Call, taken: Taken, depth: usize) RunError!Handling {
+    var all: Handling = .discards;
+    switch (call.callee) {
+        .function => |function| all = try functionHandling(self, walk, function, taken, depth),
+        .choice => |each| for (each) |function| {
+            all = joined(all, try functionHandling(self, walk, function, taken, depth));
+        },
+        .any => return .acts,
+    }
+    if (all == .acts) return .acts;
+    switch (call.args) {
+        .known => |args| for (args) |arg| {
+            all = joined(all, try handling(self, walk, arg, .dropped, depth + 1));
+            if (all == .acts) return .acts;
+        },
+        .unknown => return .unknown,
+    }
+    return all;
+}
+
+/// What calling `function` does where its result is `taken`: its body's statements, a `return`
+/// giving the call's value; read once a handler for each way its result is taken.
+fn functionHandling(self: *Context, walk: Walk, function: Facts.Decl, taken: Taken, depth: usize) RunError!Handling {
+    const held = self.project.at(function.file);
+    const record = held.model.declarations[@backingInt(function.index)];
+    if (record.kind != .function or !held.input.selected) return .acts;
     // A function's declaration is its prototype; its body is the `fn_decl` around it.
-    const declared = self.project.at(function.file).model.parentOf(record.node) orelse return false;
-    if (callee_tree.nodeTag(declared) != .fn_decl) return false;
-    var body_buffer: [2]Ast.Node.Index = undefined;
-    const body = callee_tree.blockStatements(&body_buffer, callee_tree.nodeData(declared).node_and_node[1]) orelse return false;
-    if (body.len != 0) return false;
-    const args = switch (call.args) {
-        .known => |known| known,
-        .unknown => return false,
-    };
-    for (args) |arg| if (!inert(tree, arg, 0)) return false;
-    return true;
+    const declared = held.model.parentOf(record.node) orelse return .acts;
+    if (held.file.tree.nodeTag(declared) != .fn_decl) return .acts;
+    const key: HandledKey = .{ function, taken };
+    if (walk.memo.get(key)) |known| return known;
+    try walk.memo.put(self.allocator, key, .unknown);
+    const body = held.file.tree.nodeData(declared).node_and_node[1];
+    const inner: Walk = .{ .file = function.file, .first = held.file.tree.firstToken(body), .last = held.file.tree.lastToken(body), .body = true, .returned = taken, .memo = walk.memo };
+    const found = try handling(self, inner, body, .dropped, depth + 1);
+    try walk.memo.put(self.allocator, key, found);
+    return found;
 }
 
 /// Whether an expression only reads: a name, a member, a number, or a builtin of them
@@ -475,6 +713,15 @@ fn scopeOf(model: *const Model, node: Ast.Node.Index) ?Model.Scope.Id {
 /// in, whose enclosing containers its callers name it through.
 const Signature = struct { site: Ast.TokenIndex, scope: Model.Scope.Id };
 
+/// `signature` reported at the type written at `node`, where `node` is in the checked file: each
+/// type a signature exposes is a site of its own (`pub fn f(a: A) B` two), so one suppression
+/// covers one of them. A type read in another file is reported where this file wrote what
+/// reached it.
+fn anchored(self: *const Context, signature: Signature, file: Project.FileId, node: Ast.Node.Index) Signature {
+    if (file != self.file) return signature;
+    return .{ .site = self.project.at(file).file.tree.firstToken(node), .scope = signature.scope };
+}
+
 fn privateSignature(self: *Context, signature: Signature, file: Project.FileId, function: Ast.full.FnProto, depth: usize) RunError!void {
     const tree = &self.project.at(file).file.tree;
     if (function.ast.return_type.unwrap()) |t| try privateType(self, signature, file, t, depth);
@@ -484,7 +731,8 @@ fn privateSignature(self: *Context, signature: Signature, file: Project.FileId, 
 
 /// Z012 over a type written at `node` of `file` in a public signature: each type a caller has to
 /// name to use it, read by what it is. A form this does not read leaves the signature undecided.
-fn privateType(self: *Context, signature: Signature, file: Project.FileId, written: Ast.Node.Index, depth: usize) RunError!void {
+fn privateType(self: *Context, given: Signature, file: Project.FileId, written: Ast.Node.Index, depth: usize) RunError!void {
+    const signature = anchored(self, given, file, written);
     const tree = &self.project.at(file).file.tree;
     const node = Facts.ungrouped(tree, written);
     if (depth >= 128) return undecidedType(self, signature, file, node, .budget);
@@ -563,7 +811,8 @@ fn chosen(self: *Context, signature: Signature, file: Project.FileId, node: Ast.
 }
 
 /// Z012 over a type `node` of `file` resolves to: the containers a caller has to name to use it.
-fn exposedValue(self: *Context, signature: Signature, file: Project.FileId, node: Ast.Node.Index, value: Facts.Value, depth: usize) RunError!void {
+fn exposedValue(self: *Context, given: Signature, file: Project.FileId, node: Ast.Node.Index, value: Facts.Value, depth: usize) RunError!void {
+    const signature = anchored(self, given, file, node);
     if (depth >= 128) return undecidedType(self, signature, file, node, .budget);
     switch (value) {
         .unknown => |why| try undecidedType(self, signature, file, node, why),
@@ -582,7 +831,8 @@ fn exposedValue(self: *Context, signature: Signature, file: Project.FileId, node
     }
 }
 
-fn exposedContainer(self: *Context, signature: Signature, file: Project.FileId, node: Ast.Node.Index, container: Facts.Container, depth: usize) RunError!void {
+fn exposedContainer(self: *Context, given: Signature, file: Project.FileId, node: Ast.Node.Index, container: Facts.Container, depth: usize) RunError!void {
+    const signature = anchored(self, given, file, node);
     const model = &self.project.at(container.file).model;
     // A container around the function is named through whatever names the function, as
     // `@This()` is.
@@ -612,7 +862,8 @@ fn exposedContainer(self: *Context, signature: Signature, file: Project.FileId, 
 /// whose result a public constant holds): named by its callee and its arguments, whatever it
 /// makes.
 /// `held` as for `exposedArgument`: the call is inside one a public constant holds.
-fn writtenCall(self: *Context, signature: Signature, file: Project.FileId, node: Ast.Node.Index, depth: usize, held: bool) RunError!void {
+fn writtenCall(self: *Context, given: Signature, file: Project.FileId, node: Ast.Node.Index, depth: usize, held: bool) RunError!void {
+    const signature = anchored(self, given, file, node);
     const tree = &self.project.at(file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, node).?;
@@ -629,7 +880,8 @@ fn writtenCall(self: *Context, signature: Signature, file: Project.FileId, node:
 /// constant holds (`pub const File = OwnedIo(Io.File, closeFile)`), so the constant is the name a
 /// user spells and a value argument is read by its type, what of it comes back through the result;
 /// a call written in a signature cannot be spelled where a value it takes is private.
-fn exposedArgument(self: *Context, signature: Signature, file: Project.FileId, node: Ast.Node.Index, depth: usize, held: bool) RunError!void {
+fn exposedArgument(self: *Context, given: Signature, file: Project.FileId, node: Ast.Node.Index, depth: usize, held: bool) RunError!void {
+    const signature = anchored(self, given, file, node);
     if (depth >= 128) return undecidedType(self, signature, file, node, .budget);
     const tree = &self.project.at(file).file.tree;
     if (selfNamed(tree, node) or try fromParameter(self, file, node)) return;
@@ -777,7 +1029,8 @@ fn fromParameter(self: *Context, file: Project.FileId, node: Ast.Node.Index) Run
 /// fields' values. A type held is named by the declaration holding it.
 /// `held` as for `exposedArgument`: a literal's fields are read as the call holding it reads its
 /// arguments.
-fn exposedInferred(self: *Context, signature: Signature, file: Project.FileId, node: Ast.Node.Index, value: Facts.Value, depth: usize, held: bool) RunError!void {
+fn exposedInferred(self: *Context, given: Signature, file: Project.FileId, node: Ast.Node.Index, value: Facts.Value, depth: usize, held: bool) RunError!void {
+    const signature = anchored(self, given, file, node);
     if (depth >= 128) return undecidedType(self, signature, file, node, .budget);
     switch (value) {
         .unknown => |why| try undecidedType(self, signature, file, node, why),
@@ -1009,29 +1262,89 @@ fn genericReads(self: *Context, name: []const u8) RunError!bool {
 
 /// Z016: each call by meaning (`Facts.calls`) that may be std's `debug.assert` and asserts a
 /// conjunction; one whose callee may be any function, or whose arguments are not known, is
-/// undecided.
+/// undecided. The asserted value is read by what gives it (`conjunction`).
 fn contextRules(self: *Context) RunError!void {
     if (!self.config.has(.Z016)) return;
     const tree = &self.project.at(self.file).file.tree;
     for (try Facts.calls.in(self.facts, self.file)) |call| {
-        const first: ?Ast.Node.Index = switch (call.args) {
+        const asserted: Governed.Is = switch (call.args) {
             .known => |args| first: {
                 const written = if (call.receiver == .bound) args[@min(args.len, 1)..] else args;
                 if (written.len == 0) continue;
-                break :first written[0];
+                break :first try conjunction(self, self.file, written[0], 0);
             },
-            .unknown => null,
+            .unknown => |why| .{ .unknown = why },
         };
-        if (first) |arg| if (Model.conditionOf(tree, arg) != .both) continue;
+        if (asserted == .no) continue;
         switch (try Governed.mayCallStd(self, call.node, "debug.assert")) {
             .no => {},
-            .yes => if (first == null)
-                try self.unknown(.Z016, call.node, call.args.unknown)
-            else
-                try self.at(.Z016, tree.nodeMainToken(call.node), "consider separate assertions only when evaluation and short circuit effects are preserved"),
+            .yes => switch (asserted) {
+                .no => unreachable, // unreachable: skipped above
+                .yes => try self.at(.Z016, tree.nodeMainToken(call.node), "consider separate assertions only when evaluation and short circuit effects are preserved"),
+                .unknown => |why| try self.unknown(.Z016, call.node, why),
+            },
             .unknown => |why| try self.unknown(.Z016, call.callee_expr, why),
         }
     }
+}
+
+/// Whether the value `node` of `file` gives may be a conjunction (`a and b`): each expression
+/// it comes from (`Facts.accesses.valuesOf`: through parentheses, `@as`, a labeled block's
+/// `break`s, a branch's results), and through a name, the value of the constant it names. A
+/// local `var` holds what its stores give, not read here; a builtin may hand its operand on (a
+/// cast), so one that is given a conjunction is not known. A form not read is not known.
+fn conjunction(self: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usize) RunError!Governed.Is {
+    if (depth == 16) return .{ .unknown = .budget };
+    const tree = &self.project.at(file).file.tree;
+    const leaves = switch (try Facts.accesses.valuesOf(self.facts, file, node)) {
+        .leaves => |leaves| leaves,
+        .unknown => |why| return .{ .unknown = why },
+    };
+    var answer: Governed.Is = .no;
+    for (leaves) |leaf| {
+        const one: Governed.Is = switch (Model.conditionOf(tree, leaf)) {
+            .both => .yes,
+            .not, .either, .compare => .no,
+            .other => |value| if (Facts.builtinName(tree, value) != null) passed: {
+                var buffer: [2]Ast.Node.Index = undefined;
+                for (Facts.builtinArgs(tree, value, &buffer)) |arg| switch (try conjunction(self, file, arg, depth + 1)) {
+                    .no => {},
+                    .yes => break :passed .{ .unknown = .unsupported },
+                    .unknown => |why| break :passed .{ .unknown = why },
+                };
+                break :passed .no;
+            } else if (self.project.at(file).model.reference(value)) |reference| named: {
+                // A name, by the declaration it resolves to lexically.
+                if (reference.unknown == .literal_context) break :named .no;
+                if (reference.declaration) |d| break :named try namedConjunction(self, .{ .file = file, .index = d }, depth);
+                break :named if (reference.unknown == .primitive) .no else .{ .unknown = .unresolved };
+            } else .no,
+        };
+        switch (one) {
+            .yes => return .yes,
+            .no => {},
+            .unknown => answer = one,
+        }
+    }
+    return answer;
+}
+
+/// What a name a conjunction may come through gives: a constant, the value it is given; a local
+/// `var`, what its stores give, not read here; anything else (a parameter, a capture, a
+/// container's `var`, read as a field is) its own value, no conjunction written here.
+fn namedConjunction(self: *Context, definition: Facts.Decl, depth: usize) RunError!Governed.Is {
+    const source = self.project.at(definition.file);
+    const decl = source.model.declarations[@backingInt(definition.index)];
+    if (decl.kind != .variable) return .no;
+    const variable = source.file.tree.fullVarDecl(decl.node) orelse return .no;
+    if (source.file.tree.tokenTag(variable.ast.mut_token) == .keyword_const) {
+        const init = variable.ast.init_node.unwrap() orelse return .no;
+        return conjunction(self, definition.file, init, depth + 1);
+    }
+    return switch (source.model.scopes[@backingInt(decl.scope)].kind) {
+        .file, .container => .no,
+        else => .{ .unknown = .unsupported },
+    };
 }
 
 fn unknownCoverage(self: *Context) RunError!void {

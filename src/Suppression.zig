@@ -118,18 +118,20 @@ fn one(file: *const File, comment: File.Comment, definitions: []const rules.Defi
 /// of the pack rules it names on its line (every pack rule's, in the older form naming none); a
 /// `glint-ignore` one site of its rule.
 pub fn matches(self: *Suppression, rule: rules.Rule, aegis: bool, line: u32, start: u32) error{AmbiguousSuppression}!bool {
-    if (self.line != line) return false;
-    if (self.escape != null) {
-        if (!aegis) return false;
-        if (!self.unnamed and std.mem.findScalar(rules.Rule, self.covers[0..self.covers_len], rule) == null) return false;
-        self.used = true;
-        return true;
+    if (!self.applies(rule, aegis, line)) return false;
+    if (self.escape == null) {
+        if (self.matched_start) |previous| if (previous != start) return error.AmbiguousSuppression;
+        self.matched_start = start;
     }
-    if (self.rule != rule) return false;
-    if (self.matched_start) |previous| if (previous != start) return error.AmbiguousSuppression;
-    self.matched_start = start;
     self.used = true;
     return true;
+}
+
+/// Whether this covers a finding of `rule` on `line` (`matches`), asked without using it.
+pub fn applies(self: *const Suppression, rule: rules.Rule, aegis: bool, line: u32) bool {
+    if (self.line != line) return false;
+    if (self.escape != null) return aegis and (self.unnamed or std.mem.findScalar(rules.Rule, self.covers[0..self.covers_len], rule) != null);
+    return self.rule == rule;
 }
 
 test "suppression requires exact ID and reason from a real comment" {

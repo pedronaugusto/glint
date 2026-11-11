@@ -31,7 +31,7 @@ suppressions: []Suppression = &.{},
 suppressed: usize = 0,
 stale: std.ArrayList(Report.Stale) = .empty,
 /// Where the rules' findings come in; each callback gets the runner back from it.
-sink: Context.Sink = .{ .diagnostic = sinkDiagnostic, .coverage = sinkCoverage, .config = sinkConfig },
+sink: Context.Sink = .{ .diagnostic = sinkDiagnostic, .coverage = sinkCoverage, .config = sinkConfig, .suppresses = sinkSuppresses },
 escapes: std.ArrayList(Report.Escape) = .empty,
 malformed: std.ArrayList(Report.Malformed) = .empty,
 /// What each of the current file's aegis escapes covered, by its index in `suppressions`.
@@ -343,6 +343,17 @@ fn sinkConfig(sink: *Context.Sink, file: Project.FileId) rules.Config {
     const runner: *Runner = @fieldParentPtr("sink", sink);
     for (runner.files) |setting| if (setting.file == file) return setting.config;
     return runner.base;
+}
+/// Whether a finding of `rule` at `start` of the current file would be suppressed: a
+/// `glint-ignore` of it, or an escape naming it, on its line. An escape in the older form holds
+/// its findings as findings (`emitRelated`), so it suppresses none.
+fn sinkSuppresses(sink: *Context.Sink, rule: rules.Rule, start: u32) bool {
+    const runner: *Runner = @fieldParentPtr("sink", sink);
+    if (!runner.config.has(rule)) return false;
+    const metadata = rules.definition(rule, runner.definitions) orelse return false;
+    const line = runner.project.at(runner.file).file.line(start);
+    for (runner.suppressions) |suppression| if (!suppression.unnamed and suppression.applies(rule, metadata.exception == .aegis, line)) return true;
+    return false;
 }
 fn sinkCoverage(sink: *Context.Sink, coverage: Report.Coverage) Context.Error!void {
     const runner: *Runner = @fieldParentPtr("sink", sink);
