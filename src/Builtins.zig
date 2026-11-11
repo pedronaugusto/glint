@@ -1260,91 +1260,22 @@ fn genericReads(self: *Context, name: []const u8) RunError!bool {
     return false;
 }
 
-/// Z016: each call by meaning (`Facts.calls`) that may be std's `debug.assert` and asserts a
-/// conjunction; one whose callee may be any function, or whose arguments are not known, is
-/// undecided. The asserted value is read by what gives it (`conjunction`).
+/// Z016: each call by meaning (`Facts.calls`) that resolves to std's `debug.assert` and whose
+/// first argument, as written, is a conjunction (`a and b`, through parentheses and `comptime`:
+/// `Model.conditionOf`). Nothing is followed: a conjunction a name, a block or a builtin gives is
+/// not read. A callee or argument list not known is silent.
 fn contextRules(self: *Context) RunError!void {
     if (!self.config.has(.Z016)) return;
     const tree = &self.project.at(self.file).file.tree;
     for (try Facts.calls.in(self.facts, self.file)) |call| {
-        const asserted: Governed.Is = switch (call.args) {
-            .known => |args| first: {
-                const written = if (call.receiver == .bound) args[@min(args.len, 1)..] else args;
-                if (written.len == 0) continue;
-                break :first try conjunction(self, self.file, written[0], 0);
-            },
-            .unknown => |why| .{ .unknown = why },
+        const args = switch (call.args) {
+            .known => |args| args,
+            .unknown => continue,
         };
-        if (asserted == .no) continue;
-        switch (try Governed.mayCallStd(self, call.node, "debug.assert")) {
-            .no => {},
-            .yes => switch (asserted) {
-                .no => unreachable, // unreachable: skipped above
-                .yes => try self.at(.Z016, tree.nodeMainToken(call.node), "consider separate assertions only when evaluation and short circuit effects are preserved"),
-                .unknown => |why| try self.unknown(.Z016, call.node, why),
-            },
-            .unknown => |why| try self.unknown(.Z016, call.callee_expr, why),
-        }
+        const written = if (call.receiver == .bound) args[@min(args.len, 1)..] else args;
+        if (written.len == 0 or Model.conditionOf(tree, written[0]) != .both) continue;
+        if (try Governed.mayCallStd(self, call.node, "debug.assert") == .yes) try self.at(.Z016, tree.nodeMainToken(call.node), "the assertion's argument is written `a and b`: consider separate assertions only when evaluation and short circuit effects are preserved");
     }
-}
-
-/// Whether the value `node` of `file` gives may be a conjunction (`a and b`): each expression
-/// it comes from (`Facts.accesses.valuesOf`: through parentheses, `@as`, a labeled block's
-/// `break`s, a branch's results), and through a name, the value of the constant it names. A
-/// local `var` holds what its stores give, not read here; a builtin may hand its operand on (a
-/// cast), so one that is given a conjunction is not known. A form not read is not known.
-fn conjunction(self: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usize) RunError!Governed.Is {
-    if (depth == 16) return .{ .unknown = .budget };
-    const tree = &self.project.at(file).file.tree;
-    const leaves = switch (try Facts.accesses.valuesOf(self.facts, file, node)) {
-        .leaves => |leaves| leaves,
-        .unknown => |why| return .{ .unknown = why },
-    };
-    var answer: Governed.Is = .no;
-    for (leaves) |leaf| {
-        const one: Governed.Is = switch (Model.conditionOf(tree, leaf)) {
-            .both => .yes,
-            .not, .either, .compare => .no,
-            .other => |value| if (Facts.builtinName(tree, value) != null) passed: {
-                var buffer: [2]Ast.Node.Index = undefined;
-                for (Facts.builtinArgs(tree, value, &buffer)) |arg| switch (try conjunction(self, file, arg, depth + 1)) {
-                    .no => {},
-                    .yes => break :passed .{ .unknown = .unsupported },
-                    .unknown => |why| break :passed .{ .unknown = why },
-                };
-                break :passed .no;
-            } else if (self.project.at(file).model.reference(value)) |reference| named: {
-                // A name, by the declaration it resolves to lexically.
-                if (reference.unknown == .literal_context) break :named .no;
-                if (reference.declaration) |d| break :named try namedConjunction(self, .{ .file = file, .index = d }, depth);
-                break :named if (reference.unknown == .primitive) .no else .{ .unknown = .unresolved };
-            } else .no,
-        };
-        switch (one) {
-            .yes => return .yes,
-            .no => {},
-            .unknown => answer = one,
-        }
-    }
-    return answer;
-}
-
-/// What a name a conjunction may come through gives: a constant, the value it is given; a local
-/// `var`, what its stores give, not read here; anything else (a parameter, a capture, a
-/// container's `var`, read as a field is) its own value, no conjunction written here.
-fn namedConjunction(self: *Context, definition: Facts.Decl, depth: usize) RunError!Governed.Is {
-    const source = self.project.at(definition.file);
-    const decl = source.model.declarations[@backingInt(definition.index)];
-    if (decl.kind != .variable) return .no;
-    const variable = source.file.tree.fullVarDecl(decl.node) orelse return .no;
-    if (source.file.tree.tokenTag(variable.ast.mut_token) == .keyword_const) {
-        const init = variable.ast.init_node.unwrap() orelse return .no;
-        return conjunction(self, definition.file, init, depth + 1);
-    }
-    return switch (source.model.scopes[@backingInt(decl.scope)].kind) {
-        .file, .container => .no,
-        else => .{ .unknown = .unsupported },
-    };
 }
 
 fn unknownCoverage(self: *Context) RunError!void {

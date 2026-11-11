@@ -299,7 +299,7 @@ fn withStd(rule: glint.Rule, root: []const u8) !glint.Report {
     return glint.run(std.testing.allocator, &project, config);
 }
 
-test "Z016 reads std's assert by meaning: a choice of callees one of which is it, an unknown under its own rule" {
+test "Z016 reads std's assert by meaning: a choice of callees one of which is it; a callee not known is silent" {
     // A mutable local holding std's assert in one path calls it.
     const chosen = "const std = @import(\"std\"); fn mine(ok: bool) void { _ = ok; } pub fn f(a: bool, b: bool, other: bool) void { var check: *const fn (bool) void = std.debug.assert; if (other) check = mine; check(a and b); }";
     var assert_choice = try withStd(.Z016, chosen);
@@ -310,16 +310,11 @@ test "Z016 reads std's assert by meaning: a choice of callees one of which is it
     defer no_assert.deinit();
     try std.testing.expectEqual(@as(usize, 0), no_assert.diagnostics.len); // safe: expected count fits usize.
     try std.testing.expect(no_assert.complete);
-    // A callee that may be any function, named as std's assert is: undecided under Z016.
+    // A callee that may be any function, named as std's assert is: silent, no undecided.
     var unknown = try withStd(.Z016, "pub fn f(a: bool, b: bool, g: anytype) void { g.assert(a and b); }");
     defer unknown.deinit();
     try std.testing.expectEqual(@as(usize, 0), unknown.diagnostics.len); // safe: expected count fits usize.
-    var undecided: usize = 0;
-    for (unknown.coverage) |item| if (item.rule) |rule| {
-        try std.testing.expectEqual(glint.Rule.Z016, rule);
-        undecided += 1;
-    };
-    try std.testing.expect(undecided != 0);
+    for (unknown.coverage) |item| try std.testing.expect(item.rule != glint.Rule.Z016);
 }
 
 test "an import of Zig's own builtin is no file glint lacks; a missing one is" {
