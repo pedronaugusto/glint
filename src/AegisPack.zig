@@ -1760,11 +1760,9 @@ fn checkCopies(c: *Context) Context.Error!void {
             const result = if (enclosingFunction(tree, &c.project.at(c.file).model, node)) |function| tree.fullFnProto(&proto_buffer, function).?.ast.return_type.unwrap() else null; // unreachable: a `fn_decl` has a prototype
             try checkCopy(c, tree, node, expr, result);
             var walk: Exposure = .{ .c = c };
-            if (try walk.carries(expr, 0)) {
+            if (try walk.carries(expr)) {
                 try c.at(copies, tree.nodeMainToken(node), "returned secret/guard borrow can outlive its capability; caller lifetime is undecided");
-            } else if (walk.cut) {
-                try c.undecided(copies, tree.tokenStart(tree.nodeMainToken(node)), .unsupported, "what this returns is nested past the depth A002 follows: a borrow it carries is not ruled out");
-            } else if (walk.unknown) |at| try c.undecided(copies, tree.tokenStart(tree.nodeMainToken(at)), .unsupported, "a call or builtin given a secret/guard borrow may give it back: a borrow this returns is not ruled out");
+            } else try walk.undecided("returns");
         }
     }
 }
@@ -2004,13 +2002,12 @@ fn checkStoredBorrow(c: *Context, tree: *const Ast, store: Ast.Node.Index, targe
     // A local's own storage, unless it holds a pointer the store goes through.
     if (!outer and (root == target or pointerShaped(try c.facts.resolve(c.file, root)) == false)) return;
     var walk: Exposure = .{ .c = c };
-    if (try walk.carries(value, 0)) {
+    if (try walk.carries(value)) {
         if (ref.declaration == null) return c.undecided(copies, tree.tokenStart(tree.nodeMainToken(store)), .unresolved, "a secret/guard borrow stored where the place does not resolve may outlive its capability");
         if (outer) return c.at(copies, tree.nodeMainToken(store), "stored secret/guard borrow can outlive its capability; caller lifetime is undecided");
         return c.undecided(copies, tree.tokenStart(tree.nodeMainToken(store)), .unsupported, "a secret/guard borrow stored through a pointer a local holds may outlive its capability");
     }
-    if (walk.cut) return c.undecided(copies, tree.tokenStart(tree.nodeMainToken(store)), .unsupported, "what this stores is nested past the depth A002 follows: a borrow it carries is not ruled out");
-    if (walk.unknown) |at| return c.undecided(copies, tree.tokenStart(tree.nodeMainToken(at)), .unsupported, "a call or builtin given a secret/guard borrow may give it back: a borrow this stores is not ruled out");
+    return walk.undecided("stores");
 }
 
 /// Whether a value carries a borrow of a secret or a guard's value: the borrow itself; a
@@ -2018,49 +2015,95 @@ fn checkStoredBorrow(c: *Context, tree: *const Ast, store: Ast.Node.Index, targe
 /// address (`@as`, `@ptrCast`, `@alignCast`, `@constCast`, `@bitCast`, `@field`,
 /// `@unionInit`); a slice of it, or an address of a part read through it; a part (a field, an
 /// element, a payload, what it points at) that may itself be a pointer; a field or element of a
-/// literal; a capture of it; or a local it was put in, whole or in a part. Each local is read
-/// once: a search for any borrow learns nothing more from a local already followed (`head =
-/// head orelse x`). A call given a borrow may return it: `unknown` names one whose result may be
-/// a pointer, as it does a shape not followed; past the depth it follows, `cut` says so. Neither
+/// literal; a capture of it that may hold an address; or a local it was put in, whole or in a
+/// part. Each local is read once: a search for any borrow learns nothing more from a local
+/// already followed (`head = head orelse x`). The walk keeps what it has still to read on the
+/// heap, and ends as the syntax is finite and each local is entered once. A call given a borrow
+/// may return it: `unknown` names one whose result may be a pointer, as it does a builtin not
+/// followed; `unread` names a form whose values `Facts.accesses.valuesOf` does not read. Neither
 /// is cleared.
 const Exposure = struct {
     c: *Context,
-    seen: std.AutoHashMapUnmanaged(Model.Declaration.Id, void) = .empty,
-    cut: bool = false,
+    unread: ?Unread = null,
     unknown: ?Ast.Node.Index = null,
 
-    fn carries(e: *Exposure, node: Ast.Node.Index, depth: usize) Context.Error!bool {
-        const c = e.c;
-        if (depth == 256) {
-            e.cut = true;
-            return false;
-        }
-        // What the value may be, through the forms that carry or choose it: parentheses, `try`,
-        // `.?`, `@as`, `comptime`, `nosuspend`, both sides of `orelse` and `catch`, a branch or a
-        // prong, a `break` or a loop's `else` (Facts.accesses.valuesOf). One it does not read to
-        // its end is cut short.
-        const leaves = switch (try Facts.accesses.valuesOf(c.facts, c.file, node)) {
-            .leaves => |leaves| leaves,
-            .unknown => {
-                e.cut = true;
+    const Unread = struct { node: Ast.Node.Index, why: Facts.Unknown };
+    const Seen = std.AutoHashMapUnmanaged(Model.Declaration.Id, void);
+    const Nodes = std.ArrayList(Ast.Node.Index);
+
+    /// Whether `value` carries a borrow. The calls and builtins it may be given back by are read
+    /// after, in a pass with locals seen of its own: a local an argument reads is still followed
+    /// where the value reads it itself.
+    fn carries(e: *Exposure, value: Ast.Node.Index) Context.Error!bool {
+        const gpa = e.c.allocator;
+        var work: Nodes = .empty;
+        defer work.deinit(gpa);
+        var given: Nodes = .empty;
+        defer given.deinit(gpa);
+        var seen: Seen = .empty;
+        defer seen.deinit(gpa);
+        try work.append(gpa, value);
+        if (try e.reaches(&work, &seen, &given)) return true;
+        // Each call or builtin met, its operands read, and the ones met in them in turn: one
+        // given a borrow may give it back.
+        var operands_seen: Seen = .empty;
+        defer operands_seen.deinit(gpa);
+        var next: usize = 0;
+        while (next < given.items.len) : (next += 1) {
+            const at = given.items[next];
+            try e.operands(at, &work);
+            if (try e.reaches(&work, &operands_seen, &given)) {
+                e.unknown = at;
                 return false;
-            },
-        };
-        for (leaves) |leaf| if (try e.carriesLeaf(leaf, depth + 1)) return true;
+            }
+        }
         return false;
     }
-    /// Whether a value of a form that neither carries nor chooses another carries a borrow.
-    fn carriesLeaf(e: *Exposure, node: Ast.Node.Index, depth: usize) Context.Error!bool {
+    /// Whether a value on `work`, or one it reaches, is a borrow. What the value may be, through
+    /// the forms that carry or choose it: parentheses, `try`, `.?`, `@as`, `comptime`,
+    /// `nosuspend`, both sides of `orelse` and `catch`, a branch or a prong, a `break` or a
+    /// loop's `else` (`Facts.accesses.valuesOf`), each value it gives read in its turn. Each call
+    /// or builtin met that may give back what it is given goes on `given`.
+    fn reaches(e: *Exposure, work: *Nodes, seen: *Seen, given: *Nodes) Context.Error!bool {
+        const c = e.c;
+        while (work.pop()) |node| {
+            const leaves = switch (try Facts.accesses.valuesOf(c.facts, c.file, node)) {
+                .leaves => |leaves| leaves,
+                .unknown => |why| {
+                    e.unread = e.unread orelse .{ .node = node, .why = why };
+                    continue;
+                },
+            };
+            // A form that neither carries nor chooses another gives itself.
+            if (leaves.len == 1 and leaves[0] == node) {
+                if (try e.leaf(node, work, seen, given)) return true;
+                continue;
+            }
+            try push(c, work, leaves);
+        }
+        return false;
+    }
+    /// Puts `nodes` on `work`, the first to be read first.
+    fn push(c: *Context, work: *Nodes, nodes: []const Ast.Node.Index) Context.Error!void {
+        var each = nodes.len;
+        while (each > 0) {
+            each -= 1;
+            try work.append(c.allocator, nodes[each]);
+        }
+    }
+    /// Whether a value of a form that neither carries nor chooses another is a borrow; what it
+    /// carries goes on `work`.
+    fn leaf(e: *Exposure, node: Ast.Node.Index, work: *Nodes, seen: *Seen, given: *Nodes) Context.Error!bool {
         const c = e.c;
         const tree = try c.project.syntax(try c.source());
         const model = &c.project.at(c.file).model;
         switch (Facts.accesses.formOf(tree.nodeTag(node))) {
             // A slice of a borrow borrows the same memory.
-            .slice => return e.carries(tree.fullSlice(node).?.ast.sliced, depth + 1), // unreachable: the form is a slice's
+            .slice => try work.append(c.allocator, tree.fullSlice(node).?.ast.sliced), // unreachable: the form is a slice's
             // An address of a part read through a borrow points into what it borrows.
             .address_of => {
                 const path = try Facts.accesses.pathOf(c.facts, c.file, tree.nodeData(node).node);
-                return e.carries(path.steps[path.steps.len - 1].node, depth + 1);
+                try work.append(c.allocator, path.steps[path.steps.len - 1].node);
             },
             // A part of what carries a borrow carries it where the part may be a pointer, or a
             // value holding one; a number, a truth value or an enum's tag holds none.
@@ -2069,18 +2112,25 @@ const Exposure = struct {
                 const whole = path.steps[1].node;
                 if (try plainValue(c, c.file, node, 0)) return false;
                 if (scalarShaped(c, try c.facts.resolve(c.file, node)) == true) return false;
-                return e.carries(whole, depth + 1);
+                try work.append(c.allocator, whole);
             },
             // A name: a local's or a capture's value; a literal is no borrow.
             .leaf => {
                 const index = Contract.local(c, node) orelse return false;
                 const decl = model.declarations[@backingInt(index)];
-                if ((try e.seen.getOrPut(c.allocator, index)).found_existing) return false;
-                // A capture: of what the `if`, loop or `switch` reads.
-                if (decl.kind == .capture) return if (c.facts.captureSource(c.file, decl)) |source| e.carries(source, depth + 1) else false;
+                if ((try seen.getOrPut(c.allocator, index)).found_existing) return false;
+                // A capture: of what the `if`, loop or `switch` reads, unless it holds a
+                // number, a truth value, an enum's tag or nothing (a range's counter, a plain
+                // element by value), which keeps no address.
+                if (decl.kind == .capture) {
+                    if (scalarShaped(c, try c.facts.resolve(c.file, node)) == true) return false;
+                    if (c.facts.captureSource(c.file, decl)) |source| try work.append(c.allocator, source);
+                    return false;
+                }
                 if (decl.kind != .variable) return false;
                 const v = tree.fullVarDecl(decl.node) orelse return false;
-                if (v.ast.init_node.unwrap()) |init| if (try e.carries(init, depth + 1)) return true;
+                const first = work.items.len;
+                if (v.ast.init_node.unwrap()) |init| try work.append(c.allocator, init);
                 // Anything put in it later, whole or in a part (`r.v = s.expose()`).
                 for (try Facts.accesses.storesIn(c.facts, c.file)) |site| {
                     const value = site.value orelse continue;
@@ -2090,57 +2140,83 @@ const Exposure = struct {
                         .none, .unknown => continue,
                     };
                     if (root.file != c.file or root.index != index) continue;
-                    if (try e.carries(value, depth + 1)) return true;
+                    try work.append(c.allocator, value);
                 }
-                return false;
+                // The initial value read first.
+                std.mem.reverse(Ast.Node.Index, work.items[first..]);
             },
-            .builtin => return e.builtin(node, depth),
+            .builtin => try e.builtin(node, work, given),
             // A field or an element of a literal.
             .struct_literal => {
                 var buffer: [2]Ast.Node.Index = undefined;
-                for (tree.fullStructInit(&buffer, node).?.ast.fields) |field| if (try e.carries(field, depth + 1)) return true; // unreachable: the form is a struct literal's
-                return false;
+                try push(c, work, tree.fullStructInit(&buffer, node).?.ast.fields); // unreachable: the form is a struct literal's
             },
             .array_literal => {
                 var buffer: [2]Ast.Node.Index = undefined;
-                for (tree.fullArrayInit(&buffer, node).?.ast.elements) |element| if (try e.carries(element, depth + 1)) return true; // unreachable: the form is an array literal's
-                return false;
+                try push(c, work, tree.fullArrayInit(&buffer, node).?.ast.elements); // unreachable: the form is an array literal's
             },
             .call => {
                 if (try exposure(c, node)) return true;
                 // A call given a borrow may return it, where what it returns may be a pointer.
-                var call_buffer: [1]Ast.Node.Index = undefined;
-                const call = tree.fullCall(&call_buffer, node).?; // unreachable: the form is a call's
-                var given = false;
-                const callee = try Facts.accesses.pathOf(c.facts, c.file, call.ast.fn_expr);
-                if (callee.steps.len >= 2 and callee.steps[0].kind == .field) given = try e.carries(callee.steps[1].node, depth + 1);
-                for (call.ast.params) |arg| given = given or try e.carries(arg, depth + 1);
-                if (given and scalarShaped(c, try c.facts.resolve(c.file, node)) != true) e.unknown = e.unknown orelse node;
-                return false;
+                if (scalarShaped(c, try c.facts.resolve(c.file, node)) != true) try given.append(c.allocator, node);
             },
-            else => return false,
+            else => {},
         }
+        return false;
     }
     /// A builtin's value: what keeps its operand's address carries what the operand does.
-    fn builtin(e: *Exposure, node: Ast.Node.Index, depth: usize) Context.Error!bool {
+    fn builtin(e: *Exposure, node: Ast.Node.Index, work: *Nodes, given: *Nodes) Context.Error!void {
         const c = e.c;
         const tree = try c.project.syntax(try c.source());
         const name = tree.tokenSlice(tree.nodeMainToken(node));
         var buffer: [2]Ast.Node.Index = undefined;
         const args = Facts.builtinArgs(tree, node, &buffer);
         const kept = [_][]const u8{ "@as", "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@addrSpaceCast", "@bitCast" };
-        for (kept) |each| if (std.mem.eql(u8, name, each)) return args.len != 0 and try e.carries(args[args.len - 1], depth + 1);
-        if (std.mem.eql(u8, name, "@field")) return args.len != 0 and try e.carries(args[0], depth + 1);
-        if (std.mem.eql(u8, name, "@unionInit")) return args.len == 3 and try e.carries(args[2], depth + 1);
+        for (kept) |each| if (std.mem.eql(u8, name, each)) {
+            if (args.len != 0) try work.append(c.allocator, args[args.len - 1]);
+            return;
+        };
+        if (std.mem.eql(u8, name, "@field")) {
+            if (args.len != 0) try work.append(c.allocator, args[0]);
+            return;
+        }
+        if (std.mem.eql(u8, name, "@unionInit")) {
+            if (args.len == 3) try work.append(c.allocator, args[2]);
+            return;
+        }
         // A number, a type, text, a truth value or nothing: no pointer.
         const none = [_][]const u8{ "@TypeOf", "@sizeOf", "@alignOf", "@bitSizeOf", "@offsetOf", "@bitOffsetOf", "@typeName", "@tagName", "@errorName", "@typeInfo", "@intFromPtr", "@intFromBool", "@intFromEnum", "@intFromError", "@intFromFloat", "@hasDecl", "@hasField", "@memcpy", "@memset", "@memmove", "@prefetch", "@compileError", "@panic", "@popCount", "@clz", "@ctz", "@byteSwap", "@bitReverse", "@truncate", "@intCast", "@floatCast", "@floatFromInt", "@divExact", "@divFloor", "@divTrunc", "@mod", "@rem", "@min", "@max", "@abs", "@sqrt", "@atomicStore" };
-        for (none) |each| if (std.mem.eql(u8, name, each)) return false;
+        for (none) |each| if (std.mem.eql(u8, name, each)) return;
         // Any other builtin given a borrow gives a value this does not follow.
-        for (args) |arg| if (try e.carries(arg, depth + 1)) {
-            if (scalarShaped(c, try c.facts.resolve(c.file, node)) != true) e.unknown = e.unknown orelse node;
-            return false;
-        };
-        return false;
+        if (args.len != 0 and scalarShaped(c, try c.facts.resolve(c.file, node)) != true) try given.append(c.allocator, node);
+    }
+    /// What the call or builtin `node` is given, on `work` alone: a method call's receiver and
+    /// its arguments, a builtin's operands.
+    fn operands(e: *Exposure, node: Ast.Node.Index, work: *Nodes) Context.Error!void {
+        const c = e.c;
+        const tree = try c.project.syntax(try c.source());
+        work.clearRetainingCapacity();
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (Facts.accesses.formOf(tree.nodeTag(node)) == .builtin) return push(c, work, Facts.builtinArgs(tree, node, &buffer));
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&call_buffer, node).?; // unreachable: only a call or a builtin is given
+        try push(c, work, call.ast.params);
+        const callee = try Facts.accesses.pathOf(c.facts, c.file, call.ast.fn_expr);
+        if (callee.steps.len >= 2 and callee.steps[0].kind == .field) try work.append(c.allocator, callee.steps[1].node);
+    }
+    /// Why a value with no borrow found is not cleared, where it is not: a form it is given
+    /// through whose values `valuesOf` does not read, or more of them than it reads; else a call
+    /// or builtin given a borrow, which may give it back. `what` says what the site does:
+    /// "returns" or "stores".
+    fn undecided(e: *const Exposure, comptime what: []const u8) Context.Error!void {
+        const c = e.c;
+        const tree = try c.project.syntax(try c.source());
+        if (e.unread) |unread| {
+            const at = tree.tokenStart(tree.nodeMainToken(unread.node));
+            if (unread.why == .budget) return c.undecided(copies, at, .budget_exhausted, "what this " ++ what ++ " is chosen here among more values than A002 reads in one: a borrow it carries is not ruled out");
+            return c.undecided(copies, at, .unsupported, "what this " ++ what ++ " passes through a form here whose values A002 does not read: a borrow it carries is not ruled out");
+        }
+        if (e.unknown) |at| return c.undecided(copies, tree.tokenStart(tree.nodeMainToken(at)), .unsupported, "a call or builtin given a secret/guard borrow may give it back: a borrow this " ++ what ++ " is not ruled out");
     }
 };
 
@@ -2150,6 +2226,9 @@ fn scalarShaped(c: *Context, value: Facts.Value) ?bool {
     for (Facts.valueParts(&value)) |part| each.add(part, switch (part) {
         .primitive => |name| !std.mem.eql(u8, name, "anyopaque"),
         .error_union => |inner| scalarShaped(c, inner.*),
+        // A value no type of its own is given that holds no pointer (`Facts.Value.scalar`): a
+        // number, a truth value, `null`, a range's counter.
+        .scalar => true,
         // An enum's tag, by the keyword its container is declared with (`Facts.kindOf`).
         .instance => |container| c.facts.kindOf(container) == .keyword_enum,
         .alternatives => unreachable, // unreachable: valueParts gives no choice as a part

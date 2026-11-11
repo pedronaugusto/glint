@@ -917,13 +917,14 @@ test "A002 reads a copy from any place an owner is read through, an assignment's
     // the walk); a borrow in any of its values is still returned.
     try expectJudged(head ++ "pub fn f(s: *S(u32), xs: []const u32) ?*const u32 { var head: ?*const u32 = null; for (xs) |x| { if (x == 1) head = head orelse null; if (x == 2) head = head orelse null; if (x == 3) head = head orelse null; } _ = s; return head orelse null; }", pack.copies, true, 0);
     try expectJudged(head ++ "pub fn f(s: *S(u32), xs: []const u32) ?*const u32 { var head: ?*const u32 = null; for (xs) |x| { if (x == 1) head = head orelse null; if (x == 2) head = head orelse null; if (x == 3) head = head orelse s.expose(); } return head orelse null; }", pack.copies, true, 1);
-    // A chain of locals past the depth the walk follows leaves the return undecided.
+    // A chain of locals of any length is followed to its end: the walk keeps what it has
+    // still to read on the heap, with no depth to cut it short.
     var chain: std.ArrayList(u8) = .empty;
     defer chain.deinit(std.testing.allocator);
     try chain.appendSlice(std.testing.allocator, head ++ "pub fn f(s: *S(u32)) *const u32 { const v0 = s.expose();");
     for (1..300) |i| try chain.print(std.testing.allocator, " const v{d} = v{d};", .{ i, i - 1 });
     try chain.appendSlice(std.testing.allocator, " return v299; }");
-    try expectJudged(chain.items, pack.copies, false, 0);
+    try expectJudged(chain.items, pack.copies, true, 1);
     // A reservation moved out of a local nothing reads again is moved; one whose address was
     // taken first is still reached through that address.
     const budget = "const bounded = @import(\"aegis\").bounded;\n";
