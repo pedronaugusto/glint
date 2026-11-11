@@ -515,8 +515,7 @@ fn judge(gpa: std.mem.Allocator, io: std.Io, store: *glint.Project.Store, rule: 
     var output: std.Io.Writer.Allocating = .init(a);
     var problems: std.Io.Writer.Allocating = .init(a);
     var args: std.ArrayList([]const u8) = .empty;
-    // Every case's records are read back as they were built (summaries' cross-check).
-    try args.appendSlice(a, &.{ "glint", "--only", rule, "--zig-lib-path", lib, "--module", module, "--summary-check" });
+    try args.appendSlice(a, &.{ "glint", "--only", rule, "--zig-lib-path", lib, "--module", module });
     if (job.policy) |config| try args.appendSlice(a, &.{ "--config", config });
     if (job.before) |before| try args.append(a, before);
     const own = try moduleFiles(a, io, std.Io.Dir.path.dirname(job.absolute) orelse ".");

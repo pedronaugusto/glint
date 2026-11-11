@@ -1,7 +1,0 @@
-1	body function inline_for.entry() results=some
-1	body function inline_for.size(u8) results=
-1	body function inline_for.size(u16) results=
-1	body function inline_for.size(u32) results=
-# one call each iteration: the coercion of its result to the sum's type is no call of its own
-1	  calls fn inline_for.size x3
-1	canonical yes

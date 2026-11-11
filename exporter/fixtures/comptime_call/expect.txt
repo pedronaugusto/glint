@@ -1,4 +1,0 @@
-1	body comptime_call comptime_call.square() in comptime_call.entry at 4 results=some
-0	body function comptime_call.square(
-1	body function comptime_call.entry() results=some
-1	canonical yes

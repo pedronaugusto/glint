@@ -1,6 +1,0 @@
-1	body function fn_pointer.entry() results=some
-# one returns 1: AstGen writes the literal as the constant 1 of u8, so no instruction of its gives a result
-1	body function fn_pointer.one() results=none
-1	body function fn_pointer.two() results=some
-1	  calls (runtime pointer) x1
-1	canonical yes

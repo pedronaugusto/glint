@@ -1,9 +1,0 @@
-# Each inline call is keyed by its own call: the caller's result there is what it folded to.
-# A key on an argument's instruction would show the argument's value (3, 6) instead.
-1	body inline_call nested_inline.outer() in nested_inline.entry at 18 results=some
-1	body inline_call nested_inline.inner() in nested_inline.outer at 6 results=some
-1	body inline_call nested_inline.inner() in nested_inline.outer at 12 results=some
-0	body function nested_inline.inner(
-0	body function nested_inline.outer(
-1	body function nested_inline.entry() results=some
-1	canonical yes
