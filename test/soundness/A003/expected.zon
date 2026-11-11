@@ -1,19 +1,9 @@
 .{
     .open = .{
-        // glint-b precision: an acquisition assigned to a local, put in a literal, or handed to a call is not followed (undecided, never clear), so its release there is not seen
-        "aggregate/glintb-literal/twin.zig",
-        "assignment/glintb-write/twin.zig",
         // glint-b precision: a std handle stored into memory, then closed by its local: the stored copy may be closed again by its holder, which A003 does not follow (undecided, never a finding)
         "assignment/g08-handle_stored_closed/twin.zig",
+        // glint-b precision: an acquisition handed to a call is not followed (undecided, never clear), so its release there is not seen
         "call/glintb-helper/twin.zig",
-        // glint-b precision: A003's flow does not follow a release through an alias, a capture, a comptime-known branch, @field, a byte copy or an unwrap
-        "address/glintb-alias/twin.zig",
-        "capture/glintb-value/twin.zig",
-        "compile_time/glintb-known/twin.zig",
-        "memory/glintb-bytes/twin.zig",
-        "unwrap/glintb-optional/twin.zig",
-        // glint-b precision: an owner written after its release (`maybe = null` once its capture released it) is a use the walk does not follow past the release (undecided, never clear)
-        "capture/glintb-capture_overwritten/twin.zig",
         // warp-fast precision: A003's flow does not read std's File.closeMany of a slice of a local's address as its release (A015's released does)
         "memory/wf-closemany-slice/twin.zig",
         // aegis precision: a binding that makes an owner of what a generic acquires by its type parameter has its cleanup not walked per binding (undecided, never clear)
