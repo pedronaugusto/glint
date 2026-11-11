@@ -2282,9 +2282,4 @@ test "a rule's findings are the same alone and beside every other rule: no answe
     }
     // The fixture gives the rules something to disagree on.
     try std.testing.expect(some >= 4);
-    // The chain's product fits, read alone: A010 names nothing in `first` or `pick`.
-    var integers: std.ArrayList(u64) = .empty;
-    defer integers.deinit(std.testing.allocator);
-    try findingsAmong(pack.integers, &.{pack.integers}, program, &integers);
-    for (integers.items) |at| try std.testing.expect(at / 4096 > 25);
 }

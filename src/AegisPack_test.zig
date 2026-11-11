@@ -1267,40 +1267,6 @@ test "where only a value's role is known, a field every type of that role keeps 
     try expectJudged(head ++ "pub fn f(p: *Pool) usize { return p.extra; }", pack.access, true, 0);
 }
 
-/// An aegis whose guard hands its release on to an optional hand-off: the move happens only
-/// when the call gives one.
-const handoff_root =
-    \\pub fn Guarded(comptime T: type) type {
-    \\    return struct {
-    \\        const Self = @This();
-    \\        data: T,
-    \\        lock: bool = false,
-    \\        pub fn acquire(o: *Self) Guard { o.lock = true; return .{ .owner = o }; }
-    \\        pub const Guard = struct {
-    \\            owner: *Self,
-    \\            pub fn deinit(g: *Guard) void { g.owner.lock = false; }
-    \\            pub fn handOff(g: *Guard) Handoff { return .{ .owner = g.owner }; }
-    \\            pub fn tryHandOff(g: *Guard) ?Handoff { return .{ .owner = g.owner }; }
-    \\        };
-    \\        pub const Handoff = struct {
-    \\            owner: *Self,
-    \\            pub fn release(h: *Handoff) void { h.owner.lock = false; }
-    \\        };
-    \\    };
-    \\}
-    \\pub const lint_rules = .{
-    \\    .version = 1,
-    \\    .roles = .{
-    \\        .{ .type = Guarded, .role = .guarded, .internal = .{ .lock, .data } },
-    \\        .{ .type = .{ .generic = Guarded, .member = .Guard }, .role = .guard, .internal = .{.owner} },
-    \\        .{ .type = .{ .generic = Guarded, .member = .Handoff }, .role = .handoff, .internal = .{.owner} },
-    \\    },
-    \\    .pairs = .{
-    \\        .{ .type = .{ .generic = Guarded, .member = .Guard }, .release = .{.deinit}, .transfer = .{ .handOff, .tryHandOff } },
-    \\        .{ .type = .{ .generic = Guarded, .member = .Handoff }, .release = .{.release} },
-    \\    },
-    \\};
-;
 
 test "the private fields aegis's first list missed are A001's: a reader-writer owner's admission limit, a dense map's regions and rooms, a secondary map's index and entries" {
     const head = "const aegis = @import(\"aegis\");\nconst Tag = struct {};\nconst P = aegis.handle.SlotPool(u32, Tag, .{ .generation = u64 });\n";
