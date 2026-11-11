@@ -24,6 +24,16 @@ pub const FieldNaming = @import("FieldNaming.zig");
 pub const UnwrapTrap = @import("UnwrapTrap.zig");
 pub const UndefinedReason = @import("UndefinedReason.zig");
 pub const LeftoverDebugging = @import("LeftoverDebugging.zig");
+pub const ConstantCondition = @import("ConstantCondition.zig");
+pub const InexactFloat = @import("InexactFloat.zig");
+pub const NanComparison = @import("NanComparison.zig");
+pub const NarrowCounter = @import("NarrowCounter.zig");
+pub const UndefinedConst = @import("UndefinedConst.zig");
+pub const DeadErrdefer = @import("DeadErrdefer.zig");
+pub const BuildOption = @import("BuildOption.zig");
+pub const PublicAnytype = @import("PublicAnytype.zig");
+pub const FunctionShape = @import("FunctionShape.zig");
+pub const EmptyBranch = @import("EmptyBranch.zig");
 
 /// A rule's check, as each breadth rule exports it.
 pub const Check = fn (*Context, Rule) Context.Error!void;
@@ -46,6 +56,18 @@ pub const fixture_std =
     \\pub const testing = struct {
     \\    pub fn expect(ok: bool) !void { if (!ok) return error.TestUnexpectedResult; }
     \\    pub fn expectEqual(expected: anytype, actual: anytype) !void { _ = expected; _ = actual; }
+    \\};
+    \\pub const math = struct {
+    \\    pub inline fn nan(comptime T: type) T { return 0; }
+    \\    pub fn isNan(x: anytype) bool { return x != x; }
+    \\};
+    \\pub const Build = struct {
+    \\    pub const Module = struct { pub const CreateOptions = struct { target: ?u8 = null, optimize: ?enum { Debug, ReleaseSafe, ReleaseFast, ReleaseSmall } = null }; };
+    \\    pub fn standardOptimizeOption(b: *Build, options: struct {}) @FieldType(Module.CreateOptions, "optimize") { _ = b; _ = options; return null; }
+    \\    pub fn standardTargetOptions(b: *Build, options: struct {}) u8 { _ = b; _ = options; return 0; }
+    \\    pub fn resolveTargetQuery(b: *Build, query: struct {}) u8 { _ = b; _ = query; return 0; }
+    \\    pub fn createModule(b: *Build, options: Module.CreateOptions) *Module { _ = b; _ = options; return undefined; }
+    \\    pub fn addModule(b: *Build, name: []const u8, options: Module.CreateOptions) *Module { _ = b; _ = name; _ = options; return undefined; }
     \\};
     \\pub const posix = struct {
     \\    pub fn read(fd: i32, buf: []u8) !usize { _ = fd; return buf.len; }
@@ -129,9 +151,14 @@ fn selected() rules.Config {
 /// Runs `check` over `source` (with `fixture_std` as std) and expects `expected` findings and
 /// nothing undecided.
 pub fn expectFindings(comptime check: Check, source: []const u8, expected: usize) !void {
+    return expectFindingsNamed(check, "fixture", source, expected);
+}
+
+/// As `expectFindings`, the file named `name` (`build.zig`).
+pub fn expectFindingsNamed(comptime check: Check, name: []const u8, source: []const u8, expected: usize) !void {
     const gpa = std.testing.allocator;
     var project = try Project.init(gpa, &.{
-        .{ .name = "fixture", .stem = "Fixture", .bytes = source },
+        .{ .name = name, .stem = "Fixture", .bytes = source },
         .{ .name = "standard", .bytes = fixture_std, .selected = false },
     }, &.{.{ .from = 0, .target = 1, .spelling = "std" }}, .{});
     defer project.deinit();
@@ -172,4 +199,14 @@ test {
     _ = UnwrapTrap;
     _ = UndefinedReason;
     _ = LeftoverDebugging;
+    _ = ConstantCondition;
+    _ = InexactFloat;
+    _ = NanComparison;
+    _ = NarrowCounter;
+    _ = UndefinedConst;
+    _ = DeadErrdefer;
+    _ = BuildOption;
+    _ = PublicAnytype;
+    _ = FunctionShape;
+    _ = EmptyBranch;
 }
