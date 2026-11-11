@@ -5,12 +5,12 @@
 pub const Layer = struct { name: []const u8, patterns: []const []const u8 };
 pub const layers = [_]Layer{
     .{ .name = "tokens", .patterns = &.{ "src/Token.zig", "src/Token/**" } },
-    .{ .name = "front end and selection", .patterns = &.{ "src/File.zig", "src/Constructs.zig", "src/Rule.zig", "src/FactSpec.zig", "src/names.zig", "src/Completion.zig" } },
+    .{ .name = "front end and selection", .patterns = &.{ "src/File.zig", "src/Constructs.zig", "src/Rule.zig", "src/names.zig", "src/Completion.zig" } },
     .{ .name = "bindings and comments", .patterns = &.{ "src/Model.zig", "src/Suppression.zig" } },
     .{ .name = "project", .patterns = &.{"src/Project.zig"} },
-    .{ .name = "facts and diagnostics", .patterns = &.{ "src/Facts.zig", "src/facts_format.zig", "src/compiled_read.zig", "src/Compiled.zig", "src/PackageRules.zig", "src/Summary.zig", "src/Library.zig", "src/Report.zig", "src/Fix.zig" } },
+    .{ .name = "facts and diagnostics", .patterns = &.{ "src/Facts.zig", "src/PackageRules.zig", "src/Library.zig", "src/Report.zig", "src/Fix.zig" } },
     .{ .name = "rule API", .patterns = &.{"src/RuleContext.zig"} },
-    .{ .name = "built-in rules", .patterns = &.{ "src/Builtins.zig", "src/DeadDeclarations.zig", "src/Disallowed.zig", "src/Governed.zig", "src/Present.zig", "src/Escapes.zig", "src/Metrics.zig", "src/AegisRules.zig", "src/AegisContract.zig", "src/AegisRecursion.zig", "src/Danger.zig", "src/DangerShapes.zig", "src/Undefined.zig", "src/CContract.zig", "src/ParentPointer.zig", "src/Taint.zig", "src/Range.zig", "src/Bounds.zig", "src/Proof.zig", "src/Program.zig", "src/DangerFlow.zig", "src/Streams.zig", "src/Discards.zig", "src/AegisPack.zig", "src/releases.zig" } },
+    .{ .name = "built-in rules", .patterns = &.{ "src/Builtins.zig", "src/DeadDeclarations.zig", "src/Disallowed.zig", "src/Governed.zig", "src/Present.zig", "src/Escapes.zig", "src/Metrics.zig", "src/AegisRules.zig", "src/AegisContract.zig", "src/Danger.zig", "src/DangerShapes.zig", "src/CContract.zig", "src/Program.zig", "src/Discards.zig", "src/AegisPack.zig" } },
     .{ .name = "rules", .patterns = &.{"src/Runner.zig"} },
     .{ .name = "filesystem CLI", .patterns = &.{ "src/cli.zig", "src/Result.zig" } },
     .{ .name = "public", .patterns = &.{"src/glint.zig"} },

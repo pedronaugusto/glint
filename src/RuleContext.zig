@@ -23,7 +23,7 @@ sink: *Sink,
 /// The run's compiled rules: the facts they declare are the ones `Taint` solves together.
 compiled: []const Rule = &.{},
 
-pub const Error = Facts.ResolveError || Project.QueryError || error{ AmbiguousSuppression, InvalidSelection, SolveShort };
+pub const Error = Facts.ResolveError || Project.QueryError || error{ AmbiguousSuppression, InvalidSelection };
 
 /// Makes `allocator` the run's own (`Facts.gpa`) and returns the one it was: what a function
 /// that fills a `Facts.memo` computes, its callees' memory among it, is kept for the run, as a
@@ -57,7 +57,7 @@ pub const Sink = struct {
 /// `lint_rules` names that no pack of the run knows is a problem where it is written, and a name
 /// two packs give different lists for is refused (`error.InvalidSelection`), so an entry's name
 /// names one pack.
-pub const Rule = struct { definition: rules.Definition, check: *const fn (*RuleContext) Error!void, facts: []const @import("FactSpec.zig").Spec = &.{}, roles: []const []const u8 = &.{} };
+pub const Rule = struct { definition: rules.Definition, check: *const fn (*RuleContext) Error!void, roles: []const []const u8 = &.{} };
 /// Checked immutable handle for all model queries.
 pub fn source(self: *const RuleContext) Project.QueryError!Project.Handle {
     return self.project.handle(self.file);

@@ -1,4 +1,0 @@
-.{
-    .no_hole = .{ .destructure, .capture, .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .branch },
-    .no_twin = .{ .destructure, .capture, .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch },
-}

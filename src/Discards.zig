@@ -9,7 +9,6 @@ const Facts = @import("Facts.zig");
 const Model = @import("Model.zig");
 const Governed = @import("Governed.zig");
 const AegisContract = @import("AegisContract.zig");
-const release_summary = @import("releases.zig");
 const Context = @import("RuleContext.zig");
 const Ast = std.zig.Ast;
 const Error = Context.Error;
@@ -179,8 +178,8 @@ const allocator_release_paths = [_][]const u8{ "mem.Allocator.free", "mem.Alloca
 const handle_release_paths = [_][]const u8{ "Io.File.close", "Io.File.closeMany", "Io.Dir.close", "Io.Dir.closeMany", "Io.net.Stream.close", "Io.net.Socket.close", "Io.net.Socket.closeMany", "Io.net.Server.deinit", "process.Child.kill", "process.Child.wait" };
 
 /// What a call releases, where that is all it does: what std's allocator is given to free, a
-/// handle std's own contract closes, std's own type's `deinit` (`stdDeinit`), or the receiver of
-/// a function whose body releases what it holds (`releasesHeld`), each function a choice may be.
+/// handle std's own contract closes, or std's own type's `deinit` (`stdDeinit`), each function a
+/// choice may be.
 /// Null for any other call, and one that does not resolve.
 fn releasedBy(c: *Context, call: Facts.calls.Call) Error!?Ast.Node.Index {
     const each: []const Facts.Decl = switch (call.callee) {
@@ -201,7 +200,7 @@ fn releasedBy(c: *Context, call: Facts.calls.Call) Error!?Ast.Node.Index {
     var closed = true;
     for (each) |callee| {
         if (!try amongStd(c, callee, &allocator_release_paths)) freed = false;
-        if (!try amongStd(c, callee, &handle_release_paths) and !try stdDeinit(c, callee, holder) and !try releasesHeld(c, callee, holder)) closed = false;
+        if (!try amongStd(c, callee, &handle_release_paths) and !try stdDeinit(c, callee, holder)) closed = false;
     }
     // `a.free(p)` hands over its one argument after the allocator it is called on.
     if (freed) return if (args.len == 2) args[1] else null;

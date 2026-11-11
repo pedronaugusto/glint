@@ -13,33 +13,13 @@ const Context = @import("RuleContext.zig");
 const Governed = @import("Governed.zig");
 const Escapes = @import("Escapes.zig");
 const Facts = @import("Facts.zig");
-const Proof = @import("Proof.zig");
 const Model = @import("Model.zig");
-const ParentPointer = @import("ParentPointer.zig");
 const Present = @import("Present.zig");
 const Project = @import("Project.zig");
-const Range = @import("Range.zig");
 const Contract = @import("AegisContract.zig");
 const Report = @import("Report.zig");
-const Taint = @import("Taint.zig");
 const Rule = @import("Rule.zig").Rule;
 
-/// The facts the pack's flow rules ask of the program's values (`Taint.Spec`): input a peer
-/// gives, which aegis's parse answers, and the writers that reach a peer.
-pub const peer_input: Taint.Spec = .{ .source = .{ .input = .{ .peer = true, .operator = false } }, .control = true, .answers = .{ .aegis = true } };
-/// A012's: peer input, and the sizes the program hands std (`Taint.sinkSites`), judged where
-/// they are a number.
-pub const bounded_input: Taint.Spec = .{ .source = peer_input.source, .control = peer_input.control, .answers = peer_input.answers, .sinks = .{ .size = true }, .reaches = .number };
-/// A018's writers: a value that is or holds a writer reaching a peer. A writer reaches a value
-/// only as data does (a copy, a pointer, a store), never by what a branch or a loop's passes
-/// decide: a value chosen under a condition that reads a writer holds no writer of its own.
-pub const peer_writer: Taint.Spec = .{ .source = .peer_writer, .control = false };
-/// A009's table ids: a table's own id made other than by counting its entries, reaching a
-/// position only as data does (`Range.uncountedMake`).
-pub const uncounted_ids: Taint.Spec = .{ .source = .uncounted_id, .control = false };
-/// A018's: an error's text, which aegis's public text and an error's integer answer, judged
-/// where a peer writer writes it (`Taint.sinkSites`). What an error decides is no text of it.
-pub const error_text: Taint.Spec = .{ .source = .error_text, .control = false, .answers = .{ .aegis = true, .int_from_error = true }, .sinks = .{ .peer_write = true } };
 const Ast = std.zig.Ast;
 
 /// A007: shared state outside aegis's guards. `Io.Event` is none: a signal set once, which
@@ -968,10 +948,10 @@ fn fieldsTime(c: *Context, times: []const Facts.Container, fields: []const Facts
     return out;
 }
 
-/// Whether a raw `.nanoseconds` read meets only another one, or zero (`Range.constantValue`),
+/// Whether a raw `.nanoseconds` read meets only another one, or a written `0`,
 /// in a comparison or a difference, through parentheses (`accesses.useOf`).
 /// Whether the door at `node` is called with an integer written out in the call: a value the
-/// program fixes (`Range.constantValue`) that names no declaration (`5`, `2 * 60`). The door's
+/// program writes out that names no declaration (`5`, `2 * 60`). The door's
 /// own name is then its unit (`fromSeconds(5)`); a named count (`fromSeconds(timeout_ms)`)
 /// carries its unit only in its name, and stays a site.
 fn unitWritten(c: *Context, node: Ast.Node.Index) Context.Error!bool {
@@ -982,7 +962,6 @@ fn unitWritten(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     const call = tree.fullCall(&buffer, parent) orelse return false;
     if (call.ast.fn_expr != node or call.ast.params.len != 1) return false;
     const count = call.ast.params[0];
-    if (try Range.constantValue(c, c.file, count) == null) return false;
     const first = tree.firstToken(count);
     const last = tree.lastToken(count);
     for (model.references) |reference| if (reference.token >= first and reference.token <= last) return false;
@@ -1013,7 +992,8 @@ fn sameUnit(c: *Context, counts: []const Ast.Node.Index, node: Ast.Node.Index) C
     const lhs, const rhs = tree.nodeData(parent).node_and_node;
     const other = if (lhs == at) rhs else lhs;
     if (nanoseconds(tree, counts, other)) return true;
-    return try Range.constantValue(c, c.file, other) == 0;
+    const zero = Facts.ungrouped(tree, other);
+    return tree.nodeTag(zero) == .number_literal and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(zero)), "0");
 }
 
 /// Whether a node is a raw nanosecond count: a read of std's `nanoseconds` (one of `counts`),
@@ -1044,175 +1024,65 @@ fn comparison(tree: *const Ast, node: Ast.Node.Index) bool {
     };
 }
 
-/// A013: a contract a peer's input can reach: an `assert` whose condition holds input, an
-/// `unreachable` on a branch input chooses, a `catch unreachable` or `orelse unreachable` on a
-/// call that reads input or is given it. Input must meet an error, never a panic, or undefined
-/// behaviour in a consumer's ReleaseFast build. An internal invariant no input reaches is the
-/// program's to state, as Zig's own checks are; ReleaseFast is the consumer's choice.
+/// TODO(0.8 cut): the stub A009, A010, A012 and A020 share until they become the one input-seam
+/// rule. Every reference to one of std's input sources (the reader's reads, a file's or a
+/// directory's reads, a child's output) or aegis's whole-file reads, outside tests, is a site:
+/// there are no seams yet.
+pub fn inputSources(c: *Context, rule: Rule) Context.Error!void {
+    var paths: std.ArrayList([]const u8) = .empty;
+    var sources: std.ArrayList([]const u8) = .empty;
+    for (reader_reads) |name| {
+        try paths.append(c.allocator, try std.mem.concat(c.allocator, u8, &.{ "Io.Reader.", name }));
+        try sources.append(c.allocator, "std");
+    }
+    for ([_][]const u8{ "Io.File.readStreaming", "Io.File.readPositional", "Io.File.readPositionalAll", "Io.Dir.readFile", "Io.Dir.readFileAlloc", "Io.Dir.readFileAllocOptions", "Io.Dir.readLink", "process.run" }) |path| {
+        try paths.append(c.allocator, path);
+        try sources.append(c.allocator, "std");
+    }
+    for ([_][]const u8{ "own.readFile", "own.readFileSentinel" }) |path| {
+        try paths.append(c.allocator, path);
+        try sources.append(c.allocator, "aegis");
+    }
+    const targets = try c.allocator.alloc(Governed.Target, paths.items.len);
+    const indexes = try c.allocator.alloc(usize, paths.items.len);
+    for (paths.items, sources.items, targets, indexes, 0..) |path, source, *target, *index, i| {
+        target.* = .{ .source = source, .declaration = path, .production = true };
+        index.* = i;
+    }
+    const found = try Governed.resolve(c, rule, targets, indexes);
+    var sites: std.ArrayList(Governed.Site) = .empty;
+    try Governed.sites(c, rule, found, &sites);
+    for (sites.items) |site| {
+        if (site.through_alias or c.inTest(site.token)) continue;
+        try c.at(rule, site.token, try c.allocator.print("{s}.{s}: an input source outside a declared input seam", .{ sources.items[site.index], paths.items[site.index] }));
+    }
+}
+
+/// std's `Io.Reader` functions that give bytes or numbers from what the reader reads.
+const reader_reads = [_][]const u8{ "allocRemaining", "allocRemainingAlignedSentinel", "appendExact", "appendRemaining", "appendRemainingAligned", "appendRemainingUnlimited", "buffered", "peek", "peekArray", "peekByte", "peekDelimiterExclusive", "peekDelimiterInclusive", "peekGreedy", "peekInt", "peekSentinel", "peekStruct", "peekStructPointer", "readAllocAll", "readAllocShort", "readSliceAll", "readSliceEndian", "readSliceEndianAlloc", "readSliceShort", "readVec", "readVecAll", "take", "takeArray", "takeByte", "takeByteSigned", "takeDelimiter", "takeDelimiterExclusive", "takeDelimiterInclusive", "takeEnum", "takeEnumNonexhaustive", "takeInt", "takeLeb128", "takeSentinel", "takeStruct", "takeStructPointer", "takeVarInt" };
+
+/// A013 (0.8 cut: the input condition is gone): every `std.debug.assert` call at runtime outside
+/// tests, and every `catch unreachable` / `orelse unreachable`. TODO(0.8): the written reason
+/// that answers the latter, and the package's declared assert.
 pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
-    const flow = try Taint.get(c, peer_input);
-    try asserts(c, rule, flow);
+    try asserts(c, rule);
     const tree = &c.project.at(c.file).file.tree;
-    var present: Present = try .init(c);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
-        // `unreachable`, or a `.?` (`accesses.formOf`).
-        const unwrap = Facts.accesses.formOf(tag) == .unwrap_optional;
-        if (tag != .unreachable_literal and !unwrap) continue;
+        if (tag != .@"catch" and tag != .@"orelse") continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const token = if (unwrap) tree.nodeData(node).node_and_token[1] else tree.nodeMainToken(node);
+        const answer = Facts.ungrouped(tree, tree.nodeData(node).node_and_node[1]);
+        if (tree.nodeTag(answer) != .unreachable_literal) continue;
+        const token = tree.nodeMainToken(answer);
         if (c.inTest(token) or !try atRuntime(c, node)) continue;
-        // A `.?` of a value known not to be null never reaches its `unreachable`.
-        if (unwrap and (try present.unwrapped(node) or try Proof.present(c, c.file, node))) continue;
-        // A prong no path takes never runs what it holds (`else => unreachable` past what
-        // the subject can be), nor does a `catch` whose call never fails there.
-        if (try neverRuns(c, node)) continue;
-        // `x.?` is `x orelse unreachable`: what makes `x` null chooses it too.
-        const chosen = try chosenBy(c, flow, node);
-        switch (if (unwrap) chosen.join(try failedBy(c, flow, Facts.accesses.carriedFrom(tree, node).?)) else chosen) { // unreachable: a `.?` carries its operand
-            .clean => {},
-            .unknown => try c.undecided(rule, tree.tokenStart(token), .unresolved, "a branch that passed through a call that does not resolve may be input's to choose"),
-            .data, .number => try c.at(rule, token, "unreachable on a path input chooses: a peer reaches a panic, or undefined behaviour in a consumer's ReleaseFast build; return an error"),
-        }
+        try c.at(rule, token, if (tag == .@"catch") "catch unreachable: a panic, or undefined behaviour in a consumer's ReleaseFast build; return the error" else "orelse unreachable: a panic, or undefined behaviour in a consumer's ReleaseFast build; return an error");
     }
 }
 
-/// Whether `node` is in what never runs, by Proof, up to its function: the result of a switch
-/// prong no path takes, or the answer of a `catch` whose operand never fails there.
-fn neverRuns(c: *Context, node: Ast.Node.Index) Context.Error!bool {
-    const tree = &c.project.at(c.file).file.tree;
-    const model = &c.project.at(c.file).model;
-    var at = node;
-    while (model.parentOf(at)) |parent| : (at = parent) {
-        if (tree.nodeTag(parent) == .fn_decl) return false;
-        // The answer of a `catch` whose operand never fails there.
-        if (tree.nodeTag(parent) == .@"catch" and tree.nodeData(parent).node_and_node[1] == at) {
-            if (try Proof.unfailing(c, c.file, parent)) return true;
-            continue;
-        }
-        const case = tree.fullSwitchCase(parent) orelse continue;
-        if (case.ast.target_expr == at and try Proof.untaken(c, c.file, parent)) return true;
-    }
-    return false;
-}
-
-/// How far input chooses the path to `node`: what chooses it within each construct around it
-/// (`chooses`), up to its function, and each exit taken before it that passes it by
-/// (`exitedBefore`).
-fn chosenBy(c: *Context, flow: Taint.Fact, node: Ast.Node.Index) Context.Error!Taint.Level {
-    const tree = &c.project.at(c.file).file.tree;
-    const model = &c.project.at(c.file).model;
-    var out: Taint.Level = .clean;
-    var around: std.ArrayList(Ast.Node.Index) = .empty;
-    var at = node;
-    while (model.parentOf(at)) |parent| : (at = parent) {
-        if (tree.nodeTag(parent) == .fn_decl) break;
-        try around.append(c.allocator, parent);
-        out = out.join(try chooses(c, flow, parent, at));
-    }
-    return out.join(try exitedBefore(c, flow, node, around.items));
-}
-
-/// How far input chooses whether `at`, within `parent`, runs: the condition of a branch or a
-/// loop, a `for` loop's inputs (how many passes it makes), the operand of a switch whose prong
-/// it is, and a `catch` or `orelse` it is the answer of, through the call before it (what the
-/// call reads and is given).
-fn chooses(c: *Context, flow: Taint.Fact, parent: Ast.Node.Index, at: Ast.Node.Index) Context.Error!Taint.Level {
-    const tree = &c.project.at(c.file).file.tree;
-    const model = &c.project.at(c.file).model;
-    switch (tree.nodeTag(parent)) {
-        .@"catch", .@"orelse" => {
-            const lhs, const rhs = tree.nodeData(parent).node_and_node;
-            return if (rhs == at) failedBy(c, flow, lhs) else .clean;
-        },
-        else => {},
-    }
-    if (tree.fullIf(parent)) |branch| {
-        if (branch.ast.cond_expr != at) return Taint.conditionAt(c, flow, c.file, branch.ast.cond_expr);
-    } else if (tree.fullWhile(parent)) |loop| {
-        if (loop.ast.cond_expr != at) return Taint.conditionAt(c, flow, c.file, loop.ast.cond_expr);
-    } else if (tree.fullFor(parent)) |loop| {
-        if (std.mem.findScalar(Ast.Node.Index, loop.ast.inputs, at) != null) return .clean;
-        var out: Taint.Level = .clean;
-        for (loop.ast.inputs) |input| out = out.join(try Taint.levelAt(c, flow, c.file, input));
-        return out;
-    } else if (tree.fullSwitchCase(parent) != null) {
-        const choice = model.parentOf(parent) orelse return .clean;
-        const whole = tree.fullSwitch(choice) orelse return .clean;
-        return Taint.levelAt(c, flow, c.file, whole.ast.condition);
-    }
-    return .clean;
-}
-
-/// How far input chooses an exit taken before `node` that passes it by, `around` the
-/// constructs that hold `node` up to its function: a `return`, or a `break` or `continue` that
-/// lands outside it, in a statement before the one that holds `node` in a block around it
-/// (`if (b == ':') return b; unreachable;`, a loop that returns or breaks out on one), and a
-/// `break` out of a loop whose `else` holds `node`; by what chooses the exit within that
-/// statement or loop body (`chooses`, from the exit up), as `Present.holds` reads a guard
-/// before a `.?`.
-fn exitedBefore(c: *Context, flow: Taint.Fact, node: Ast.Node.Index, around: []const Ast.Node.Index) Context.Error!Taint.Level {
-    const tree = &c.project.at(c.file).file.tree;
-    const model = &c.project.at(c.file).model;
-    if (around.len == 0) return .clean;
-    const first = tree.firstToken(around[around.len - 1]);
-    const end = tree.firstToken(node);
-    var out: Taint.Level = .clean;
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .@"return" and tag != .@"break" and tag != .@"continue") continue;
-        const jump: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const token = tree.nodeMainToken(jump);
-        if (token < first or token >= end) continue;
-        var level: Taint.Level = .clean;
-        var below = jump;
-        while (model.parentOf(below)) |up| : (below = up) {
-            if (tree.nodeTag(up) == .fn_decl) break;
-            const index = std.mem.findScalar(Ast.Node.Index, around, up) orelse {
-                level = level.join(try chooses(c, flow, up, below));
-                continue;
-            };
-            // `up` holds `node` too: the exit is in the part of it before `node`'s, or holds it.
-            const toward = if (index == 0) node else around[index - 1];
-            if (toward == below) break;
-            var buffer: [2]Ast.Node.Index = undefined;
-            if (tree.blockStatements(&buffer, up) != null) {
-                if (tag == .@"return" or !landsIn(tree, model, jump, below)) out = out.join(level);
-            } else if (tag == .@"break" and Facts.accesses.breakTarget(tree, model, jump) == up) {
-                const body, const otherwise = if (tree.fullWhile(up)) |loop| .{ loop.ast.then_expr, loop.ast.else_expr } else if (tree.fullFor(up)) |loop| .{ loop.ast.then_expr, loop.ast.else_expr } else break;
-                if (below == body and otherwise.unwrap() == toward) out = out.join(level);
-            }
-            break;
-        }
-    }
-    return out;
-}
-
-/// Whether the `break` or `continue` `jump` goes to a place within `node`
-/// (`Facts.accesses.breakTarget`); one whose target is not found leaves it.
-fn landsIn(tree: *const Ast, model: *const Model, jump: Ast.Node.Index, node: Ast.Node.Index) bool {
-    const target = Facts.accesses.breakTarget(tree, model, jump) orelse return false;
-    return tree.firstToken(target) >= tree.firstToken(node) and tree.lastToken(target) <= tree.lastToken(node);
-}
-
-/// How far input can make `expression` fail: what it holds, and what each call whose result
-/// it gives (`Facts.copiedParts`: through parentheses, `try`, a branch, `orelse`) reads and is
-/// given; a value nested past what is followed may hold any.
-fn failedBy(c: *Context, flow: Taint.Fact, expression: Ast.Node.Index) Context.Error!Taint.Level {
-    var out = try Taint.levelAt(c, flow, c.file, expression);
-    const copied = try c.facts.copiedParts(c.file, expression);
-    if (copied.deep != null) out = out.join(.unknown);
-    for (copied.results) |call| {
-        const reached = (try Taint.reached(c, flow, c.file, call)) orelse continue;
-        for (reached.args) |arg| out = out.join(try Taint.levelAt(c, flow, c.file, arg));
-        if (try Taint.isRead(c, flow, c.file, call)) out = out.join(.data);
-    }
-    return out;
-}
-
-/// A013's `std.debug.assert` sites whose condition holds input, each with its fix where the
-/// file's code alone decides it: `std.debug.assert(c)`, or a call through a private alias,
-/// becomes `aegis.assert.invariant(c, "c")`, the file importing aegis for it when it does not.
-fn asserts(c: *Context, rule: Rule, flow: Taint.Fact) Context.Error!void {
-    const message = "std.debug.assert on input: a contract a peer can break, a panic or undefined behaviour in a consumer's ReleaseFast build; return an error, or aegis assert.invariant checks it in every build";
+/// A013's `std.debug.assert` calls, each with its fix where the file's code alone decides it:
+/// `std.debug.assert(c)`, or a call through a private alias, becomes
+/// `aegis.assert.invariant(c, "c")`, the file importing aegis for it when it does not.
+fn asserts(c: *Context, rule: Rule) Context.Error!void {
+    const message = "std.debug.assert: a panic, or undefined behaviour in a consumer's ReleaseFast build; aegis assert.invariant checks it in every build";
     var target: [1]Governed.Target = .{.{ .source = "std", .declaration = "debug.assert", .production = true }};
     var index: [1]usize = .{0};
     const found = try Governed.resolve(c, rule, &target, &index);
@@ -1220,101 +1090,17 @@ fn asserts(c: *Context, rule: Rule, flow: Taint.Fact) Context.Error!void {
     try Governed.sites(c, rule, found, &sites);
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
-    // Each call of it, by what its callee reaches (`Facts.calls`): by its name, through an alias
-    // or a constant pointer to it (a dependency's among them), a field or a table holding it.
-    var calls: std.ArrayList(Ast.Node.Index) = .empty;
-    for (try Facts.calls.in(c.facts, c.file)) |call| {
-        const reaches = switch (call.callee) {
-            .function => |one| try reachesAssert(c, found[0].decls, one),
-            .choice => |each| for (each) |one| {
-                if (try reachesAssert(c, found[0].decls, one)) break true;
-            } else false,
-            .any => false,
-        };
-        if (reaches) try calls.append(c.allocator, call.node);
-    }
-    // Its value taken anywhere else: every call through it is one above where the program's
-    // calls of it are all known (`Facts.programCallSites`: the program's own, judged here); where
-    // its value goes elsewhere, a call through it may be none of these.
-    var followed = true;
-    for (found[0].decls) |decl| {
-        const known = (try c.facts.programCallSites(decl)) orelse {
-            followed = false;
-            break;
-        };
-        // A call through a field or a table whose callee `Facts.calls` does not resolve.
-        for (known) |site| if (site.file == c.file and std.mem.findScalar(Ast.Node.Index, calls.items, site.call) == null) try calls.append(c.allocator, site.call);
-    }
-    // Where they are not, any call whose callee does not resolve may be one through its value:
-    // `unseen` judges each.
-    if (!followed) try unseen(c, rule, flow);
     for (sites.items) |site| {
-        if (c.inTest(site.token) or followed) continue;
+        if (site.through_alias or c.inTest(site.token)) continue;
         const parent = model.parentOf(site.node) orelse continue;
-        if (try Facts.calls.at(c.facts, c.file, parent)) |call| if (call.callee_expr == site.node) continue;
-        try c.undecided(rule, tree.tokenStart(site.token), .unresolved, "std.debug.assert taken as a value: its calls are not read");
-    }
-    for (calls.items) |node| {
-        if (c.inTest(tree.nodeMainToken(node)) or !try atRuntime(c, node)) continue;
-        const call = (try Facts.calls.at(c.facts, c.file, node)).?; // unreachable: each is a call `Facts.calls` read
-        const args = switch (call.args) {
-            .known => |each| each,
-            .unknown => {
-                try c.undecided(rule, tree.tokenStart(tree.firstToken(node)), .unresolved, "a call of std.debug.assert whose condition is not known");
-                continue;
-            },
+        const call = (try Facts.calls.at(c.facts, c.file, parent)) orelse {
+            try c.at(rule, site.token, "std.debug.assert taken as a value: each call through it is a contract a release build may not check");
+            continue;
         };
-        if (args.len != 1) continue;
-        const token = tree.firstToken(node);
-        switch (try Taint.conditionAt(c, flow, c.file, args[0])) {
-            .clean => {},
-            .unknown => try c.undecided(rule, tree.tokenStart(token), .unresolved, "a condition that passed through a call that does not resolve may hold input"),
-            .data, .number => {
-                var edits: std.ArrayList(Report.Edit) = .empty;
-                if (try invariant(c, node, &edits)) try c.fixedAt(rule, token, message, edits.items) else try c.at(rule, token, message);
-            },
-        }
-    }
-}
-
-/// Where std's assert's value goes where its calls are not all read (`Facts.programCallSites`
-/// null), each call of this file whose callee does not resolve (`.any`) may be one of it: a
-/// call through a field whose stores are not all seen (`erased_field`), a function-pointer
-/// parameter, a method of a holder that does not resolve. Undecided where its one argument may
-/// hold input; one that takes another count of arguments is no call of it, and a clean
-/// condition makes none a finding. A callee of Zig's own per-build file (`zig_own`) or of code
-/// the build leaves out (`absent`) is none of the program's values.
-fn unseen(c: *Context, rule: Rule, flow: Taint.Fact) Context.Error!void {
-    const tree = &c.project.at(c.file).file.tree;
-    for (try Facts.calls.in(c.facts, c.file)) |call| {
-        const why = switch (call.callee) {
-            .any => |why| why,
-            .function, .choice => continue,
-        };
-        if (why == .zig_own or why == .absent) continue;
-        if (c.inTest(tree.nodeMainToken(call.node)) or !try atRuntime(c, call.node)) continue;
-        const token = tree.firstToken(call.node);
-        const condition = switch (call.args) {
-            .known => |each| if (each.len == 1) each[0] else continue,
-            // A method on a holder that does not resolve may bind its receiver first or not:
-            // bound, the call takes two or more, so it is no call of std's assert, a function of
-            // one bool that no type declares as a method; not bound, the one written is its
-            // condition. A call whose arguments are not written (`@call` with a tuple read
-            // elsewhere) may be any.
-            .unknown => blk: {
-                var buffer: [1]Ast.Node.Index = undefined;
-                const written = tree.fullCall(&buffer, call.node) orelse {
-                    try c.undecided(rule, tree.tokenStart(token), .unresolved, "a call whose callee and arguments do not resolve may be std.debug.assert, whose value the program takes where its calls are not all read");
-                    continue;
-                };
-                if (written.ast.params.len != 1) continue;
-                break :blk written.ast.params[0];
-            },
-        };
-        switch (try Taint.conditionAt(c, flow, c.file, condition)) {
-            .clean => {},
-            .unknown, .data, .number => try undecidedCall(c, rule, token, why),
-        }
+        if (call.callee_expr != site.node or !try atRuntime(c, parent)) continue;
+        var edits: std.ArrayList(Report.Edit) = .empty;
+        const token = tree.firstToken(parent);
+        if (try invariant(c, parent, &edits)) try c.fixedAt(rule, token, message, edits.items) else try c.at(rule, token, message);
     }
 }
 
@@ -1459,34 +1245,11 @@ pub fn unsafeSet(c: *Context, rule: Rule) Context.Error!void {
             try c.at(rule, token, try c.allocator.print("@setRuntimeSafety off in {s} builds: bounds, overflow and union checks off where the build keeps them; only a measured hot loop validated at its boundary", .{names}));
             continue;
         }
-        // An address read out of a pointer (`@intFromPtr`) is never undefined behavior. The
-        // parent a field's pointer is taken to (`@fieldParentPtr`, std's reader and writer
-        // pattern) is that parent only where the pointer is that field's, which no build checks,
-        // and so is the alignment `@alignCast` asserts of it: a consumer may build the package
-        // ReleaseFast, where nothing checks either.
-        // Where the program shows the pointer is that field's (an interface's own field, a
-        // node of an intrusive list), the parent is shown and its alignment with it.
-        // A C handed to a generic whose body could not be read leaves it undecided; so does a
-        // judgement the fact budget ran out in.
-        const before = c.facts.remaining;
-        var verdict: ParentPointer.Verdict = if (std.mem.eql(u8, name, "@fieldParentPtr"))
-            try ParentPointer.cleared(c, node)
-        else if (std.mem.eql(u8, name, "@alignCast")) try ParentPointer.clearedAlignment(c, node) else .open;
-        if (verdict == .open and before != 0 and c.facts.budgetSpent()) verdict = .undecided;
-        switch (verdict) {
-            .shown => continue,
-            .undecided => {
-                try c.undecided(rule, tree.tokenStart(token), .unsupported, "a parent pointer whose parent is handed to a generic that is not read to its end: a copy of the field there is not ruled out");
-                continue;
-            },
-            .open => {},
-        }
+        // An address read out of a pointer (`@intFromPtr`) is never undefined behavior.
         for ([_][]const u8{ "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@ptrFromInt", "@fieldParentPtr" }) |cast| if (std.mem.eql(u8, name, cast)) {
             try c.at(rule, token, try c.allocator.print("{s}: a pointer conversion no build checks", .{name}));
         };
     }
-    // The interface contract: what may break a parent pointer an interface recovers.
-    try ParentPointer.contract(c, rule);
     const model = &c.project.at(c.file).model;
     for (model.declarations) |decl| {
         if (decl.kind != .variable and decl.kind != .function) continue;

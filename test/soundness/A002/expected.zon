@@ -1,8 +1,0 @@
-.{
-    .open = .{
-        // glint-b: the binding is judged plain (#6), but the generic's body is still read at no binding where an unresolved call may bind it (undecided, never clear); main's ruling (a body judged only at its bindings) closes it
-        "call/glintb-unresolved_receiver/twin.zig",
-    },
-    .no_hole = .{},
-    .no_twin = .{},
-}

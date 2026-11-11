@@ -29,16 +29,9 @@ test {
     _ = @import("Runner.zig");
     _ = Fix;
     _ = @import("Facts.zig");
-    _ = @import("facts_format.zig");
-    _ = @import("compiled_read.zig");
-    _ = @import("Compiled.zig");
     _ = @import("PackageRules.zig");
-    _ = @import("Summary.zig");
     _ = @import("accesses_test.zig");
     _ = @import("calls_test.zig");
-    _ = @import("releases_test.zig");
-    _ = @import("Taint.zig");
-    _ = @import("Undefined.zig");
     _ = token;
     _ = cli;
 }

@@ -12,7 +12,6 @@ const Model = @import("Model.zig");
 const Project = @import("Project.zig");
 const Contract = @import("AegisContract.zig");
 const Danger = @import("Danger.zig");
-const Taint = @import("Taint.zig");
 const Program = @import("Program.zig");
 const Rule = @import("Rule.zig").Rule;
 const Ast = std.zig.Ast;
@@ -295,7 +294,7 @@ fn heldBy(c: *Context, resources: []const ?Facts.Container, value: Facts.Value, 
             const made = k.made_by orelse break :blk .other;
             if (try c.inLibrary(Contract.library, made.function.file)) break :blk .other;
             var found: Holding = .other;
-            for (try Taint.fieldsOf(c, k)) |field| found = holdingOf(found, try heldBy(c, resources, try c.facts.memberField(k, field), depth + 1));
+            for (try fieldsOf(c, k)) |field| found = holdingOf(found, try heldBy(c, resources, try c.facts.memberField(k, field), depth + 1));
             break :blk found;
         },
         .optional, .error_union, .array => |inner| heldBy(c, resources, inner.*, depth + 1),
@@ -448,7 +447,7 @@ fn madeHolds(c: *Context, rule: Rule, resources: []const ?Facts.Container, paths
         .container, .instance => |container| {
             const made = container.made_by orelse return;
             if (try c.inLibrary(Contract.library, made.function.file)) return;
-            for (try Taint.fieldsOf(c, container)) |field| {
+            for (try fieldsOf(c, container)) |field| {
                 const declared = c.project.at(field.file).model.declarations[@backingInt(field.index)];
                 const held = try c.facts.memberField(container, field);
                 switch (try heldBy(c, resources, held, 0)) {
@@ -4888,4 +4887,14 @@ fn byPointer(value: Facts.Value) ?Facts.Container {
         found = one;
     }
     return found;
+}
+
+/// The fields `container` declares itself.
+fn fieldsOf(c: *Context, container: Facts.Container) Context.Error![]const Facts.Decl {
+    var out: std.ArrayList(Facts.Decl) = .empty;
+    for (c.project.at(container.file).model.declarations, 0..) |decl, d| {
+        if (decl.kind != .field or decl.scope != container.scope) continue;
+        try out.append(c.allocator, .{ .file = container.file, .index = @fromBackingInt(@intCast(d)) });
+    }
+    return out.items;
 }

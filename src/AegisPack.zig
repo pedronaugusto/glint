@@ -13,19 +13,13 @@ const stdCall = Governed.stdCall;
 const Is = Governed.Is;
 const isStd = Governed.isStd;
 const Shapes = @import("DangerShapes.zig");
-const Undefined = @import("Undefined.zig");
-const Flows = @import("DangerFlow.zig");
 const Program = @import("Program.zig");
 const Rule = @import("Rule.zig").Rule;
 const Report = @import("Report.zig");
 const PackageRules = @import("PackageRules.zig");
 const Ast = std.zig.Ast;
 pub const access = Ids.access;
-pub const copies = Ids.copies;
-pub const cleanup = Ids.cleanup;
 pub const scalar = Ids.scalar;
-pub const capacity = Ids.capacity;
-pub const recursion = Ids.recursion;
 // The danger rules (designs/aegis.md §7): each finds where its danger exists and aegis's type is
 // the answer, from what the code resolves to.
 pub const shared_state = Ids.shared_state;
@@ -38,8 +32,6 @@ pub const contracts = Ids.contracts;
 pub const lifetimes = Ids.lifetimes;
 pub const ownership = Ids.ownership;
 pub const identity = Ids.identity;
-pub const state_machines = Ids.state_machines;
-pub const diagnostics = Ids.diagnostics;
 pub const unsafe_set = Ids.unsafe_set;
 pub const cancellation = Ids.cancellation;
 pub const lock_order = Ids.lock_order;
@@ -50,7 +42,7 @@ pub const package = Contract.package;
 pub const Role = Contract.Kind;
 pub const library = Contract.library;
 /// The danger rules: each finds where a danger exists and aegis's type is the answer.
-pub const danger = [_]Rule{ shared_state, secrets, untrusted_input, integers, units, bounded_work, contracts, lifetimes, ownership, identity, state_machines, diagnostics, unsafe_set, cancellation, lock_order };
+pub const danger = [_]Rule{ shared_state, secrets, untrusted_input, integers, units, bounded_work, contracts, lifetimes, ownership, identity, unsafe_set, cancellation, lock_order };
 /// The first file outside aegis whose import reaches aegis (`Facts.packageRoots`): a file of
 /// aegis's package, by the identity the caller states, whatever the program names it after. A
 /// module of aegis's name that is not of aegis's package is not aegis.
@@ -68,38 +60,31 @@ pub fn importer(gpa: std.mem.Allocator, project: *const Project) Facts.ResolveEr
 
 pub const rules = [_]Context.Rule{
     .{ .definition = .{ .id = access, .name = "A001", .group = .family_policy, .purpose = "secret disclosure or shared-state access without a live capability", .version = 2, .exception = .aegis }, .check = checkAccess },
-    .{ .definition = .{ .id = copies, .name = "A002", .group = .family_policy, .purpose = "duplicated secret owner or lock capability; borrowed storage escapes", .version = 2, .exception = .aegis }, .check = checkCopies },
-    .{ .definition = .{ .id = cleanup, .name = "A003", .group = .family_policy, .purpose = "missing owner cleanup or use after cleanup/transfer on a supported local path", .version = 2, .exception = .aegis }, .check = checkCleanup },
     .{ .definition = .{ .id = scalar, .name = "A004", .group = .family_policy, .purpose = "domain/unit or all-build integer checks bypassed by raw arithmetic/casts", .version = 2, .exception = .aegis }, .check = checkScalar },
-    .{ .definition = .{ .id = capacity, .name = "A005", .group = .family_policy, .purpose = "SecretBytes adoption truncates wipe capacity or lacks proven allocation ownership", .version = 2, .exception = .aegis }, .check = checkCapacity },
-    .{ .definition = .{ .id = recursion, .name = "A006", .group = .family_policy, .purpose = "recursion reachable from untrusted input without a depth bound", .version = 1, .exception = .aegis }, .check = checkRecursion, .facts = &.{Danger.peer_input} },
     .{ .definition = .{ .id = shared_state, .name = "A007", .group = .family_policy, .purpose = "shared state outside aegis's guards", .exception = .aegis }, .check = checkSharedState },
     .{ .definition = .{ .id = secrets, .name = "A008", .group = .family_policy, .purpose = "secret material outside aegis's Secret and Choice", .exception = .aegis }, .check = checkSecrets },
-    .{ .definition = .{ .id = untrusted_input, .name = "A009", .group = .family_policy, .purpose = "input used before a parser refines it", .exception = .aegis }, .check = checkInput, .facts = &.{ Danger.peer_input, Danger.uncounted_ids } },
-    .{ .definition = .{ .id = integers, .name = "A010", .group = .family_policy, .purpose = "integer conversion or arithmetic on input that a peer can make fail", .exception = .aegis }, .check = checkIntegers, .facts = &.{Danger.peer_input} },
+    .{ .definition = .{ .id = untrusted_input, .name = "A009", .group = .family_policy, .purpose = "input used before a parser refines it", .exception = .aegis }, .check = checkInput },
+    .{ .definition = .{ .id = integers, .name = "A010", .group = .family_policy, .purpose = "integer conversion or arithmetic on input that a peer can make fail", .exception = .aegis }, .check = checkIntegers },
     .{ .definition = .{ .id = units, .name = "A011", .group = .family_policy, .purpose = "time crossing to std as a raw integer", .exception = .aegis }, .check = checkUnits },
-    .{ .definition = .{ .id = bounded_work, .name = "A012", .group = .family_policy, .purpose = "work sized by input without a stated limit", .exception = .aegis }, .check = checkBoundedWork, .facts = &.{Danger.bounded_input} },
-    .{ .definition = .{ .id = contracts, .name = "A013", .group = .family_policy, .purpose = "contract that is undefined behaviour when false in a release build", .exception = .aegis }, .check = checkContracts, .facts = &.{Danger.peer_input} },
+    .{ .definition = .{ .id = bounded_work, .name = "A012", .group = .family_policy, .purpose = "work sized by input without a stated limit", .exception = .aegis }, .check = checkBoundedWork },
+    .{ .definition = .{ .id = contracts, .name = "A013", .group = .family_policy, .purpose = "contract that is undefined behaviour when false in a release build", .exception = .aegis }, .check = checkContracts },
     .{ .definition = .{ .id = lifetimes, .name = "A014", .group = .family_policy, .purpose = "pointer that outlives what it points into", .exception = .aegis }, .check = checkLifetimes },
     .{ .definition = .{ .id = ownership, .name = "A015", .group = .family_policy, .purpose = "std resource held or returned without its one owner", .exception = .aegis }, .check = checkOwnership },
     .{ .definition = .{ .id = identity, .name = "A016", .group = .family_policy, .purpose = "identifying integers of one type that one may pass for another", .exception = .aegis }, .check = checkIdentity },
-    .{ .definition = .{ .id = state_machines, .name = "A017", .group = .family_policy, .purpose = "state machine kept by hand", .exception = .aegis }, .check = checkStateMachines },
-    .{ .definition = .{ .id = diagnostics, .name = "A018", .group = .family_policy, .purpose = "internal text written to a peer", .exception = .aegis }, .check = checkDiagnostics, .facts = &.{ Danger.peer_writer, Danger.error_text } },
     .{ .definition = .{ .id = unsafe_set, .name = "A019", .group = .family_policy, .purpose = "operation Zig leaves unchecked", .exception = .aegis }, .check = checkUnsafeSet },
-    .{ .definition = .{ .id = cancellation, .name = "A020", .group = .family_policy, .purpose = "loop on input or without bound that cannot be canceled", .exception = .aegis }, .check = checkCancellation, .facts = &.{Danger.peer_input} },
+    .{ .definition = .{ .id = cancellation, .name = "A020", .group = .family_policy, .purpose = "loop on input or without bound that cannot be canceled", .exception = .aegis }, .check = checkCancellation },
     .{ .definition = .{ .id = lock_order, .name = "A021", .group = .family_policy, .purpose = "two aegis guards held at once without both ranked by Order", .exception = .aegis }, .check = checkLockOrder },
 };
+// TODO(0.8 cut): A009, A010, A012 and A020 lost their flow engine; until they become the one
+// input-seam rule, each reports every reference to std's input sources (`Danger.inputSources`).
 fn checkInput(c: *Context) Context.Error!void {
-    if (try begin(c, untrusted_input)) try Flows.input(c, untrusted_input);
+    if (try begin(c, untrusted_input)) try Danger.inputSources(c, untrusted_input);
 }
 fn checkBoundedWork(c: *Context) Context.Error!void {
-    if (try begin(c, bounded_work)) try Flows.boundedWork(c, bounded_work);
-}
-fn checkDiagnostics(c: *Context) Context.Error!void {
-    if (try begin(c, diagnostics)) try Flows.diagnostics(c, diagnostics);
+    if (try begin(c, bounded_work)) try Danger.inputSources(c, bounded_work);
 }
 fn checkCancellation(c: *Context) Context.Error!void {
-    if (try begin(c, cancellation)) try Flows.cancellation(c, cancellation);
+    if (try begin(c, cancellation)) try Danger.inputSources(c, cancellation);
 }
 fn checkSharedState(c: *Context) Context.Error!void {
     if (try begin(c, shared_state)) try Danger.sharedState(c, shared_state);
@@ -108,8 +93,7 @@ fn checkSecrets(c: *Context) Context.Error!void {
     if (try begin(c, secrets)) try Danger.secrets(c, secrets);
 }
 fn checkIntegers(c: *Context) Context.Error!void {
-    if (!try begin(c, integers)) return;
-    try Flows.integers(c, integers);
+    if (try begin(c, integers)) try Danger.inputSources(c, integers);
 }
 fn checkUnits(c: *Context) Context.Error!void {
     if (try begin(c, units)) try Danger.units(c, units);
@@ -120,7 +104,6 @@ fn checkContracts(c: *Context) Context.Error!void {
 fn checkLifetimes(c: *Context) Context.Error!void {
     if (!try begin(c, lifetimes)) return;
     try Danger.lifetimes(c, lifetimes);
-    try Shapes.borrowsStored(c, lifetimes);
 }
 fn checkLockOrder(c: *Context) Context.Error!void {
     if (try begin(c, lock_order)) try Shapes.lockOrder(c, lock_order);
@@ -131,17 +114,9 @@ fn checkOwnership(c: *Context) Context.Error!void {
 fn checkIdentity(c: *Context) Context.Error!void {
     if (try begin(c, identity)) try Shapes.identity(c, identity);
 }
-fn checkStateMachines(c: *Context) Context.Error!void {
-    if (try begin(c, state_machines)) try Shapes.stateMachines(c, state_machines);
-}
 fn checkUnsafeSet(c: *Context) Context.Error!void {
     if (!try begin(c, unsafe_set)) return;
     try Danger.unsafeSet(c, unsafe_set);
-    try Undefined.reads(c, unsafe_set, followsCleanup);
-}
-fn checkRecursion(c: *Context) Context.Error!void {
-    if (!try begin(c, recursion)) return;
-    try @import("AegisRecursion.zig").check(c, recursion);
 }
 /// Starts a check of this file. What a `lint_rules` it declares says that glint cannot read is
 /// reported where it is written, in whatever package (`ownRules`). The library's own files are

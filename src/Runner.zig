@@ -11,7 +11,6 @@ const Context = @import("RuleContext.zig");
 const Fix = @import("Fix.zig");
 const Builtins = @import("Builtins.zig");
 const Metrics = @import("Metrics.zig");
-const Summary = @import("Summary.zig");
 const Contract = @import("AegisContract.zig");
 const AegisPack = @import("AegisPack.zig");
 
@@ -50,13 +49,6 @@ pub const Options = struct {
     /// a canceled run is `Canceled`. Null: none is asked, and a canceller
     /// waits for the whole project.
     io: ?std.Io = null,
-    /// Summaries' cross-check (`Facts.check_records`): every record a query builds is read back
-    /// and compared with the live answer, and any difference stops the run.
-    summary_check: bool = false,
-    /// std's size summaries answered by std's open-world records (`Facts.read_records`).
-    summary_records: bool = false,
-    /// The run's compiled facts (`Facts.compiled`), which must outlive the run.
-    compiled: ?*const @import("Compiled.zig") = null,
 };
 pub const FileConfig = struct { file: Project.FileId, config: rules.Config };
 
@@ -74,8 +66,6 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
         if (@backingInt(setting.file) >= project.count()) return error.InvalidHandle;
         for (options.files[0..i]) |earlier| if (setting.file == earlier.file) return error.InvalidSelection;
     }
-    // The flow facts the rules declare are solved together, a lane each.
-    if (!@import("Taint.zig").fits(options.project_rules)) return error.InvalidSelection;
     const definitions = try a.alloc(rules.Definition, options.project_rules.len);
     for (options.project_rules, 0..) |rule, i| {
         definitions[i] = rule.definition;
@@ -84,7 +74,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     }
     try validateRules(config, definitions);
     const known = try knownRules(a, definitions);
-    var runner: Runner = .{ .a = a, .project = project, .config = config, .base = config, .files = options.files, .definitions = definitions, .facts = .{ .project = project, .gpa = a, .backing = gpa, .known = Contract.package, .role_names = try roleNames(a, options.project_rules), .remaining = config.fact_budget, .check_records = if (options.summary_check) &Summary.check else null, .read_records = options.summary_records, .compiled = options.compiled } };
+    var runner: Runner = .{ .a = a, .project = project, .config = config, .base = config, .files = options.files, .definitions = definitions, .facts = .{ .project = project, .gpa = a, .backing = gpa, .known = Contract.package, .role_names = try roleNames(a, options.project_rules), .remaining = config.fact_budget } };
     defer runner.facts.deinit();
     var metrics: std.ArrayList(Report.Metrics.File) = .empty;
     var total: Report.Metrics.Counts = .{};
@@ -145,12 +135,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
         _ = scratch.reset(.free_all);
         if (file.status == .parsed) for (options.project_rules) |rule| {
             if (!runner.config.has(rule.definition.id)) continue;
-            rule.check(&context) catch |err| switch (err) {
-                // The program's solve ran short of its budget, or could not be made at this
-                // file (`Taint.get`): what the rule reads of it here is not judged.
-                error.SolveShort => try runner.addCoverage(.{ .file = runner.file, .rule = rule.definition.id, .reason = .budget_exhausted, .detail = "the program's flow facts were not solved within their budget" }),
-                else => |e| return e,
-            };
+            try rule.check(&context);
             _ = scratch.reset(.free_all);
         };
         if (file.status != .parsed) runner.complete = false;

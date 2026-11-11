@@ -105,10 +105,6 @@ edges_compiled: std.AutoHashMapUnmanaged(usize, bool) = .empty,
 /// as one; the functions and container-level constants by name; and the budget of resolutions
 /// that reading spends, its own as a fact of the whole run.
 file_parts: std.AutoHashMapUnmanaged(Project.FileId, *const FileParts) = .empty,
-/// The run's compiled facts (`Compiled`): the compiler's own analysis of each declared
-/// configuration, where facts files were given. None reads them yet; a query will ask them
-/// before its own reading, and their absence decides nothing.
-compiled: ?*const @import("Compiled.zig") = null,
 remaining: usize = 100_000,
 /// Whether this Facts is the one building the analysis (`analysis`): it reads each declaration
 /// as one a compilation may analyze, in any reading.
@@ -127,23 +123,6 @@ walk: ?*Analysis = null,
 /// The memos (`memo`) handed out while the analysis is built, made then or before: each is
 /// replaced once it is built (`dropMemos`).
 walked: std.AutoHashMapUnmanaged(usize, void) = .empty,
-/// Summaries' build mode (designs/glint-summaries.md, step 4): this Facts reads a unit (std, a
-/// dependency) for every program that may import it, never for the one it is given. A field,
-/// and a public container-level `var`, may be written by code the unit does not hold: each
-/// query of its writes also meets one site of kind `open` (`accesses.Each`).
-open_world: bool = false,
-/// std's size summaries answered by std's open-world records (`Taint.OpenUnit`), as a lint that
-/// loads them reads them: what the open world leaves undecided, measured against the live run.
-read_records: bool = false,
-/// Summaries' cross-check (`Summary.check`): set, each record a query builds is written and
-/// read back, and a record that reads back other than the live answer stops the run.
-check_records: ?*const RecordCheck = null,
-
-/// What reads a record back for the cross-check (`check_records`), one for each kind of record.
-pub const RecordCheck = struct {
-    accesses: *const fn (*Facts, Project.FileId, *const accesses.File, []const u8) ResolveError!void,
-    copies: *const fn (*Facts, *const std.AutoHashMapUnmanaged(Decl, []const ParameterCopy)) ResolveError!void,
-};
 
 pub const Key = struct { file: Project.FileId, node: Ast.Node.Index };
 /// A node read under a set of settled comptime conditions (`assumed`).
@@ -784,7 +763,6 @@ fn findCopies(self: *Facts) ResolveError!void {
         }
     }
     self.copies = found;
-    if (self.check_records) |check| try check.copies(self, &self.copies.?);
 }
 
 /// What a function may do with a generic parameter's values.
@@ -4590,12 +4568,6 @@ pub fn analysis(self: *Facts) ResolveError!*const Analysis {
     const found = try self.memo(Analysis);
     if (found.built) return found;
     found.built = true;
-    // A unit read for every program that may import it: any of its declarations may be
-    // analyzed, in any reading.
-    if (self.open_world) {
-        found.everything = true;
-        return found;
-    }
     // What the walk asks of the analysis while it is built is answered as if anything may be
     // analyzed (`building_analysis`); what is read on that answer is not kept (`wide`). Once
     // built, what a query in progress reads of it is exact.
@@ -13360,14 +13332,7 @@ pub const accesses = struct {
         pub fn next(each: *Each) Error!?Site {
             while (true) {
                 const index = each.index orelse {
-                    if (each.file == each.files.len) {
-                        if (each.opened or each.of == .reads or !each.facts.open_world or !each.opensTo()) return null;
-                        each.opened = true;
-                        const decl = switch (each.place) {
-                            inline else => |d| d,
-                        };
-                        return .{ .file = decl.file, .node = each.record().node, .kind = .open };
-                    }
+                    if (each.file == each.files.len) return null;
                     const file = each.files[each.file];
                     each.file += 1;
                     each.index = switch (each.of) {
@@ -13398,20 +13363,6 @@ pub const accesses = struct {
                 }
                 each.index = null;
             }
-        }
-
-        /// Whether a program the unit is read for may write the place (`Facts.open_world`): any
-        /// field, of any value it is handed, and a public container-level `var`.
-        fn opensTo(each: *const Each) bool {
-            const decl = switch (each.place) {
-                .field => return true,
-                .declaration => |d| d,
-            };
-            const declared = each.record();
-            if (!declared.public or !global(each.facts, decl)) return false;
-            const tree = &each.facts.project.at(decl.file).file.tree;
-            const variable = tree.fullVarDecl(declared.node) orelse return false;
-            return tree.tokenTag(variable.ast.mut_token) == .keyword_var;
         }
 
         fn record(each: *const Each) Model.Declaration {
@@ -13711,7 +13662,6 @@ pub const accesses = struct {
         try state.writes.put(facts.gpa, file, index);
         _ = state.walked.remove(file);
         try walk.settle();
-        if (facts.check_records) |check| try check.accesses(facts, file, index, "writes");
         return index;
     }
 
@@ -13743,7 +13693,6 @@ pub const accesses = struct {
         var walk: Walk = .{ .facts = facts, .file = file, .index = index };
         try walk.reads();
         try state.reads.put(facts.gpa, file, index);
-        if (facts.check_records) |check| try check.accesses(facts, file, index, "reads");
         return index;
     }
 

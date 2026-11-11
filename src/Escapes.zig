@@ -1,4 +1,6 @@
-//! E001: a pointer into a function's own frame that outlives the call.
+//! A014 (0.8 cut): a pointer into a function's own frame that a `return` carries out. Stores of
+//! one (through a parameter, into a container's variable) are no longer read: `scope` and
+//! `handle` carry those. TODO(0.8): narrow to the certain `return &local` shape.
 //!
 //! A `var` declared in a function's body lives in the call's frame, which the return frees.
 //! Its address (`&x`, `&x.field`, `&x[i]`), or a slice of it when it is an array (`x[a..b]`),
@@ -34,10 +36,6 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         if (tag != .@"return") continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         try found.append(c.allocator, .{ .node = node, .operand = tree.nodeData(node).opt_node.unwrap() orelse continue, .stored = null });
-    }
-    for (try Facts.accesses.storesIn(c.facts, c.file)) |site| {
-        if (site.kind != .set) continue;
-        try found.append(c.allocator, .{ .node = site.node, .operand = site.value orelse continue, .stored = site.target });
     }
     for (found.items) |each| {
         const node = each.node;

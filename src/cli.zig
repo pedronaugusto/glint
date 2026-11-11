@@ -6,18 +6,12 @@ const AegisPack = @import("AegisPack.zig");
 const Report = @import("Report.zig");
 const RuleContext = @import("RuleContext.zig");
 const Runner = @import("Runner.zig");
-const Compiled = @import("Compiled.zig");
 const Fix = @import("Fix.zig");
 const Result = @import("Result.zig");
 const aegis = @import("aegis");
 const ensign = @import("ensign");
 const release = @import("release");
 
-/// The most a compiled-facts file may hold. A budget from its measured size comes with the
-/// exporter (designs/glint-compiled-facts.md (q)).
-const compiled_facts_limit = 1024 * 1024 * 1024;
-/// The most compiled-facts files one run reads: one per declared configuration.
-const compiled_facts_files = 64;
 
 const Module = struct { name: []const u8, path: []const u8 };
 const Options = struct {
@@ -33,12 +27,6 @@ const Options = struct {
     fix: bool = false,
     /// The escapes of a run before, by which the fix names an escape in the older form.
     escapes_before: []const Fix.Escaped = &.{},
-    /// Summaries' cross-check (`Runner.Options.summary_check`).
-    summary_check: bool = false,
-    /// std's size summaries read from its open-world records (`Runner.Options.summary_records`).
-    summary_records: bool = false,
-    /// The compiled-facts files of the run (`Compiled`), by path.
-    compiled_facts: []const []const u8 = &.{},
     /// Whether the aegis pack runs: on by itself where a file imports aegis, on whatever the
     /// files import (`--aegis`, the `aegis` profile), or as `--only` selects its rules.
     aegis: enum { imported, forced, selected } = .imported,
@@ -254,9 +242,6 @@ pub const Arguments = struct {
     metrics: bool = false,
     fix: bool = false,
     escapes_before: ?[]const u8 = null,
-    summary_check: bool = false,
-    summary_records: bool = false,
-    compiled_facts: []const []const u8 = &.{},
     zig_lib_path: ?[]const u8 = null,
     module: []const []const u8 = &.{},
     root: []const []const u8 = &.{},
@@ -284,9 +269,6 @@ pub const Arguments = struct {
             .strict_suppressions = .{ .negatable = false, .help = "A suppression that suppresses nothing makes the run incomplete" },
             .metrics = .{ .negatable = false, .help = "Count each file's functions and assertion calls into the report" },
             .fix = .{ .negatable = false, .help = "Apply each finding's deterministic fix to its file (the aegis pack's), and remove escapes that cover nothing; the report is the run before them" },
-            .summary_check = .{ .negatable = false, .help = "Check that every record of the run's facts reads back as it was built (summaries' cross-check); a difference stops the run" },
-            .summary_records = .{ .negatable = false, .help = "Read std's size summaries from std's open-world records, as a lint loading them would (summaries' measure of what the open world leaves undecided)" },
-            .compiled_facts = .{ .value_name = "FILE", .hint = .file, .help = "A compiled-facts file of one configuration of the package (the exporter's), repeated; read whole or refused whole, and read by no rule yet" },
             .escapes_before = .{ .value_name = "FILE", .hint = .file, .help = "The escapes a run before reported (its text report, or preflight's escapes.txt): --fix names an escape in the older form, at that place with those words, with only the rules listed for it there that find something now, and leaves one not listed to its owner; never with --only" },
             .zig_lib_path = .{ .value_name = "DIR", .hint = .directory, .section = "Inputs", .help = "Zig's library, for std's imports" },
             .module = .{ .value_name = "NAME=FILE", .section = "Inputs", .help = "A module the files import by name, and its root file, repeated" },
@@ -329,9 +311,6 @@ fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, definitions: 
     if (arguments.max_line_length) |n| result.config.max_line_length = n;
     if (arguments.max_function_lines) |n| result.config.max_function_lines = n;
     if (arguments.fact_budget) |n| result.config.fact_budget = n;
-    result.summary_check = arguments.summary_check;
-    result.summary_records = arguments.summary_records;
-    result.compiled_facts = arguments.compiled_facts;
     if (arguments.strict_suppressions) result.config.strict_suppressions = true;
     if (arguments.metrics) result.config.metrics = true;
     result.fix = arguments.fix;
@@ -468,21 +447,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     var config = configured.config;
     const importer = if (configured.aegis == .imported) try AegisPack.importer(gpa, &project) else null;
     if (importer != null) try packOn(a, &config, definitions);
-    // Each facts file is read whole, as untrusted input, and kept or refused whole (`Compiled`).
-    if (configured.compiled_facts.len > compiled_facts_files) return error.FileBudgetExceeded;
-    const given = try a.alloc(Compiled.Given, configured.compiled_facts.len);
-    for (given, configured.compiled_facts) |*each, path| each.* = .{ .path = path, .bytes = try aegis.own.readFile(io, std.Io.Dir.cwd(), path, a, .fromRaw(compiled_facts_limit)) };
-    // A file's records are charged at most one per four bytes of its limit, its smallest record.
-    const compiled = try Compiled.init(a, &project, given, .{ .records = compiled_facts_limit / 4 });
-    // A refused file holds nothing and the run goes on without it; why is said beside the report.
-    for (compiled.files) |each| switch (each.read) {
-        .kept => {},
-        .refused => |why| {
-            const said = Compiled.words(why);
-            try problems.writeAll(try std.mem.concat(a, u8, &.{ "glint: compiled facts: ", each.path, ": ", said.lead, said.name, said.tail, "\n" }));
-        },
-    };
-    var report = try Runner.runConfigured(gpa, &project, config, .{ .project_rules = project_rules, .io = io, .summary_check = configured.summary_check, .summary_records = configured.summary_records, .compiled = if (given.len == 0) null else &compiled });
+    var report = try Runner.runConfigured(gpa, &project, config, .{ .project_rules = project_rules, .io = io });
     defer report.deinit();
     record.outcome = .output_failure;
     var rendered: std.Io.Writer.Allocating = .init(a);
