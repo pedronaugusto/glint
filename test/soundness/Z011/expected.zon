@@ -1,11 +1,12 @@
 .{
+    .no_hole = .{
+        // The callee does not resolve; a miss is allowed: a function stored by @atomicStore
+        // and called through @atomicLoad.
+        .memory,
+    },
     .na = .{
         // No operator yields a function: arithmetic, bit and comparison operators take
         // numbers, bools and many-item pointers, never a callable.
         .operator,
-    },
-    .open = .{
-        // matrix Z011 precision: a callee loaded by an atomic is undecided whatever it calls
-        "memory/mx-z11-atomic_store/twin.zig",
     },
 }
