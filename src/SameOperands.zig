@@ -63,7 +63,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
     }
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: same operands: each form reported, a float compared with itself and an operand that runs code not" {
     try breadth.expectFindings(check, "pub fn f(a: u32, b: bool) bool { return a == a or (b and b); }", 2);

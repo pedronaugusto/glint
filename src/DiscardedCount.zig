@@ -49,7 +49,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
     }
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: discarded count: a partial read or write's count dropped, reported; the All forms and a kept count not" {
     try breadth.expectFindings(check, "const std = @import(\"std\"); pub fn f(b: []u8) !void { _ = try std.posix.read(0, b); }", 1);

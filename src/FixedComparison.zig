@@ -58,7 +58,7 @@ fn unsigned(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!b
     };
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: fixed comparison: an unsigned value against 0 reported both ways and either side; signed, other fields, other bounds not" {
     try breadth.expectFindings(check, "pub fn f(x: u32) bool { return x < 0; }", 1);

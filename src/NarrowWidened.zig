@@ -89,7 +89,7 @@ fn joined(a: ?Width, b: ?Width) ?Width {
     };
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: narrow widened: a product and a shift widened after, reported; widened first or as wide, not" {
     try breadth.expectFindings(check, "pub fn f(a: u32, b: u32) u64 { return @as(u64, a * b); }", 1);

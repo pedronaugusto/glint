@@ -18,7 +18,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
     }
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: undefined reason: each undefined outside tests reported" {
     try breadth.expectFindings(check, "pub fn f() u8 { var b: [4]u8 = undefined; b[0] = 1; return b[0]; }", 1);

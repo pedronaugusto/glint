@@ -29,7 +29,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
     }
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: unwrap trap: .? and orelse unreachable reported; another orelse and test code not" {
     try breadth.expectFindings(check, "pub fn f(o: ?u8) u8 { return o.? + (o orelse unreachable); }", 2);

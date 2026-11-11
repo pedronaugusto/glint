@@ -29,7 +29,7 @@ fn body(c: *Context, rule: Rule, tree: *const Ast, node: Ast.Node.Index, message
     try c.at(rule, open, message);
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: empty branch: an empty if or else body reported; one with a comment, a loop, a prong not" {
     try breadth.expectFindings(check, "pub fn f(a: bool) void { if (a) {} }", 1);

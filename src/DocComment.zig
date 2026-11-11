@@ -93,7 +93,7 @@ fn publicPath(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool 
     return true;
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: doc comment: a public declaration on the surface without one reported; documented, private, nested in a private type not" {
     try breadth.expectFindings(check, "pub fn f() void {}\npub const x: u32 = 1;", 2);

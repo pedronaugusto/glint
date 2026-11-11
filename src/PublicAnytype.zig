@@ -40,7 +40,7 @@ fn publicPath(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool 
     return true;
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: public anytype: a public function's anytype parameter reported; a private one's, a typed one not" {
     try breadth.expectFindings(check, "pub fn f(a: anytype, b: u8) void { _ = a; _ = b; }", 1);

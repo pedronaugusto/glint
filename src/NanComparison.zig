@@ -29,7 +29,7 @@ fn isNan(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!bool
     return try Governed.stdCall(c, at, "math.nan") == .yes;
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: nan comparison: a comparison with std.math.nan reported; isNan and another call not" {
     try breadth.expectFindings(check, "const std = @import(\"std\"); pub fn f(x: f64) bool { return x == std.math.nan(f64) or std.math.nan(f64) != x; }", 2);

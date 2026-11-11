@@ -44,7 +44,7 @@ fn neverError(tree: *const Ast, node: Ast.Node.Index) bool {
     }
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: dead errdefer: in a void, an integer or an optional function reported; an error union's not" {
     try breadth.expectFindings(check, "fn g() void {} pub fn f() void { errdefer g(); }", 1);

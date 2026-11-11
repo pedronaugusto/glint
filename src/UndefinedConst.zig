@@ -39,7 +39,7 @@ fn readAsValue(tree: *const Ast, model: *const Model, decl: Model.Declaration.Id
     return false;
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: undefined const: a constant read as a value reported; one read only in @TypeOf, or a var, not" {
     try breadth.expectFindings(check, "pub fn f() u32 { const x: u32 = undefined; return x; }", 1);

@@ -48,7 +48,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
     }
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: build option: a hard-coded optimize or target beside the standard option reported; the option passed, or no standard option, not" {
     const head = "const std = @import(\"std\");\npub fn build(b: *std.Build) void {\n    const optimize = b.standardOptimizeOption(.{});\n    const target = b.standardTargetOptions(.{});\n";

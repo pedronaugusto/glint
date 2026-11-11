@@ -65,7 +65,7 @@ fn flow(tree: *const Ast, node: Ast.Node.Index) bool {
     return tree.fullIf(node) != null or tree.fullWhile(node) != null or tree.fullFor(node) != null or tree.fullSwitch(node) != null;
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: function shape: too many parameters, too deep a nesting reported; an else-if chain one level" {
     try breadth.expectFindings(check, "pub fn f(a: u8, b: u8, c: u8, d: u8, e: u8, f2: u8, g: u8, h: u8) void { _ = .{ a, b, c, d, e, f2, g, h }; }", 1);

@@ -43,7 +43,7 @@ fn literal(tree: *const Ast, node: Ast.Node.Index) bool {
     };
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: expectEqual order: a literal second reported; literal first, two literals, two values not" {
     try breadth.expectFindings(check, "const std = @import(\"std\"); test { const a: u32 = 1; try std.testing.expectEqual(a, 1); try std.testing.expectEqual(a, .x); }", 2);

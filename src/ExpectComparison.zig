@@ -70,7 +70,7 @@ fn literal(tree: *const Ast, node: Ast.Node.Index) bool {
     };
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: expect comparison: the fix writes expectEqual with the literal first, only with one literal side" {
     try breadth.expectFixes(check, "const std = @import(\"std\"); test { const a: u32 = 1; try std.testing.expect(a == 1); }", 1, &.{ "expectEqual", "1, a" });

@@ -88,7 +88,7 @@ fn inRuntimeFunction(tree: *const Ast, model: *const @import("Model.zig"), node:
     return false;
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: large stack array: a local var over the limit reported; a const, a small one, a container's, a type function's not" {
     try breadth.expectFindings(check, "pub fn f() u8 { var buf: [1 << 20]u8 = undefined; buf[0] = 1; return buf[0]; }", 1);

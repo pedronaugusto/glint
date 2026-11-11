@@ -27,7 +27,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
     }
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: constant condition: if (true), if (false), while (false) reported; while (true) and a name not" {
     try breadth.expectFindings(check, "pub fn f() u8 { if (true) return 1; if ((false)) return 2; while (false) {} return 0; }", 3);

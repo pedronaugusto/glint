@@ -87,7 +87,7 @@ fn exact(text: []const u8, bits: u8) ?bool {
     return 128 - @clz(value) <= bits;
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: inexact float: 0.1 and 1e-3 against a float reported; 0.5, 0, 1e3, an integer type not" {
     try breadth.expectFindings(check, "pub fn f(x: f64) bool { return x == 0.1 or 1e-3 != x; }", 2);

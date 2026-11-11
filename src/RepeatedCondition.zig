@@ -59,7 +59,7 @@ fn empty(tree: *const Ast, body: Ast.Node.Index) bool {
     return statements.len == 0;
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: repeated condition: a chain's repeat reported, distinct conditions and a call not" {
     try breadth.expectFindings(check, "pub fn f(a: u32) u32 { if (a == 1) return 1 else if (a == 2) return 2 else if (a == 1) return 3; return 0; }", 1);

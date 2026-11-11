@@ -64,7 +64,7 @@ fn callable(tree: *const Ast, node: Ast.Node.Index) bool {
     return false;
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: field naming: a camel field, a snake type field and an upper tag reported; the guide's forms, extern and quoted not" {
     try breadth.expectFindings(check, "pub const S = struct { someField: u32 };", 1);

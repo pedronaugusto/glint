@@ -31,7 +31,7 @@ test {
     _ = @import("Facts.zig");
     _ = @import("PackageRules.zig");
     _ = @import("fuzz_test.zig");
-    _ = @import("breadth.zig");
+    _ = @import("breadth_test.zig");
     _ = @import("accesses_test.zig");
     _ = @import("calls_test.zig");
     _ = token;

@@ -43,7 +43,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
     }
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: narrow counter: a u8 counter to a u16 or usize bound reported; as wide, or another step, not" {
     try breadth.expectFindings(check, "pub fn f(n: u16) void { var i: u8 = 0; while (i < n) : (i += 1) {} }", 1);

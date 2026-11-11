@@ -67,7 +67,7 @@ fn stops(tree: *const Ast, statement: Ast.Node.Index) bool {
     return false;
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: self recursion: a call of itself first reported; one after a branch, a call or a try not" {
     try breadth.expectFindings(check, "pub fn f(n: u32) u32 { return f(n + 1); }", 1);

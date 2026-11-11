@@ -34,7 +34,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
     }
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: leftover debugging: a breakpoint and an unfinished panic reported; a real panic message not" {
     try breadth.expectFindings(check, "pub fn f() void { @breakpoint(); }", 1);

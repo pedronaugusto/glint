@@ -50,7 +50,7 @@ fn continues(tree: *const Ast, model: *const @import("Model.zig"), loop: Ast.Nod
     return false;
 }
 
-const breadth = @import("breadth.zig");
+const breadth = @import("breadth_test.zig");
 
 test "breadth: never loops: a body ending in break or return reported; a continue to it, an inner loop's, a conditional exit not" {
     try breadth.expectFindings(check, "pub fn f(s: []const u8) u8 { for (s) |b| { return b; } return 0; }", 1);
