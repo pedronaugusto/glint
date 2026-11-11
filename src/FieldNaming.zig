@@ -1,10 +1,10 @@
 //! Hygiene, opt-in: a container field or an enum tag not named as Zig's style guide names it (the
-//! langref's "Names": a type is TitleCase, a callable camelCase, everything else snake_case). A
-//! field whose written type is `type` is TitleCase; one whose written type is a function or a
-//! pointer to one, camelCase; any other field or tag, snake_case. A name written `@"..."`, a
-//! non-exhaustive enum's `_`, and a field of an `extern` or `packed` container (laid out by a
-//! foreign contract, which names it) are not read. Error names are not read: the guide states no
-//! case for them.
+//! langref's "Names": a callable is camelCase, everything else snake_case). A field whose written
+//! type is a function or a pointer to one is camelCase (a one-word name is both); any other field
+//! or tag, snake_case. Not read: a tuple's fields (no names), a field of type `type` (the guide
+//! makes it TitleCase, std's own are snake_case), a name written `@"..."`, a non-exhaustive enum's
+//! `_`, a field of an `extern` or `packed` container (laid out by a foreign contract, which names
+//! it), and error names (the guide states no case for them).
 const std = @import("std");
 const Ast = std.zig.Ast;
 const Context = @import("RuleContext.zig");
@@ -23,24 +23,27 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         };
         for (container.ast.members) |member| {
             const field = tree.fullContainerField(member) orelse continue;
+            // A tuple's fields have no names: its main token is the field's type.
+            if (field.ast.tuple_like) continue;
             const token = field.ast.main_token;
             if (tree.tokenTag(token) != .identifier) continue;
             const name = tree.tokenSlice(token);
             if (name[0] == '@' or std.mem.eql(u8, name, "_")) continue;
-            const wanted: enum { title, camel, snake } = if (field.ast.type_expr.unwrap()) |written| kind: {
-                if (isType(tree, written)) break :kind .title;
-                if (callable(tree, written)) break :kind .camel;
+            const wanted: enum { callable, snake } = if (field.ast.type_expr.unwrap()) |written| kind: {
+                // The guide makes a type TitleCase, but std's own type fields are snake_case
+                // (`std.builtin.Type.Pointer.child`): a field of type `type` is not read.
+                if (isType(tree, written)) continue;
+                if (callable(tree, written)) break :kind .callable;
                 break :kind .snake;
             } else .snake;
+            // A function a field holds is camelCase by the guide; a one-word name is both.
             const ok = switch (wanted) {
-                .title => names.isPascalCase(name),
-                .camel => names.isValidFunctionName(name),
+                .callable => names.isValidFunctionName(name) or names.isSnakeCase(name),
                 .snake => names.isSnakeCase(name),
             };
             if (ok) continue;
             try c.at(rule, token, try c.allocator.print("field '{s}' should be {s}", .{ name, switch (wanted) {
-                .title => "TitleCase: its type is `type`",
-                .camel => "camelCase: it holds a function",
+                .callable => "camelCase: it holds a function",
                 .snake => "snake_case",
             } }));
         }
@@ -64,8 +67,9 @@ const breadth = @import("breadth.zig");
 
 test "breadth: field naming: a camel field, a snake type field and an upper tag reported; the guide's forms, extern and quoted not" {
     try breadth.expectFindings(check, "pub const S = struct { someField: u32 };", 1);
-    try breadth.expectFindings(check, "pub const S = struct { some_field: u32, Kind: type, drawFrame: *const fn () void };", 0);
-    try breadth.expectFindings(check, "pub const S = struct { kind: type, draw_frame: *const fn () void };", 2);
+    try breadth.expectFindings(check, "pub const S = struct { some_field: u32, Kind: type, kind: type, drawFrame: *const fn () void, draw_frame: *const fn () void };", 0);
+    try breadth.expectFindings(check, "pub const S = struct { DrawFrame: *const fn () void };", 1);
+    try breadth.expectFindings(check, "pub const T = struct { []const u8, Kind: u8 };", 0);
     try breadth.expectFindings(check, "pub const E = enum { ok, Bad, _ };", 1);
     try breadth.expectFindings(check, "pub const C = extern struct { someField: u32 };", 0);
     try breadth.expectFindings(check, "pub const S = struct { @\"Quoted\": u32 };", 0);
