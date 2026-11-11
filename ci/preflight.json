@@ -36,10 +36,12 @@
     }
   },
   "fuzz": {
-    "trusted": {
-      "parse": "a rule's name, from the configuration the repository writes for itself, looked up in a table",
-      "parseConfigured": "a rule's name, from the configuration the repository writes for itself, looked up in its tables"
-    }
+    "parsers": [
+      "configure",
+      "parseConfigured",
+      "initWithLowering",
+      "settleRules"
+    ]
   },
   "sources": [
     "src"

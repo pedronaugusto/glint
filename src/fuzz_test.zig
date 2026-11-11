@@ -19,7 +19,7 @@ test "fuzz: suppression and escape comments" {
             var buffer: [2048]u8 = undefined;
             const bytes = buffer[0..smith.slice(&buffer)];
             const gpa = std.testing.allocator;
-            var file = File.init(gpa, bytes, .{}) catch |err| switch (err) {
+            var file = File.initWithLowering(gpa, bytes, .{}, true, .zig) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 // A file past the limits is refused before any comment is read.
                 error.SourceTooLarge, error.SourceTooComplex => return,
