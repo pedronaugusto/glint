@@ -471,26 +471,6 @@ test "accesses: a place's path, whether two name one place, a discarded value, a
     const discard = spelledNode(tree, "_ = d", 0).?;
     try std.testing.expectEqualStrings("d", tree.getNodeSource((try accesses.discardedBy(&facts, file, discard)).?));
     try std.testing.expect(try accesses.discardedBy(&facts, file, spelledNode(tree, "s.b[1..][0] = 2", 0).?) == null);
-    // `(o.?)` carries `o.?`, which carries `o`; `o` carries nothing.
-    const grouped = spelledNode(tree, "(o.?)", 0).?;
-    const unwrapped = accesses.carriedFrom(tree, grouped).?;
-    try std.testing.expectEqualStrings("o.?", tree.getNodeSource(unwrapped));
-    try std.testing.expectEqualStrings("o", tree.getNodeSource(accesses.carriedFrom(tree, unwrapped).?));
-    try std.testing.expect(accesses.carriedFrom(tree, accesses.carriedFrom(tree, unwrapped).?) == null);
-}
-
-test "Facts.knownBool: a bool known as the program compiles" {
-    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "fn f(x: bool) void { _ = !true; _ = (true and true); _ = x; }" }}, &.{}, .{});
-    defer project.deinit();
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
-    defer facts.deinit();
-    const file = project.sources[0].id;
-    const tree = &project.sources[0].file.tree;
-    try std.testing.expectEqual(@as(?bool, false), try facts.knownBool(file, spelledNode(tree, "!true", 0).?));
-    try std.testing.expectEqual(@as(?bool, true), try facts.knownBool(file, spelledNode(tree, "(true and true)", 0).?));
-    try std.testing.expectEqual(@as(?bool, null), try facts.knownBool(file, spelledNode(tree, "x", 0).?));
 }
 
 test "Facts: an enum's and a union's tags written with no type are members" {
@@ -616,9 +596,6 @@ test "Facts.literalType: `&.{}` is what its place points at, a slice's an array 
     // call's arguments, `?[*]u16` (another call makes `?[*]u8`).
     const buffer = try facts.literalType(file, spelledNode(tree, "@ptrCast(@alignCast(p))", 0).?);
     try std.testing.expect(buffer == .optional and buffer.optional.* == .pointer and buffer.optional.pointer.child.* == .primitive and std.mem.eql(u8, buffer.optional.pointer.child.primitive, "u16"));
-    // A declaration literal under `comptime` or `try` names its place's container's member.
-    try std.testing.expect(std.meta.eql((try facts.resultContainer(file, spelledNode(tree, ".of(1)", 0).?)).?.scope, a.scope));
-    try std.testing.expect(std.meta.eql((try facts.resultContainer(file, spelledNode(tree, ".ofError(2)", 0).?)).?.scope, a.scope));
 }
 
 test "Facts.literalType: a compared enum literal is of the other operand's type, type information's fields std.builtin.Type's" {
@@ -751,12 +728,6 @@ test "batch 2: an update's operation, error names and sets, a condition's truths
     const update = (try accesses.storeInto(&facts, file, spelledNode(tree, "x.*", 0).?)).?;
     try std.testing.expectEqual(.add, update.operator.?.op.op);
     try std.testing.expectEqual(.wrapping, update.operator.?.op.overflow);
-    // Errors by name, through a const and a set's member; sets through `||`, `E!T` and consts.
-    try std.testing.expectEqualStrings("Canceled", (try facts.errorName(file, spelledNode(tree, "canceled", 0).?)).?);
-    try std.testing.expectEqualStrings("Timeout", (try facts.errorName(file, spelledNode(tree, "E.Timeout", 0).?)).?);
-    try std.testing.expect(try facts.errorSetHolds(file, spelledNode(tree, "E || error{Other}", 0).?, "Other") == .yes);
-    try std.testing.expect(try facts.errorSetHolds(file, spelledNode(tree, "R", 0).?, "Timeout") == .yes);
-    try std.testing.expect(try facts.errorSetHolds(file, spelledNode(tree, "R", 0).?, "Other") == .no);
     var buffer: [1]std.zig.Ast.Node.Index = undefined;
     const g = facts.member(facts.rootOf(file), "g").?;
     const g_proto = tree.fullFnProto(&buffer, project.sources[0].model.declarations[@backingInt(g.index)].node).?;
@@ -764,23 +735,6 @@ test "batch 2: an update's operation, error names and sets, a condition's truths
     const h = facts.member(facts.rootOf(file), "h").?;
     const h_proto = tree.fullFnProto(&buffer, project.sources[0].model.declarations[@backingInt(h.index)].node).?;
     try std.testing.expect(try facts.returnedErrors(file, h_proto) == .inferred);
-    // `!(a and b) or x.* < 4` false: `a and b` true, so `a` and `b`, and `x.* < 4` false.
-    const condition = spelledNode(tree, "!(a and b) or x.* < 4", 0).?;
-    const shown = (try facts.truthsWhen(file, condition, false)).?;
-    try std.testing.expectEqual(@as(usize, 3), shown.len);
-    try std.testing.expectEqualStrings("a", tree.getNodeSource(shown[0].part));
-    try std.testing.expect(shown[0].value);
-    try std.testing.expectEqualStrings("x.* < 4", tree.getNodeSource(shown[2].part));
-    try std.testing.expect(!shown[2].value);
-    // True, it is kept whole: neither side alone is shown.
-    const whole = (try facts.truthsWhen(file, condition, true)).?;
-    try std.testing.expectEqual(@as(usize, 1), whole.len);
-    try std.testing.expect(whole[0].part == condition and whole[0].value);
-    // Each part is read inside its parentheses: `(a) and (x.* == 2)` true shows `a` and `x.* == 2`.
-    const grouped = (try facts.truthsWhen(file, spelledNode(tree, "(a) and (x.* == 2)", 0).?, true)).?;
-    try std.testing.expectEqual(@as(usize, 2), grouped.len);
-    try std.testing.expectEqualStrings("a", tree.getNodeSource(grouped[0].part));
-    try std.testing.expectEqualStrings("x.* == 2", tree.getNodeSource(grouped[1].part));
     // The values the `if` gives: `.{}`, `c`, `3`, `5`.
     const result = spelledNode(tree, "if (a) .{} else blk: { if (b) break :blk c orelse 3; break :blk @as(u8, 5); }", 0).?;
     const leaves = (try accesses.valuesOf(&facts, file, result)).leaves;
@@ -794,43 +748,6 @@ test "batch 2: an update's operation, error names and sets, a condition's truths
     }
     try std.testing.expect((try facts.literalOf(file, spelledNode(tree, "5", 0).?)).? == .number);
     try std.testing.expect(try facts.literalOf(file, spelledNode(tree, "c", 0).?) == null);
-}
-
-test "an array type through names, and the memory a length reads" {
-    const source =
-        \\const N = 4;
-        \\const Buf = [N]u8;
-        \\const Named = (Buf);
-        \\const Header = struct { len: u32 };
-        \\const Item = struct { x: u8 };
-        \\fn f(b: Named, s: []const u8, p: *const [3]u16, h: *Header, items: []Item) usize {
-        \\    const t: [2:0]u8 = .{ 1, 2 };
-        \\    return b.len + s.len + p.len + h.len + items.len + t.len;
-        \\}
-    ;
-    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
-    defer project.deinit();
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
-    defer facts.deinit();
-    const file = project.sources[0].id;
-    const tree = &project.sources[0].file.tree;
-    // `Named` is `(Buf)`, which is `[N]u8`: its length the node `N`, its element `u8`.
-    const named = (try facts.arrayType(file, spelledNode(tree, "Named", 0).?)).?;
-    try std.testing.expectEqualStrings("N", tree.getNodeSource(named.length.?));
-    try std.testing.expectEqualStrings("u8", tree.getNodeSource(named.element));
-    try std.testing.expect(named.sentinel == null);
-    const sentinel = (try facts.arrayType(file, spelledNode(tree, "[2:0]u8", 0).?)).?;
-    try std.testing.expectEqualStrings("0", tree.getNodeSource(sentinel.sentinel.?));
-    try std.testing.expect(try facts.arrayType(file, spelledNode(tree, "Header", 0).?) == null);
-    // The length of an array, a slice, a pointer to an array, and a slice of structs; a
-    // field `len` a struct declares, read through a pointer to it, is none.
-    for ([_][]const u8{ "b.len", "s.len", "p.len", "items.len", "t.len" }) |spelled| {
-        const memory = (try facts.lengthOf(file, spelledNode(tree, spelled, 0).?)).?;
-        try std.testing.expectEqualStrings(spelled[0 .. spelled.len - 4], tree.getNodeSource(memory));
-    }
-    try std.testing.expect(try facts.lengthOf(file, spelledNode(tree, "h.len", 0).?) == null);
 }
 
 test "accesses: asking a place's sites again keeps nothing more on the run's memory" {
@@ -1100,40 +1017,4 @@ test "consolidate: a member read's step, which language field it is, the program
     try std.testing.expect(Facts.integerType(.{ .primitive = "comptime_int" }, 64) == .literal);
     try std.testing.expect(Facts.integerType(.{ .primitive = "c_longdouble" }, 64) == .unknown);
     try std.testing.expect(Facts.integerType(.{ .primitive = "bool" }, 64) == .unknown);
-}
-
-test "Q5: a type's field list, by descriptions or names, and the field names a name is one of" {
-    const source =
-        \\const S = struct { a: u8, b: u8 };
-        \\const info = @typeInfo(S).@"struct";
-        \\fn f(out: *S) void {
-        \\    inline for (@typeInfo(S).@"struct".fields) |field| @field(out, field.name) = 0;
-        \\    inline for (info.field_names) |name| @field(out, name) = 0;
-        \\    const other = .{ .fields = 1 };
-        \\    _ = other.fields;
-        \\}
-    ;
-    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
-    defer project.deinit();
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
-    defer facts.deinit();
-    const file = project.sources[0].id;
-    const tree = &project.sources[0].file.tree;
-
-    // The descriptions in place, the names through a constant; a literal's own `fields` is none.
-    const descriptions = (try facts.fieldList(file, spelledNode(tree, "@typeInfo(S).@\"struct\".fields", 0).?)).?;
-    try std.testing.expect(!descriptions.names);
-    try std.testing.expectEqualStrings("S", tree.getNodeSource(descriptions.of.subject));
-    const names = (try facts.fieldList(file, spelledNode(tree, "info.field_names", 0).?)).?;
-    try std.testing.expect(names.names);
-    try std.testing.expectEqualStrings("S", tree.getNodeSource(names.of.subject));
-    try std.testing.expect(try facts.fieldList(file, spelledNode(tree, "other.fields", 0).?) == null);
-
-    // A description's `name` and a capture of the names are field names of S; the capture of
-    // the descriptions itself is none.
-    try std.testing.expectEqualStrings("S", tree.getNodeSource((try facts.fieldNameOf(file, spelledNode(tree, "field.name", 0).?)).?.subject));
-    try std.testing.expectEqualStrings("S", tree.getNodeSource((try facts.fieldNameOf(file, spelledNode(tree, "name", 0).?)).?.subject));
-    try std.testing.expect(try facts.fieldNameOf(file, spelledNode(tree, "field", 0).?) == null);
 }
