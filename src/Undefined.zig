@@ -3355,14 +3355,16 @@ fn writesParts(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.E
     return remembered(bool, c, .{ .decl = decl, .index = index, .question = .parts }, depth, writesPartsRead, false);
 }
 
+/// What a statement wrote: the part (null: all of it), and the statement.
+const Written = struct { part: ?Ast.Node.Index, statement: Ast.Node.Index };
+
 fn writesPartsRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Error!bool {
     const found = (try parameter(c, decl, index, true)) orelse return false;
     var walk: Walk = .init(c, decl.file, found.id, true, depth);
     try walk.collect();
     const tree = walk.tree;
     const model = walk.model;
-    // What a statement wrote: the part (null: all of it), and the statement.
-    var written: std.ArrayList(struct { part: ?Ast.Node.Index, statement: Ast.Node.Index }) = .empty;
+    var written: std.ArrayList(Written) = .empty;
     for (walk.mentions) |mention| {
         const key = tree.nodeMainToken(mention);
         const facts = c.facts;
@@ -3795,7 +3797,7 @@ fn statementOf(model: *const Model, tree: *const Ast, node: Ast.Node.Index) ?Ast
 /// Whether `use`, all of a parameter's memory (`part` null) or the part `part` of it, was
 /// written by one of `written`'s statements before it in a block that holds it: the same part,
 /// spelled alike, or all of it; with nothing between assigning a name the part's bounds spell.
-fn coveredBefore(c: *Context, file: Project.FileId, written: anytype, part: ?Ast.Node.Index, use: Ast.Node.Index) Context.Error!bool {
+fn coveredBefore(c: *Context, file: Project.FileId, written: []const Written, part: ?Ast.Node.Index, use: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
     for (written) |each| {
@@ -4710,62 +4712,63 @@ fn isMember(facts: *Facts, file: Project.FileId, node: Ast.Node.Index, name: []c
     return std.mem.eql(u8, read.name orelse return false, name);
 }
 
-/// A ring of diamonds deeper than the depths the summaries follow: each level reaches the next
-/// by two paths, and the last goes back to the first. Read once per function a pass, a count
-/// stays near the functions'; read again on each path, it doubles per level. `main` hands the
-/// ring `local`, declared `S` as `declared` spells. Returns how many functions it holds.
-fn diamonds(gpa: std.mem.Allocator, source: *std.ArrayList(u8), declared: []const u8) !usize {
-    const n = 12;
-    try source.print(gpa, "const S = struct {{ a: u32 }};\n", .{});
-    for (0..n) |i| try source.print(gpa,
-        \\fn g{d}(p: *S, k: u32) void {{ if (k == 0) return; l{d}(p, k - 1); r{d}(p, k - 1); }}
-        \\fn l{d}(p: *S, k: u32) void {{ g{d}(p, k); }}
-        \\fn r{d}(p: *S, k: u32) void {{ g{d}(p, k); }}
-        \\
-    , .{ i, i, i, i, i + 1, i, i + 1 });
-    try source.print(gpa, "fn g{d}(p: *S, k: u32) void {{ g0(p, k); }}\n", .{n});
-    try source.print(gpa, "pub fn main() u32 {{ var local: {s}; g0(&local, 3); return local.a; }}\n", .{declared});
-    return 3 * n + 1;
-}
-
-/// Runs A019's reads over `source`, the program alone, and gives its summaries' memo.
-fn readSummaries(gpa: std.mem.Allocator, source: []const u8) !Calls {
-    const Report = @import("Report.zig");
-    const Probe = struct {
-        const id: Rule = @fromBackingInt(1000); // safe: an extension identity the test owns.
-        const config: @import("Rule.zig").Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = id, .level = .report }} };
-        fn never(_: *Context, _: Model.Declaration) Context.Error!bool {
-            return false;
+test "summaries are read a bounded number of times per function, through nested recursion and past the depth" {
+    const ring = struct {
+        /// A ring of diamonds deeper than the depths the summaries follow: each level reaches the next
+        /// by two paths, and the last goes back to the first. Read once per function a pass, a count
+        /// stays near the functions'; read again on each path, it doubles per level. `main` hands the
+        /// ring `local`, declared `S` as `declared` spells. Returns how many functions it holds.
+        fn diamonds(gpa: std.mem.Allocator, source: *std.ArrayList(u8), declared: []const u8) !usize {
+            const n = 12;
+            try source.print(gpa, "const S = struct {{ a: u32 }};\n", .{});
+            for (0..n) |i| try source.print(gpa,
+                \\fn g{d}(p: *S, k: u32) void {{ if (k == 0) return; l{d}(p, k - 1); r{d}(p, k - 1); }}
+                \\fn l{d}(p: *S, k: u32) void {{ g{d}(p, k); }}
+                \\fn r{d}(p: *S, k: u32) void {{ g{d}(p, k); }}
+                \\
+            , .{ i, i, i, i, i + 1, i, i + 1 });
+            try source.print(gpa, "fn g{d}(p: *S, k: u32) void {{ g0(p, k); }}\n", .{n});
+            try source.print(gpa, "pub fn main() u32 {{ var local: {s}; g0(&local, 3); return local.a; }}\n", .{declared});
+            return 3 * n + 1;
         }
-        fn diagnostic(_: *Context.Sink, _: Rule, _: u32, _: u32, _: []const u8, _: []const Report.Span, _: []const Report.Edit) Context.Error!void {}
-        fn coverage(_: *Context.Sink, _: Report.Coverage) Context.Error!void {}
-        fn configOf(_: *Context.Sink, _: Project.FileId) @import("Rule.zig").Config {
-            return config;
+
+        /// Runs A019's reads over `source`, the program alone, and gives its summaries' memo.
+        fn readSummaries(gpa: std.mem.Allocator, source: []const u8) !Calls {
+            const Report = @import("Report.zig");
+            const Probe = struct {
+                const id: Rule = @fromBackingInt(1000); // safe: an extension identity the test owns.
+                const config: @import("Rule.zig").Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = id, .level = .report }} };
+                fn never(_: *Context, _: Model.Declaration) Context.Error!bool {
+                    return false;
+                }
+                fn diagnostic(_: *Context.Sink, _: Rule, _: u32, _: u32, _: []const u8, _: []const Report.Span, _: []const Report.Edit) Context.Error!void {}
+                fn coverage(_: *Context.Sink, _: Report.Coverage) Context.Error!void {}
+                fn configOf(_: *Context.Sink, _: Project.FileId) @import("Rule.zig").Config {
+                    return config;
+                }
+            };
+            var project = try Project.init(gpa, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+            defer project.deinit();
+            // A program std's AstGen refuses is never read: it would pass with no summary read.
+            try std.testing.expectEqual(.parsed, project.sources[0].file.status);
+            var arena: std.heap.ArenaAllocator = .init(gpa);
+            defer arena.deinit();
+            var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+            defer facts.deinit();
+            var sink: Context.Sink = .{ .diagnostic = Probe.diagnostic, .coverage = Probe.coverage, .config = Probe.configOf };
+            const definitions = [_]@import("Rule.zig").Definition{.{ .id = Probe.id, .name = "SUMMARIES", .group = .family_policy, .purpose = "counts summaries", .version = 1 }};
+            var c: Context = .{ .allocator = arena.allocator(), .project = &project, .file = project.sources[0].id, .config = Probe.config, .facts = &facts, .definitions = &definitions, .sink = &sink };
+            try reads(&c, Probe.id, Probe.never);
+            const memo = try facts.memo(Calls);
+            return .{ .reads = memo.reads, .remembered_reads = memo.remembered_reads };
         }
     };
-    var project = try Project.init(gpa, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
-    defer project.deinit();
-    // A program std's AstGen refuses is never read: it would pass with no summary read.
-    try std.testing.expectEqual(.parsed, project.sources[0].file.status);
-    var arena: std.heap.ArenaAllocator = .init(gpa);
-    defer arena.deinit();
-    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
-    defer facts.deinit();
-    var sink: Context.Sink = .{ .diagnostic = Probe.diagnostic, .coverage = Probe.coverage, .config = Probe.configOf };
-    const definitions = [_]@import("Rule.zig").Definition{.{ .id = Probe.id, .name = "SUMMARIES", .group = .family_policy, .purpose = "counts summaries", .version = 1 }};
-    var c: Context = .{ .allocator = arena.allocator(), .project = &project, .file = project.sources[0].id, .config = Probe.config, .facts = &facts, .definitions = &definitions, .sink = &sink };
-    try reads(&c, Probe.id, Probe.never);
-    const memo = try facts.memo(Calls);
-    return .{ .reads = memo.reads, .remembered_reads = memo.remembered_reads };
-}
-
-test "summaries are read a bounded number of times per function, through nested recursion and past the depth" {
     const gpa = std.testing.allocator;
     // What a call leaves undefined (`undefines`), for a local the ring is given.
     var deinit_ring: std.ArrayList(u8) = .empty;
     defer deinit_ring.deinit(gpa);
-    const deinit_functions = try diamonds(gpa, &deinit_ring, "S = .{ .a = 1 }");
-    const deinit_read = try readSummaries(gpa, deinit_ring.items);
+    const deinit_functions = try ring.diamonds(gpa, &deinit_ring, "S = .{ .a = 1 }");
+    const deinit_read = try ring.readSummaries(gpa, deinit_ring.items);
     try std.testing.expect(deinit_read.reads >= deinit_functions);
     try std.testing.expect(deinit_read.reads <= 3 * deinit_functions);
     // What a call writes, keeps, reads or needs (`remembered`), for a local declared undefined:
@@ -4773,8 +4776,8 @@ test "summaries are read a bounded number of times per function, through nested 
     // its own), some twenty a function; read again on each path, thousands.
     var write_ring: std.ArrayList(u8) = .empty;
     defer write_ring.deinit(gpa);
-    const write_functions = try diamonds(gpa, &write_ring, "S = undefined");
-    const write_read = try readSummaries(gpa, write_ring.items);
+    const write_functions = try ring.diamonds(gpa, &write_ring, "S = undefined");
+    const write_read = try ring.readSummaries(gpa, write_ring.items);
     try std.testing.expect(write_read.remembered_reads >= write_functions);
     try std.testing.expect(write_read.remembered_reads <= 40 * write_functions);
 }

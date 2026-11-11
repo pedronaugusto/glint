@@ -217,9 +217,8 @@ const Publications = struct { found: std.AutoHashMapUnmanaged(u64, *const Public
 /// a reference that does not resolve, a role no pack reads), is a gap: its roles may be missing,
 /// so a rule reading them is undecided where that root is imported, never plain. Found once per
 /// run and shared by every rule.
-pub fn publication(facts: *Facts, library: anytype) Facts.ResolveError!*const Publication {
-    const Roles = @TypeOf(library).Role;
-    const vocabulary = comptime std.hash.Wyhash.hash(0, @typeName(Roles));
+pub fn publication(facts: *Facts, comptime R: type, library: @import("Library.zig").Library(R)) Facts.ResolveError!*const Publication {
+    const vocabulary = comptime std.hash.Wyhash.hash(0, @typeName(R));
     const keyed = vocabulary ^ library.package.fingerprint;
     const memo = try facts.memo(Publications);
     if (memo.found.get(keyed)) |known| return known;
@@ -234,7 +233,7 @@ pub fn publication(facts: *Facts, library: anytype) Facts.ResolveError!*const Pu
         for (rules.problems) |problem| if (problem.part == .roles) try gaps.append(facts.gpa, .{ .root = root, .problem = problem });
         try pairs.appendSlice(facts.gpa, rules.pairs);
         for (rules.roles) |declared| {
-            const role_value = roleValue(Roles, declared.role) orelse continue;
+            const role_value = roleValue(R, declared.role) orelse continue;
             const decl = declared.type.declaration() orelse continue;
             // A declaration that is a choice (a type chosen per build): each part the role's.
             const declared_value = try facts.declaration(decl);
@@ -271,8 +270,8 @@ pub fn publication(facts: *Facts, library: anytype) Facts.ResolveError!*const Pu
 pub const Operation = union(enum) { release, transfer: @FieldType(Transfer, "to"), teardown, unknown };
 
 /// What `callee`, by its declaration, does to an obligation `library`'s package declares.
-pub fn operation(facts: *Facts, library: anytype, callee: Facts.Decl) Facts.ResolveError!?Operation {
-    const found = try publication(facts, library);
+pub fn operation(facts: *Facts, comptime R: type, library: @import("Library.zig").Library(R), callee: Facts.Decl) Facts.ResolveError!?Operation {
+    const found = try publication(facts, R, library);
     for (found.pairs) |pair| {
         for (pair.release) |each| if (namesDecl(each, callee)) return if (pair.refused) .unknown else .release;
         for (pair.transfer) |move| if (namesDecl(move.member, callee)) return if (pair.refused or move.to == .unknown) .unknown else .{ .transfer = move.to };
@@ -294,37 +293,37 @@ fn roleValue(comptime Roles: type, name: []const u8) ?u32 {
 /// The role `library`'s package declares for a function declaration, or a type or instance of a
 /// container with a role, seen through pointers, optionals and error unions; of a choice, the
 /// role every part agrees on.
-pub fn role(facts: *Facts, library: anytype, value: Facts.Value) Facts.ResolveError!?@TypeOf(library).Role {
-    const raw = (try roleNumber(facts, library, value)) orelse return null;
-    return @as(@TypeOf(library).Role, @fromBackingInt(@intCast(raw)));
+pub fn role(facts: *Facts, comptime R: type, library: @import("Library.zig").Library(R), value: Facts.Value) Facts.ResolveError!?R {
+    const raw = (try roleNumber(facts, R, library, value)) orelse return null;
+    return @as(R, @fromBackingInt(@intCast(raw)));
 }
 
-/// The number of the role `role` reads, compared as a number (no `Role` a library's `anytype`
-/// makes is compared or copied): of a choice, the one every part agrees on, none where they
+/// The number of the role `role` reads, compared as a number (no value of the library's `R` is
+/// compared or copied): of a choice, the one every part agrees on, none where they
 /// differ or one has none.
-fn roleNumber(facts: *Facts, library: anytype, value: Facts.Value) Facts.ResolveError!?@FieldType(Entry, "role") {
+fn roleNumber(facts: *Facts, comptime R: type, library: @import("Library.zig").Library(R), value: Facts.Value) Facts.ResolveError!?@FieldType(Entry, "role") {
     if (value == .alternatives) {
         if (value.alternatives.len == 0) return null;
-        const first = ((try entryOf(facts, library, value.alternatives[0])) orelse return null).role;
+        const first = ((try entryOf(facts, R, library, value.alternatives[0])) orelse return null).role;
         for (value.alternatives[1..]) |part| {
-            const other = ((try entryOf(facts, library, part)) orelse return null).role;
+            const other = ((try entryOf(facts, R, library, part)) orelse return null).role;
             if (other != first) return null;
         }
         return first;
     }
-    return ((try entryOf(facts, library, value)) orelse return null).role;
+    return ((try entryOf(facts, R, library, value)) orelse return null).role;
 }
 
 /// The fields only `library`'s package touches of a value's type (`.internal`), where its type is
 /// one the package gives a role, seen as `role` sees it; null where it is none.
-pub fn internalOf(facts: *Facts, library: anytype, value: Facts.Value) Facts.ResolveError!?[]const []const u8 {
-    const found = (try entryOf(facts, library, value)) orelse return null;
+pub fn internalOf(facts: *Facts, comptime R: type, library: @import("Library.zig").Library(R), value: Facts.Value) Facts.ResolveError!?[]const []const u8 {
+    const found = (try entryOf(facts, R, library, value)) orelse return null;
     return found.internal;
 }
 
 /// The entry of the declaration `value` is, or is a type or instance of.
-fn entryOf(facts: *Facts, library: anytype, value: Facts.Value) Facts.ResolveError!?Entry {
-    const found = try publication(facts, library);
+fn entryOf(facts: *Facts, comptime R: type, library: @import("Library.zig").Library(R), value: Facts.Value) Facts.ResolveError!?Entry {
+    const found = try publication(facts, R, library);
     var current = value;
     while (true) switch (current) {
         .pointer => |inner| current = inner.child.*,

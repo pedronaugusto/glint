@@ -248,7 +248,7 @@ fn checkFieldBuiltin(c: *Context, tree: *const Ast, node: Ast.Node.Index) Contex
 }
 /// Whether a name `@field` spells or ranges over may be a field only aegis touches of any type.
 fn anyNamedInternal(c: *Context, named: Facts.FieldName) Context.Error!bool {
-    const found = try PackageRules.publication(c.facts, Contract.library);
+    const found = try PackageRules.publication(c.facts, Contract.Kind, Contract.library);
     for (found.entries) |entry| for (entry.internal) |name| if (c.facts.mayName(named, name)) return true;
     return false;
 }
@@ -260,7 +260,7 @@ fn namedInternal(c: *Context, named: Facts.FieldName, holder: Facts.Value, k: Co
         .computed => return .unknown,
         .each_of, .names => {
             var found: Internal = .no;
-            const entries = (try PackageRules.publication(c.facts, Contract.library)).entries;
+            const entries = (try PackageRules.publication(c.facts, Contract.Kind, Contract.library)).entries;
             for (entries) |entry| for (entry.internal) |name| {
                 if (!c.facts.mayName(named, name)) continue;
                 switch (try internalField(c, holder, k, name)) {
@@ -326,7 +326,7 @@ fn checkByteRead(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Er
 /// The published types only their own constructor may make: `err.PublicSource`, whose
 /// `classify` takes the reviewed reason that a literal of it skips.
 fn constructed(c: *Context) Context.Error![]const Facts.Container {
-    const found = try PackageRules.publication(c.facts, Contract.library);
+    const found = try PackageRules.publication(c.facts, Contract.Kind, Contract.library);
     var out: std.ArrayList(Facts.Container) = .empty;
     for (found.entries) |entry| if (entry.target == .container and @as(Contract.Kind, @fromBackingInt(@intCast(entry.role))) == .public_source) try out.append(c.allocator, entry.target.container);
     return out.items;
@@ -503,7 +503,7 @@ fn namesFields(c: *Context, tree: *const Ast, literal: Ast.full.StructInit, cont
 /// `others`: `p.key` read beside `p.value`, and no aegis type whose `value` is backing state
 /// has a `key`.
 fn noLibraryHolder(c: *Context, name: []const u8, others: []const []const u8) Context.Error!bool {
-    const found = try PackageRules.publication(c.facts, Contract.library);
+    const found = try PackageRules.publication(c.facts, Contract.Kind, Contract.library);
     for (found.files) |file| {
         const model = &c.project.at(file).model;
         for (model.declarations) |decl| {
@@ -640,7 +640,7 @@ fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!b
     const siblings = try receiverMembers(c, tree, receiver, name);
     if (siblings.len != 0 and try noLibraryHolder(c, name, siblings)) return true;
     if (member == null and literal == null and !operand and !called) return false;
-    const found = try PackageRules.publication(c.facts, Contract.library);
+    const found = try PackageRules.publication(c.facts, Contract.Kind, Contract.library);
     var any = false;
     for (found.entries) |entry| {
         if (!among(entry.internal, name)) continue;
@@ -813,7 +813,7 @@ fn internalField(c: *Context, holder: Facts.Value, k: Contract.Kind, name: []con
             every = false;
         };
     } else {
-        const found = try PackageRules.publication(c.facts, Contract.library);
+        const found = try PackageRules.publication(c.facts, Contract.Kind, Contract.library);
         for (found.entries) |entry| {
             if (@as(Contract.Kind, @fromBackingInt(@intCast(entry.role))) != k) continue;
             if (among(entry.internal, name)) some = true else every = false;
@@ -835,7 +835,7 @@ fn keepsInternal(c: *Context, holder: Facts.Value, k: Contract.Kind) Context.Err
             every = false;
         };
     } else {
-        const found = try PackageRules.publication(c.facts, Contract.library);
+        const found = try PackageRules.publication(c.facts, Contract.Kind, Contract.library);
         for (found.entries) |entry| {
             if (@as(Contract.Kind, @fromBackingInt(@intCast(entry.role))) != k) continue;
             if (entry.internal.len != 0) some = true else every = false;
@@ -854,13 +854,13 @@ fn holderInternals(c: *Context, holder: Facts.Value) Context.Error![]const []con
         .pointer => |inner| try pending.append(c.allocator, inner.child.*),
         .optional, .error_union => |inner| try pending.append(c.allocator, inner.*),
         .alternatives => |choices| try pending.appendSlice(c.allocator, choices),
-        else => if (try PackageRules.internalOf(c.facts, Contract.library, each)) |own| try found.append(c.allocator, own),
+        else => if (try PackageRules.internalOf(c.facts, Contract.Kind, Contract.library, each)) |own| try found.append(c.allocator, own),
     };
     return found.items;
 }
 /// Whether `name` is a field only aegis touches of any type aegis gives a role.
 fn anyInternal(c: *Context, name: []const u8) Context.Error!bool {
-    const found = try PackageRules.publication(c.facts, Contract.library);
+    const found = try PackageRules.publication(c.facts, Contract.Kind, Contract.library);
     for (found.entries) |entry| if (among(entry.internal, name)) return true;
     return false;
 }
@@ -895,11 +895,11 @@ fn owes(k: Contract.Kind) bool {
 fn pairCall(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?PackageRules.Operation {
     const call = (try Facts.calls.at(c.facts, file, node)) orelse return null;
     switch (call.callee) {
-        .function => |decl| return PackageRules.operation(c.facts, Contract.library, decl),
+        .function => |decl| return PackageRules.operation(c.facts, Contract.Kind, Contract.library, decl),
         .choice => |all| {
             var found: ?PackageRules.Operation = null;
             for (all, 0..) |decl, i| {
-                const each = try PackageRules.operation(c.facts, Contract.library, decl);
+                const each = try PackageRules.operation(c.facts, Contract.Kind, Contract.library, decl);
                 if (i == 0) {
                     found = each;
                 } else if (!std.meta.eql(found, each)) return .unknown;
@@ -911,10 +911,10 @@ fn pairCall(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
             if (path.steps.len < 2 or path.steps[0].kind != .field) return .unknown;
             const name = path.steps[0].name orelse return .unknown;
             const holder = recordOf(try c.facts.resolve(file, path.steps[1].node)) orelse return .unknown;
-            const k = (try PackageRules.role(c.facts, Contract.library, .{ .container = holder })) orelse return .unknown;
+            const k = (try PackageRules.role(c.facts, Contract.Kind, Contract.library, .{ .container = holder })) orelse return .unknown;
             if (!logical(k)) return .unknown;
             const decl = c.facts.member(holder, name) orelse return null;
-            return PackageRules.operation(c.facts, Contract.library, decl);
+            return PackageRules.operation(c.facts, Contract.Kind, Contract.library, decl);
         },
     }
 }
@@ -1017,7 +1017,7 @@ fn aegisRelease(facts: *Facts, callee: Facts.Decl, owner: Facts.Value) Facts.Res
     if (record.kind != .function) return false;
     if (logical(k)) {
         // By its declaration: a release, or a move into storage the caller names.
-        const found = (try PackageRules.operation(facts, Contract.library, callee)) orelse return false;
+        const found = (try PackageRules.operation(facts, Contract.Kind, Contract.library, callee)) orelse return false;
         if (!(found == .release or (found == .transfer and found.transfer == .argument))) return false;
     } else if (!releaseName(k, record.name)) return false;
     const container = recordOf(owner) orelse return false;
@@ -1288,7 +1288,7 @@ fn typed(facts: *Facts, value: Facts.Value, depth: usize) Facts.ResolveError!Typ
             break :blk found;
         },
         // A guard and its hand-off among them, by the roles aegis declares (`Guarded(T).Guard`).
-        .container, .instance => if (try PackageRules.role(facts, Contract.library, value)) |k| .{ .owner = k } else .other,
+        .container, .instance => if (try PackageRules.role(facts, Contract.Kind, Contract.library, value)) |k| .{ .owner = k } else .other,
         else => .other,
     };
 }

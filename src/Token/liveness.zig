@@ -331,6 +331,10 @@ const Names = struct {
     }
 };
 
+/// An import spec and the index in the stream of its token, which says
+/// whether only tests reach it.
+pub const Spec = struct { import: types.Import, token: u32 };
+
 /// References between container-level members, gathered as recovery walks
 /// a file's words and strings. Live from the roots (`pub`, `export`,
 /// `comptime`, fields, `main`), else test-only from `test` declarations and
@@ -394,16 +398,16 @@ pub const Words = struct {
     }
     /// After every word: marks `test` each spec whose token only a test
     /// build analyses, and `dead` each one no build analyses. A dead import
-    /// keeps its kind, since dead code is no evidence of a test. `where`
-    /// holds the index in the stream of each spec's token.
-    pub fn classify(self: *Words, scratch: std.mem.Allocator, specs: []types.Import, where: []const u32) std.mem.Allocator.Error!void {
-        // aegis: no-danger(A013): Token.zig appends each spec and its token together, at every site that makes them
-        std.debug.assert(specs.len == where.len);
+    /// keeps its kind, since dead code is no evidence of a test. Each spec
+    /// carries the index in the stream of its token.
+    pub fn classify(self: *Words, scratch: std.mem.Allocator, specs: []Spec) std.mem.Allocator.Error!void {
         const reach = try self.reachable(scratch);
         var member: usize = 0;
         var test_range: usize = 0;
         var previous: u32 = 0;
-        for (specs, where) |*spec, at| {
+        for (specs) |*found| {
+            const spec = &found.import;
+            const at = found.token;
             // Base-import and alias-member facts each arrive in token order.
             if (at < previous) {
                 member = 0;

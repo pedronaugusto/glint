@@ -31,13 +31,13 @@ fn scanBuilt(comptime small: bool, arena: std.mem.Allocator, source: [:0]const u
     var builder: liveness.Builder(small) = .{};
     var buffer: [if (small) 2048 else 0]u8 = undefined;
     var storage: std.heap.BufferFirstAllocator = .init(&buffer, arena);
-    const ts = try tokenize(arena, if (small) storage.allocator() else arena, source, seen, &builder);
+    const ts = try tokenize(small, arena, if (small) storage.allocator() else arena, source, seen, &builder);
     return recoverShaped(arena, source, ts, try builder.finish(arena, ts));
 }
 
 /// The stored stream keeps whole operators; the observer, when it wants
 /// punctuation, receives every byte of one, and decoded escaped names.
-fn tokenize(arena: std.mem.Allocator, storage: std.mem.Allocator, source: [:0]const u8, seen: ?*Observer, builder: anytype) Error![]StoredToken {
+fn tokenize(comptime small: bool, arena: std.mem.Allocator, storage: std.mem.Allocator, source: [:0]const u8, seen: ?*Observer, builder: *liveness.Builder(small)) Error![]StoredToken {
     var lexer = std.zig.Tokenizer.init(source);
     var out: std.ArrayList(StoredToken) = .empty;
     try out.ensureTotalCapacityPrecise(storage, if (source.len < 1024) @min(source.len / 2 + 4, 32) else @min(source.len / 4 + 4, 512));
@@ -116,9 +116,7 @@ inline fn unit(kind: Token.Kind, text: []const u8, start: usize, finish: usize) 
 }
 
 fn recoverShaped(arena: std.mem.Allocator, source: []const u8, ts: []const StoredToken, shape: liveness.Shape) error{ InvalidLiteral, OutOfMemory }!Facts {
-    var out: std.ArrayList(Import) = .empty;
-    // The token of each spec, which says whether only tests reach it.
-    var where: std.ArrayList(u32) = .empty;
+    var out: std.ArrayList(liveness.Spec) = .empty;
     var unsupported: std.ArrayList(Unsupported) = .empty;
     var aliases: std.StringHashMapUnmanaged([]const u8) = .empty;
     for (shape.imports) |index| {
@@ -131,11 +129,9 @@ fn recoverShaped(arena: std.mem.Allocator, source: []const u8, ts: []const Store
         // Without an escape or a line break a literal is its own value.
         const plain = std.mem.findAny(u8, ts[i + 3].text(), "\\\n") == null;
         const name = if (plain) ts[i + 3].text() else try std.zig.string_literal.parseAlloc(arena, source[ts[i + 3].offset..ts[i + 3].end()]);
-        try out.append(arena, .{ .name = name, .offset = t.offset });
-        try where.append(arena, index);
+        try out.append(arena, .{ .import = .{ .name = name, .offset = t.offset }, .token = index });
         if (i + 6 < ts.len and ts[i + 5].is(".") and ts[i + 6].kind() == .word) {
-            try out.append(arena, .{ .name = name, .member = ts[i + 6].text(), .offset = t.offset });
-            try where.append(arena, index);
+            try out.append(arena, .{ .import = .{ .name = name, .member = ts[i + 6].text(), .offset = t.offset }, .token = index });
         }
         // const/var alias [: type] = @import(...); as used by layering checks.
         // The `;` comes first: it bounds the walk back to the declaration.
@@ -149,14 +145,16 @@ fn recoverShaped(arena: std.mem.Allocator, source: []const u8, ts: []const Store
     // Short streams have at most a handful of declarations. Specialising
     // the temporary table keeps its mask constant in the word loop.
     if (out.items.len > 0) {
-        if (ts.len <= 128) try classify(64, arena, ts, shape, &out, &where, aliases) else try classify(256, arena, ts, shape, &out, &where, aliases);
+        if (ts.len <= 128) try classify(64, arena, ts, shape, &out, aliases) else try classify(256, arena, ts, shape, &out, aliases);
     }
     const tests = try arena.alloc(Range, shape.tests.len);
     for (shape.tests, tests) |r, *bytes| bytes.* = .{ .first = ts[r.first].offset, .last = if (r.last + 1 < ts.len) ts[r.last + 1].offset - 1 else @intCast(source.len -| 1) };
-    return .{ .imports = try out.toOwnedSlice(arena), .unsupported = try unsupported.toOwnedSlice(arena), .tests = tests };
+    const imports = try arena.alloc(Import, out.items.len);
+    for (out.items, imports) |spec, *import| import.* = spec.import;
+    return .{ .imports = imports, .unsupported = try unsupported.toOwnedSlice(arena), .tests = tests };
 }
 
-fn classify(comptime capacity: usize, arena: std.mem.Allocator, ts: []const StoredToken, shape: liveness.Shape, out: *std.ArrayList(Import), where: *std.ArrayList(u32), aliases: std.StringHashMapUnmanaged([]const u8)) std.mem.Allocator.Error!void {
+fn classify(comptime capacity: usize, arena: std.mem.Allocator, ts: []const StoredToken, shape: liveness.Shape, out: *std.ArrayList(liveness.Spec), aliases: std.StringHashMapUnmanaged([]const u8)) std.mem.Allocator.Error!void {
     // No recovered reference borrows this table after classification.
     var slots: [capacity]u32 = undefined;
     // A short stream has at most 128 members and references. Its member
@@ -177,11 +175,10 @@ fn classify(comptime capacity: usize, arena: std.mem.Allocator, ts: []const Stor
         if (i + 2 >= ts.len or !dot(ts[i + 1]) or ts[i + 2].kind() != .word) continue;
         if (i > 0 and dot(ts[i - 1])) continue;
         if (aliases.get(t.text())) |name| {
-            try out.append(arena, .{ .name = name, .member = ts[i + 2].text(), .offset = t.offset });
-            try where.append(arena, @intCast(i));
+            try out.append(arena, .{ .import = .{ .name = name, .member = ts[i + 2].text(), .offset = t.offset }, .token = @intCast(i) });
         }
     }
-    try words.classify(workspace, out.items, where.items);
+    try words.classify(workspace, out.items);
 }
 
 inline fn dot(t: StoredToken) bool {

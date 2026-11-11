@@ -1101,7 +1101,7 @@ fn peakResident() ?usize {
     };
     const peak: usize = @intCast(usage.maxrss);
     // Darwin's is in bytes, the others' in KiB.
-    return if (builtin.os.tag.isDarwin()) peak else peak * 1024;
+    return if (std.Target.Os.Tag.isDarwin(builtin.os.tag)) peak else peak * 1024;
 }
 
 test "a rule's memory for one file is given back when the rule is done with the file" {

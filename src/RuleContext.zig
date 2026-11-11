@@ -63,11 +63,11 @@ pub fn resolve(self: *RuleContext, node: Project.NodeId) Error!Facts.Value {
 /// Null when the value is none of its declarations with a role; recognition follows the roles
 /// the library's package declares in `lint_rules`, never file bytes or names.
 pub fn role(self: *RuleContext, library: anytype, value: Facts.Value) Error!?@TypeOf(library).Role {
-    return PackageRules.role(self.facts, library, value);
+    return PackageRules.role(self.facts, @TypeOf(library).Role, library, value);
 }
 /// Whether `file` is one of the library's own files: of its package, by the identity the caller states.
 pub fn inLibrary(self: *RuleContext, library: anytype, file: Project.FileId) Error!bool {
-    const found = try PackageRules.publication(self.facts, library);
+    const found = try PackageRules.publication(self.facts, @TypeOf(library).Role, library);
     for (found.files) |own| if (own == file) return true;
     return false;
 }
@@ -173,7 +173,7 @@ fn isType(self: *RuleContext, node: Ast.Node.Index) Error!bool {
 pub const Drift = struct { detail: []const u8, start: u32 };
 pub fn drift(self: *RuleContext, library: anytype) Error!?Drift {
     if (!self.project.at(self.file).input.compilations.inProgram()) return null;
-    const found = try PackageRules.publication(self.facts, library);
+    const found = try PackageRules.publication(self.facts, @TypeOf(library).Role, library);
     const tree = try self.project.syntax(try self.source());
     const model = &self.project.at(self.file).model;
     for (found.gaps) |gap| for (model.import_nodes) |node| {

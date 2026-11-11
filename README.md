@@ -76,7 +76,7 @@ Gantry owns path dialect and cross-file architecture policy. Preflight orchestra
 
 Run `bay check`, `bay lint`, `bay check-token-portable`, and targeted tests such as `bay test -Dtest-filter=review`. `bay plan -- --workflow .github/workflows/ci.yml` generates the pinned CI caller through preflight. Fast CI validates working candidates; merge CI validates the exact candidate on Linux, macOS and Windows before main advances.
 
-`bay bench` runs only Glint's own ReleaseFast benchmarks. Rows cover parse/lower/cold and warm scans, matched G1r selections, requested allocations, mapped deprecation, private imports, and compiled project rules. CI compiles these; timing is manual. Earlier semantic measurement rows live in private trials. The token drivers and frozen corpus pins are in `bench/`; their measured rows live in private trials. No speed guarantee is claimed.
+`bay bench` runs only Glint's own ReleaseFast benchmarks. Rows cover parse/lower/cold and warm scans, matched G1r selections, requested allocations, mapped deprecation, private imports, and compiled project rules. CI compiles these; timing is manual. Earlier semantic measurement rows live in private trials. The frozen token corpus pins are in `bench/`; the token measurement rows live in private trials. No speed guarantee is claimed.
 
 MIT. See [LICENSE](LICENSE).
 

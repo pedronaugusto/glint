@@ -715,7 +715,7 @@ fn returned(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!?Magnitud
 }
 
 /// The function a node is in.
-fn enclosing(tree: *const Ast, model: anytype, node: Ast.Node.Index) ?Ast.Node.Index {
+fn enclosing(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Ast.Node.Index {
     var at = node;
     while (model.parentOf(at)) |parent| : (at = parent) {
         if (tree.nodeTag(parent) == .fn_decl) return parent;
