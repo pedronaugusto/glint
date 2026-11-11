@@ -4745,8 +4745,9 @@ fn peerSites(c: *Context, flow: *Flow, file: Project.FileId, callee: Callee, out
 }
 
 /// Whether `node` is the writer of a `std.Io.Writer.Allocating`, as each expression it comes
-/// from gives it: `&a.writer`, the member that resolves to that type's `writer` field (by its
-/// declaration's origin, `writerField`), or a name, through the one value its variable holds.
+/// from gives it: `&a.writer`, or `a.writer` as a method's receiver, the member that resolves to
+/// that type's `writer` field (by its declaration's origin, `writerField`), or a name, through
+/// the one value its variable holds.
 fn allocatingWriter(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!bool {
     if (depth > 4) return false;
     const written_by = switch (try accesses.valuesOf(c.facts, file, node)) {
@@ -4768,6 +4769,8 @@ fn allocatingWriter(c: *Context, file: Project.FileId, node: Ast.Node.Index, dep
             .decl => |decl| decl,
             .none, .unknown => return false,
         };
+        // The member itself, a method's receiver (`a.writer.print(…)`, its address taken there).
+        if (try writerField(c, named)) continue;
         // Only a variable is given values (`givenTo`): any other declaration answers null.
         if (named.file != file) return false;
         const given = (try c.facts.givenTo(named, false)) orelse return false;

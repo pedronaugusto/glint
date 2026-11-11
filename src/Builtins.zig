@@ -896,7 +896,10 @@ fn syntaxRules(self: *Context) RunError!void {
                     else => break .{ .unknown = .unsupported },
                 } else value.alternatives[0];
                 switch (value) {
-                    .unknown => |reason| {
+                    // A parameter declared `type` is a type whatever each binding gives it.
+                    .unknown => |reason| if (try typeParameter(self, expr)) {
+                        if (names.acronymIssue(name)) try self.at(.Z032, decl.token, "treat acronyms in type names as ordinary words, for example XmlParser");
+                    } else {
                         try unknown(self, .Z006, expr, reason);
                         if (names.acronymIssue(name)) try unknown(self, .Z032, expr, reason);
                     },
@@ -949,6 +952,19 @@ fn interfaceName(self: *Context, decl: Model.Declaration, name: []const u8) RunE
         }
     }
     return false;
+}
+
+/// Whether `node` names a parameter whose declared type is the type `type` (`comptime R: type`,
+/// or through an alias of it), by the declaration the name refers to: every binding gives it a
+/// type. `anytype` (its declaration's node the prototype) is not one.
+fn typeParameter(self: *Context, node: Ast.Node.Index) RunError!bool {
+    const named = switch (try self.facts.definition(self.file, node)) {
+        .decl => |decl| decl,
+        .none, .unknown => return false,
+    };
+    const decl = self.project.at(named.file).model.declarations[@backingInt(named.index)];
+    if (decl.kind != .parameter) return false;
+    return namesType(self, named.file, decl.node);
 }
 
 /// Whether `node` of `file` is the type `type`, by what it resolves to (an alias of it too).

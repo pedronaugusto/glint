@@ -1,0 +1,10 @@
+.{
+    .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .operator, .conversion, .unwrap, .aggregate, .memory, .branch },
+    .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .operator, .conversion, .unwrap, .aggregate, .memory, .branch },
+    .open = .{
+        // a comptime parameter declared with a number type is read as no value (Facts.valueIn
+        // answers false for every `comptime` parameter that declares a type), so its alias is
+        // taken for a type: a Facts question, not Z006's
+        "compile_time/rs-z06-number_parameter/hole.zig",
+    },
+}

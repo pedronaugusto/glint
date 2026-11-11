@@ -597,9 +597,9 @@ const Held = union(enum) { none, at: []const u8, unread };
 /// `heldIo` of a parameter, `anytype` and a type spelled with `Io` inside included.
 fn parameterIo(c: *Context, decl: Model.Declaration, io_type: Facts.Container) Context.Error!Held {
     const tree = &c.project.at(c.file).file.tree;
-    // `anytype` records the prototype as its node: any type, an `Io` among them.
-    var proto_buffer: [1]Ast.Node.Index = undefined;
-    if (tree.fullFnProto(&proto_buffer, decl.node) != null or tree.tokenTag(decl.token + 2) == .keyword_anytype) return .unread;
+    // `anytype`: any type, an `Io` among them. A parameter typed `fn (…)` or a pointer to one
+    // is a function, which holds no state: its type resolves to a function type, read below.
+    if (tree.tokenTag(decl.token + 2) == .keyword_anytype) return .unread;
     const held = try heldIo(c, try c.facts.resolve(c.file, decl.node), io_type, 0);
     if (held != .none) return held;
     return if (try spellsIo(c, c.file, decl.node, io_type)) .unread else .none;
