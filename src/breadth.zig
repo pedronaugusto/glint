@@ -66,7 +66,18 @@ pub const fixture_std =
 
 /// What a run of one breadth rule over one file found (`run`): its findings' messages and
 /// whether it left anything undecided.
-pub const Found = struct { messages: std.ArrayList([]const u8) = .empty, undecided: usize = 0 };
+pub const Found = struct {
+    messages: std.ArrayList([]const u8) = .empty,
+    undecided: usize = 0,
+    fixes: std.ArrayList([]const u8) = .empty,
+
+    pub fn deinit(self: *Found, gpa: std.mem.Allocator) void {
+        for (self.messages.items) |m| gpa.free(m);
+        for (self.fixes.items) |f| gpa.free(f);
+        self.messages.deinit(gpa);
+        self.fixes.deinit(gpa);
+    }
+};
 
 /// Runs `check` over the first file of `project` under `test_id`, as the runner runs a project
 /// rule: its own Facts, the file's context, a sink that keeps each finding's message.
@@ -95,9 +106,10 @@ const Collect = struct {
     found: Found = .{},
     gpa: std.mem.Allocator,
 
-    fn diagnostic(_: *Context.Sink, _: Rule, _: u32, _: u32, message: []const u8, _: []const Report.Span, _: []const Report.Edit) Context.Error!void {
+    fn diagnostic(_: *Context.Sink, _: Rule, _: u32, _: u32, message: []const u8, _: []const Report.Span, fix: []const Report.Edit) Context.Error!void {
         const self = collecting orelse return;
         try self.found.messages.append(self.gpa, try self.gpa.dupe(u8, message));
+        for (fix) |edit| try self.found.fixes.append(self.gpa, try self.gpa.dupe(u8, edit.text));
     }
     fn coverage(_: *Context.Sink, _: Report.Coverage) Context.Error!void {
         const self = collecting orelse return;
@@ -124,12 +136,24 @@ pub fn expectFindings(comptime check: Check, source: []const u8, expected: usize
     }, &.{.{ .from = 0, .target = 1, .spelling = "std" }}, .{});
     defer project.deinit();
     var found = try run(gpa, &project, project.sources[0].id, check);
-    defer {
-        for (found.messages.items) |m| gpa.free(m);
-        found.messages.deinit(gpa);
-    }
+    defer found.deinit(gpa);
     try std.testing.expectEqual(expected, found.messages.items.len);
     try std.testing.expectEqual(@as(usize, 0), found.undecided);
+}
+
+/// As `expectFindings`, and the fix edits' texts, in order, are `fixes`.
+pub fn expectFixes(comptime check: Check, source: []const u8, expected: usize, fixes: []const []const u8) !void {
+    const gpa = std.testing.allocator;
+    var project = try Project.init(gpa, &.{
+        .{ .name = "fixture", .stem = "Fixture", .bytes = source },
+        .{ .name = "standard", .bytes = fixture_std, .selected = false },
+    }, &.{.{ .from = 0, .target = 1, .spelling = "std" }}, .{});
+    defer project.deinit();
+    var found = try run(gpa, &project, project.sources[0].id, check);
+    defer found.deinit(gpa);
+    try std.testing.expectEqual(expected, found.messages.items.len);
+    try std.testing.expectEqual(fixes.len, found.fixes.items.len);
+    for (fixes, found.fixes.items) |want, got| try std.testing.expectEqualStrings(want, got);
 }
 
 test {
