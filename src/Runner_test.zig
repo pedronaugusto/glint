@@ -253,7 +253,7 @@ test "Z026 reads the handler's syntax: each empty form is a site, a call, a stor
     try check(.Z026, head ++ "pub fn f() void { fallible() catch return; while (true) { fallible() catch continue; fallible() catch break; } }", 3);
     try check(.Z026, head ++ "pub fn f() void { if (give()) |_| {} else |_| {} while (give()) |_| {} else |_| {} }", 2);
     // `unreachable` as the whole handler of a `catch` or an `orelse`.
-    try check(.Z026, head ++ "pub fn f(o: ?u8) u8 { fallible() catch unreachable; return o orelse unreachable; }", 2);
+    try check(.Z026, head ++ "pub fn f(o: ?u8) u8 { fallible() catch unreachable; return o orelse unreachable; }", 1);
     // Not empty: a call (whatever the callee does), a store, a value, a `return` of one.
     try check(.Z026, head ++ "pub fn f() void { fallible() catch |e| record(e); fallible() catch { _ = record(error.X); }; }", 0);
     try check(.Z026, head ++ "pub fn f(c: bool) u8 { fallible() catch { n += 1; }; fallible() catch if (c) record(error.X); return give() catch 0; }", 0);

@@ -242,10 +242,12 @@ fn amendedPolicies(self: *Context) RunError!void {
     };
 }
 
-/// Z026: each error handler written empty (`emptyHandler`), and `catch unreachable` or `orelse
-/// unreachable`, outside a `test` block. The handlers are `catch`'s and an `if`'s or a
-/// `while`'s `else |err|`. Only the handler's syntax is read: a handler that calls anything or
-/// gives a value is not empty, whatever the callee does with the error.
+/// Z026: each error handler written empty (`emptyHandler`), and `catch unreachable`, outside a
+/// `test` block: a discarded error needs a reason written at the site. The handlers are
+/// `catch`'s and an `if`'s or a `while`'s `else |err|`. Only the handler's syntax is read: a
+/// handler that calls anything or gives a value is not empty, whatever the callee does with the
+/// error. `orelse` handles a null, which is no error: `orelse unreachable` and `.?` are another
+/// rule's (an unwrap that can trap, opt-in).
 fn emptyHandlers(self: *Context) RunError!void {
     if (!self.config.has(.Z026)) return;
     const tree = &self.project.at(self.file).file.tree;
@@ -261,12 +263,10 @@ fn emptyHandlers(self: *Context) RunError!void {
             continue;
         const token = tree.nodeMainToken(node);
         if (self.inTest(token)) continue;
-        if (tree.nodeTag(ungrouped(tree, handler)) == .unreachable_literal and (tag == .@"catch" or tag == .@"orelse")) {
-            try self.at(.Z026, token, if (tag == .@"catch")
-                "catch unreachable: a panic, or undefined behaviour in a ReleaseFast build; return the error, or write the reason at this site"
-            else
-                "orelse unreachable: a panic, or undefined behaviour in a ReleaseFast build; return an error, or write the reason at this site");
-        } else if (tag != .@"orelse" and emptyHandler(tree, handler)) {
+        if (tag == .@"orelse") continue;
+        if (tree.nodeTag(ungrouped(tree, handler)) == .unreachable_literal) {
+            try self.at(.Z026, token, "catch unreachable: a panic, or undefined behaviour in a ReleaseFast build; return the error, or write the reason at this site");
+        } else if (emptyHandler(tree, handler)) {
             try self.at(.Z026, token, "an error handler that does nothing with the error; write the reason at this site");
         }
     }
