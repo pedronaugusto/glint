@@ -1267,7 +1267,6 @@ test "where only a value's role is known, a field every type of that role keeps 
     try expectJudged(head ++ "pub fn f(p: *Pool) usize { return p.extra; }", pack.access, true, 0);
 }
 
-
 test "the private fields aegis's first list missed are A001's: a reader-writer owner's admission limit, a dense map's regions and rooms, a secondary map's index and entries" {
     const head = "const aegis = @import(\"aegis\");\nconst Tag = struct {};\nconst P = aegis.handle.SlotPool(u32, Tag, .{ .generation = u64 });\n";
     try expectJudged(head ++ "pub fn f(g: *aegis.RwGuarded(u32)) usize { return g.limit; }", pack.access, true, 1);
