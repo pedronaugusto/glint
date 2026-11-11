@@ -317,8 +317,8 @@ fn amendedPolicies(self: *Context) RunError!void {
     if (!selected(self, &.{ .Z012, .Z026 })) return;
     const source = self.project.at(self.file);
     const tree = &source.file.tree;
-    // Z012 reads the public surface: a public function's signature, a public constant's or
-    // variable's type, written or inferred, and a field of a container the surface reaches.
+    // Z012 reads the public surface as written: a public function's signature, a public
+    // constant's or variable's written type, and a field of a container the surface reaches.
     if (self.config.has(.Z012)) for (source.model.declarations, 0..) |decl, i| {
         if (decl.kind != .field and !decl.public and !decl.exported) continue;
         if (!try self.facts.onSurface(self.file, decl.scope)) continue;
@@ -729,15 +729,17 @@ fn privateSignature(self: *Context, signature: Signature, file: Project.FileId, 
     while (it.next()) |param| if (param.type_expr) |t| try privateType(self, signature, file, t, depth);
 }
 
-/// Z012 over a type written at `node` of `file` in a public signature: each type a caller has to
-/// name to use it, read by what it is. A form this does not read leaves the signature undecided.
+/// Z012 over a type written at `node` of `file` in a public signature: each name written in it
+/// that resolves to a private container with no public alias. Only the written shape is read:
+/// parentheses, `?T`, `E!T`, a pointer's or an array's child, a function prototype and a container
+/// written in place. A type reached any other way (a call, a builtin, a comptime choice, an
+/// inferred type) is not read; a miss is allowed, a wrong report is not.
 fn privateType(self: *Context, given: Signature, file: Project.FileId, written: Ast.Node.Index, depth: usize) RunError!void {
     const signature = anchored(self, given, file, written);
     const tree = &self.project.at(file).file.tree;
     const node = Facts.ungrouped(tree, written);
-    if (depth >= 128) return undecidedType(self, signature, file, node, .budget);
-    // A parameter, a part of one (`M.Event`) or `@TypeOf` of one: the type the caller gave.
-    if (try fromParameter(self, file, node)) return;
+    // No one writes a type nested this deep; what is past it is not read.
+    if (depth >= 128) return;
     if (tree.fullPtrType(node)) |pointer| return privateType(self, signature, file, pointer.ast.child_type, depth + 1);
     if (tree.fullArrayType(node)) |array| return privateType(self, signature, file, array.ast.elem_type, depth + 1);
     var prototype: [1]Ast.Node.Index = undefined;
@@ -748,7 +750,7 @@ fn privateType(self: *Context, given: Signature, file: Project.FileId, written: 
         // types are not. The fields of one the surface reaches are read as its fields.
         if (container.ast.arg.unwrap()) |tag| try privateType(self, signature, file, tag, depth + 1);
         const model = &self.project.at(file).model;
-        const scope = scopeOf(model, node) orelse return undecidedType(self, signature, file, node, .unsupported);
+        const scope = scopeOf(model, node) orelse return;
         // A tuple's fields are no declarations: they are read here, reached or not.
         const named = try self.facts.onSurface(file, scope);
         for (container.ast.members) |member| if (model.containerField(tree, member)) |field| {
@@ -759,317 +761,57 @@ fn privateType(self: *Context, given: Signature, file: Project.FileId, written: 
     }
     switch (tree.nodeTag(node)) {
         .identifier, .field_access => {
-            switch (try self.facts.definition(file, node)) {
-                .decl => |definition| {
-                    const decl = self.project.at(definition.file).model.declarations[@backingInt(definition.index)];
-                    // A type parameter is the caller's own; a public declaration callers reach is
-                    // named by its path.
-                    if (decl.kind == .parameter) return;
-                    if ((decl.public or decl.exported) and self.project.at(definition.file).model.surfaceReachable(decl.scope)) return;
-                    const value = try self.facts.resolve(file, node);
-                    if (value == .unknown) if (initOf(self, definition)) |init| return privateType(self, signature, definition.file, init, depth + 1);
-                    return exposedValue(self, signature, file, node, value, depth + 1);
-                },
-                // A primitive, or a member no holder declares: what it resolves to says.
-                .none => {},
-                .unknown => |why| return undecidedType(self, signature, file, node, why),
-            }
-            try exposedValue(self, signature, file, node, try self.facts.resolve(file, node), depth + 1);
+            const definition = switch (try self.facts.definition(file, node)) {
+                .decl => |definition| definition,
+                // A primitive, a member no holder declares, a name that does not resolve.
+                .none, .unknown => return,
+            };
+            const held = self.project.at(definition.file);
+            const decl = held.model.declarations[@backingInt(definition.index)];
+            // A type parameter is the caller's own; a public declaration callers reach is named
+            // by its path.
+            if (decl.kind == .parameter) return;
+            if ((decl.public or decl.exported) and try self.facts.onSurface(definition.file, decl.scope)) return;
+            // A type for certain: a constant whose value is a container written in place.
+            if (decl.kind != .variable) return;
+            const variable = held.file.tree.fullVarDecl(decl.node) orelse return;
+            if (held.file.tree.tokenTag(variable.ast.mut_token) != .keyword_const) return;
+            const init = Facts.ungrouped(&held.file.tree, variable.ast.init_node.unwrap() orelse return);
+            var holds: [2]Ast.Node.Index = undefined;
+            if (held.file.tree.fullContainerDecl(&holds, init) == null) return;
+            const scope = scopeOf(&held.model, init) orelse return;
+            // A container around the signature is named through whatever names the signature,
+            // as `@This()` is.
+            if (definition.file == self.file and encloses(&held.model, scope, signature.scope)) return;
+            if (try self.facts.aliasedOnSurface(definition.file, scope)) return;
+            const holder = held.model.privateHolder(scope) orelse return;
+            const message = try self.allocator.print("public signature exposes private type '{s}'", .{held.model.declarations[@backingInt(holder)].name});
+            try self.atDefinition(.Z012, signature.site, message, .{ .file = definition.file, .index = holder });
         },
         .optional_type => try privateType(self, signature, file, tree.nodeData(node).node, depth + 1),
         .error_union => try privateType(self, signature, file, tree.nodeData(node).node_and_node[1], depth + 1),
-        // Error-set policy is not Z012.
-        .error_set_decl, .merge_error_sets => {},
-        // A type function's call is named by its callee and its arguments, whatever it makes.
-        .call, .call_comma, .call_one, .call_one_comma => try writtenCall(self, signature, file, node, depth + 1, false),
-        // A comptime choice is one of its branches: each is read.
-        .@"if", .if_simple, .@"switch", .switch_comma => try eachBranch(self, signature, file, node, depth + 1),
-        // A builtin or a comptime choice: the type it gives.
-        else => try exposedValue(self, signature, file, node, try self.facts.resolve(file, node), depth + 1),
-    }
-}
-
-/// Z012 over each type a comptime choice written at `node` may give: an `if`'s branches, a
-/// `switch`'s prongs.
-fn eachBranch(self: *Context, signature: Signature, file: Project.FileId, node: Ast.Node.Index, depth: usize) RunError!void {
-    const tree = &self.project.at(file).file.tree;
-    if (tree.fullIf(node)) |branch| {
-        try chosen(self, signature, file, branch.ast.then_expr, depth);
-        if (branch.ast.else_expr.unwrap()) |other| try chosen(self, signature, file, other, depth);
-        return;
-    }
-    const choice = tree.fullSwitch(node) orelse return undecidedType(self, signature, file, node, .unsupported);
-    for (choice.ast.cases) |case| try chosen(self, signature, file, tree.fullSwitchCase(case).?.ast.target_expr, depth);
-}
-
-/// One branch of a comptime choice: a type is read as written, a value by its type
-/// (`if (builtin.is_test) u8 else Hidden{ .x = 1 }` gives a Hidden in every other build).
-fn chosen(self: *Context, signature: Signature, file: Project.FileId, node: Ast.Node.Index, depth: usize) RunError!void {
-    const value = try self.facts.resolve(file, node);
-    if (value == .unknown or isType(value)) return privateType(self, signature, file, node, depth);
-    try exposedInferred(self, signature, file, node, value, depth, false);
-}
-
-/// Z012 over a type `node` of `file` resolves to: the containers a caller has to name to use it.
-fn exposedValue(self: *Context, given: Signature, file: Project.FileId, node: Ast.Node.Index, value: Facts.Value, depth: usize) RunError!void {
-    const signature = anchored(self, given, file, node);
-    if (depth >= 128) return undecidedType(self, signature, file, node, .budget);
-    switch (value) {
-        .unknown => |why| try undecidedType(self, signature, file, node, why),
-        // A primitive alias can be named as the primitive; error-set policy is not Z012.
-        .primitive, .scalar, .error_set => {},
-        .pointer => |inner| try exposedValue(self, signature, file, node, inner.child.*, depth + 1),
-        .array, .optional, .error_union => |inner| try exposedValue(self, signature, file, node, inner.*, depth + 1),
-        .alternatives => |each| for (each) |one| try exposedValue(self, signature, file, node, one, depth + 1),
-        .fn_type => |key| {
-            var prototype: [1]Ast.Node.Index = undefined;
-            const function = self.project.at(key.file).file.tree.fullFnProto(&prototype, key.node) orelse return undecidedType(self, signature, file, node, .unsupported);
-            try privateSignature(self, signature, key.file, function, depth + 1);
-        },
-        .container => |container| try exposedContainer(self, signature, file, node, container, depth + 1),
-        .instance, .function, .literal, .reflected, .reified => try undecidedType(self, signature, file, node, .unsupported),
-    }
-}
-
-fn exposedContainer(self: *Context, given: Signature, file: Project.FileId, node: Ast.Node.Index, container: Facts.Container, depth: usize) RunError!void {
-    const signature = anchored(self, given, file, node);
-    const model = &self.project.at(container.file).model;
-    // A container around the function is named through whatever names the function, as
-    // `@This()` is.
-    if (container.file == self.file and encloses(model, container.scope, signature.scope)) return;
-    if (container.made_by) |made| {
-        // A made container is named by its type function's call: the function and each argument.
-        const maker = self.project.at(made.function.file).model.declarations[@backingInt(made.function.index)];
-        if (!(maker.public or maker.exported) or !self.project.at(made.function.file).model.surfaceReachable(maker.scope))
-            return self.atDefinition(.Z012, signature.site, try self.allocator.print("public signature exposes private type function '{s}'", .{maker.name}), made.function);
-        var buffer: [1]Ast.Node.Index = undefined;
-        const call = self.project.at(made.file).file.tree.fullCall(&buffer, made.call) orelse return undecidedType(self, signature, file, node, .unsupported);
-        for (call.ast.params) |argument| try exposedArgument(self, signature, made.file, argument, depth + 1, false);
-        return;
-    }
-    if (container.symbolic) return undecidedType(self, signature, file, node, .comptime_dependent);
-    const holder = model.privateHolder(container.scope) orelse return;
-    if (try self.facts.aliasedOnSurface(container.file, container.scope)) return;
-    const decl = model.declarations[@backingInt(holder)];
-    const message = if (decl.kind == .function)
-        try self.allocator.print("public signature exposes a type private function '{s}' writes", .{decl.name})
-    else
-        try self.allocator.print("public signature exposes private type '{s}'", .{decl.name});
-    try self.atDefinition(.Z012, signature.site, message, .{ .file = container.file, .index = holder });
-}
-
-/// A call written where a caller has to name what it gives (a type function's, or a function's
-/// whose result a public constant holds): named by its callee and its arguments, whatever it
-/// makes.
-/// `held` as for `exposedArgument`: the call is inside one a public constant holds.
-fn writtenCall(self: *Context, given: Signature, file: Project.FileId, node: Ast.Node.Index, depth: usize, held: bool) RunError!void {
-    const signature = anchored(self, given, file, node);
-    const tree = &self.project.at(file).file.tree;
-    var buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&buffer, node).?;
-    if (!try fromParameter(self, file, call.ast.fn_expr)) switch (try self.facts.definition(file, call.ast.fn_expr)) {
-        .decl => |definition| try namedDeclaration(self, signature, definition),
-        .none => try exposedValue(self, signature, file, call.ast.fn_expr, try self.facts.resolve(file, call.ast.fn_expr), depth + 1),
-        .unknown => |why| try undecidedType(self, signature, file, call.ast.fn_expr, why),
-    };
-    for (call.ast.params) |argument| try exposedArgument(self, signature, file, argument, depth + 1, held);
-}
-
-/// A type function's argument: a type a caller names, or a value, named by its declaration
-/// (`Wrap(helper)`, `Gen(config)`) or written in the call. `held`: the call is what a public
-/// constant holds (`pub const File = OwnedIo(Io.File, closeFile)`), so the constant is the name a
-/// user spells and a value argument is read by its type, what of it comes back through the result;
-/// a call written in a signature cannot be spelled where a value it takes is private.
-fn exposedArgument(self: *Context, given: Signature, file: Project.FileId, node: Ast.Node.Index, depth: usize, held: bool) RunError!void {
-    const signature = anchored(self, given, file, node);
-    if (depth >= 128) return undecidedType(self, signature, file, node, .budget);
-    const tree = &self.project.at(file).file.tree;
-    if (selfNamed(tree, node) or try fromParameter(self, file, node)) return;
-    switch (tree.nodeTag(node)) {
-        .call, .call_comma, .call_one, .call_one_comma => return writtenCall(self, signature, file, node, depth + 1, held),
-        .identifier, .field_access => switch (try self.facts.definition(file, node)) {
-            .decl => |definition| {
-                const value = try self.facts.resolve(file, node);
-                // A type is named by what it is; a value by its declaration, or, in a call a public
-                // constant holds, by its type.
-                if (isType(value) and value != .unknown) return exposedValue(self, signature, file, node, value, depth + 1);
-                if (value == .unknown) {
-                    if (initOf(self, definition)) |init| return exposedArgument(self, signature, definition.file, init, depth + 1, held);
-                    return namedDeclaration(self, signature, definition);
-                }
-                if (held) return exposedInferred(self, signature, file, node, value, depth + 1, true);
-                return namedDeclaration(self, signature, definition);
-            },
-            .none => {},
-            .unknown => |why| return undecidedType(self, signature, file, node, why),
-        },
+        // A call, a builtin, a comptime choice, a labeled block, an error set: not read.
         else => {},
     }
-    const value = try self.facts.resolve(file, node);
-    if (isType(value)) return exposedValue(self, signature, file, node, value, depth + 1);
-    try exposedInferred(self, signature, file, node, value, depth + 1, held);
 }
 
-/// Whether `node` is a literal its own text names: a number, a string, a character, an enum
-/// literal, `true`, `null`.
-fn selfNamed(tree: *const Ast, node: Ast.Node.Index) bool {
-    return switch (tree.nodeTag(node)) {
-        .number_literal, .string_literal, .multiline_string_literal, .char_literal, .enum_literal => true,
-        .identifier => {
-            const name = tree.tokenSlice(tree.nodeMainToken(node));
-            return std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false") or std.mem.eql(u8, name, "null") or std.mem.eql(u8, name, "undefined");
-        },
-        else => false,
-    };
-}
-
-/// Whether a value `resolve` gives is a type, not a value of one.
-fn isType(value: Facts.Value) bool {
-    return switch (value) {
-        .container, .primitive, .error_set, .fn_type, .unknown => true,
-        .instance, .scalar, .literal, .function, .reflected => false,
-        .reified => |reified| !reified.value,
-        .pointer => |inner| isType(inner.child.*),
-        .array, .optional, .error_union => |inner| isType(inner.*),
-        .alternatives => |each| each.len != 0 and isType(each[0]),
-    };
-}
-
-/// A declaration a caller has to name: a parameter is the caller's own; any other is named by
-/// its path only where it is public and the surface reaches it.
-fn namedDeclaration(self: *Context, signature: Signature, definition: Facts.Decl) RunError!void {
-    const model = &self.project.at(definition.file).model;
-    const decl = model.declarations[@backingInt(definition.index)];
-    if (decl.kind == .parameter) return;
-    if ((decl.public or decl.exported) and model.surfaceReachable(decl.scope)) return;
-    try self.atDefinition(.Z012, signature.site, try self.allocator.print("public signature names private declaration '{s}'", .{decl.name}), definition);
-}
-
-/// A public constant's or variable's type: the type written, or the type of its value.
+/// A public constant's or variable's type as written: its annotation, or a type written in place
+/// as its value (`pub const Many = []const Hidden;`). A name as its value is an alias, which is
+/// the name callers spell; an inferred type is not read.
 fn publicValue(self: *Context, signature: Signature, index: Model.Declaration.Id) RunError!void {
     const source = self.project.at(self.file);
     const decl = source.model.declarations[@backingInt(index)];
     const variable = source.file.tree.fullVarDecl(decl.node) orelse return;
     if (variable.ast.type_node.unwrap()) |t| return privateType(self, signature, self.file, t, 0);
-    const init = variable.ast.init_node.unwrap() orelse return;
-    // A part of a parameter (a generic's `h.n`) has the type the caller gave it.
-    if (try fromParameter(self, self.file, init)) return;
-    // A choice is one of its branches, each a type or a value of one.
-    switch (source.file.tree.nodeTag(init)) {
-        .@"if", .if_simple, .@"switch", .switch_comma => return eachBranch(self, signature, self.file, init, 0),
-        else => {},
-    }
-    const value = try self.facts.declaration(.{ .file = self.file, .index = index });
-    // A public constant holding a type is a name for it: what the type is written as is read
-    // (a slice or a function type of a private type, a tuple's fields, a type function's
-    // arguments), and a container it names is reached through it.
-    if (value != .unknown and isType(value)) {
-        // A type function's call it holds is named by the constant: its callee is no part of the
-        // surface (`pub const Step = StepOf(u8);`), its arguments are.
-        var made: [1]Ast.Node.Index = undefined;
-        if (source.file.tree.fullCall(&made, Facts.ungrouped(&source.file.tree, init))) |call| {
-            for (call.ast.params) |argument| try exposedArgument(self, signature, self.file, argument, 1, true);
-            return;
-        }
-        return privateType(self, signature, self.file, init, 0);
-    }
-    if (value == .unknown) {
-        // What a call gives is of the type its callee declares it returns.
-        var buffer: [1]Ast.Node.Index = undefined;
-        const call = source.file.tree.fullCall(&buffer, init) orelse return exposedInferred(self, signature, self.file, init, value, 0, false);
-        const callee = switch (try self.facts.definition(self.file, call.ast.fn_expr)) {
-            .decl => |callee| callee,
-            .none => return exposedInferred(self, signature, self.file, init, value, 0, false),
-            .unknown => |why| return undecidedType(self, signature, self.file, call.ast.fn_expr, why),
-        };
-        const callee_source = self.project.at(callee.file);
-        var prototype: [1]Ast.Node.Index = undefined;
-        const function = callee_source.file.tree.fullFnProto(&prototype, callee_source.model.declarations[@backingInt(callee.index)].node) orelse return exposedInferred(self, signature, self.file, init, value, 0, false);
-        const result = function.ast.return_type.unwrap() orelse return;
-        // A type function's call is a type: the constant names it.
-        if (try namesType(self, callee.file, result)) return;
-        return privateType(self, signature, callee.file, result, 0);
-    }
-    try exposedInferred(self, signature, self.file, init, value, 0, false);
-}
-
-/// What a constant is written as, for an alias whose value does not resolve: `const Repr =
-/// Backing(T)` names what `Backing(T)` does.
-fn initOf(self: *Context, definition: Facts.Decl) ?Ast.Node.Index {
-    const source = self.project.at(definition.file);
-    const decl = source.model.declarations[@backingInt(definition.index)];
-    if (decl.kind != .variable) return null;
-    const variable = source.file.tree.fullVarDecl(decl.node) orelse return null;
-    if (source.file.tree.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
-    return variable.ast.init_node.unwrap();
-}
-
-/// Whether `node` reads a parameter or a field of one, as `h` or `h.n`.
-fn fromParameter(self: *Context, file: Project.FileId, node: Ast.Node.Index) RunError!bool {
-    const tree = &self.project.at(file).file.tree;
-    var at = node;
-    while (true) {
-        const path = try Facts.accesses.pathOf(self.facts, file, at);
-        for (path.steps) |step| if (step.kind != .field and step.kind != .root) return false;
-        switch (path.root) {
-            .decl => |definition| return self.project.at(definition.file).model.declarations[@backingInt(definition.index)].kind == .parameter,
-            .unknown => return false,
-            .none => {},
-        }
-        // `@TypeOf(x)` of a parameter is the type the caller gave.
-        const root = path.steps[path.steps.len - 1].node;
-        var buffer: [2]Ast.Node.Index = undefined;
-        const args = Facts.builtinArgs(tree, root, &buffer);
-        if (args.len != 1 or !Facts.isBuiltin(tree, root, "@TypeOf")) return false;
-        at = args[0];
-    }
-}
-
-/// The types a value exposes: an instance's container, a function's signature, a literal's
-/// fields' values. A type held is named by the declaration holding it.
-/// `held` as for `exposedArgument`: a literal's fields are read as the call holding it reads its
-/// arguments.
-fn exposedInferred(self: *Context, given: Signature, file: Project.FileId, node: Ast.Node.Index, value: Facts.Value, depth: usize, held: bool) RunError!void {
-    const signature = anchored(self, given, file, node);
-    if (depth >= 128) return undecidedType(self, signature, file, node, .budget);
-    switch (value) {
-        .unknown => |why| try undecidedType(self, signature, file, node, why),
-        .container, .primitive, .error_set, .fn_type, .scalar => {},
-        .instance => |container| try exposedContainer(self, signature, file, node, container, depth + 1),
-        .pointer => |inner| try exposedInferred(self, signature, file, node, inner.child.*, depth + 1, held),
-        .array, .optional, .error_union => |inner| try exposedInferred(self, signature, file, node, inner.*, depth + 1, held),
-        .alternatives => |each| for (each) |one| try exposedInferred(self, signature, file, node, one, depth + 1, held),
-        .function => |function| {
-            // An alias of a function: its signature, named through the alias.
-            const model = &self.project.at(function.file).model;
-            const decl = model.declarations[@backingInt(function.index)];
-            if ((decl.public or decl.exported) and model.surfaceReachable(decl.scope)) return;
-            var prototype: [1]Ast.Node.Index = undefined;
-            const proto = self.project.at(function.file).file.tree.fullFnProto(&prototype, decl.node) orelse return undecidedType(self, signature, file, node, .unsupported);
-            try privateSignature(self, signature, function.file, proto, depth + 1);
-        },
-        .literal => |key| {
-            const tree = &self.project.at(key.file).file.tree;
-            var buffer: [2]Ast.Node.Index = undefined;
-            const init = tree.fullStructInit(&buffer, key.node) orelse return undecidedType(self, signature, file, node, .unsupported);
-            for (init.ast.fields) |field| try exposedArgument(self, signature, key.file, field, depth + 1, held);
-        },
-        .reified => |reified| if (reified.value) try undecidedType(self, signature, file, node, .unsupported),
-        .reflected => try undecidedType(self, signature, file, node, .unsupported),
-    }
+    const init = Facts.ungrouped(&source.file.tree, variable.ast.init_node.unwrap() orelse return);
+    if (try self.facts.definition(self.file, init) != .none) return;
+    try privateType(self, signature, self.file, init, 0);
 }
 
 fn encloses(model: *const Model, outer: Model.Scope.Id, inner: Model.Scope.Id) bool {
     var at: ?Model.Scope.Id = inner;
     while (at) |s| : (at = model.scopes[@backingInt(s)].parent) if (s == outer) return true;
     return false;
-}
-
-/// An undecided Z012: at the node when it is in the file checked, else at the signature.
-fn undecidedType(self: *Context, signature: Signature, file: Project.FileId, node: Ast.Node.Index, why: Facts.Unknown) RunError!void {
-    if (file == self.file) return unknown(self, .Z012, node, why);
-    const tree = &self.project.at(self.file).file.tree;
-    try self.undecided(.Z012, tree.tokenStart(signature.site), if (why == .budget) .budget_exhausted else .unresolved, @tagName(why));
 }
 
 fn deprecated(self: *const Context, definition: Facts.Decl) bool {
