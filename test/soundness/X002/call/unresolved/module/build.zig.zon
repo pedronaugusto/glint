@@ -1,0 +1,1 @@
+.{ .name = .pkg, .version = "0.0.0", .fingerprint = 0x6b7a8c9d0e1f2a3b, .minimum_zig_version = "0.17.0", .paths = .{""} }

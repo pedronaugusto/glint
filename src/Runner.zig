@@ -42,6 +42,8 @@ definitions: []const rules.Definition = &.{},
 files: []const FileConfig = &.{},
 /// The file whose rules run; set before each file's run, and read only during it.
 file: Project.FileId = undefined,
+/// The sites each seam held, by seam (its index in the base configuration) and rule.
+seam_sites: std.AutoArrayHashMapUnmanaged(struct { usize, rules.Rule }, usize) = .empty,
 
 pub const RunError = Suppression.ParseError || Context.Error || std.Io.Cancelable;
 pub const Options = struct {
@@ -169,7 +171,51 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     }
     if (config.strict_suppressions and runner.stale.items.len != 0) runner.complete = false;
     std.mem.sort(Report.Diagnostic, runner.diagnostics.items, project, diagnosticLess);
-    return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .coverage = runner.coverage.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale.items.len, .stale = runner.stale.items, .escapes = runner.escapes.items, .malformed = runner.malformed.items, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null };
+    return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .coverage = runner.coverage.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale.items.len, .stale = runner.stale.items, .escapes = runner.escapes.items, .malformed = runner.malformed.items, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null, .seams = try runner.seamCounts(config), .test_inputs = try testInputCounts(a, project, config), .unmapped_import_files = unmappedImportFiles(runner.coverage.items) };
+}
+
+/// Each seam of `config` with the sites it held per rule; stale where every rule it names ran
+/// and it held none.
+fn seamCounts(runner: *const Runner, config: rules.Config) error{OutOfMemory}![]const Report.SeamCount {
+    const counts = try runner.a.alloc(Report.SeamCount, config.seams.len);
+    for (config.seams, counts, 0..) |seam, *count, i| {
+        const per_rule = try runner.a.alloc(Report.RuleSites, seam.rules.len);
+        var total: usize = 0;
+        var all_ran = true;
+        for (seam.rules, per_rule) |name, *sites| {
+            const id = rules.parseConfigured(name, runner.definitions);
+            const held = if (id) |rule| runner.seam_sites.get(.{ i, rule }) orelse 0 else 0;
+            sites.* = .{ .name = name, .sites = held };
+            total += held;
+            all_ran = all_ran and id != null and config.has(id.?);
+        }
+        count.* = .{ .where = seam.file orelse seam.module.?, .reason = seam.reason, .rules = per_rule, .stale = all_ran and total == 0 };
+    }
+    return counts;
+}
+
+/// Each test input entry of `config` with the project's inputs it holds (the first entry that
+/// holds an input counts it).
+fn testInputCounts(a: std.mem.Allocator, project: *const Project, config: rules.Config) error{OutOfMemory}![]const Report.TestInputCount {
+    const counts = try a.alloc(Report.TestInputCount, config.test_inputs.len);
+    for (config.test_inputs, counts) |entry, *count| count.* = .{ .pattern = entry.path orelse entry.module.?, .files = 0 };
+    for (project.sources) |*source| if (config.testInput(source.input.name)) |i| {
+        counts[i].files += 1;
+    };
+    return counts;
+}
+
+/// How many files reported an import no module mapping names.
+fn unmappedImportFiles(coverage: []const Report.Coverage) usize {
+    var count: usize = 0;
+    for (coverage, 0..) |entry, i| {
+        if (entry.reason != .unresolved or !std.mem.eql(u8, entry.detail, "missing_mapping")) continue;
+        const earlier = for (coverage[0..i]) |before| {
+            if (before.file == entry.file and before.reason == .unresolved and std.mem.eql(u8, before.detail, "missing_mapping")) break true;
+        } else false;
+        if (!earlier) count += 1;
+    }
+    return count;
 }
 
 /// `config` with each package rule that is on by default selected at report level, where the
@@ -330,6 +376,12 @@ fn emitRelated(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: [
     const file = self.project.at(self.file).file;
     const line = file.line(start);
     const metadata = rules.definition(rule, self.definitions) orelse return error.InvalidSelection;
+    // A site in a seam the project declares for this rule is the seam's, counted, not reported.
+    if (self.config.seamOf(self.project.at(self.file).input.name, metadata.name)) |seam| {
+        const held = try self.seam_sites.getOrPut(self.a, .{ seam, rule });
+        held.value_ptr.* = if (held.found_existing) held.value_ptr.* + 1 else 1;
+        return;
+    }
     const span: Report.Span = .{ .file = self.file, .start = start, .end = end, .line = line + 1, .column = file.column(start) };
     const key = try self.a.print("{d} {d} {d} {d} {s}", .{ @backingInt(rule), @backingInt(self.file), start, end, message });
     const seen = try self.emitted.getOrPut(self.a, key);

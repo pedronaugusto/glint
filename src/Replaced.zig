@@ -13,7 +13,6 @@ const Governed = @import("Governed.zig");
 const PackageRules = @import("PackageRules.zig");
 const Facts = @import("Facts.zig");
 const Project = @import("Project.zig");
-const Model = @import("Model.zig");
 const Rule = @import("Rule.zig");
 
 /// One entry as the run reads it, with the package that declares it.
@@ -191,4 +190,16 @@ fn message(c: *Context, entry: Entry) Context.Error![]const u8 {
 
 fn declName(project: *const Project, decl: Facts.Decl) []const u8 {
     return project.at(decl.file).model.declarations[@backingInt(decl.index)].name;
+}
+
+/// P005, glint's own replaced declaration: a reference outside test code that resolves to std's
+/// `debug.print`, a hygiene rule, so one that does not resolve is silent. The program's output
+/// or logging is the answer; a project names the file that is its output in a seam.
+pub fn debugPrints(c: *Context) Context.Error!void {
+    if (!c.config.has(.P005)) return;
+    const found = try Governed.resolve(c, .P005, &.{.{ .source = "std", .declaration = "debug.print", .production = true }}, &.{0});
+    var sites: std.ArrayList(Governed.Site) = .empty;
+    var unread: std.ArrayList(Governed.Unread) = .empty;
+    try Governed.sitesLeaving(c, .P005, found, &sites, &unread);
+    for (sites.items) |site| try c.atDefinition(.P005, site.token, "production debug print; use the program's output or logging", site.decl);
 }

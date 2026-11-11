@@ -49,7 +49,7 @@ pub fn check(context: *Context) RunError!void {
     try syntaxRules(context);
     try precedence(context);
     try contextRules(context);
-    try sourcePolicies(context);
+    try @import("Replaced.zig").debugPrints(context);
     try functionLengths(context);
     try Disallowed.check(context);
     try DeadDeclarations.check(context);
@@ -735,19 +735,6 @@ fn unknownCoverage(self: *Context) RunError!void {
 /// P005: each call by meaning (`Facts.calls`) of std's `debug.print`, wherever the file reaches
 /// it from (std imported here, or through another file's alias); a call of a choice one of
 /// which is it is one; one whose callee may be any function is undecided.
-fn sourcePolicies(self: *Context) RunError!void {
-    if (!self.config.has(.P005)) return;
-    const tree = &self.project.at(self.file).file.tree;
-    for (try Facts.calls.in(self.facts, self.file)) |call| {
-        const token = tree.nodeMainToken(call.node);
-        if (self.inTest(token)) continue;
-        switch (try Governed.mayCallStd(self, call.node, "debug.print")) {
-            .no => {},
-            .yes => try self.at(.P005, token, "production debug print; use the project's output/logging contract"),
-            .unknown => |why| try self.unknown(.P005, call.callee_expr, why),
-        }
-    }
-}
 fn functionLengths(self: *Context) RunError!void {
     if (!self.config.has(.P003)) return;
     const file = self.project.at(self.file).file;

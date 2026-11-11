@@ -78,7 +78,9 @@ const Loader = struct {
         const basename = std.Io.Dir.path.basename(path);
         const stem = if (std.mem.endsWith(u8, basename, ".zig")) basename[0 .. basename.len - 4] else basename;
         const package = try self.packageOf(canonical);
-        try self.inputs.append(self.a, .{ .name = path, .stem = stem, .kind = if (std.mem.endsWith(u8, basename, ".zon")) .zon else .zig, .bytes = bytes, .selected = selected, .package = package.name, .fingerprint = package.fingerprint });
+        // An input the configuration names as test code is test code throughout (`test_inputs`).
+        const classification: @FieldType(Project.Input, "classification") = if (self.options.config.testInput(path) != null) .@"test" else .production;
+        try self.inputs.append(self.a, .{ .name = path, .stem = stem, .kind = if (std.mem.endsWith(u8, basename, ".zon")) .zon else .zig, .bytes = bytes, .selected = selected, .package = package.name, .fingerprint = package.fingerprint, .classification = classification });
         try self.canonical_paths.append(self.a, canonical);
         try self.paths.put(self.a, canonical, position);
         return position;
@@ -298,6 +300,9 @@ fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, definitions: 
         // A configuration file is the checked repository's content: input until parsed.
         const configured = try aegis.input.Untrusted([]const u8).init(bytes).parse(a, configure);
         result.config = configured.config;
+        // Its seams and test inputs name paths from its own directory.
+        const real = try std.Io.Dir.cwd().realPathFileAlloc(io, path, a);
+        result.config.paths_from = std.Io.Dir.path.dirname(real) orelse ".";
         result.settings = configured.settings;
         result.package_defaults = configured.package_defaults;
         if (configured.aegis) {
@@ -368,6 +373,8 @@ fn resolve(a: std.mem.Allocator, result: *Options, definitions: []const Rule.Def
         for (result.only) |id| try select(a, &result.config, Rule.parseConfigured(id, definitions) orelse return error.UnknownRule, .report);
     }
     for (result.levels) |level| for (level[0]) |id| try select(a, &result.config, Rule.parseConfigured(id, definitions) orelse return error.UnknownRule, level[1]);
+    // A seam names rules the run has.
+    for (result.config.seams) |seam| for (seam.rules) |name| if (Rule.parseConfigured(name, definitions) == null) return error.UnknownRule;
     try result.config.validate();
 }
 
@@ -613,6 +620,8 @@ pub const Configuration = struct {
     fact_budget: usize = 100_000,
     peer_writers: []const Rule.Config.PeerWriter = &.{},
     pointer_widths: []const u16 = &.{},
+    seams: []const Rule.Config.Seam = &.{},
+    test_inputs: []const Rule.Config.TestInput = &.{},
     pub const Setting = struct { id: []const u8, level: Rule.Config.Level };
 };
 fn select(a: std.mem.Allocator, config: *Rule.Config, id: Rule.Rule, level: Rule.Config.Level) !void {
@@ -648,6 +657,8 @@ fn configure(a: std.mem.Allocator, bytes: []const u8) ConfigureError!Configured 
     config.fact_budget = document.fact_budget;
     config.peer_writers = document.peer_writers;
     config.pointer_widths = document.pointer_widths;
+    config.seams = document.seams;
+    config.test_inputs = document.test_inputs;
     try config.validate();
     return .{ .config = config, .aegis = document.profile == .aegis, .package_defaults = document.profile != .none, .settings = document.rules };
 }
