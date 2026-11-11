@@ -7,14 +7,14 @@
 //! and a private declaration is used only where its file spells its name: an identifier, a
 //! member access or declaration literal (`.name`), or `@field` with that name. Every spelling
 //! counts as a use unless the identifier resolves lexically to another declaration (Zig
-//! rejects an ambiguous one); a use inside the declaration itself does not count. A `@field`
-//! whose name is computed reaches nothing on a run-time value (there it names only fields), every
-//! declaration of its receiver's container on a type, and leaves the file undecided when the
-//! receiver could be a type and does not resolve. No reachability: a declaration only
-//! dead code names is not reported.
+//! rejects an ambiguous one); a use inside the declaration itself does not count. A spelling
+//! of the same name that is no use of it (an error name, an asm operand, a field or enum
+//! literal) still counts, so a miss is allowed and a wrong report is not. A file holding a
+//! `@field` whose name is not a plain string literal reports nothing: a computed name may
+//! reach any declaration of a type. No reachability: a declaration only dead code names is
+//! not reported.
 const std = @import("std");
 const Context = @import("RuleContext.zig");
-const Facts = @import("Facts.zig");
 const Model = @import("Model.zig");
 const Ast = std.zig.Ast;
 
@@ -84,6 +84,26 @@ pub fn check(context: *Context) Context.Error!void {
         try candidates.add(a, model, .{ .decl = @fromBackingInt(@intCast(d)), .first = tree.firstToken(whole), .last = tree.lastToken(whole) });
     }
     if (candidates.list.items.len == 0) return;
+    // A `@field` names a declaration by its literal name; a computed name may name any, so the
+    // file's findings are withheld.
+    for (tree.nodes.items(.tag), 0..) |tag, n| {
+        switch (tag) {
+            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {},
+            else => continue,
+        }
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
+        const main = tree.nodeMainToken(node);
+        if (!std.mem.eql(u8, tree.tokenSlice(main), "@field")) continue;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const args = tree.builtinCallParams(&buffer, node) orelse continue;
+        if (args.len != 2) continue;
+        if (tree.nodeTag(args[1]) != .string_literal) return;
+        const name = std.zig.string_literal.parseAlloc(a, tree.tokenSlice(tree.nodeMainToken(args[1]))) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return,
+        };
+        candidates.spelled(model, name, main);
+    }
     const resolved = try a.alloc(?Model.Declaration.Id, tree.tokens.len);
     @memset(resolved, null);
     for (model.references) |reference| if (reference.declaration) |d| {
@@ -97,34 +117,6 @@ pub fn check(context: *Context) Context.Error!void {
         if (resolved[token]) |d| if (candidates.resolvedUse(d, token)) continue;
         candidates.spelled(model, try Model.identifier(a, tree.tokenSlice(token)), token);
     }
-    var undecided = false;
-    for (0..tree.nodes.len) |n| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
-        if (!Facts.isBuiltin(tree, node, "@field")) continue;
-        const main = tree.nodeMainToken(node);
-        var buffer: [2]Ast.Node.Index = undefined;
-        const args = Facts.builtinArgs(tree, node, &buffer);
-        if (args.len != 2) continue;
-        // The names it spells (a literal, a `const` holding one, a list it ranges over).
-        switch (try context.facts.fieldName(context.file, args[1])) {
-            .name => |name| {
-                candidates.spelled(model, name, main);
-                continue;
-            },
-            .names => |names| {
-                for (names) |name| candidates.spelled(model, name, main);
-                continue;
-            },
-            .each_of, .computed => {},
-        }
-        // On a value `@field` reaches only fields; only a type's declarations can be named.
-        if (try context.facts.runtime(context.file, args[0])) continue;
-        if (!try computed(context, candidates.list.items, model, try context.facts.resolve(context.file, args[0]), main)) {
-            undecided = true;
-            try context.undecided(.D001, tree.tokenStart(main), .unresolved, "a @field with a computed name on a receiver that does not resolve may name any private declaration of this file");
-        }
-    }
-    if (undecided) return;
     // A container's finding stands for what it holds only where it is reported: one suppressed
     // there leaves its declarations' own findings.
     for (candidates.list.items) |*candidate| {
@@ -169,27 +161,6 @@ fn fieldName(tree: *const Ast, token: Ast.TokenIndex) bool {
 
 fn use(candidate: *Candidate, token: Ast.TokenIndex) void {
     if (token < candidate.first or token > candidate.last) candidate.used = true;
-}
-
-/// A computed `@field` name reaches every declaration of its receiver's container. False when
-/// the receiver does not resolve, so any private declaration may be the one it names.
-fn computed(context: *Context, candidates: []Candidate, model: *const Model, value: Facts.Value, token: Ast.TokenIndex) Context.Error!bool {
-    switch (value) {
-        .container, .instance => |container| {
-            if (container.symbolic) return false;
-            if (container.file != context.file) return true; // Another file's container shows this one nothing private.
-            for (candidates) |*candidate| if (model.declarations[@backingInt(candidate.decl)].scope == container.scope) use(candidate, token);
-            return true;
-        },
-        .pointer => |child| return computed(context, candidates, model, child.child.*, token),
-        .optional, .error_union => |child| return computed(context, candidates, model, child.*, token),
-        .alternatives => |each| {
-            for (each) |one| if (!try computed(context, candidates, model, one, token)) return false;
-            return true;
-        },
-        .primitive, .scalar, .error_set, .function, .array, .literal, .reified, .fn_type => return true,
-        .unknown, .reflected => return false,
-    }
 }
 
 /// A declaration inside a container that is itself reported: the container is the finding.

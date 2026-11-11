@@ -1,4 +1,4 @@
 .{
-    .no_hole = .{ .assignment, .destructure, .capture, .field, .call, .deferred, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch },
-    .no_twin = .{ .assignment, .destructure, .capture, .field, .call, .deferred, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch },
+    .no_hole = .{ .destructure, .capture, .field, .call, .deferred, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch },
+    .no_twin = .{ .assignment, .destructure, .capture, .deferred, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch },
 }
