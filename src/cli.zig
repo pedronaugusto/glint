@@ -556,8 +556,9 @@ test "fuzz: the configuration JSON" {
             const bytes = buffer[0..smith.slice(&buffer)];
             var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
             defer arena.deinit();
-            // A document refused, for its JSON or its names, is the answer: the CLI says so.
-            _ = configure(.{ .a = arena.allocator(), .definitions = &.{} }, bytes) catch |err| switch (err) {
+            // A document refused for its JSON is the answer: the CLI says so. Its rule names are
+            // resolved later, against the run's rules (`resolve`).
+            _ = configure(arena.allocator(), bytes) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return,
             };
