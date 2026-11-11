@@ -1,44 +1,12 @@
 .{
     .open = .{
-        // matrix A014: a store through a local copy of the caller's pointer is not one that outlives the call
-        "assignment/mx-store_through_local_alias/hole.zig",
-        // matrix A014: a std list's items stored in a field through a local are no borrow the rule reads
-        "assignment/mx-items_through_local/hole.zig",
         // matrix A014: a destructured name is no alias the rule follows
         "destructure/mx-destructured_pointer/hole.zig",
-        // matrix A014: a pointer capture into a local optional is no alias the rule follows
-        "capture/mx-optional_pointer_capture/hole.zig",
-        // matrix A014: a for loop's pointer capture into a local array is no alias the rule follows
-        "capture/mx-for_pointer_capture/hole.zig",
-        // matrix A014: `&p.*` is no path into the local the rule reads
-        "address/mx-address_of_deref/hole.zig",
-        // matrix A014: a slice's `.ptr` is no pointer into the local the rule reads
-        "address/mx-slice_ptr/hole.zig",
         // matrix A014: a call's result is not followed into what it was given
         "call/mx-identity_callee/hole.zig",
         // matrix A014: a pointer handed to a callee that stores it is no store the rule reads
         "call/mx-callee_stores/hole.zig",
-        // matrix A014: a defer that makes the store counts as the defer that undoes it
-        "deferred/mx-defer_stores/hole.zig",
-        // matrix A014: a labeled block's result is not followed
-        "jump/mx-block_result_pointer/hole.zig",
-        // matrix A014: an inline for's capture of a pointer is no alias the rule follows
-        "inline_loop/mx-inline_capture/hole.zig",
-        // matrix A014: pointer arithmetic on a pointer into the local is not followed
-        "operator/mx-pointer_arithmetic/hole.zig",
-        // matrix A014: @ptrCast of a pointer into the local is not followed
-        "conversion/mx-ptr_cast/hole.zig",
-        // matrix A014: @as of a pointer into the local is not followed
-        "conversion/mx-as_coerced/hole.zig",
-        // matrix A014: `.?` of a local optional holding a pointer into the frame is not followed
-        "unwrap/mx-optional_local_pointer/hole.zig",
-        // matrix A014: orelse's right is not followed
-        "unwrap/mx-orelse_local/hole.zig",
-        // matrix A014: an array literal is not read, only a struct literal
-        "aggregate/mx-tuple_literal/hole.zig",
         // matrix A014: @atomicStore is no store the rule reads
         "memory/mx-atomic_store_global/hole.zig",
-        // matrix A014: an if expression's result is not followed
-        "branch/mx-if_result_pointer/hole.zig",
     },
 }

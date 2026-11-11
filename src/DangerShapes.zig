@@ -4657,13 +4657,30 @@ pub fn borrowsStored(c: *Context, rule: Rule) Context.Error!void {
     for (try Facts.accesses.storesIn(c.facts, c.file)) |site| {
         if (site.kind != .set) continue;
         const node = site.node;
-        const value = site.value orelse continue;
+        const value = try constValue(c, tree, site.value orelse continue);
         if (try Facts.accesses.memberRead(c.facts, c.file, site.target orelse continue) == null) continue;
         if (c.inTest(tree.nodeMainToken(node)) or !try Danger.atRuntime(c, node)) continue;
         const what = (try borrow(c, tree, namespaces, value)) orelse continue;
         if (try settled(c, node, value)) continue;
         try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("a borrow of a std container's storage ({s}) stored in a field: the next growth moves it; aegis handle keys or scope references stay valid", .{what}));
     }
+}
+
+/// The value `node` gives through the names of a function's own variables that hold one value
+/// alone (`Facts.givenTo`: a `const`'s, a `var`'s given no other).
+fn constValue(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!Ast.Node.Index {
+    var at = Facts.ungrouped(tree, node);
+    // A chain of names, each given the next, as far as a function writes one.
+    for (0..16) |_| switch (try c.facts.definition(c.file, at)) {
+        .decl => |d| {
+            if (d.file != c.file or Facts.accesses.global(c.facts, d)) return at;
+            const given = (try c.facts.givenTo(d, false)) orelse return at;
+            if (given.len != 1 or given[0].file != c.file) return at;
+            at = Facts.ungrouped(tree, given[0].node);
+        },
+        .none, .unknown => return at,
+    };
+    return at;
 }
 
 /// What borrow of std container storage `node` is, if it is one.

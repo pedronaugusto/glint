@@ -48,7 +48,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         if (stored) |target| if (!try self.outlives(target)) continue;
         const reached = try self.escaping(operand, function, 0);
         if (reached == .none) continue;
-        if (stored) |target| if (try self.restored(function, target)) continue;
+        if (stored) |target| if (try self.restored(function, target, node)) continue;
         const local = switch (reached) {
             .none => unreachable, // unreachable: left above
             .unknown => |why| {
@@ -102,12 +102,23 @@ const Walk = struct {
     /// The declaration an identifier names, when it is one of `function`'s own: declared in its
     /// body, outside any nested function or `comptime`.
     fn own(self: Walk, identifier: Ast.Node.Index, function: Ast.Node.Index) ?Model.Declaration.Id {
+        const d, const decl = self.declared(identifier, function) orelse return null;
+        return if (decl.kind == .variable) d else null;
+    }
+
+    /// The declaration of a capture an identifier names, when it is one of `function`'s own.
+    fn capture(self: Walk, identifier: Ast.Node.Index, function: Ast.Node.Index) ?Model.Declaration {
+        _, const decl = self.declared(identifier, function) orelse return null;
+        return if (decl.kind == .capture) decl else null;
+    }
+
+    /// The declaration an identifier names, when `function`'s body declares it.
+    fn declared(self: Walk, identifier: Ast.Node.Index, function: Ast.Node.Index) ?struct { Model.Declaration.Id, Model.Declaration } {
         const reference = self.model.reference(identifier) orelse return null;
         const d = reference.declaration orelse return null;
         const decl = self.model.declarations[@backingInt(d)];
-        if (decl.kind != .variable) return null;
         if (self.enclosing(decl.node) != function) return null;
-        return d;
+        return .{ d, decl };
     }
 
     /// The local a pointer value reaches into: through `depth` aliases so far.
@@ -115,15 +126,14 @@ const Walk = struct {
         const tree = self.tree;
         const node = Facts.ungrouped(tree, written);
         if (depth > 8) return .{ .unknown = .{ .reason = .budget_exhausted, .detail = "a pointer followed through more aliases than are read may point into a local the return frees" } };
+        // A value carried or chosen (`.?`, `try`, both sides of `orelse` and `catch`, an `if`'s
+        // or a `switch`'s results, a labeled block's `break`s, `@as`): each value it may give.
+        switch (try Facts.accesses.valuesOf(self.c.facts, self.c.file, node)) {
+            .leaves => |leaves| if (leaves.len != 1 or leaves[0] != node) return self.first(leaves, function, depth + 1),
+            .unknown => |why| return .{ .unknown = .{ .reason = if (why == .budget) .budget_exhausted else .unresolved, .detail = "a value whose possible values are not read may point into a local the return frees" } },
+        }
         switch (tree.nodeTag(node)) {
-            .address_of => {
-                const inner = tree.nodeData(node).node;
-                const root = (try self.storage(inner)) orelse return .none;
-                // The local itself is its frame's memory, whatever its type.
-                if (root == Facts.ungrouped(tree, inner)) return reach(self.variable(root, function));
-                const d = self.variable(root, function) orelse return .none;
-                return if (try self.value(d)) .{ .local = d } else .none;
-            },
+            .address_of => return self.addressOf(tree.nodeData(node).node, function, depth),
             .slice_open, .slice, .slice_sentinel => {
                 const sliced = (tree.fullSlice(node) orelse return .none).ast.sliced;
                 const root = (try self.storage(sliced)) orelse return .none;
@@ -143,6 +153,17 @@ const Walk = struct {
             // what a `const` holds; a store that may give it any value may give it a local's
             // address.
             .identifier => {
+                // A capture: a pointer one points into its source's memory; one by value is
+                // what the source gives, a loop's each element of a literal it runs over.
+                if (self.capture(node, function)) |record| {
+                    const source = self.c.facts.captureSource(self.c.file, record) orelse return .none;
+                    if (tree.tokenTag(record.token - 1) == .asterisk) return self.pointed(source, function, depth + 1);
+                    if (try self.c.facts.holdsNoAddress(try self.c.facts.resolve(self.c.file, node))) return .none;
+                    if (tree.fullFor(record.node) == null) return self.escaping(source, function, depth + 1);
+                    var buffer: [2]Ast.Node.Index = undefined;
+                    const literal = tree.fullArrayInit(&buffer, Facts.ungrouped(tree, source)) orelse return .none;
+                    return self.first(literal.ast.elements, function, depth + 1);
+                }
                 const d = self.own(node, function) orelse return .none;
                 // A value that holds no pointer (`[4]u8` returned whole) points nowhere.
                 if (try self.c.facts.holdsNoAddress(try self.typeOf(d))) return .none;
@@ -150,14 +171,83 @@ const Walk = struct {
                     return .{ .unknown = .{ .reason = .unresolved, .detail = "a pointer named by a local given a value no store here shows (its address taken, its bytes written) may point into a local the return frees" } };
                 return self.first(given, function, depth + 1);
             },
+            // A pointer moved by a number points into the memory it did (`p + 1`); a difference
+            // of two is a number.
+            .add, .sub, .add_wrap, .sub_wrap => {
+                if (try self.c.facts.holdsNoAddress(try self.c.facts.resolve(self.c.file, node))) return .none;
+                return self.escaping(tree.nodeData(node).node_and_node[0], function, depth + 1);
+            },
+            // A slice's `ptr` points where the slice does.
+            .field_access => return switch (try self.c.facts.languageField(self.c.file, node)) {
+                .ptr => self.escaping(tree.nodeData(node).node_and_token[0], function, depth + 1),
+                .len, .none, .unknown => .none,
+            },
             else => {
+                // A cast of a pointer keeps its address.
+                var arguments: [2]Ast.Node.Index = undefined;
+                const args = Facts.builtinArgs(tree, node, &arguments);
+                for ([_]struct { []const u8, usize }{ .{ "@ptrCast", 0 }, .{ "@alignCast", 0 }, .{ "@constCast", 0 }, .{ "@volatileCast", 0 }, .{ "@fieldParentPtr", 1 } }) |cast| {
+                    if (Facts.isBuiltin(tree, node, cast[0]) and cast[1] < args.len) return self.escaping(args[cast[1]], function, depth + 1);
+                }
                 var buffer: [2]Ast.Node.Index = undefined;
-                const literal = tree.fullStructInit(&buffer, node) orelse return .none;
-                var fields: std.ArrayList(Facts.Key) = .empty;
-                for (literal.ast.fields) |field| try fields.append(self.c.allocator, .{ .file = self.c.file, .node = field });
-                return self.first(fields.items, function, depth);
+                if (tree.fullStructInit(&buffer, node)) |literal| return self.first(literal.ast.fields, function, depth);
+                if (tree.fullArrayInit(&buffer, node)) |literal| return self.first(literal.ast.elements, function, depth);
+                return .none;
             },
         }
+    }
+
+    /// The local the address of the place `inner` points into.
+    fn addressOf(self: Walk, inner: Ast.Node.Index, function: Ast.Node.Index, depth: u8) Context.Error!Reached {
+        // A place reached through a pointer (`&p.*`, `&p.f`, `&s[i]`) is in the memory that
+        // pointer points at.
+        if (try self.crossed(inner)) |pointer| return self.escaping(pointer, function, depth + 1);
+        const root = (try self.storage(inner)) orelse return .none;
+        // The local itself is its frame's memory, whatever its type.
+        if (root == Facts.ungrouped(self.tree, inner)) return reach(self.variable(root, function));
+        const d = self.variable(root, function) orelse return .none;
+        return if (try self.value(d)) .{ .local = d } else .none;
+    }
+
+    /// The local a pointer capture (`|*v|`) points into: the memory its source points at (a
+    /// slice, a pointer to an array), or the source's own where it holds what it captures (an
+    /// optional, a union, an array). Where the source's type is not known, its own memory may
+    /// be the local's only as one not known.
+    fn pointed(self: Walk, source: Ast.Node.Index, function: Ast.Node.Index, depth: u8) Context.Error!Reached {
+        const typed = try self.c.facts.resolve(self.c.file, source);
+        var pointer = false;
+        var holder = false;
+        var unknown = false;
+        for (Facts.valueParts(&typed)) |part| switch (part) {
+            .pointer => pointer = true,
+            // A choice, which valueParts never gives as a part, is read as one not known.
+            .unknown, .alternatives => unknown = true,
+            else => holder = true,
+        };
+        var out: Reached = .none;
+        if (pointer or unknown) out = try self.escaping(source, function, depth);
+        if (out == .local) return out;
+        if (holder or unknown) switch (try self.addressOf(source, function, depth)) {
+            .local => |d| return if (holder) .{ .local = d } else .{ .unknown = .{ .reason = .unresolved, .detail = "a pointer capture of a local whose type is not known may point into the local the return frees" } },
+            .unknown => |why| out = .{ .unknown = why },
+            .none => {},
+        };
+        return out;
+    }
+
+    /// The pointer the place `node` is reached through nearest to it, whose memory holds the
+    /// place (`p` of `p.*`, `p.f`, `p[i]`, `s[i]` of a slice); null where no step crosses one.
+    fn crossed(self: Walk, node: Ast.Node.Index) Context.Error!?Ast.Node.Index {
+        const path = try Facts.accesses.pathOf(self.c.facts, self.c.file, node);
+        // The root crosses none.
+        for (path.steps) |step| if (step.crosses) return switch (step.kind) {
+            .field => step.receiver,
+            .index => self.tree.nodeData(step.node).node_and_node[0],
+            .slice => (self.tree.fullSlice(step.node) orelse return null).ast.sliced,
+            .deref => self.tree.nodeData(step.node).node,
+            .unwrap, .root => null,
+        };
+        return null;
     }
 
     /// Whether `given` is a slice of the local `d` itself, by its own name.
@@ -170,10 +260,11 @@ const Walk = struct {
         return reference.declaration == d;
     }
 
-    /// The first local one of `values` reaches into; else what may be one, or none.
-    fn first(self: Walk, values: []const Facts.Key, function: Ast.Node.Index, depth: u8) Context.Error!Reached {
+    /// The first local one of `values` (expressions, or `Facts.Key`s of this file) reaches
+    /// into; else what may be one, or none.
+    fn first(self: Walk, values: anytype, function: Ast.Node.Index, depth: u8) Context.Error!Reached {
         var out: Reached = .none;
-        for (values) |each| switch (try self.escaping(each.node, function, depth)) {
+        for (values) |each| switch (try self.escaping(if (@TypeOf(each) == Facts.Key) each.node else each, function, depth)) {
             .local => |d| return .{ .local = d },
             .unknown => |why| out = .{ .unknown = why },
             .none => {},
@@ -261,9 +352,22 @@ const Walk = struct {
         // The name itself is its frame's, a parameter's included; a place through it may be
         // the caller's.
         if (path.steps.len == 1) return self.global(root);
-        const reference = self.model.reference(root) orelse return false;
+        if (self.parameter(root) or self.global(root)) return true;
+        // A place through a local's pointer is in the memory that pointer is given: a place
+        // that outlives the call, or what a parameter's or a container variable's points at.
+        const pointer = (try self.crossed(target)) orelse return false;
+        if (try Facts.accesses.pointed(self.c.facts, self.c.file, pointer)) |place| return place != target and try self.outlives(place);
+        const memory = try Facts.accesses.viewed(self.c.facts, self.c.file, pointer);
+        const reached = try Facts.accesses.pathOf(self.c.facts, self.c.file, memory);
+        if (reached.root != .decl) return false;
+        const base = reached.steps[reached.steps.len - 1].node;
+        return self.parameter(base) or self.global(base);
+    }
+
+    fn parameter(self: Walk, identifier: Ast.Node.Index) bool {
+        const reference = self.model.reference(identifier) orelse return false;
         const d = reference.declaration orelse return false;
-        return self.model.declarations[@backingInt(d)].kind == .parameter or self.global(root);
+        return self.model.declarations[@backingInt(d)].kind == .parameter;
     }
 
     fn global(self: Walk, identifier: Ast.Node.Index) bool {
@@ -279,13 +383,16 @@ const Walk = struct {
 
     /// Whether a `defer` of `function` assigns the target again, naming the same memory, as its
     /// statement or one of its block's own statements (never under a branch): a scoped
-    /// registration cleared on every exit before the frame goes.
-    fn restored(self: Walk, function: Ast.Node.Index, target: Ast.Node.Index) Context.Error!bool {
+    /// registration cleared on every exit before the frame goes. A store a `defer` makes itself
+    /// is undone only by one that runs after it: declared before it, in a block that holds it.
+    fn restored(self: Walk, function: Ast.Node.Index, target: Ast.Node.Index, store: Ast.Node.Index) Context.Error!bool {
         const tree = self.tree;
+        const later = self.deferring(store);
         for (tree.nodes.items(.tag), 0..) |tag, i| {
             if (tag != .@"defer") continue;
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
             if (self.enclosing(node) != function) continue;
+            if (later) |made| if (!self.runsAfter(node, made)) continue;
             const deferred = tree.nodeData(node).node;
             var buffer: [2]Ast.Node.Index = undefined;
             const statements = tree.blockStatements(&buffer, deferred) orelse &.{deferred};
@@ -295,6 +402,27 @@ const Walk = struct {
                 if (try Facts.accesses.samePlace(self.c.facts, self.c.file, written, target) == .yes) return true;
             };
         }
+        return false;
+    }
+
+    /// The `defer` or `errdefer` that runs `node`, if one of its function does.
+    fn deferring(self: Walk, node: Ast.Node.Index) ?Ast.Node.Index {
+        var at = node;
+        while (self.model.parentOf(at)) |parent| : (at = parent) switch (self.tree.nodeTag(parent)) {
+            .@"defer", .@"errdefer" => return parent,
+            .fn_decl => return null,
+            else => {},
+        };
+        return null;
+    }
+
+    /// Whether the `defer` `node` runs after the defer `other` as their scopes exit: it is
+    /// declared before it in a block that holds it.
+    fn runsAfter(self: Walk, node: Ast.Node.Index, other: Ast.Node.Index) bool {
+        if (node == other or self.tree.nodeMainToken(node) >= self.tree.nodeMainToken(other)) return false;
+        const block = self.model.parentOf(node) orelse return false;
+        var at = other;
+        while (self.model.parentOf(at)) |parent| : (at = parent) if (parent == block) return true;
         return false;
     }
 };
