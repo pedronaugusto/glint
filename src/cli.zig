@@ -501,6 +501,28 @@ fn refused(err: ensign.Error, diagnostic: ensign.Diagnostic, problems: *std.Io.W
     return error.InvalidArguments;
 }
 
+test "fuzz: the configuration JSON" {
+    const Target = struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var buffer: [4096]u8 = undefined;
+            const bytes = buffer[0..smith.slice(&buffer)];
+            var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer arena.deinit();
+            // A document refused, for its JSON or its names, is the answer: the CLI says so.
+            _ = configure(.{ .a = arena.allocator(), .definitions = &.{} }, bytes) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return,
+            };
+        }
+    };
+    try std.testing.fuzz({}, Target.one, .{ .corpus = &.{
+        "{\"profile\": \"reviewed\", \"rules\": [{\"id\": \"Z026\", \"level\": \"gate\"}]}",
+        "{\"profile\": \"aegis\", \"max_line_length\": 120, \"disallowed\": [{\"source\": \"std\", \"declaration\": \"debug.print\", \"reason\": \"r\", \"replacement\": \"x\"}]}",
+        "{\"function_exceptions\": [{\"function\": \"f\", \"lines\": 200, \"reason\": \"r\"}]}",
+        "{",
+    } });
+}
+
 test "CLI invalid selections and unknown formats fail" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
