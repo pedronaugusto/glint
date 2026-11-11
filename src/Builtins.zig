@@ -477,8 +477,9 @@ fn lineLength(self: *Context) RunError!void {
     if (self.config.has(.Z024)) for (file.lines, 0..) |_, l| {
         const line = file.lineBytes(l);
         if (line.text.len <= self.config.max_line_length) continue;
-        const over = std.math.add(u32, line.start, self.config.max_line_length) catch continue;
-        const end = std.math.add(u32, line.start, std.math.cast(u32, line.text.len) orelse continue) catch continue;
+        // A line past what a u32 position holds is none the report can name.
+        const over = std.math.cast(u32, @as(u64, line.start) + self.config.max_line_length) orelse continue;
+        const end = std.math.cast(u32, @as(u64, line.start) + line.text.len) orelse continue;
         try self.emit(.Z024, over, end, "line exceeds configured byte length");
     };
 }

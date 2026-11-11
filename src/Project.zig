@@ -110,7 +110,7 @@ pub const Import = struct {
     compilation: ?Compilations = null,
 };
 /// An import checked against the inputs, and the compilations it holds in.
-const Edge = struct { from: FileId, spelling: []const u8, target: FileId, in: Compilations };
+pub const Edge = struct { from: FileId, spelling: []const u8, target: FileId, in: Compilations };
 /// Per-source limits for front-end work.
 pub const Options = struct {
     lowering: bool = true,

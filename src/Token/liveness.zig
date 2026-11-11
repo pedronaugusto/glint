@@ -10,7 +10,7 @@ const Token = @import("store.zig").Token;
 /// Token indices, both ends included.
 pub const Range = struct { first: u32, last: u32 };
 /// Bracket partners borrow private token storage until recovery returns.
-const Partners = struct {
+pub const Partners = struct {
     stream: []const Token,
     fn get(self: Partners, i: usize) u32 {
         return self.stream[i].partner();
@@ -274,7 +274,7 @@ pub const Reach = enum { dead, live, test_only };
 /// a reference can change: by their lengths, then by a slot of length and
 /// ends with the members that share it chained. Most words name no such
 /// member, and most of those are passed over without reading their bytes.
-const Names = struct {
+pub const Names = struct {
     const none = std.math.maxInt(u32);
     members: []const Member,
     /// The names bound to `@This()`, roots or not.
