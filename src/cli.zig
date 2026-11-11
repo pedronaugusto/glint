@@ -356,10 +356,7 @@ fn knownForm(name: []const u8, definitions: []const Rule.Definition) error{Unkno
 /// level's names. A name no rule has is `UnknownRule`.
 fn resolve(a: std.mem.Allocator, result: *Options, definitions: []const Rule.Definition) !void {
     if (result.pack_on) try packOn(a, &result.config, definitions);
-    if (result.package_defaults) for (definitions) |definition| {
-        const declared = definition.declared orelse continue;
-        if (declared.default and !result.config.has(definition.id)) try select(a, &result.config, definition.id, .report);
-    };
+    result.config.package_defaults = result.package_defaults;
     for (result.settings, 0..) |setting, i| {
         for (result.settings[0..i]) |earlier| if (std.mem.eql(u8, setting.id, earlier.id)) return error.InvalidSelection;
         try select(a, &result.config, Rule.parseConfigured(setting.id, definitions) orelse return error.UnknownRule, setting.level);
@@ -367,6 +364,7 @@ fn resolve(a: std.mem.Allocator, result: *Options, definitions: []const Rule.Def
     if (result.only.len != 0) {
         result.config.enabled = Rule.Config.none().enabled;
         result.config.selections = &.{};
+        result.config.package_defaults = false;
         for (result.only) |id| try select(a, &result.config, Rule.parseConfigured(id, definitions) orelse return error.UnknownRule, .report);
     }
     for (result.levels) |level| for (level[0]) |id| try select(a, &result.config, Rule.parseConfigured(id, definitions) orelse return error.UnknownRule, level[1]);
@@ -668,7 +666,7 @@ fn packOn(a: std.mem.Allocator, config: *Rule.Config, definitions: []const Rule.
     }
 }
 
-test "a package rule on by default is selected unless a profile of none or --only says otherwise, and its name resolves once the packages' rules are read" {
+test "the packages' rules on by default run unless a profile of none or --only says otherwise, and a package rule's name resolves once the packages' rules are read" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -678,10 +676,10 @@ test "a package rule on by default is selected unless a profile of none or --onl
     };
     var plain = try options(a, std.testing.io, .{}, &declared);
     try resolve(a, &plain, &declared);
-    try std.testing.expectEqual(Rule.Config.Level.report, plain.config.level(declared[0].id));
-    try std.testing.expectEqual(Rule.Config.Level.off, plain.config.level(declared[1].id));
+    // The run selects the defaults (Runner); the configuration says it takes them.
+    try std.testing.expect(plain.config.package_defaults);
     var only = try options(a, std.testing.io, .{ .only = &.{"X002"} }, &declared);
     try resolve(a, &only, &declared);
-    try std.testing.expectEqual(Rule.Config.Level.off, only.config.level(declared[0].id));
+    try std.testing.expect(!only.config.package_defaults);
     try std.testing.expectEqual(Rule.Config.Level.report, only.config.level(declared[1].id));
 }

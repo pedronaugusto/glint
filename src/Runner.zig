@@ -13,6 +13,7 @@ const Builtins = @import("Builtins.zig");
 const Metrics = @import("Metrics.zig");
 const Contract = @import("AegisContract.zig");
 const PackageRules = @import("PackageRules.zig");
+const Replaced = @import("Replaced.zig");
 const AegisPack = @import("AegisPack.zig");
 
 a: std.mem.Allocator,
@@ -98,9 +99,9 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
         if (!source.input.selected or source.input.kind == .zon) continue;
         if (options.io) |io| try io.checkCancel();
         runner.file = source.id;
-        runner.config = config;
+        runner.config = try withDefaults(a, config, definitions);
         for (options.files) |setting| if (setting.file == runner.file) {
-            runner.config = setting.config;
+            runner.config = try withDefaults(a, setting.config, definitions);
         };
         // Each file's analysis has its own budget: work a scan of the program did for an
         // earlier file is kept, and charged to that file, unless that file's budget ran out.
@@ -140,6 +141,16 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
             try metrics.append(a, .{ .file = runner.file, .counts = counts });
         }
         _ = scratch.reset(.free_all);
+        // The rules packages declare, each run by the engine of what it reads.
+        if (file.status == .parsed) for (definitions) |definition| {
+            const declared_by = definition.declared orelse continue;
+            if (!runner.config.has(definition.id)) continue;
+            switch (declared_by.reads) {
+                .replaces => try Replaced.check(&context, definition),
+                .governed, .exits => {},
+            }
+            _ = scratch.reset(.free_all);
+        };
         if (file.status == .parsed) for (options.project_rules) |rule| {
             if (!runner.config.has(rule.definition.id)) continue;
             try rule.check(&context);
@@ -159,6 +170,25 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     if (config.strict_suppressions and runner.stale.items.len != 0) runner.complete = false;
     std.mem.sort(Report.Diagnostic, runner.diagnostics.items, project, diagnosticLess);
     return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .coverage = runner.coverage.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale.items.len, .stale = runner.stale.items, .escapes = runner.escapes.items, .malformed = runner.malformed.items, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null };
+}
+
+/// `config` with each package rule that is on by default selected at report level, where the
+/// configuration takes package defaults (`Config.package_defaults`) and sets nothing for it.
+fn withDefaults(a: std.mem.Allocator, config: rules.Config, definitions: []const rules.Definition) error{OutOfMemory}!rules.Config {
+    if (!config.package_defaults) return config;
+    var selections: std.ArrayList(rules.Config.Selection) = .empty;
+    try selections.appendSlice(a, config.selections);
+    for (definitions) |definition| {
+        const declared_by = definition.declared orelse continue;
+        if (!declared_by.default or config.enabled.isSet(@backingInt(definition.id))) continue;
+        const named = for (config.selections) |selection| {
+            if (selection.rule == definition.id) break true;
+        } else false;
+        if (!named) try selections.append(a, .{ .rule = definition.id, .level = .report });
+    }
+    var effective = config;
+    effective.selections = selections.items;
+    return effective;
 }
 
 /// The rules the project's packages declare (`PackageRules.table`), with the ids the run gives

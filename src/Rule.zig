@@ -120,6 +120,9 @@ pub const Set = std.bit_set.Array(usize, 1 << 16);
 /// Explicit rule selection. Only the two inspected inherited core rules default on.
 pub const Config = struct {
     enabled: Set = core,
+    /// Whether each rule a package declares on by default (`.default = true`) runs unless the
+    /// configuration sets it: off for a profile of none and for a run of named rules (`--only`).
+    package_defaults: bool = true,
     max_line_length: u32 = 100,
     strict_suppressions: bool = false,
     max_function_lines: u32 = 120,
@@ -206,12 +209,13 @@ pub const Config = struct {
     }
     /// An empty selection for callers migrating explicit policy.
     pub fn none() Config {
-        return .{ .enabled = .empty };
+        return .{ .enabled = .empty, .package_defaults = false };
     }
     /// All reviewed rules for reporting but the opt-in ones. A caller decides which groups gate.
     pub fn reviewed() Config {
         var config = none();
         for (std.meta.tags(Rule)) |rule| config.set(rule, !rule.optIn());
+        config.package_defaults = true;
         return config;
     }
     /// Selects a stable rule ID.
