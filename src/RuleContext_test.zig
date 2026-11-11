@@ -196,3 +196,43 @@ test "a call given a type made by a type function or a type builtin is no functi
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 2), report.diagnostics.len); // safe: the two type arguments are refused, the value accepted.
 }
+
+/// Reports each function declaration that is not test code, by `RuleContext.inTest`.
+fn productionFunctions(context: *glint.RuleContext) glint.RuleContext.Error!void {
+    for (try context.project.declarations(try context.source())) |decl| {
+        if (decl.kind == .function and !context.inTest(decl.token)) try context.at(own, decl.token, "production function");
+    }
+}
+
+test "test code is a test block or an input classified test, never what only tests reach" {
+    const root =
+        \\fn helper() u32 {
+        \\    return 1;
+        \\}
+        \\test "uses the helper and the support file" {
+        \\    const support = @import("support.zig");
+        \\    const inside = struct {
+        \\        fn local() u32 {
+        \\            return 2;
+        \\        }
+        \\    };
+        \\    _ = helper() + support.made() + inside.local();
+        \\}
+    ;
+    const support = "pub fn made() u32 {\n    return 3;\n}\n";
+    const declared = "pub fn given() u32 {\n    return 4;\n}\n";
+    var project = try glint.Project.init(std.testing.allocator, &.{
+        .{ .name = "root.zig", .bytes = root },
+        .{ .name = "support.zig", .bytes = support },
+        .{ .name = "declared.zig", .bytes = declared, .classification = .@"test" },
+    }, &.{.{ .from = 0, .spelling = "support.zig", .target = 1 }}, .{});
+    defer project.deinit();
+    const checking: glint.ProjectRule = .{ .definition = rule.definition, .check = productionFunctions };
+    var report = try glint.runConfigured(std.testing.allocator, &project, configuration(.report), .{ .project_rules = &.{checking} });
+    defer report.deinit();
+    // The private helper only the test calls and the file only the test imports are production;
+    // the function inside the test block and the input classified test are not.
+    try std.testing.expectEqual(@as(usize, 2), report.diagnostics.len); // safe: helper and made, nothing else.
+    for (report.diagnostics) |found| try std.testing.expect(found.span.file != project.sources[2].id);
+    try std.testing.expect(report.diagnostics[0].span.file != report.diagnostics[1].span.file);
+}
