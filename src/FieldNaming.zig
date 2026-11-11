@@ -23,8 +23,9 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         };
         for (container.ast.members) |member| {
             const field = tree.fullContainerField(member) orelse continue;
-            // A tuple's fields have no names: its main token is the field's type.
-            if (field.ast.tuple_like) continue;
+            // A tuple's fields have no names: its main token is the field's type. An enum's tag
+            // reads as tuple-like too (no `:`), and is a name.
+            if (field.ast.tuple_like and tree.tokenTag(container.ast.main_token) != .keyword_enum) continue;
             const token = field.ast.main_token;
             if (tree.tokenTag(token) != .identifier) continue;
             const name = tree.tokenSlice(token);
@@ -69,7 +70,7 @@ test "breadth: field naming: a camel field, a snake type field and an upper tag 
     try breadth.expectFindings(check, "pub const S = struct { someField: u32 };", 1);
     try breadth.expectFindings(check, "pub const S = struct { some_field: u32, Kind: type, kind: type, drawFrame: *const fn () void, draw_frame: *const fn () void };", 0);
     try breadth.expectFindings(check, "pub const S = struct { DrawFrame: *const fn () void };", 1);
-    try breadth.expectFindings(check, "pub const T = struct { []const u8, Kind: u8 };", 0);
+    try breadth.expectFindings(check, "const Kind = enum { a }; pub const T = struct { []const u8, Kind };", 0);
     try breadth.expectFindings(check, "pub const E = enum { ok, Bad, _ };", 1);
     try breadth.expectFindings(check, "pub const C = extern struct { someField: u32 };", 0);
     try breadth.expectFindings(check, "pub const S = struct { @\"Quoted\": u32 };", 0);
