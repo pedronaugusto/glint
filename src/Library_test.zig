@@ -144,7 +144,7 @@ test "a reference in lint_rules that does not resolve is drift with where it is 
 }
 test "a version of lint_rules the reader does not know is drift, and none of its roles are read" {
     const later = [_]Layout{
-        .{ .name = "gadgets.zig", .bytes = "pub const Widget = @import(\"widget.zig\").Widget;\npub const lint_rules = .{ .version = 2, .roles = .{.{ .type = Widget, .role = .widget }} };\n" },
+        .{ .name = "gadgets.zig", .bytes = "pub const Widget = @import(\"widget.zig\").Widget;\npub const lint_rules = .{ .version = 3, .roles = .{.{ .type = Widget, .role = .widget }} };\n" },
         flat[1],
     };
     var run = try probeAll("const gadgets = @import(\"gadgets\");\npub const A = gadgets.Widget;", &later);

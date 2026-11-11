@@ -201,6 +201,9 @@ pub fn drift(self: *RuleContext, library: anytype) Error!?Drift {
 fn problemText(why: PackageRules.Problem.Why) []const u8 {
     return switch (why) {
         .unknown_version => "a version of the vocabulary this glint does not read",
+        .unknown_rule => "a replacement naming a rule the package does not declare to read replacements",
+        .duplicate_rule => "a rule id declared twice",
+        .unknown_builtin => "a builtin the language does not have",
         .unknown_field => "a field the vocabulary does not have",
         .malformed => "a value not of the form the vocabulary gives it",
         .unresolved => "a reference that does not resolve",
