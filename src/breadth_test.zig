@@ -1,6 +1,7 @@
-//! The breadth rules (glint 0.8): fifteen hygiene rules and opt-in bans, each in its own file, that
-//! read the syntax and the type a declaration writes, and report only what is certain. Until they are registered
-//! as built-in rules, each runs and is tested as a project rule of the id below.
+//! The breadth rules (glint 0.8): twenty-five hygiene rules and opt-in bans, each in its own file, that
+//! read the syntax and the type a declaration writes, and report only what is certain. Registered as
+//! built-in rules (`Rule.zig`, run from `Builtins.check`); their unit tests run each one alone, as a
+//! project rule of the id below, which the measuring tool also uses.
 const std = @import("std");
 const Context = @import("RuleContext.zig");
 const Rule = @import("Rule.zig").Rule;
@@ -104,18 +105,23 @@ pub const Found = struct {
 /// Runs `check` over the first file of `project` under `test_id`, as the runner runs a project
 /// rule: its own Facts, the file's context, a sink that keeps each finding's message.
 pub fn run(gpa: std.mem.Allocator, project: *const Project, file: Project.FileId, comptime check: Check) !Found {
+    return runWith(gpa, project, file, check, .none());
+}
+
+/// As `run`, under `base`'s options (its limits) with the rule selected.
+pub fn runWith(gpa: std.mem.Allocator, project: *const Project, file: Project.FileId, comptime check: Check, base: rules.Config) !Found {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
     var facts: Facts = .{ .project = project, .gpa = a, .backing = gpa };
     defer facts.deinit();
     var sink: Context.Sink = .{ .diagnostic = Collect.diagnostic, .coverage = Collect.coverage, .config = Collect.configOf };
-    var collector: Collect = .{ .gpa = gpa };
+    var collector: Collect = .{ .gpa = gpa, .config = selected(base) };
     const before = collecting;
     collecting = &collector;
     defer collecting = before;
     const definitions = [_]rules.Definition{projectRule(check).definition};
-    var context: Context = .{ .allocator = a, .backing = gpa, .project = project, .file = file, .config = selected(), .facts = &facts, .definitions = &definitions, .sink = &sink };
+    var context: Context = .{ .allocator = a, .backing = gpa, .project = project, .file = file, .config = collector.config, .facts = &facts, .definitions = &definitions, .sink = &sink };
     try check(&context, test_id);
     return collector.found;
 }
@@ -127,6 +133,7 @@ threadlocal var collecting: ?*Collect = null;
 const Collect = struct {
     found: Found = .{},
     gpa: std.mem.Allocator,
+    config: rules.Config,
 
     fn diagnostic(_: *Context.Sink, _: Rule, _: u32, _: u32, message: []const u8, _: []const Report.Span, fix: []const Report.Edit) Context.Error!void {
         const self = collecting orelse return;
@@ -138,12 +145,13 @@ const Collect = struct {
         self.found.undecided += 1;
     }
     fn configOf(_: *Context.Sink, _: Project.FileId) rules.Config {
-        return selected();
+        const self = collecting orelse return selected(.none());
+        return self.config;
     }
 };
 
-fn selected() rules.Config {
-    var config: rules.Config = .none();
+fn selected(base: rules.Config) rules.Config {
+    var config = base;
     config.selections = &.{.{ .rule = test_id, .level = .report }};
     return config;
 }
@@ -163,6 +171,20 @@ pub fn expectFindingsNamed(comptime check: Check, name: []const u8, source: []co
     }, &.{.{ .from = 0, .target = 1, .spelling = "std" }}, .{});
     defer project.deinit();
     var found = try run(gpa, &project, project.sources[0].id, check);
+    defer found.deinit(gpa);
+    try std.testing.expectEqual(expected, found.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), found.undecided);
+}
+
+/// As `expectFindings`, under `base`'s options (its limits).
+pub fn expectFindingsWith(comptime check: Check, base: rules.Config, source: []const u8, expected: usize) !void {
+    const gpa = std.testing.allocator;
+    var project = try Project.init(gpa, &.{
+        .{ .name = "fixture", .stem = "Fixture", .bytes = source },
+        .{ .name = "standard", .bytes = fixture_std, .selected = false },
+    }, &.{.{ .from = 0, .target = 1, .spelling = "std" }}, .{});
+    defer project.deinit();
+    var found = try runWith(gpa, &project, project.sources[0].id, check, base);
     defer found.deinit(gpa);
     try std.testing.expectEqual(expected, found.messages.items.len);
     try std.testing.expectEqual(@as(usize, 0), found.undecided);

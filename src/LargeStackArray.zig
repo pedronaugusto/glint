@@ -1,7 +1,7 @@
 //! Hygiene: a local array so large that one call's frame may not fit the stack it runs on, a
 //! thread's above all: a `var` in a function body whose written type is `[N]T`, with `N` an
 //! integer literal or literal arithmetic and `T` a primitive whose size its spelling states
-//! (`u8`, `i32`, `f64`, `bool`), of more than `limit` bytes. Zig compiles a 64 MiB local array and
+//! (`u8`, `i32`, `f64`, `bool`), of more than the configured bytes (`max_stack_array`, 64 KiB by default). Zig compiles a 64 MiB local array and
 //! the program aborts when it runs. A `const` local holding a value known as it compiles is not in
 //! the frame, so only `var` is read, and nothing inside `comptime` or in a function returning
 //! `type`. A length or element whose size is not written leaves the site unread.
@@ -11,15 +11,8 @@ const Context = @import("RuleContext.zig");
 const Rule = @import("Rule.zig").Rule;
 const Written = @import("Written.zig");
 
-/// The most bytes a local array may take before it is reported. TODO(0.8): configurable, as
-/// `max_line_length` is, once the rule is registered.
-pub const limit: u64 = 64 * 1024;
-
 pub fn check(c: *Context, rule: Rule) Context.Error!void {
-    return checkLimit(c, rule, limit);
-}
-
-pub fn checkLimit(c: *Context, rule: Rule, most: u64) Context.Error!void {
+    const most = c.config.max_stack_array;
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
@@ -98,4 +91,13 @@ test "breadth: large stack array: a local var over the limit reported; a const, 
     try breadth.expectFindings(check, "var buf: [1 << 20]u8 = undefined; pub fn f() u8 { return buf[0]; }", 0);
     try breadth.expectFindings(check, "pub fn T() type { var n: [1 << 20]u8 = undefined; _ = &n; return u8; }", 0);
     try breadth.expectFindings(check, "const N = 1 << 20; pub fn f() u8 { var buf: [N]u8 = undefined; buf[0] = 1; return buf[0]; }", 0);
+}
+
+test "breadth: large stack array: the limit is the configuration's" {
+    var tight: @import("Rule.zig").Config = .none();
+    tight.max_stack_array = 1024;
+    try breadth.expectFindingsWith(check, tight, "pub fn f() u8 { var buf: [4096]u8 = undefined; buf[0] = 1; return buf[0]; }", 1);
+    var loose: @import("Rule.zig").Config = .none();
+    loose.max_stack_array = 2 << 20;
+    try breadth.expectFindingsWith(check, loose, "pub fn f() u8 { var buf: [1 << 20]u8 = undefined; buf[0] = 1; return buf[0]; }", 0);
 }

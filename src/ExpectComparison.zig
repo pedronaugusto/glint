@@ -1,8 +1,13 @@
 //! Hygiene: `std.testing.expect(a == b)`, where `expectEqual` says the same and prints
 //! both values when it fails; `expect` prints nothing. Read: a call whose every callee is std's
 //! `testing.expect` (`Governed.stdCall`, through aliases), its argument written `==`
-//! through parentheses. `!=` and other comparisons are left: expectEqual says none of them. Its
-//! fix (`rewrite`) writes `expectEqual(literal, other)` where exactly one side is a literal. A callee that does not resolve is silent.
+//! through parentheses, with a side written as a value literal: a number, a character, a string,
+//! `null`, `true` or `false`. Such a side makes the other a type `expectEqual` compares as `==`
+//! does. An enum literal does not: `u == .tag` reads a tagged union's tag, where
+//! `expectEqual(.tag, u)` would make `.tag` a union and does not compile when its payload is not
+//! void; with no literal side either may be such a union. Those, `!=` and other comparisons are
+//! left. Its fix (`rewrite`) writes `expectEqual(literal, other)` where exactly one side is a
+//! literal. A callee that does not resolve is silent.
 const std = @import("std");
 const Ast = std.zig.Ast;
 const Context = @import("RuleContext.zig");
@@ -23,6 +28,8 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         if (written.len != 1) continue;
         const operator = tree.nodeTag(Written.ungrouped(tree, written[0]));
         if (operator != .equal_equal) continue;
+        const lhs, const rhs = tree.nodeData(Written.ungrouped(tree, written[0])).node_and_node;
+        if (!literal(tree, lhs) and !literal(tree, rhs)) continue;
         if (try Governed.stdCall(c, call.node, "testing.expect") != .yes) continue;
         const message = "std.testing.expect of `a == b`: expectEqual(expected, actual) says the same and prints both values when it fails";
         var edits: std.ArrayList(Report.Edit) = .empty;
@@ -53,11 +60,12 @@ fn rewrite(c: *Context, tree: *const Ast, callee: Ast.Node.Index, comparison: As
     return true;
 }
 
-/// Whether an expression is written as a literal value (as Z042 reads one).
+/// Whether an expression is written as a value literal: what Z042 reads as one but an enum
+/// literal, which may stand for a tagged union's tag.
 fn literal(tree: *const Ast, node: Ast.Node.Index) bool {
     const at = Written.ungrouped(tree, node);
     return switch (tree.nodeTag(at)) {
-        .number_literal, .char_literal, .string_literal, .multiline_string_literal, .enum_literal => true,
+        .number_literal, .char_literal, .string_literal, .multiline_string_literal => true,
         .negation => literal(tree, tree.nodeData(at).node),
         .identifier => blk: {
             const spelled = tree.tokenSlice(tree.nodeMainToken(at));
@@ -75,7 +83,7 @@ const breadth = @import("breadth_test.zig");
 test "breadth: expect comparison: the fix writes expectEqual with the literal first, only with one literal side" {
     try breadth.expectFixes(check, "const std = @import(\"std\"); test { const a: u32 = 1; try std.testing.expect(a == 1); }", 1, &.{ "expectEqual", "1, a" });
     try breadth.expectFixes(check, "const std = @import(\"std\"); test { const a: ?u32 = 1; try std.testing.expect(null == a); }", 1, &.{ "expectEqual", "null, a" });
-    try breadth.expectFixes(check, "const std = @import(\"std\"); test { const a: u32 = 1; const b: u32 = 1; try std.testing.expect(a == b); try std.testing.expect(1 == 1); }", 2, &.{});
+    try breadth.expectFixes(check, "const std = @import(\"std\"); test { try std.testing.expect(1 == 1); }", 1, &.{});
     try breadth.expectFixes(check, "const std = @import(\"std\"); const expect = std.testing.expect; test { const a: u32 = 1; try expect(a == 1); }", 1, &.{});
 }
 
@@ -84,4 +92,9 @@ test "breadth: expect comparison: an equality reported, through an alias too; an
     try breadth.expectFindings(check, "const std = @import(\"std\"); const expect = std.testing.expect; test { const a: u32 = 1; try expect(a == 1); }", 1);
     try breadth.expectFindings(check, "const std = @import(\"std\"); test { const a: u32 = 1; try std.testing.expect(a < 2); try std.testing.expectEqual(1, a); }", 0);
     try breadth.expectFindings(check, "fn expect(ok: bool) !void { _ = ok; } test { const a: u32 = 1; try expect(a == 1); }", 0);
+}
+
+test "breadth: expect comparison: an enum literal side, or no literal side, not reported: either may be a tagged union's tag" {
+    try breadth.expectFindings(check, "const std = @import(\"std\"); const U = union(enum) { a: u32, b }; test { const u: U = .b; try std.testing.expect(u == .b); }", 0);
+    try breadth.expectFindings(check, "const std = @import(\"std\"); const U = union(enum) { a: u32, b }; test { const u: U = .b; const t: std.meta.Tag(U) = .b; try std.testing.expect(u == t); }", 0);
 }

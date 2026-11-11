@@ -470,7 +470,7 @@ test "accesses: a place's path, whether two name one place, a discarded value, a
     // `_ = d;` discards `d`; the store into the element discards nothing.
     const discard = spelledNode(tree, "_ = d", 0).?;
     try std.testing.expectEqualStrings("d", tree.getNodeSource((try accesses.discardedBy(&facts, file, discard)).?));
-    try std.testing.expect(try accesses.discardedBy(&facts, file, spelledNode(tree, "s.b[1..][0] = 2", 0).?) == null);
+    try std.testing.expectEqual(null, try accesses.discardedBy(&facts, file, spelledNode(tree, "s.b[1..][0] = 2", 0).?));
 }
 
 test "Facts: an enum's and a union's tags written with no type are members" {
@@ -747,7 +747,7 @@ test "batch 2: an update's operation, error names and sets, a condition's truths
         } else return error.TestUnexpectedResult;
     }
     try std.testing.expect((try facts.literalOf(file, spelledNode(tree, "5", 0).?)).? == .number);
-    try std.testing.expect(try facts.literalOf(file, spelledNode(tree, "c", 0).?) == null);
+    try std.testing.expectEqual(null, try facts.literalOf(file, spelledNode(tree, "c", 0).?));
 }
 
 test "accesses: asking a place's sites again keeps nothing more on the run's memory" {
@@ -956,8 +956,8 @@ test "consolidate: a member read's step, which language field it is, the program
     try std.testing.expectEqualStrings("f", spelled.name.?);
     try std.testing.expectEqualStrings("s", tree.getNodeSource(spelled.receiver.?));
     const computed = (try accesses.memberRead(&facts, file, spelledNode(tree, "@field(s, n)", 0).?)).?;
-    try std.testing.expect(computed.name == null);
-    try std.testing.expect(try accesses.memberRead(&facts, file, spelledNode(tree, "s", 0).?) == null);
+    try std.testing.expectEqual(null, computed.name);
+    try std.testing.expectEqual(null, try accesses.memberRead(&facts, file, spelledNode(tree, "s", 0).?));
 
     // Q2: a slice's and an array's own `len`, a slice's `ptr`; a struct's fields so named are
     // none; a holder whose type does not resolve may be either.

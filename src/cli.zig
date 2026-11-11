@@ -568,6 +568,7 @@ test "fuzz: the configuration JSON" {
         "{\"profile\": \"reviewed\", \"rules\": [{\"id\": \"Z026\", \"level\": \"gate\"}]}",
         "{\"profile\": \"aegis\", \"max_line_length\": 120, \"disallowed\": [{\"source\": \"std\", \"declaration\": \"debug.print\", \"reason\": \"r\", \"replacement\": \"x\"}]}",
         "{\"function_exceptions\": [{\"function\": \"f\", \"lines\": 200, \"reason\": \"r\"}]}",
+        "{\"profile\": \"reviewed\", \"max_parameters\": 4, \"max_nesting\": 3, \"max_stack_array\": 4096, \"rules\": [{\"id\": \"P013\", \"level\": \"report\"}]}",
         "{",
     } });
 }
@@ -587,12 +588,26 @@ test "CLI invalid selections and unknown formats fail" {
     try std.testing.expect(!within("/root", "/root-copy/x.zig"));
 }
 
+test "a configuration's limits reach the rules that read them: P013's parameters and nesting, Z038's array bytes" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const configured = try configure(arena.allocator(), "{\"profile\": \"reviewed\", \"max_parameters\": 4, \"max_nesting\": 3, \"max_stack_array\": 4096}");
+    try std.testing.expectEqual(@as(u32, 4), configured.config.max_parameters);
+    try std.testing.expectEqual(@as(u32, 3), configured.config.max_nesting);
+    try std.testing.expectEqual(@as(u64, 4096), configured.config.max_stack_array);
+    // The opt-in rules stay off under the reviewed profile until a setting names them.
+    try std.testing.expect(configured.config.has(.Z035) and !configured.config.has(.P013));
+}
+
 /// Strict JSON policy, containing code options only. Callers own file selection.
 pub const Configuration = struct {
     profile: enum { core, none, reviewed, aegis } = .core,
     rules: []const Setting = &.{},
     max_line_length: u32 = 100,
     max_function_lines: u32 = 120,
+    max_parameters: u32 = 7,
+    max_nesting: u32 = 5,
+    max_stack_array: u64 = 64 * 1024,
     function_exceptions: []const Rule.Config.FunctionException = &.{},
     disallowed: []const Rule.Config.Disallowed = &.{},
     strict_suppressions: bool = false,
@@ -625,6 +640,9 @@ fn configure(a: std.mem.Allocator, bytes: []const u8) ConfigureError!Configured 
     };
     config.max_line_length = document.max_line_length;
     config.max_function_lines = document.max_function_lines;
+    config.max_parameters = document.max_parameters;
+    config.max_nesting = document.max_nesting;
+    config.max_stack_array = document.max_stack_array;
     config.function_exceptions = document.function_exceptions;
     config.disallowed = document.disallowed;
     config.strict_suppressions = document.strict_suppressions;

@@ -2,21 +2,16 @@
 //! a metric as P003 (length) is. Counted: every parameter its prototype declares, `comptime`
 //! and `anytype` ones included; and the deepest nesting of `if`, `while`, `for` and `switch` in
 //! its body, each one inside another adding a level (an `else if` is the same level as its `if`;
-//! a nested function or container is its own). TODO(0.8): the limits are configuration once the
-//! rule is registered.
+//! a nested function or container is its own). The limits are the configuration's
+//! `max_parameters` (7 by default) and `max_nesting` (5).
 const std = @import("std");
 const Ast = std.zig.Ast;
 const Context = @import("RuleContext.zig");
 const Rule = @import("Rule.zig").Rule;
 const Model = @import("Model.zig");
 
-pub const Limits = struct { parameters: usize = 7, nesting: usize = 5 };
-
 pub fn check(c: *Context, rule: Rule) Context.Error!void {
-    return checkLimits(c, rule, .{});
-}
-
-pub fn checkLimits(c: *Context, rule: Rule, limits: Limits) Context.Error!void {
+    const limits = .{ .parameters = c.config.max_parameters, .nesting = c.config.max_nesting };
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
     for (model.declarations) |decl| {
@@ -72,4 +67,14 @@ test "breadth: function shape: too many parameters, too deep a nesting reported;
     try breadth.expectFindings(check, "pub fn f(a: u8) void { if (a > 0) { if (a > 1) { if (a > 2) { if (a > 3) { if (a > 4) { if (a > 5) {} } } } } } }", 1);
     try breadth.expectFindings(check, "pub fn f(a: u8) u8 { if (a == 0) return 0 else if (a == 1) return 1 else if (a == 2) return 2 else if (a == 3) return 3 else if (a == 4) return 4 else if (a == 5) return 5; return 9; }", 0);
     try breadth.expectFindings(check, "pub fn f(a: u8, b: u8) void { _ = a; _ = b; }", 0);
+}
+
+test "breadth: function shape: the limits are the configuration's" {
+    var tight: @import("Rule.zig").Config = .none();
+    tight.max_parameters = 1;
+    tight.max_nesting = 1;
+    try breadth.expectFindingsWith(check, tight, "pub fn f(a: u8, b: u8) void { if (a > b) { if (b > 0) {} } }", 2);
+    var loose: @import("Rule.zig").Config = .none();
+    loose.max_parameters = 9;
+    try breadth.expectFindingsWith(check, loose, "pub fn f(a: u8, b: u8, c: u8, d: u8, e: u8, f2: u8, g: u8, h: u8) void { _ = .{ a, b, c, d, e, f2, g, h }; }", 0);
 }

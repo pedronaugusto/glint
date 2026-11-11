@@ -1551,13 +1551,13 @@ test "what a root's lint_rules cannot name is a problem where it is written: dri
     try std.testing.expect(rules.deprecated[0].decl == .unresolved);
     try std.testing.expectEqualStrings("publish", f.name(rules.deprecated[0].with.?));
     try std.testing.expect(rules.deprecated[1].decl == .foreign);
-    try std.testing.expect(rules.deprecated[1].with == null);
+    try std.testing.expectEqual(null, rules.deprecated[1].with);
     // Another version is read as no rules at all.
     const later = try of(&f.facts, f.project.sources[2].id);
     try std.testing.expectEqual(@as(usize, 0), later.deprecated.len);
     try std.testing.expectEqual(Problem.Why.unknown_version, later.problems[0].why);
     // A root that declares none has none, and no problem.
-    try std.testing.expect((try of(&f.facts, f.project.sources[1].id)).declared == null);
+    try std.testing.expectEqual(null, (try of(&f.facts, f.project.sources[1].id)).declared);
 }
 
 test "a replacement names a std declaration or an external symbol, one of the two: both, or neither, is malformed where it is written" {
@@ -1581,7 +1581,7 @@ test "a replacement names a std declaration or an external symbol, one of the tw
     const rules = try of(&f.facts, f.project.sources[0].id);
     try std.testing.expectEqual(@as(usize, 1), rules.replaces.len);
     try std.testing.expectEqualStrings("fsync", rules.replaces[0].symbol.?);
-    try std.testing.expect(rules.replaces[0].std == null);
+    try std.testing.expectEqual(null, rules.replaces[0].std);
     try std.testing.expectEqualStrings("publish", f.name(rules.replaces[0].with));
     var whys: [4]Problem.Why = undefined;
     for (rules.problems, 0..) |problem, i| whys[i] = problem.why;

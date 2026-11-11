@@ -257,7 +257,7 @@ test "a package directory names its files' package, the innermost one winning" {
     defer output.deinit();
     const status = try cli.execute(a, std.testing.io, &.{ "glint", "--config", joined[0], "--package", owner, "--package", inner, joined[3], joined[4], joined[5] }, &output.writer, &quiet.writer);
     try std.testing.expectEqual(@as(u8, 1), status); // safe: findings exit.
-    try std.testing.expect(std.mem.find(u8, output.written(), "a.zig:2") == null);
+    try std.testing.expectEqual(null, std.mem.find(u8, output.written(), "a.zig:2"));
     try std.testing.expect(std.mem.find(u8, output.written(), "b.zig:2") != null);
     try std.testing.expect(std.mem.find(u8, output.written(), "c.zig:2") != null);
     try std.testing.expectError(error.InvalidPackage, cli.execute(a, std.testing.io, &.{ "glint", "--package", "=dir", joined[3] }, &output.writer, &quiet.writer));
@@ -283,11 +283,11 @@ test "--only beside --config runs only its rules, under the configuration's opti
     const status = try cli.execute(a, std.testing.io, &.{ "glint", "--only", "P006", "--config", config, file }, &output.writer, &quiet.writer);
     try std.testing.expectEqual(@as(u8, 1), status); // safe: findings exit.
     try std.testing.expect(std.mem.find(u8, output.written(), "P006: ") != null);
-    try std.testing.expect(std.mem.find(u8, output.written(), "Z013") == null);
+    try std.testing.expectEqual(null, std.mem.find(u8, output.written(), "Z013"));
     // Without the configuration P006 has no declaration to keep out.
     output.clearRetainingCapacity();
     try std.testing.expectEqual(@as(u8, 0), try cli.execute(a, std.testing.io, &.{ "glint", "--only", "P006", file }, &output.writer, &quiet.writer));
-    try std.testing.expect(std.mem.find(u8, output.written(), "P006: ") == null);
+    try std.testing.expectEqual(null, std.mem.find(u8, output.written(), "P006: "));
 }
 
 /// The run's output on `file` under `tmp`, with `options` before it; its status in `status`.
@@ -360,7 +360,7 @@ test "publishing aegis's API turns the pack on and nothing more: a program file 
     defer a.free(republished);
     try std.testing.expect(std.mem.find(u8, republished, "A009: ") != null);
     // aegis's root, imported as aegis, is no namespace module of it: it lacks no member.
-    try std.testing.expect(std.mem.find(u8, republished, "does not resolve") == null);
+    try std.testing.expectEqual(null, std.mem.find(u8, republished, "does not resolve"));
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "helpers.zig", .data = "const std = @import(\"std\");\n" ++ index });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "common.zig", .data = "const aegis = @import(\"aegis\");\npub const Secret = aegis.Secret;\npub const SecretBytes = aegis.SecretBytes;\npub const f = @import(\"helpers.zig\").f;\n" });
     const forwarded = try runOnFiles(a, &tmp, &.{ "--only", "A009", "--zig-lib-path=lib", "--module", "aegis=aegis/src/root.zig" }, &.{ "main.zig", "helpers.zig" }, &status);
@@ -375,7 +375,7 @@ test "publishing aegis's API turns the pack on and nothing more: a program file 
     const wrapped = try runOnFiles(a, &tmp, &.{ "--only", "A009", "--zig-lib-path=lib", "--module", "aegis=aegis/src/root.zig", "--module", "wrap=wrap/root.zig", "--package", "wrap=wrap" }, &.{ "app.zig", "wrap/root.zig" }, &status);
     defer a.free(wrapped);
     try std.testing.expect(std.mem.find(u8, wrapped, "A009: ") != null);
-    try std.testing.expect(std.mem.find(u8, wrapped, "does not resolve") == null);
+    try std.testing.expectEqual(null, std.mem.find(u8, wrapped, "does not resolve"));
     // A second revision of aegis under its own manifest, imported as aegis_old, whose lint_rules
     // names a guard its guarded types do not declare: aegis, its other roles read, the role that
     // does not resolve a gap the run reports where it is imported.
@@ -418,7 +418,7 @@ test "the aegis pack is on where a file's import of aegis resolves to aegis, and
     const off = try runOn(a, &tmp, &.{}, "plain.zig", &status);
     defer a.free(off);
     try std.testing.expectEqual(@as(u8, 0), status); // safe: a clean exit.
-    try std.testing.expect(std.mem.find(u8, off, "aegis pack") == null);
+    try std.testing.expectEqual(null, std.mem.find(u8, off, "aegis pack"));
     // --aegis: on, whatever the file imports.
     const forced = try runOn(a, &tmp, &.{"--aegis"}, "plain.zig", &status);
     defer a.free(forced);
@@ -454,16 +454,16 @@ test "the aegis pack is on where a file's import of aegis resolves to aegis, and
     for ([_][2][]const u8{ .{ "aegis=app/libs/src/root.zig", "app/uses.zig" }, .{ "safety=app/libs/src/root.zig", "app/renamed.zig" } }) |case| {
         const in_tree = try runOn(a, &tmp, &.{ "--module", case[0] }, case[1], &status);
         defer a.free(in_tree);
-        try std.testing.expect(std.mem.find(u8, in_tree, "aegis pack") == null);
+        try std.testing.expectEqual(null, std.mem.find(u8, in_tree, "aegis pack"));
     }
     // A module named aegis that is not aegis: off.
     const other = try runOn(a, &tmp, &.{ "--module", "aegis=fake.zig" }, "uses.zig", &status);
     defer a.free(other);
     try std.testing.expectEqual(@as(u8, 0), status); // safe: a clean exit.
-    try std.testing.expect(std.mem.find(u8, other, "aegis pack") == null);
+    try std.testing.expectEqual(null, std.mem.find(u8, other, "aegis pack"));
     // --only selects the pack's rules as it selects any: no line.
     const only = try runOn(a, &tmp, &.{ "--only", "A019", "--module", "aegis=aegis/src/root.zig" }, "uses.zig", &status);
     defer a.free(only);
-    try std.testing.expect(std.mem.find(u8, only, "aegis pack") == null);
+    try std.testing.expectEqual(null, std.mem.find(u8, only, "aegis pack"));
     try std.testing.expect(std.mem.find(u8, only, "A019: ") != null);
 }
