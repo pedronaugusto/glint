@@ -25,7 +25,7 @@ pub fn main(init: std.process.Init) !void {
         findings = report.diagnostics.len;
     }
     var buffer: [4096]u8 = undefined;
-    var output = std.Io.File.stdout().writer(init.io, &buffer);
+    var output = std.Io.File.stdout().writerStreaming(init.io, &buffer);
     try output.interface.print("row=warm_aegis total_ns={d} rounds={d} observed={d} bytes={d}\n", .{ start.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds(), rounds, findings, source.written().len });
     try output.interface.flush();
 }

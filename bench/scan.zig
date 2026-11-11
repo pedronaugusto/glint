@@ -15,7 +15,7 @@ pub fn main(init: std.process.Init) !void {
     const source = try a.dupeSentinel(u8, text.written(), 0);
     const inputs: []const glint.Project.Input = &.{.{ .name = "benchmark", .stem = "Benchmark", .bytes = source }};
     var buffer: [4096]u8 = undefined;
-    var output = std.Io.File.stdout().writer(init.io, &buffer);
+    var output = std.Io.File.stdout().writerStreaming(init.io, &buffer);
     const writer = &output.interface;
     try writer.print("version=1 bytes={d} files=1 declarations={d} rounds={d} optimize={s}\n", .{ source.len, count, rounds, @tagName(@import("builtin").optimize) });
     const start = now(init.io, small);
