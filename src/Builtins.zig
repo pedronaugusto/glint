@@ -125,158 +125,63 @@ fn precedence(self: *Context) RunError!void {
     }
 }
 
+/// Z013: a private `const X = @import("...")` at file or container level whose name its file
+/// spells nowhere else. Zig refuses another file a private declaration, so only its own file
+/// could use it. Any spelling is a use: an identifier (`@"..."` decoded), a member or a
+/// declaration literal `.X` from any holder, and `@field`'s literal name; `@hasDecl` sees no
+/// private declaration, so its string is none. A miss is allowed; a report is never wrong. A
+/// `@field` whose name is not a string literal may reach any of them, so such a file's reports
+/// are withheld.
 fn unusedImports(self: *Context) RunError!void {
     if (!self.config.has(.Z013)) return;
     const source = self.project.at(self.file);
     const tree = &source.file.tree;
     const model = &source.model;
-    const declarations = model.declarations;
-    // A declaration literal (`.name`, a switch prong's `.name`) reaches a declaration only as a
-    // value of the type the literal is given, from that type's own declarations; an import of a
-    // file's namespace holds a type, of type `type`, which has none, so such a spelling is no use
-    // of it. A ZON import's data may be of any type: there it stays a use.
-    const literal_uses = try self.allocator.alloc(u32, declarations.len);
-    @memset(literal_uses, 0);
-    for (model.references) |reference| if (reference.declaration) |d| {
-        if (reference.unknown == .literal_context) literal_uses[@backingInt(d)] += 1;
-    };
-    var indexes: std.ArrayList(Model.Declaration.Id) = .empty;
-    for (declarations, 0..) |decl, index| {
-        if (decl.kind != .variable or decl.public or decl.exported or decl.references != literal_uses[index]) continue;
-        const value = tree.fullVarDecl(decl.node).?.ast.init_node.unwrap() orelse continue;
-        // An `@import` written there is one, whatever module it names; any other value is one
-        // by meaning: what it holds is another file's root, however it is reached (an alias of
-        // one, a type function or `@as` given one, a block's `break`), or a choice of such
-        // roots (one per target). One that does not resolve, or a choice of a root and
-        // something else, is undecided.
+    // Each candidate's name, and how often the file spells it, its own name token included.
+    var spelled: std.StringHashMapUnmanaged(u32) = .empty;
+    var candidates: std.ArrayList(Model.Declaration.Id) = .empty;
+    for (model.declarations, 0..) |decl, index| {
+        if (decl.kind != .variable or decl.public or decl.exported) continue;
+        switch (model.scopes[@backingInt(decl.scope)].kind) {
+            .file, .container => {},
+            else => continue,
+        }
+        const full = tree.fullVarDecl(decl.node) orelse continue;
+        if (tree.tokenTag(full.ast.mut_token) != .keyword_const) continue;
+        const value = Facts.ungrouped(tree, full.ast.init_node.unwrap() orelse continue);
         var buffer: [2]Ast.Node.Index = undefined;
-        const written = Facts.builtinArgs(tree, value, &buffer).len == 1 and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "@import");
-        if (written and decl.references != 0 and Facts.importKind(tree, value) != .namespace) continue;
-        if (!written) switch (importOf(self, try self.facts.declaration(.{ .file = self.file, .index = @fromBackingInt(@intCast(index)) }))) {
-            .yes => {},
-            .no => continue,
-            .unknown => |why| {
-                try unknown(self, .Z013, decl.node, why);
-                continue;
-            },
-        };
-        try indexes.append(self.allocator, @fromBackingInt(@intCast(index)));
+        const args = Facts.builtinArgs(tree, value, &buffer);
+        if (!Facts.isBuiltin(tree, value, "@import") or args.len != 1 or tree.nodeTag(args[0]) != .string_literal) continue;
+        try candidates.append(self.allocator, @fromBackingInt(@intCast(index)));
+        try spelled.put(self.allocator, decl.name, 0);
     }
-    if (indexes.items.len == 0) return;
-    var used: Used = .empty;
-    var undecided: Used = .empty;
-    // One pass for all candidates: a member reaches a candidate only as Zig's lookup in the
-    // candidate's own container finds it by that name; what it resolves to decides the use.
-    for (tree.nodes.items(.tag), 0..) |tag, n| {
+    if (candidates.items.len == 0) return;
+    // An identifier is every spelling but `@field`'s: a name, a member, a literal `.X`.
+    for (tree.tokens.items(.tag), 0..) |tag, t| {
+        if (tag != .identifier) continue;
+        const name = try Model.identifier(self.allocator, tree.tokenSlice(@intCast(t)));
+        if (spelled.getPtr(name)) |count| count.* += 1;
+    }
+    for (0..tree.nodes.len) |n| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
-        if (tag != .field_access) {
-            try reflectedImport(self, node, indexes.items, &used, &undecided);
-            continue;
-        }
-        const pair = tree.nodeData(node).node_and_token;
-        const name = try Model.identifier(self.allocator, tree.tokenSlice(pair[1]));
-        if (!namedBy(model, indexes.items, name)) continue;
-        switch (try self.facts.definition(self.file, node)) {
-            .decl => |definition| if (definition.file == self.file) try used.put(self.allocator, definition.index, {}),
-            // A member its holder does not declare, or of a number: no import of this file.
-            .none => {},
-            .unknown => |why| {
-                try unknown(self, .Z013, node, why);
-                try markNamed(self, model, indexes.items, name, &undecided);
-            },
-        }
+        if (!Facts.isBuiltin(tree, node, "@field")) continue;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const args = Facts.builtinArgs(tree, node, &buffer);
+        if (args.len != 2) continue;
+        const name_node = Facts.ungrouped(tree, args[1]);
+        // A computed name may be any candidate's: the file's reports are withheld.
+        if (tree.nodeTag(name_node) != .string_literal) return;
+        const name = std.zig.string_literal.parseAlloc(self.allocator, tree.tokenSlice(tree.nodeMainToken(name_node))) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // No name is read from it: it may be any.
+            error.InvalidLiteral => return,
+        };
+        if (spelled.getPtr(name)) |count| count.* += 1;
     }
-    for (indexes.items) |index| {
-        const decl = declarations[@backingInt(index)];
-        if (!used.contains(index) and !undecided.contains(index)) try self.at(.Z013, decl.token, try self.allocator.print("unused private import '{s}'", .{decl.name}));
-    }
-}
-
-/// Whether candidate `index` is the one its own container declares under `name`, as Zig's
-/// member lookup finds it (`Model.Scope.names`).
-fn declaresAs(model: *const Model, index: Model.Declaration.Id, name: []const u8) bool {
-    const scope = model.declarations[@backingInt(index)].scope;
-    return model.scopes[@backingInt(scope)].names.get(name) == index;
-}
-
-/// Whether a member spelled `name` may be one of the candidates.
-fn namedBy(model: *const Model, indexes: []const Model.Declaration.Id, name: []const u8) bool {
-    for (indexes) |index| if (declaresAs(model, index, name)) return true;
-    return false;
-}
-
-/// Puts in `into` every candidate a member spelled `name` may be.
-fn markNamed(self: *Context, model: *const Model, indexes: []const Model.Declaration.Id, name: []const u8, into: *Used) RunError!void {
-    for (indexes) |index| if (declaresAs(model, index, name)) try into.put(self.allocator, index, {});
-}
-
-/// Whether `value` is another file's root, or a choice of nothing but such roots.
-fn importOf(self: *const Context, value: Facts.Value) Governed.Is {
-    switch (value) {
-        .container => |container| return if (container.file != self.file and self.project.at(container.file).model.scopes[@backingInt(container.scope)].kind == .file) .yes else .no,
-        .unknown => |why| return .{ .unknown = why },
-        .alternatives => |each| {
-            var roots: usize = 0;
-            for (each) |one| switch (importOf(self, one)) {
-                .yes => roots += 1,
-                .no => {},
-                .unknown => |why| return .{ .unknown = why },
-            };
-            if (roots == 0) return .no;
-            return if (roots == each.len) .yes else .{ .unknown = .comptime_dependent };
-        },
-        else => return .no,
-    }
-}
-
-/// The candidate imports a selected file names.
-const Used = std.AutoHashMapUnmanaged(Model.Declaration.Id, void);
-
-fn reflectedImport(self: *Context, node: Ast.Node.Index, indexes: []const Model.Declaration.Id, used: *Used, undecided: *Used) RunError!void {
-    const tree = &self.project.at(self.file).file.tree;
-    var buffer: [2]Ast.Node.Index = undefined;
-    const args = Facts.builtinArgs(tree, node, &buffer);
-    if (args.len != 2) return;
-    // `@field` reads a private declaration of its own file; `@hasDecl` sees none, even of
-    // its own file, so it never uses a private import.
-    if (!Facts.isBuiltin(tree, node, "@field")) return;
-    // The one name it spells; any other is read by its holder below.
-    const name: ?[]const u8 = switch (try self.facts.fieldName(self.file, args[1])) {
-        .name => |one| one,
-        .each_of, .names, .computed => null,
-    };
-    const model = &self.project.at(self.file).model;
-    if (name) |one| {
-        if (!namedBy(model, indexes, one)) return;
-        switch (try self.facts.reflected(self.file, node)) {
-            .decl => |definition| {
-                if (definition.file == self.file) try used.put(self.allocator, definition.index, {});
-                return;
-            },
-            // Read by its holder below.
-            .none, .unknown => {},
-        }
-    }
-    const value = try self.facts.resolve(self.file, args[0]);
-    const container: ?Facts.Container = switch (value) {
-        .container, .instance => |v| v,
-        // A choice of holders is no one container: the import may be what any of them reads.
-        .alternatives => null,
-        else => null,
-    };
-    if (container) |known| if (!known.symbolic) {
-        // A literal missing member, or a foreign namespace, cannot use this file's import.
-        if (name != null or known.file != self.file) return;
-    };
-    var affected = false;
-    for (indexes) |index| {
+    for (candidates.items) |index| {
         const decl = model.declarations[@backingInt(index)];
-        if (name) |literal| if (!declaresAs(model, index, literal)) continue;
-        if (container) |known| if (!known.symbolic and (known.file != self.file or known.scope != decl.scope)) continue;
-        try undecided.put(self.allocator, index, {});
-        affected = true;
+        if (spelled.get(decl.name).? <= 1) try self.at(.Z013, decl.token, try self.allocator.print("unused private import '{s}'", .{decl.name}));
     }
-    if (affected) try unknown(self, .Z013, node, if (value == .unknown) value.unknown else .comptime_dependent);
 }
 
 fn selected(self: *const Context, selection: []const rules.Rule) bool {

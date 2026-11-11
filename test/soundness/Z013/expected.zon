@@ -1,4 +1,8 @@
 .{
+    // Any spelling of the name is a use; only a written @import is a candidate. A case of these
+    // rows moves an import through something else (an alias, a choice, a call, `@as`, a block,
+    // a member or literal of the name), so none holds a report Z013 makes.
+    .no_hole = .{ .address, .branch, .call, .conversion, .field, .jump },
     .na = .{
         // Zig parses no destructure at container level and refuses an unused local, so no
         // destructured binding of an import is left dead.

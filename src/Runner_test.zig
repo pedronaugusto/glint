@@ -197,15 +197,19 @@ test "review typed scalar aliases are values, not type acronyms" {
     try check(.Z006, "pub const good_name: u32 = 1;", 0);
 }
 
-test "review private imports used through the actual file identity are not dead" {
+test "Z013 counts any spelling of a private import's name as a use" {
     try check(.Z013, "const Self = @This(); const object = @import(\"dep\"); pub const exports = struct { pub const exposed = Self.object; };", 0);
-    try check(.Z013, "const object = @import(\"dep\"); const Other = struct { pub const object = 1; }; pub const exposed = Other.object;", 1);
-    // A member whose holder does not resolve may be each private import its own container
-    // declares under that name, in every container: none is reported. Named through a known
-    // container, the other is.
+    // Another container's member of that name spells it too: a miss, never a wrong report.
+    try check(.Z013, "const object = @import(\"dep\"); const Other = struct { pub const object = 1; }; pub const exposed = Other.object;", 0);
+    // Two imports of one name in two containers: each declaration spells the other's name.
     const two = "const A = struct { const dep = @import(\"dep\"); }; const B = struct { const dep = @import(\"other\"); }; ";
-    try check(.Z013, two ++ "pub fn f(x: anytype) void { _ = x.dep; }", 0);
-    try check(.Z013, two ++ "pub fn f() void { _ = A.dep; }", 1);
+    try check(.Z013, two ++ "pub fn f() void {}", 0);
+    try check(.Z013, "const A = struct { const dep = @import(\"dep\"); }; pub fn f() void {}", 1);
+    // Only a written `@import` is a candidate; a `var`, a `pub` one or an alias is not.
+    try check(.Z013, "const dep = (@import(\"dep\"));", 1);
+    try check(.Z013, "const dep = @import(\"dep\"); const alias = dep;", 0);
+    try check(.Z013, "const alias = @as(type, @import(\"dep\"));", 0);
+    try check(.Z013, "pub const dep = @import(\"dep\");", 0);
 }
 
 test "Z034 finds operators Zig 0.18 refuses to order without parentheses, and leaves the orders it keeps" {
@@ -915,26 +919,22 @@ test "G2 policy configuration rejects blank reasons empty qualifiers and stale e
     try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: incomplete policy has no invented finding.
 }
 
-test "private import references through reflection strings preserve declaration identity" {
+test "Z013 reads @field's literal name as a use and @hasDecl's as none" {
     try check(.Z013, "const Self = @This(); const dep = @import(\"dep\"); pub fn run() void { _ = @field(Self, \"dep\"); }", 0);
     // `@hasDecl` sees no private declaration, even of its own file: the import is unused.
     try check(.Z013, "const Self = @This(); const dep = @import(\"dep\"); pub fn run() void { _ = @hasDecl(Self, \"dep\"); }", 1);
-    try check(.Z013, "const dep = @import(\"dep\"); const Other = struct { pub const dep = 1; }; pub fn run() void { _ = @field(Other, \"dep\"); }", 1);
+    // From any holder.
+    try check(.Z013, "const dep = @import(\"dep\"); pub fn run(comptime T: type) void { _ = @field(T, \"dep\"); }", 0);
 }
 
-test "private import gates retain required dynamic reflection uncertainty" {
-    const sources = [_][]const u8{
-        "const dep = @import(\"dep\"); pub fn run(comptime T: type) void { _ = @field(T, \"dep\"); }",
-        "const Self = @This(); const dep = @import(\"dep\"); pub fn run(name: []const u8) void { _ = @field(Self, name); }",
-    };
-    for (sources) |bytes| {
-        var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = bytes }}, &.{}, .{});
-        defer project.deinit();
-        var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = .Z013, .level = .gate }} }, .{});
-        defer report.deinit();
-        try std.testing.expect(!report.complete);
-        try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: unknown reflection cannot support a dead-import allegation.
-    }
+test "Z013 withholds a file's reports where a @field name is computed, and stays complete" {
+    const bytes = "const Self = @This(); const dep = @import(\"dep\"); pub fn run(comptime name: []const u8) void { _ = @field(Self, name); }";
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = bytes }}, &.{}, .{});
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = .Z013, .level = .gate }} }, .{});
+    defer report.deinit();
+    try std.testing.expect(report.complete);
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: a computed name may be the import's.
 }
 
 test "metrics count assertion calls by the declaration their callee resolves to" {
