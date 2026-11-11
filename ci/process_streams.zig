@@ -4,6 +4,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const programs = @import("programs");
+const aegis = @import("aegis");
 
 /// A run that prints: a one-line coverage report over a file in the package.
 const arguments = [_][]const u8{ programs.glint, "--only", "Z026", "examples/report.zig" };
@@ -61,6 +62,6 @@ fn runOn(io: std.Io, file: std.Io.File) !void {
 }
 
 fn expectFile(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, parts: []const []const u8) !void {
-    const actual = try dir.readFileAlloc(io, "f", a, .limited(1024 * 1024));
+    const actual = try aegis.own.readFile(io, dir, "f", a, .fromRaw(1024 * 1024));
     try std.testing.expectEqualStrings(try std.mem.concat(a, u8, parts), actual);
 }

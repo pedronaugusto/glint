@@ -224,7 +224,7 @@ pub fn dev(b: *std.Build, tools: type) void {
         .root_source_file = p.path("ci/process_streams.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "programs", .module = streams_programs.createModule() }},
+        .imports = &.{ .{ .name = "programs", .module = streams_programs.createModule() }, .{ .name = "aegis", .module = aegis_dependency.module("aegis") } },
     }), .filters = if (filter) |f| &.{f} else &.{} });
     const streams_run = b.addRunArtifact(streams);
     test_step.dependOn(&streams_run.step);
