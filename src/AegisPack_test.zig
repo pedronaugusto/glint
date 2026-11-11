@@ -1856,6 +1856,11 @@ test "an adoption of an allocation freed, changed or kept elsewhere before it is
     try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) ![2]Bytes { const buffer = try gpa.alloc(u8, n); return .{ try Bytes.adopt(buffer, n), try Bytes.adopt(buffer, n) }; }", pack.capacity, false, 1);
     // Its elements written and its length read leave it whole.
     try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); if (buffer.len != n) return error.Short; buffer[0] = 1; @memset(buffer[1..], 0); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
+    // Freed through `@as`, through an alias's `p.*`, or in a branch the program compiles in.
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); gpa.free(@as([]u8, buffer)); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); const p = &buffer; gpa.free(p.*); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
+    try expectJudgedStd(head ++ "const freeing = true;\npub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); if (comptime freeing) gpa.free(buffer); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
+    try expectJudgedStd(head ++ "const freeing = false;\npub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); if (comptime freeing) {} else gpa.free(buffer); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
 }
 
 test "an adoption of a whole byte allocation, handed over alone, is decided" {
@@ -1865,8 +1870,21 @@ test "an adoption of a whole byte allocation, handed over alone, is decided" {
     // The owner is unmanaged: which allocator made the allocation is the caller's to give its
     // deinit, so another allocator's allocation is decided at the adoption too.
     try expectJudgedStd(head ++ "pub fn f(other: std.mem.Allocator, n: usize) !Bytes { const buffer = try other.alloc(u8, n); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
-    // A pending errdefer, a later use or an element wider than a byte stay review sites.
+    // Read through `@as`, an alias's `p.*` and an optional's payload, or freed in a branch the
+    // program does not compile in, it is still whole.
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); @as([]u8, buffer)[0] = 0; return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); const p = &buffer; p.*[0] = 0; if (p.*.len == 0) return error.Empty; return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const maybe: ?[]u8 = try gpa.alloc(u8, n); const buffer = maybe.?; return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
+    try expectJudgedStd(head ++ "const freeing = false;\npub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); if (comptime freeing) gpa.free(buffer); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
+    // An errdefer where the adoption is what the function returns: it runs only where the
+    // adoption fails, which takes nothing.
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); errdefer gpa.free(buffer); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
+    // A pending errdefer, a later use or an element wider than a byte stay review sites; so do
+    // an alias read where the scope ends, and a local copied from before it is freed.
     try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); errdefer gpa.free(buffer); const b = try Bytes.adopt(buffer, n); return b; }", pack.capacity, false, 0);
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); const p = &buffer; defer gpa.free(p.*); return Bytes.adopt(buffer, n); }", pack.capacity, false, 0);
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const first = try gpa.alloc(u8, n); const buffer = first; gpa.free(first); return Bytes.adopt(buffer, n); }", pack.capacity, false, 0);
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const maybe: ?[]u8 = try gpa.alloc(u8, n); const buffer = maybe.?; gpa.free(maybe.?); return Bytes.adopt(buffer, n); }", pack.capacity, false, 0);
     try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); const b = try Bytes.adopt(buffer, n); buffer[0] = 1; return b; }", pack.capacity, false, 0);
     try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); return Bytes.adopt(buffer[0..n], n); }", pack.capacity, false, 1);
     // std's allocator by its declaration: a pool of the program's own with an `alloc` of the

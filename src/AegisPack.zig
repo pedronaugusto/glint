@@ -5497,11 +5497,7 @@ fn checkCapacity(c: *Context) Context.Error!void {
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
         if (call.ast.params.len != 2) continue;
-        const path = try Facts.accesses.pathOf(c.facts, c.file, call.ast.fn_expr);
-        if (path.steps.len < 2 or path.steps[0].kind != .field) continue;
-        const name = (try memberNamed(c, c.file, call.ast.fn_expr)) orelse continue;
-        if (!std.mem.eql(u8, name, adopts(.bytes).?)) continue;
-        if (try requiredOwner(c, path.steps[1].node, capacity, tree.lastToken(call.ast.fn_expr)) != .bytes) continue;
+        if (!try adoptsBytes(c, call.ast.fn_expr)) continue;
         // What was done with the allocation's local before it is adopted.
         if (allocationLocal(c, call.ast.params[0])) |local| switch (try beforeAdoption(c, c.file, local.index, local.read, tree.firstToken(node), 0)) {
             .whole => {},
@@ -5522,14 +5518,27 @@ fn checkCapacity(c: *Context) Context.Error!void {
     }
 }
 
+/// Whether a call of this file through `callee` is `SecretBytes.adopt`: the member `adopt` of
+/// a holder whose type is the bytes owner.
+fn adoptsBytes(c: *Context, callee: Ast.Node.Index) Context.Error!bool {
+    const tree = try c.project.syntax(try c.source());
+    const path = try Facts.accesses.pathOf(c.facts, c.file, callee);
+    if (path.steps.len < 2 or path.steps[0].kind != .field) return false;
+    const name = (try memberNamed(c, c.file, callee)) orelse return false;
+    if (!std.mem.eql(u8, name, adopts(.bytes).?)) return false;
+    return try requiredOwner(c, path.steps[1].node, capacity, tree.lastToken(callee)) == .bytes;
+}
+
 /// Whether an adoption's `allocation` is a whole byte allocation the adoption takes over alone,
 /// so the extent is the allocation's and the alignment a byte's: `a.alloc(u8, n)`, `a.dupe(u8,
-/// bytes)` or `a.print(format, args)`, through `try`, a `catch` or `orelse` that does not
+/// bytes)` or `a.print(format, args)`, through `try`, `.?`, a `catch` or `orelse` that does not
 /// complete, a local it initializes, an `if` capture of it, what a function of this file returns
 /// on every path that gives a value, or a parameter of a private function every call of which
-/// passes one. Nothing else may hold it once it is taken: no use of a local follows, and none
-/// waits in a `defer` or `errdefer`, which would free or reach memory the owner now holds. Any
-/// other shape stays a review site. The owner is unmanaged: the allocator its `deinit` is given
+/// passes one. Each local on the way is used before the take only as `beforeAdoption` leaves it
+/// whole. Nothing else may hold it once it is taken: no use of a local follows, and none waits
+/// in a `defer` or `errdefer`, which would free or reach memory the owner now holds, but an
+/// `errdefer` where the adoption is what a `return` gives (`heldAlone`). Any other shape stays a
+/// review site. The owner is unmanaged: the allocator its `deinit` is given
 /// is the caller's to keep the one that made the allocation.
 fn wholeAllocation(c: *Context, adoption: Ast.Node.Index, allocation: Ast.Node.Index) Context.Error!bool {
     const tree = try c.project.syntax(try c.source());
@@ -5622,7 +5631,7 @@ fn wholeBytes(c: *Context, node: Ast.Node.Index, want: ?Path, frames: []const Fr
     const tree = try c.project.syntax(try c.source());
     const model = &c.project.at(c.file).model;
     switch (Facts.accesses.formOf(tree.nodeTag(node))) {
-        .grouped, .tried => return wholeBytes(c, Facts.accesses.carriedFrom(tree, node).?, want, frames, until, depth + 1),
+        .grouped, .tried, .unwrap_optional => return wholeBytes(c, Facts.accesses.carriedFrom(tree, node).?, want, frames, until, depth + 1),
         // The other side does not complete: the value is the operand's.
         .@"catch", .@"orelse" => {
             if (!completesNot(tree, tree.nodeData(node).node_and_node[1])) return false;
@@ -5637,14 +5646,16 @@ fn wholeBytes(c: *Context, node: Ast.Node.Index, want: ?Path, frames: []const Fr
                     if (model.scopes[@backingInt(decl.scope)].kind != .block) return false;
                     const v = tree.fullVarDecl(decl.node) orelse return false;
                     const init = v.ast.init_node.unwrap() orelse return false;
-                    if (!heldAlone(c, index, node, until)) return false;
+                    if (!try heldAlone(c, index, node, until)) return false;
+                    if (try beforeAdoption(c, c.file, index, node, until, 0) != .whole) return false;
                     return wholeBytes(c, init, want, frames, until, depth + 1);
                 },
                 // `if (x) |bytes|`: the optional's payload.
                 .capture => {
                     const branch = tree.fullIf(decl.node) orelse return false;
                     if (branch.payload_token != decl.token or branch.error_token != null) return false;
-                    if (!heldAlone(c, index, node, until)) return false;
+                    if (!try heldAlone(c, index, node, until)) return false;
+                    if (try beforeAdoption(c, c.file, index, node, until, 0) != .whole) return false;
                     return wholeBytes(c, branch.ast.cond_expr, want, frames, until, depth + 1);
                 },
                 .parameter => {
@@ -5744,10 +5755,13 @@ fn parameterOf(c: *Context, function: Facts.Decl, position: usize) ?Model.Declar
 /// allocation it holds: an element read or written, its length, a comparison, a builtin that
 /// copies into or out of it, or its address compared, leave it whole; a free, a write of the
 /// slice itself (`buf = ...`, `buf.len = 1`, `buf.ptr += 1`), or a copy of it or its address
-/// kept elsewhere (stored, put in a local, a literal or another adoption) spoil it. A function
+/// kept elsewhere (stored, put in a local, a literal or another adoption) spoil it. Its value
+/// through parentheses, `try`, `.?` or `@as`, and `p.*` where its address is all the constant
+/// `p` holds, are read as it is. A function
 /// it is handed to is read the same way in its parameter, through `depth` calls, and leaves
 /// it whole where it does and gives back no pointer. Any other use is not known. Deferred uses
-/// are left to `heldAlone`. `file` is the one the local is in.
+/// are left to `heldAlone`; a use in the side of an `if` its condition, known as the program
+/// compiles (`Facts.knownBool`), never takes is none. `file` is the one the local is in.
 fn beforeAdoption(c: *Context, file: Project.FileId, index: Model.Declaration.Id, read: Ast.Node.Index, until: Ast.TokenIndex, depth: u8) Context.Error!Before {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
@@ -5756,19 +5770,34 @@ fn beforeAdoption(c: *Context, file: Project.FileId, index: Model.Declaration.Id
         if (use == read or tree.nodeMainToken(use) >= until) continue;
         // Deferred code runs at the scope's end: `heldAlone` reads it.
         var deferred = false;
+        var untaken = false;
+        var at = use;
         var up = model.parentOf(use);
-        while (up) |parent| : (up = model.parentOf(parent)) switch (tree.nodeTag(parent)) {
+        while (up) |parent| : ({
+            at = parent;
+            up = model.parentOf(parent);
+        }) switch (tree.nodeTag(parent)) {
             .@"defer", .@"errdefer" => deferred = true,
+            .if_simple, .@"if" => {
+                // A truth value's `if` (no capture): its `then` runs where the condition is true,
+                // its `else` where it is false.
+                const branch = tree.fullIf(parent).?; // unreachable: the node is an `if`
+                if (branch.payload_token != null or branch.error_token != null) continue;
+                const side: ?bool = if (at == branch.ast.then_expr) true else if (branch.ast.else_expr.unwrap() == at) false else null;
+                if (side) |taken_when| if (try c.facts.knownBool(file, branch.ast.cond_expr)) |known| {
+                    if (known != taken_when) untaken = true;
+                };
+            },
             else => {},
         };
-        if (deferred) continue;
-        const found = try allocationUse(c, file, use, depth);
+        if (deferred or untaken) continue;
+        const found = try allocationUse(c, file, use, until, depth);
         if (found != .whole) return found;
     }
     return .whole;
 }
 
-fn allocationUse(c: *Context, file: Project.FileId, use: Ast.Node.Index, depth: u8) Context.Error!Before {
+fn allocationUse(c: *Context, file: Project.FileId, use: Ast.Node.Index, until: Ast.TokenIndex, depth: u8) Context.Error!Before {
     const tree = &c.project.at(file).file.tree;
     // `view` is what holds the allocation's memory: the local, a slice of it, its `.ptr`.
     var view = use;
@@ -5776,7 +5805,7 @@ fn allocationUse(c: *Context, file: Project.FileId, use: Ast.Node.Index, depth: 
         const held = try Facts.accesses.useOf(c.facts, file, view);
         switch (held) {
             .carried => |carry| switch (carry.how) {
-                .grouped, .tried => view = carry.into,
+                .grouped, .tried, .unwrapped => view = carry.into,
                 else => break held,
             },
             .sliced => |slice| view = slice,
@@ -5809,8 +5838,37 @@ fn allocationUse(c: *Context, file: Project.FileId, use: Ast.Node.Index, depth: 
             for ([_][]const u8{ "@memset", "@memcpy", "@memmove", "@sizeOf", "@TypeOf" }) |each| if (Facts.isBuiltin(tree, at.call, each)) return .whole;
             // Its address as a number: what is done with the number, as with the memory
             // (`where = @intFromPtr(buf.ptr)` keeps it; a comparison does not).
-            if (Facts.isBuiltin(tree, at.call, "@intFromPtr")) return allocationUse(c, file, at.call, depth);
+            if (Facts.isBuiltin(tree, at.call, "@intFromPtr")) return allocationUse(c, file, at.call, until, depth);
+            // Coerced to a type: the same memory, as the coercion's value.
+            if (Facts.isBuiltin(tree, at.call, "@as") and at.position == 1) return allocationUse(c, file, at.call, until, depth);
             return .{ .unknown = at.call };
+        },
+        // Its address kept in a block's constant (`const p = &buf`): each use of `p.*` is one of
+        // the memory, every one before `until` and none deferred; any other use of `p` is not
+        // known.
+        .address => |taking| {
+            const variable = switch (try Facts.accesses.useOf(c.facts, file, taking)) {
+                .initializes => |variable| tree.fullVarDecl(variable) orelse return .{ .unknown = taking },
+                else => return .{ .unknown = taking },
+            };
+            if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return .{ .unknown = taking };
+            const model = &c.project.at(file).model;
+            var named_by = Mentions.all(model, variable.ast.mut_token + 1);
+            while (named_by.next()) |mention| {
+                if (tree.nodeMainToken(mention) >= until) return .{ .unknown = mention };
+                var up = model.parentOf(mention);
+                while (up) |parent| : (up = model.parentOf(parent)) switch (tree.nodeTag(parent)) {
+                    .@"defer", .@"errdefer" => return .{ .unknown = mention },
+                    else => {},
+                };
+                const memory = switch (try Facts.accesses.useOf(c.facts, file, mention)) {
+                    .dereferenced => |deref| deref,
+                    else => return .{ .unknown = mention },
+                };
+                const found = try allocationUse(c, file, memory, until, depth);
+                if (found != .whole) return found;
+            }
+            return .whole;
         },
         .argument => |at| .{ at.call, at.position },
         else => return .{ .unknown = view },
@@ -5827,11 +5885,7 @@ fn allocationUse(c: *Context, file: Project.FileId, use: Ast.Node.Index, depth: 
         .unknown => return .{ .unknown = parent },
     };
     const call = (try Facts.calls.at(c.facts, file, parent)).?; // unreachable: `view` is its argument
-    if (file == c.file) {
-        const path = try Facts.accesses.pathOf(c.facts, file, call.callee_expr);
-        if (path.steps.len >= 2 and path.steps[0].kind == .field and std.mem.eql(u8, (try memberNamed(c, file, call.callee_expr)) orelse "", adopts(.bytes).?) and
-            try requiredOwner(c, path.steps[1].node, capacity, tree.lastToken(call.callee_expr)) == .bytes) return .{ .spoiled = .{ .at = parent, .what = "adopted by another owner" } };
-    }
+    if (file == c.file and try adoptsBytes(c, call.callee_expr)) return .{ .spoiled = .{ .at = parent, .what = "adopted by another owner" } };
     // A function it is handed to: what it does with its parameter there. One that frees or
     // keeps it spoils it; one that leaves it whole and gives back no pointer hands nothing on.
     if (depth == 4) return .{ .unknown = parent };
@@ -5876,10 +5930,12 @@ fn enclosingFunction(tree: *const Ast, model: *const Model, node: Ast.Node.Index
 }
 
 /// Whether the local `index` is named, apart from at `read`, only before `until` and never in
-/// deferred code: what it holds is the reader's alone from there.
-fn heldAlone(c: *Context, index: Model.Declaration.Id, read: Ast.Node.Index, until: Ast.TokenIndex) bool {
+/// deferred code: what it holds is the reader's alone from there. An `errdefer` may name it
+/// where `read` is in the adoption a `return` gives (`adoptionReturned`).
+fn heldAlone(c: *Context, index: Model.Declaration.Id, read: Ast.Node.Index, until: Ast.TokenIndex) Context.Error!bool {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
+    const returned = try adoptionReturned(c, read, until);
     var named_by = Mentions.all(model, model.declarations[@backingInt(index)].token);
     while (named_by.next()) |candidate| {
         if (candidate == read) continue;
@@ -5887,12 +5943,37 @@ fn heldAlone(c: *Context, index: Model.Declaration.Id, read: Ast.Node.Index, unt
         var up = model.parentOf(candidate);
         while (up) |parent| : (up = model.parentOf(parent)) {
             switch (tree.nodeTag(parent)) {
-                .@"defer", .@"errdefer" => return false,
+                .@"defer" => return false,
+                .@"errdefer" => if (!returned) return false,
                 else => {},
             }
         }
     }
     return true;
+}
+
+/// Whether `read` is in a `return` that gives, through parentheses and `try`, the adoption that
+/// ends at `until`. An `errdefer` runs only where the function returns an error, and that
+/// `return` gives one only where the adoption fails, which takes nothing (`SecretBytes.adopt`
+/// takes the allocation on success only): no `errdefer` runs once the owner holds it.
+fn adoptionReturned(c: *Context, read: Ast.Node.Index, until: Ast.TokenIndex) Context.Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    var up = model.parentOf(read);
+    const ret = while (up) |parent| : (up = model.parentOf(parent)) switch (tree.nodeTag(parent)) {
+        .@"return" => break parent,
+        .fn_decl => return false,
+        else => {},
+    } else return false;
+    var value = tree.nodeData(ret).opt_node.unwrap() orelse return false;
+    while (true) switch (Facts.accesses.formOf(tree.nodeTag(value))) {
+        .grouped, .tried => value = Facts.accesses.carriedFrom(tree, value).?, // unreachable: the form carries its one operand
+        else => break,
+    };
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, value) orelse return false;
+    if (tree.lastToken(value) != until) return false;
+    return adoptsBytes(c, call.ast.fn_expr);
 }
 
 /// Whether every call of the function whose parameter `index` is passes a whole allocation

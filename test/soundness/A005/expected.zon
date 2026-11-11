@@ -1,13 +1,5 @@
 .{
     .no_hole = .{},
     .no_twin = .{},
-    .open = .{
-        // glint-b precision: A005 does not follow an allocation through an alias, an @as, an errdefer or an optional's payload to its adoption
-        "address/glintb-alias/twin.zig",
-        "conversion/glintb-cast/twin.zig",
-        "deferred/glintb-defer/twin.zig",
-        "unwrap/glintb-optional/twin.zig",
-        // glint-b precision: A005 reads a free under a comptime-false condition as taken
-        "compile_time/glintb-known/twin.zig",
-    },
+    .open = .{},
 }
