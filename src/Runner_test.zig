@@ -461,7 +461,7 @@ test "D001 reports what only the declaration itself or a field of that name name
     try check(.D001, "fn helper() u8 { return 1; } const S = struct { fn helper() u8 { return 2; } }; pub fn live() u8 { return helper(); }", 1);
 }
 
-test "D001 reads a computed @field through its receiver and withholds an unresolved one" {
+test "D001 withholds a file with a computed @field name, and writes no coverage" {
     try check(.D001, "const S = struct { const needed = 1; }; pub fn live(name: []const u8) void { _ = @field(S, name); }", 0);
     var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "fixture", .bytes = "fn unused() void {} pub fn live(x: anytype, comptime name: []const u8) void { _ = @field(x, name); }" }}, &.{}, .{});
     defer project.deinit();
@@ -469,12 +469,8 @@ test "D001 reads a computed @field through its receiver and withholds an unresol
     config.set(.D001, true);
     var report = try glint.run(std.testing.allocator, &project, config);
     defer report.deinit();
-    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: the unresolved receiver withholds the file.
-    var withheld = false;
-    for (report.coverage) |item| if (item.rule) |rule| {
-        if (rule == .D001 and item.reason == .unresolved) withheld = true;
-    };
-    try std.testing.expect(withheld);
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: the computed name withholds the file.
+    for (report.coverage) |item| if (item.rule) |rule| try std.testing.expect(rule != .D001);
 }
 
 test "G2 function length follows configured code policy" {
