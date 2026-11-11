@@ -1042,13 +1042,15 @@ pub fn inputSources(c: *Context, rule: Rule) Context.Error!void {
         try paths.append(c.allocator, path);
         try sources.append(c.allocator, "aegis");
     }
-    const targets = try c.allocator.alloc(Governed.Target, paths.items.len);
-    const indexes = try c.allocator.alloc(usize, paths.items.len);
-    for (paths.items, sources.items, targets, indexes, 0..) |path, source, *target, *index, i| {
-        target.* = .{ .source = source, .declaration = path, .production = true };
-        index.* = i;
+    // A source this std or this program does not declare has no reference to report.
+    var targets: std.ArrayList(Governed.Target) = .empty;
+    var indexes: std.ArrayList(usize) = .empty;
+    for (paths.items, sources.items, 0..) |path, source, i| {
+        if (try Governed.declarations(c, source, path) != .decls) continue;
+        try targets.append(c.allocator, .{ .source = source, .declaration = path, .production = true });
+        try indexes.append(c.allocator, i);
     }
-    const found = try Governed.resolve(c, rule, targets, indexes);
+    const found = try Governed.resolve(c, rule, targets.items, indexes.items);
     var sites: std.ArrayList(Governed.Site) = .empty;
     try Governed.sites(c, rule, found, &sites);
     for (sites.items) |site| {
