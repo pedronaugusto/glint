@@ -200,19 +200,20 @@ pub fn sitesLeaving(self: *Context, rule: Rule, governed: []const Governed, out:
                 break :blk .{ member, try Model.identifier(self.allocator, tree.tokenSlice(member)) };
             },
             .builtin_call_two, .builtin_call_two_comma => blk: {
-                if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) continue;
-                var buffer: [2]Ast.Node.Index = undefined;
-                const args = Facts.builtinArgs(tree, node, &buffer);
-                if (args.len != 2) continue;
-                const named = try self.facts.fieldName(self.file, args[1]);
+                // Every builtin that names a field by a string (`fieldBuiltin`) is a member
+                // reference to it.
+                const by = fieldBuiltin(tree, node) orelse continue;
+                const named = try self.facts.fieldName(self.file, by.name);
                 switch (named) {
-                    .name => |name| break :blk .{ tree.nodeMainToken(node), name },
-                    // A name it ranges over or computes: each governed name it may be.
-                    .each_of, .names, .computed => {
-                        try fieldSites(self, rule, governed, renamed, node, args[0], args[1], named, out);
-                        continue;
-                    },
+                    // `@field(h, "f")`, `@offsetOf(T, "f")`: the member its holder has, as a
+                    // member access reaches it (`reach`).
+                    .name => |name| if (by.holder != null) break :blk .{ tree.nodeMainToken(node), name },
+                    .each_of, .names, .computed => {},
                 }
+                // A name it ranges over or computes, or a holder only its result names
+                // (`@fieldParentPtr`): each governed name it may be.
+                try fieldSites(self, rule, governed, renamed, node, by, named, out);
+                continue;
             },
             // A decl literal (`.fromMilliseconds(ms)`, `.zero`): a member of the type its place
             // gives it.
@@ -267,18 +268,48 @@ fn literalSite(self: *Context, rule: Rule, governed: []const Governed, renamed: 
     }
 }
 
-/// `@field` by a name it ranges over or computes: each governed member its holder has that the
-/// name may be is a site; a holder that does not resolve is undecided where a governed name may
-/// be named.
-fn fieldSites(self: *Context, rule: Rule, governed: []const Governed, renamed: []const []const []const u8, node: Ast.Node.Index, holder: Ast.Node.Index, names_node: Ast.Node.Index, named: Facts.FieldName, out: *std.ArrayList(Site)) Context.Error!void {
+/// A builtin that names a field by a string: `@field(holder, name)`, `@offsetOf(T, name)`,
+/// `@bitOffsetOf(T, name)`, and `@fieldParentPtr(name, field)`, whose holder is the type its
+/// result points at (null `holder`). `@hasField` and `@FieldType` name one too, but read no
+/// value and make none: they answer of the type alone.
+pub const FieldBuiltin = struct { name: Ast.Node.Index, holder: ?Ast.Node.Index };
+pub fn fieldBuiltin(tree: *const Ast, node: Ast.Node.Index) ?FieldBuiltin {
+    const builtin = Facts.builtinName(tree, node) orelse return null;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = Facts.builtinArgs(tree, node, &buffer);
+    if (args.len != 2) return null;
+    for ([_][]const u8{ "@field", "@offsetOf", "@bitOffsetOf" }) |each| if (std.mem.eql(u8, builtin, each)) return .{ .name = args[1], .holder = args[0] };
+    if (std.mem.eql(u8, builtin, "@fieldParentPtr")) return .{ .name = args[0], .holder = null };
+    return null;
+}
+
+/// What a field builtin's holder is: its holder's value, or for `@fieldParentPtr` what the
+/// pointer its place gives it points at (`Facts.castTypeIn`).
+pub fn fieldHolder(self: *Context, node: Ast.Node.Index, by: FieldBuiltin) Context.Error!Facts.Value {
+    if (by.holder) |holder| return self.facts.resolve(self.file, holder);
+    const made = try self.facts.castTypeIn(null, self.file, node);
+    return if (made == .pointer) made.pointer.child.* else made;
+}
+
+/// A field builtin by a name it ranges over or computes, or by any name where only its result
+/// names its holder: each governed member its holder has that the name may be is a site; a
+/// holder that does not resolve is undecided where a governed name may be named.
+fn fieldSites(self: *Context, rule: Rule, governed: []const Governed, renamed: []const []const []const u8, node: Ast.Node.Index, by: FieldBuiltin, named: Facts.FieldName, out: *std.ArrayList(Site)) Context.Error!void {
     // A name of the fields or tags of the very type the holder is, or holds, is a field's or a
-    // tag's: Zig forbids a declaration of one name with them in a container, so it reaches none.
-    if (try self.facts.fieldNameOwn(self.file, holder, names_node)) return;
+    // tag's: Zig forbids a declaration of one name with them in a container, so it reaches no
+    // declaration, but it does reach a governed field among them.
+    const own = if (by.holder) |holder| try self.facts.fieldNameOwn(self.file, holder, by.name) else false;
+    if (own) for (governed) |g| {
+        if (isField(self, g)) break;
+    } else return;
     const tree = &self.project.at(self.file).file.tree;
     const site = tree.nodeMainToken(node);
-    const value = try self.facts.resolve(self.file, holder);
+    const value = try fieldHolder(self, node, by);
     for (governed, renamed) |g, names| {
-        for ([_][]const []const u8{ &.{g.name}, names }) |list| for (list) |name| {
+        if (own and !isField(self, g)) continue;
+        // An alias names a declaration, never a field.
+        const aliases: []const []const u8 = if (own) &.{} else names;
+        for ([_][]const []const u8{ &.{g.name}, aliases }) |list| for (list) |name| {
             if (!self.facts.mayName(named, name) or (self.inTest(site) and g.target.production)) continue;
             if (value == .unknown) return self.unknown(rule, node, value.unknown);
             var options: std.ArrayList(Facts.Container) = .empty;
@@ -293,6 +324,155 @@ fn fieldSites(self: *Context, rule: Rule, governed: []const Governed, renamed: [
             }
         };
     }
+}
+
+/// Whether a governed target is a field of its container.
+fn isField(self: *Context, g: Governed) bool {
+    for (g.decls) |decl| if (self.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind == .field) return true;
+    return false;
+}
+
+/// Whether a value of one of `types` is made other than by its own code, and by what callee.
+pub const Made = union(enum) { no, yes: ?Facts.Decl, unknown: Facts.Unknown };
+
+/// Whether the call at `node` makes a value of one of `types` (or a pointer to one, through
+/// optionals and error unions) outside its type's own code: its callee is outside the program
+/// (the program's own is judged by its body) and is a function of another package, or of the
+/// type's own package but reflective, its result written in terms of its own comptime type
+/// parameter (std's `mem.zeroInit(T, init)`, `mem.zeroes(T)`), which makes whatever type it is
+/// given from what the caller hands it. A type's makers are functions of its own package with
+/// a result of that type: never reflective. The callee is given (`yes`) for the caller to
+/// weigh its own library; a reflective callee whose result does not resolve is unknown, but
+/// for a generic's binding, judged where it is bound.
+pub fn madeByCall(self: *Context, node: Ast.Node.Index, types: []const Facts.Container) Context.Error!Made {
+    if (types.len == 0) return .no;
+    const call = (try Facts.calls.at(self.facts, self.file, node)) orelse return .no;
+    const callees: []const Facts.Decl = switch (call.callee) {
+        .function => |function| &.{function},
+        .choice => |each| each,
+        .any => return .no,
+    };
+    var result: ?Facts.Value = null;
+    for (callees) |callee| {
+        if (try self.facts.program(callee.file)) continue;
+        if (result == null) result = try self.facts.resolve(self.file, node);
+        const made = madeType(result.?, types) orelse {
+            if (result.? == .unknown and result.?.unknown != .generic and reflectiveResult(self, callee)) return .{ .unknown = result.?.unknown };
+            continue;
+        };
+        if (!reflectiveResult(self, callee) and try samePackage(self, callee.file, made.file)) continue;
+        // A copy of memory out of a value of the same type (`std.mem.bytesToValue(T,
+        // std.mem.asBytes(&t))`, `Facts.accesses.copyAt`) makes it from its own bytes.
+        if (try Facts.accesses.copyAt(self.facts, self.file, node)) |copy| if (madeType(try self.facts.resolve(self.file, copy.from.node()), types)) |from| {
+            if (from.file == made.file and from.scope == made.scope) continue;
+        };
+        return .{ .yes = callee };
+    }
+    return .no;
+}
+
+/// Whether the cast at `node` (`@ptrCast`, `@bitCast`) makes a value of one of `types`, or a
+/// pointer to one, from a value of another type: a reinterpretation no maker of the type sees.
+/// Unknown where its result does not resolve and its operand is of none of `types`.
+pub fn madeByCast(self: *Context, node: Ast.Node.Index, types: []const Facts.Container) Context.Error!Made {
+    if (types.len == 0) return .no;
+    const tree = &self.project.at(self.file).file.tree;
+    const builtin = Facts.builtinName(tree, node) orelse return .no;
+    if (!std.mem.eql(u8, builtin, "@ptrCast") and !std.mem.eql(u8, builtin, "@bitCast")) return .no;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = Facts.builtinArgs(tree, node, &buffer);
+    if (args.len != 1) return .no;
+    const operand = try self.facts.resolve(self.file, args[0]);
+    const from = madeType(operand, types);
+    const result = try self.facts.castTypeIn(null, self.file, node);
+    const into = madeType(result, types) orelse {
+        if (result == .unknown and result.unknown != .generic and from == null) return .{ .unknown = result.unknown };
+        return .no;
+    };
+    if (from) |same| if (same.file == into.file and same.scope == into.scope) return .no;
+    return .{ .yes = null };
+}
+
+/// The one of `types` a value is, or points at, through optionals and error unions; of a
+/// choice, the first a part of it is (the build that takes that part makes it).
+fn madeType(value: Facts.Value, types: []const Facts.Container) ?Facts.Container {
+    var at = value;
+    while (true) at = switch (at) {
+        .pointer => |inner| inner.child.*,
+        .optional, .error_union => |inner| inner.*,
+        .alternatives => |each| {
+            for (each) |one| if (madeType(one, types)) |found| return found;
+            return null;
+        },
+        else => break,
+    };
+    const found = switch (at) {
+        .instance, .container => |found| found,
+        .alternatives => return null, // unreachable: a choice is read above
+        else => return null,
+    };
+    for (types) |t| if (t.file == found.file and t.scope == found.scope) return t;
+    return null;
+}
+
+/// Whether two files are of one package: both std's, or both of one package their caller names.
+fn samePackage(self: *Context, a: Project.FileId, b: Project.FileId) Context.Error!bool {
+    if (try self.facts.standard(a) and try self.facts.standard(b)) return true;
+    const left = self.project.at(a).input.package;
+    return left.len != 0 and std.mem.eql(u8, left, self.project.at(b).input.package);
+}
+
+/// Whether a function's result is written in terms of its own parameter (`T`, `?T`, `E!T`,
+/// `*T`, `[]T`, `@TypeOf(x)`): a name in its result type whose declaration is one of the
+/// function's own parameters (a made container's method returning its type function's `T`
+/// returns what the container holds, and is none).
+fn reflectiveResult(self: *Context, function: Facts.Decl) bool {
+    const tree = &self.project.at(function.file).file.tree;
+    const model = &self.project.at(function.file).model;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, model.declarations[@backingInt(function.index)].node) orelse return false;
+    const result = proto.ast.return_type.unwrap() orelse return false;
+    return refersToParameter(tree, model, proto, result);
+}
+
+/// Whether a type expression refers to one of `proto`'s parameters, by its declaration (`T`,
+/// `?T`, `E!*T`, `[]const T`, `@TypeOf(x)`, `Made(T)`, `T.Elem`). A form not read here refers
+/// to none.
+pub fn refersToParameter(tree: *const Ast, model: *const Model, proto: Ast.full.FnProto, written: Ast.Node.Index) bool {
+    return parameterIn(tree, model, proto, written, 0);
+}
+
+fn parameterIn(tree: *const Ast, model: *const Model, proto: Ast.full.FnProto, node: Ast.Node.Index, depth: usize) bool {
+    if (depth == 16) return false;
+    if (tree.fullPtrType(node)) |ptr| return parameterIn(tree, model, proto, ptr.ast.child_type, depth + 1);
+    if (tree.fullArrayType(node)) |array| return parameterIn(tree, model, proto, array.ast.elem_type, depth + 1);
+    switch (tree.nodeTag(node)) {
+        .identifier => {
+            const index = (model.reference(node) orelse return false).declaration orelse return false;
+            const record = model.declarations[@backingInt(index)];
+            if (record.kind != .parameter) return false;
+            var parameters = proto.iterate(tree);
+            while (parameters.next()) |parameter| if (parameter.name_token == record.token) return true;
+            return false;
+        },
+        .optional_type, .grouped_expression => return parameterIn(tree, model, proto, tree.nodeData(node).node, depth + 1),
+        .error_union => {
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            return parameterIn(tree, model, proto, lhs, depth + 1) or parameterIn(tree, model, proto, rhs, depth + 1);
+        },
+        .field_access => return parameterIn(tree, model, proto, tree.nodeData(node).node_and_token[0], depth + 1),
+        else => {},
+    }
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (Facts.builtinName(tree, node) != null) {
+        for (Facts.builtinArgs(tree, node, &buffer)) |arg| if (parameterIn(tree, model, proto, arg, depth + 1)) return true;
+        return false;
+    }
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    if (tree.fullCall(&call_buffer, node)) |call| {
+        for (call.ast.params) |arg| if (parameterIn(tree, model, proto, arg, depth + 1)) return true;
+    }
+    return false;
 }
 
 /// Whether a governed declaration is spelled `spelled` where `site` is.

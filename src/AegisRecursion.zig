@@ -55,9 +55,20 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
     const tree = try c.project.syntax(try c.source());
     const model = &c.project.at(c.file).model;
     var walk: Walk = .{ .c = c, .rule = rule };
+    // No untrusted type in the run: no value holds one.
+    if ((try @import("PackageRules.zig").publication(c.facts, Contract.Kind, Contract.library)).files.len == 0) return;
+    const reads = try containerReads(c, tree, model);
     for (model.declarations, 0..) |decl, d| {
         if (decl.kind != .function) continue;
-        if (!try takesUntrusted(c, tree, decl.node)) continue;
+        const taken = (try takesUntrusted(c, tree, decl.node, inScopeOfFunction(tree, model, decl.scope))).join(reads[d]);
+        switch (taken) {
+            .no => continue,
+            .unknown => {
+                try c.undecided(rule, tree.tokenStart(decl.token), .unresolved, "a parameter or a container variable this function reads has a type that does not resolve: it may hold untrusted input, and recursion from it is undecided");
+                continue;
+            },
+            .yes => {},
+        }
         try entry(&walk, .{ .file = c.file, .index = @fromBackingInt(@intCast(d)) }, decl.token);
     }
     // Each call of an untrusted value's own `parse` (`u.parse(bytes, parser)`, or through its
@@ -84,16 +95,193 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
     }
 }
 
-/// Whether a function declares a parameter of an untrusted type.
-fn takesUntrusted(c: *Context, tree: *const Ast, proto: Ast.Node.Index) Context.Error!bool {
+/// Whether a value holds untrusted input: yes, no, or unknown (its type does not resolve).
+const Held = enum {
+    yes,
+    no,
+    unknown,
+
+    fn join(a: Held, b: Held) Held {
+        if (a == .yes or b == .yes) return .yes;
+        if (a == .unknown or b == .unknown) return .unknown;
+        return .no;
+    }
+};
+
+/// Whether a function declares a parameter whose type holds an untrusted type at any depth, by
+/// declaration (`untrustedIn`): an `Untrusted` itself, or a struct field, an optional, a pointer,
+/// a slice or an array, or a union's arm that holds one. A parameter `anytype`, or one typed
+/// with another of the function's parameters, is judged where it is bound.
+/// A method of a type function's container as written (`method`, `inFunction`): its
+/// parameters' types are each instance's.
+fn takesUntrusted(c: *Context, tree: *const Ast, proto: Ast.Node.Index, method: bool) Context.Error!Held {
     var buffer: [1]Ast.Node.Index = undefined;
-    const function = tree.fullFnProto(&buffer, proto) orelse return false;
+    const function = tree.fullFnProto(&buffer, proto) orelse return .no;
     var parameters = function.iterate(tree);
+    var out: Held = .no;
     while (parameters.next()) |parameter| {
         const type_expr = parameter.type_expr orelse continue;
-        if (try c.role(Contract.library, try c.facts.resolve(c.file, type_expr)) == .untrusted) return true;
+        // A type written with the function's own parameter (`into: *T`, `copy: @TypeOf(a)`) is
+        // each binding's: the function is reached from what binds it, where the walk enters it.
+        if (@import("Governed.zig").refersToParameter(tree, &c.project.at(c.file).model, function, type_expr)) continue;
+        out = out.join(try untrustedIn(c, try c.facts.resolve(c.file, type_expr), method));
+        if (out == .yes) return out;
+    }
+    return out;
+}
+
+/// Whether a type holds an untrusted type at any depth by declaration: itself (`c.role`), what a
+/// pointer, a slice, an array, an optional or an error union holds, each field or arm of a struct
+/// or a union (`Facts.heldFields`, a made one's with its bindings), each alternative of a
+/// per-build choice. An aegis type other than `Untrusted` holds what its role says; a type,
+/// a number, a function hold none; what does not resolve may hold one.
+fn untrustedIn(c: *Context, value: Facts.Value, template: bool) Context.Error!Held {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
+    var search: Search = .{ .c = c, .memo = try c.facts.memo(Untrusted) };
+    return search.at(value, template, 0);
+}
+
+/// Each container's answer as `untrustedIn` reads it, by its declaration and whether it is read
+/// as a type function's container as written; a made one (its binding its own) is read afresh.
+const Untrusted = struct {
+    found: std.AutoHashMapUnmanaged(Key, Held) = .empty,
+
+    const Key = struct { file: @import("Project.zig").FileId, scope: Model.Scope.Id, template: bool };
+};
+
+/// One `untrustedIn` reading: the containers on its path, and how many times it met one of them
+/// again (a reading cut so holds only on that path, and is kept only where it found one).
+const Search = struct {
+    c: *Context,
+    memo: *Untrusted,
+    seen: std.ArrayList(Facts.Container) = .empty,
+    cuts: usize = 0,
+
+    /// `untrustedIn` at `depth` containers down; `template` where the value is held, at any
+    /// depth, by a type function's container as written, no binding given.
+    fn at(self: *Search, value: Facts.Value, template: bool, depth: usize) Context.Error!Held {
+        const c = self.c;
+        if (depth == 64) return .unknown;
+        switch (value) {
+            .pointer => |inner| return self.at(inner.child.*, template, depth),
+            .array, .optional, .error_union => |inner| return self.at(inner.*, template, depth),
+            .alternatives => |each| {
+                var out: Held = .no;
+                for (each) |one| out = out.join(try self.at(one, template, depth));
+                return out;
+            },
+            .container, .instance => |found| {
+                if (try c.role(Contract.library, value)) |role| return if (role == .untrusted) .yes else .no;
+                if (try c.inLibrary(Contract.library, found.file)) return .no;
+                // A type met again on its own path holds nothing it has not shown there.
+                for (self.seen.items) |earlier| if (std.meta.eql(earlier, found)) {
+                    self.cuts += 1;
+                    return .no;
+                };
+                const keyed = found.made_by == null;
+                const memo_key: Untrusted.Key = .{ .file = found.file, .scope = found.scope, .template = template };
+                if (keyed) if (self.memo.found.get(memo_key)) |known| return known;
+                try self.seen.append(c.allocator, found);
+                defer _ = self.seen.pop();
+                const cuts = self.cuts;
+                // A type function's container as written, no binding given: what its
+                // parameters type, at any depth (`cursor: *Cursor(Backend)`'s fields), is each
+                // instance's, judged where an instance is held (a function taking or making one
+                // is the entry, and the walk follows its calls into this one's methods).
+                const unbound = template or (found.made_by == null and (found.symbolic or inFunction(c, found)));
+                var out: Held = .no;
+                for (try c.facts.heldFields(found)) |field| {
+                    out = out.join(try self.at(field.value, unbound, depth + 1));
+                    if (out == .yes) break;
+                }
+                if (keyed and (out != .no or self.cuts == cuts)) try self.memo.found.put(c.allocator, memo_key, out);
+                return out;
+            },
+            // What std computes from the target, and code the build does not compile, hold
+            // none; a generic's parameter is judged at each binding, as the pack judges
+            // generics. In a type function's container as written, what does not resolve is
+            // each instance's: untrusted input reaches its methods only through an instance
+            // some entry holds, read there with its binding.
+            .unknown => |why| return if (template) .no else switch (why) {
+                .zig_own, .absent, .generic => .no,
+                else => .unknown,
+            },
+            else => return .no,
+        }
+    }
+};
+
+/// Whether a container is written inside a generic function (a type function's `return struct
+/// {...}`), by its scope: read with no binding, what the function's parameters decide is not
+/// known.
+fn inFunction(c: *Context, found: Facts.Container) bool {
+    return inScopeOfFunction(&c.project.at(found.file).file.tree, &c.project.at(found.file).model, found.scope);
+}
+
+/// Whether a scope is, or is within, the scope of a generic function: one that takes a
+/// `comptime` or `anytype` parameter, whose containers its bindings decide.
+fn inScopeOfFunction(tree: *const Ast, model: *const Model, from: ?Model.Scope.Id) bool {
+    var scope = from;
+    while (scope) |s| : (scope = model.scopes[@backingInt(s)].parent) {
+        if (model.scopes[@backingInt(s)].kind != .function) continue;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const node = model.scopes[@backingInt(s)].node;
+        const proto = tree.fullFnProto(&buffer, if (tree.nodeTag(node) == .fn_decl) tree.nodeData(node).node_and_node[0] else node) orelse continue;
+        var parameters = proto.iterate(tree);
+        while (parameters.next()) |parameter| {
+            if (parameter.type_expr == null) return true;
+            if (parameter.comptime_noalias) |token| if (tree.tokenTag(token) == .keyword_comptime) return true;
+        }
     }
     return false;
+}
+
+/// For each declaration of the file, by its index, whether the function it is reads a
+/// container-level `var` (of any file) whose type holds an untrusted type (`untrustedIn`): input
+/// waiting there is input the function takes.
+fn containerReads(c: *Context, tree: *const Ast, model: *const Model) Context.Error![]Held {
+    const out = try c.allocator.alloc(Held, model.declarations.len);
+    @memset(out, .no);
+    // Each function's declaration by its body's node.
+    var functions: std.AutoHashMapUnmanaged(u32, usize) = .empty;
+    for (model.declarations, 0..) |d, index| {
+        if (d.kind != .function) continue;
+        const parent = model.parentOf(d.node) orelse continue;
+        if (tree.nodeTag(parent) == .fn_decl) try functions.put(c.allocator, @backingInt(parent), index); // safe: AST node indexes key their own table.
+    }
+    // Each variable's answer, once.
+    var known: std.AutoHashMapUnmanaged(Facts.Decl, Held) = .empty;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        // A name the file resolves, or a member read (`mod.inbox`).
+        const named = model.reference(node);
+        if (named == null and Facts.accesses.formOf(tag) != .member) continue;
+        // A name of this file's that is no variable needs no resolving.
+        if (named) |reference| if (reference.declaration) |index| if (model.declarations[@backingInt(index)].kind != .variable) continue;
+        const decl = switch (try c.facts.definition(c.file, node)) {
+            .decl => |decl| decl,
+            .none, .unknown => continue,
+        };
+        const source = c.project.at(decl.file);
+        const record = source.model.declarations[@backingInt(decl.index)];
+        if (record.kind != .variable) continue;
+        const scope = source.model.scopes[@backingInt(record.scope)].kind;
+        if (scope != .file and scope != .container) continue;
+        const variable = source.file.tree.fullVarDecl(record.node) orelse continue;
+        if (source.file.tree.tokenTag(variable.ast.mut_token) != .keyword_var) continue;
+        // The function whose body holds the read, nearest first.
+        var at = model.parentOf(node);
+        const function = while (at) |parent| : (at = model.parentOf(parent)) {
+            if (tree.nodeTag(parent) == .fn_decl) break functions.get(@backingInt(parent)) orelse null; // safe: AST node indexes key their own table.
+        } else null;
+        const index = function orelse continue;
+        const entry_ = try known.getOrPut(c.allocator, decl);
+        if (!entry_.found_existing) entry_.value_ptr.* = try untrustedIn(c, try c.facts.declaration(decl), false);
+        out[index] = out[index].join(entry_.value_ptr.*);
+    }
+    return out;
 }
 
 fn entry(self: *Walk, start: Facts.Decl, token: Ast.TokenIndex) Context.Error!void {
@@ -107,8 +295,8 @@ fn entry(self: *Walk, start: Facts.Decl, token: Ast.TokenIndex) Context.Error!vo
         for (self.unresolved.items, 0..) |one, i| {
             const file = self.c.project.at(one.file).file;
             const at = file.line(file.tree.tokenStart(file.tree.firstToken(one.call))) + 1;
-            var buffer: [1]Ast.Node.Index = undefined;
-            const callee = file.tree.getNodeSource(file.tree.fullCall(&buffer, one.call).?.ast.fn_expr);
+            var buffer: [2]Ast.Node.Index = undefined;
+            const callee = file.tree.getNodeSource(walkedCall(&file.tree, one.call, &buffer).?.ast.fn_expr); // unreachable: a walked call is one
             // An allocating writer fails only when its allocation does.
             names.writer.print("{s}{s}:{d} `{s}`", .{ if (i == 0) "" else ", ", self.c.project.at(one.file).input.name, at, callee }) catch return error.OutOfMemory;
         }
@@ -122,8 +310,8 @@ fn visit(self: *Walk, function: Facts.Decl, token: Ast.TokenIndex) Context.Error
     defer _ = self.stack.pop();
     const tree = &self.c.project.at(function.file).file.tree;
     for (try callsOf(self, function)) |call_node| {
-        var buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&buffer, call_node).?;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const call = walkedCall(tree, call_node, &buffer).?; // unreachable: a walked call is one
         // A call reaches a function, or one of several a branch chose; through anything else (a
         // function pointer, a vtable's field, what does not resolve) where it goes is undecided.
         const callee = try self.c.facts.resolve(function.file, call.ast.fn_expr);
@@ -248,9 +436,10 @@ fn around(self: *Walk, looped: []const Facts.Decl, edges: []const Walk.Edge, at:
     const file = from.file;
     const tree = &c.project.at(file).file.tree;
     const flow = try Taint.get(c, Danger.peer_input);
-    var buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&buffer, edge.call).?; // unreachable: an edge is a call
-    const receiver = try hasReceiver(c, file, call);
+    var buffer: [2]Ast.Node.Index = undefined;
+    const call = walkedCall(tree, edge.call, &buffer).?; // unreachable: an edge is a call
+    // `@call` binds no receiver: a method is named through its type, the value in the tuple.
+    const receiver = !Facts.isBuiltin(tree, edge.call, "@call") and try hasReceiver(c, file, call);
     const positions = @min(call.ast.params.len + @intFromBool(receiver), parameterCount(self, looped[(at + 1) % looped.len]));
     for (0..positions) |position| {
         const argument = plain(tree, argumentAt(tree, call, receiver, position));
@@ -285,9 +474,9 @@ fn around(self: *Walk, looped: []const Facts.Decl, edges: []const Walk.Edge, at:
                 // the field of its parameter and fails unless a guard holds it: what it checked
                 // holds where it succeeded.
                 for (try triedBefore(self, file, edge.call)) |tried| {
-                    var tried_buffer: [1]Ast.Node.Index = undefined;
-                    const inner = tree.fullCall(&tried_buffer, tried.call).?; // unreachable: tried calls are calls
-                    const inner_receiver = try hasReceiver(c, file, inner);
+                    var tried_buffer: [2]Ast.Node.Index = undefined;
+                    const inner = walkedCall(tree, tried.call, &tried_buffer).?; // unreachable: tried calls are calls
+                    const inner_receiver = !Facts.isBuiltin(tree, tried.call, "@call") and try hasReceiver(c, file, inner);
                     for (try movesIn(self, tried.callee)) |move| {
                         const root = plain(tree, tree.nodeData(move.depth).node_and_token[0]);
                         const q = (try parameterPosition(self, tried.callee, root)) orelse continue;
@@ -607,15 +796,29 @@ fn triedBefore(self: *Walk, file: @import("Project.zig").FileId, call: Ast.Node.
         var tried = statement;
         if (tree.fullVarDecl(statement)) |local| tried = local.ast.init_node.unwrap() orelse continue;
         if (tree.nodeTag(tried) != .@"try") continue;
-        var buffer: [1]Ast.Node.Index = undefined;
-        const inner = tree.fullCall(&buffer, tree.nodeData(tried).node) orelse continue;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const inner = walkedCall(tree, tree.nodeData(tried).node, &buffer) orelse continue;
         const callee = try self.c.facts.resolve(file, inner.ast.fn_expr);
         if (callee != .function or callee.function.file != file) continue;
         try out.append(self.c.allocator, .{ .callee = callee.function, .call = tree.nodeData(tried).node });
     }
     return out.items;
 }
-/// The calls whose nearest enclosing function is `f`, indexed once per file.
+/// A call the walk follows, as its parts are written: `f(a)`, or `@call(modifier, f, .{ a })`
+/// with its tuple literal's elements as its arguments (none known for any other tuple, which
+/// then carries no depth). Null where `node` is neither.
+fn walkedCall(tree: *const Ast, node: Ast.Node.Index, buffer: *[2]Ast.Node.Index) ?Ast.full.Call {
+    if (tree.fullCall(buffer[0..1], node)) |call| return call;
+    if (!Facts.isBuiltin(tree, node, "@call")) return null;
+    var operands_buffer: [2]Ast.Node.Index = undefined;
+    const operands = Facts.builtinArgs(tree, node, &operands_buffer);
+    if (operands.len != 3) return null;
+    const params: []const Ast.Node.Index = if (tree.fullArrayInit(buffer, operands[2])) |tuple| (if (tuple.ast.type_expr == .none) tuple.ast.elements else &.{}) else &.{};
+    return .{ .ast = .{ .lparen = tree.nodeMainToken(node) + 1, .fn_expr = operands[1], .params = params } };
+}
+
+/// The calls whose nearest enclosing function is `f`, indexed once per file: each written as a
+/// call or as `@call` (`Facts.calls.written`).
 fn callsOf(self: *Walk, f: Facts.Decl) Context.Error![]const Ast.Node.Index {
     const tree = &self.c.project.at(f.file).file.tree;
     const model = &self.c.project.at(f.file).model;
@@ -625,8 +828,7 @@ fn callsOf(self: *Walk, f: Facts.Decl) Context.Error![]const Ast.Node.Index {
         entry_.value_ptr.* = .empty;
         for (tree.nodes.items(.tag), 0..) |_, i| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            var buffer: [1]Ast.Node.Index = undefined;
-            _ = tree.fullCall(&buffer, node) orelse continue;
+            if (!Facts.calls.written(tree, node)) continue;
             var at = model.node_parents[i];
             while (at) |parent| : (at = model.parentOf(parent)) {
                 if (tree.nodeTag(parent) != .fn_decl) continue;

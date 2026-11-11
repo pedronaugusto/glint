@@ -49,6 +49,7 @@ pub fn sharedState(c: *Context, rule: Rule) Context.Error!void {
     const message = "{s}: raw synchronization; aegis Guarded, BlockingGuarded, RwGuarded, SpinRwGuarded, Condition, Atomic, Once or Lazy holds the data it guards";
     const spelled = try governedHeld(c, rule, &sync, message);
     const held = try heldUnderOtherNames(c, rule, &sync, spelled, message);
+    try derefCopies(c, rule, spelled.found, &sync);
     // A futex is a lock or a signal made by hand on a word the program writes as it likes.
     const futex = [_][]const u8{ "Io.futexWait", "Io.futexWaitTimeout", "Io.futexWaitUncancelable", "Io.futexWake", "Io.VTable.futexWait", "Io.VTable.futexWaitUncancelable", "Io.VTable.futexWake" };
     try governed(c, rule, &futex, true, "{s}: a wait or wake on a word the program synchronizes by hand; aegis Atomic, Condition or Once holds the state it signals, Io.Event a signal alone");
@@ -77,6 +78,75 @@ pub fn sharedState(c: *Context, rule: Rule) Context.Error!void {
             if (try guards(c, try c.facts.resolve(c.file, kind))) continue;
         }
         try c.at(rule, decl.token, try c.allocator.print("container-level var '{s}': mutable state any thread may reach; aegis Guarded, Atomic, Once or Lazy holds it, or Confined checks its one owner", .{decl.name}));
+    }
+}
+
+/// A record copied whole out of a pointer (`var copy = g.*`, a store, an argument, a result): a
+/// copy of every lock and atomic it holds by value, a second one no thread synchronizes with.
+/// Judged by the record's declared fields, std's records among them (`copiedSync`: std's
+/// `Io.Group` holds an `atomic.Value`), where reading a declaration of such a record judges it
+/// by its type alone (`unjudgedFields`). A copy whose value holds one by its type alone is
+/// reported where that value is held (`heldUnderOtherNames`); one whose fields do not resolve
+/// is undecided.
+fn derefCopies(c: *Context, rule: Rule, found: []const Governed.Governed, paths: []const []const u8) Context.Error!void {
+    const tree = &c.project.at(c.file).file.tree;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (Facts.accesses.formOf(tag) != .deref) continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(node);
+        if (c.inTest(token) or !try copiedWhole(c, node) or !try atRuntime(c, node)) continue;
+        const value = try c.facts.resolve(c.file, node);
+        if (try heldSync(c, found, value) == .yes) continue;
+        switch (try copiedSync(c, found, value, 0)) {
+            .no => {},
+            .unknown => |why| if (why != .generic) try c.undecided(rule, tree.tokenStart(token), .unresolved, "a record copied out of a pointer whose fields do not resolve may copy std's synchronization"),
+            .yes => |index| try c.at(rule, token, try c.allocator.print("{s} copied by value out of a pointer: a second one no thread synchronizes with; keep the pointer", .{paths[index]})),
+        }
+    }
+}
+
+/// Whether the value at `node` is copied where it stands, through what carries it: into a
+/// variable, a store, an argument, a literal, a result. A member read of it, its address, a store
+/// into it or a discard copies nothing.
+fn copiedWhole(c: *Context, node: Ast.Node.Index) Context.Error!bool {
+    var at = node;
+    for (0..64) |_| switch (try Facts.accesses.useOf(c.facts, c.file, at)) {
+        .carried => |carried| at = carried.into,
+        .initializes, .stored, .argument, .returned, .element_of, .field_of, .destructured, .continued, .unknown => return true,
+        else => return false,
+    };
+    return true;
+}
+
+/// Whether a value holds one of std's synchronization types by value through any record's
+/// declared fields, std's and its dependencies' included: what a copy of it copies. aegis's
+/// own types hold theirs behind their contract, as `heldSync` reads them.
+fn copiedSync(c: *Context, found: []const Governed.Governed, value: Facts.Value, depth: usize) Context.Error!Sync {
+    if (depth == 16) return .{ .unknown = .budget };
+    switch (value) {
+        .instance => |inner| {
+            if (try syncType(c, found, .{ .container = inner })) |index| return .{ .yes = index };
+            if (inner.made_by == null and try c.inLibrary(Contract.library, inner.file)) return .no;
+            if (inner.symbolic and inner.made_by == null) return .{ .unknown = .comptime_dependent };
+            var out: Sync = .no;
+            for (try c.facts.heldFields(inner)) |field| switch (try copiedSync(c, found, field.value, depth + 1)) {
+                .yes => |index| return .{ .yes = index },
+                .unknown => |why| out = .{ .unknown = why },
+                .no => {},
+            };
+            return out;
+        },
+        .array, .optional, .error_union => |inner| return copiedSync(c, found, inner.*, depth + 1),
+        .alternatives => |each| {
+            var out: Sync = .no;
+            for (each) |one| switch (try copiedSync(c, found, one, depth + 1)) {
+                .yes => |index| return .{ .yes = index },
+                .unknown => |why| out = .{ .unknown = why },
+                .no => {},
+            };
+            return out;
+        },
+        else => return heldSync(c, found, value),
     }
 }
 
@@ -327,7 +397,8 @@ fn enumLiteralPart(c: *Context, literal: Facts.Key, index: usize) Context.Error!
 /// written, read with the instance's bindings: a tuple's field (`struct { Key, u8 }`, which
 /// declares none); a field a type function's parameters type (`unjudged`); and every field of
 /// the program's record in a file the run does not select (a dependency's). std's and the
-/// known libraries' records are judged by their types alone.
+/// known libraries' records are judged by their types alone where a declaration holds one; a
+/// record copied out of a pointer is judged by its declared fields (`derefCopies`).
 fn unjudgedFields(c: *Context, found: Facts.Container) Context.Error![]const Facts.Value {
     const unselected = !c.project.at(found.file).input.selected and try c.facts.program(found.file);
     if (found.made_by == null and !unselected and !try hasTupleField(c, found)) return &.{};
@@ -809,6 +880,24 @@ fn rawTime(c: *Context, rule: Rule, paths: []const []const u8, made: usize) Cont
         try times.append(c.allocator, .{ .file = decl.file, .scope = c.project.at(decl.file).model.declarations[@backingInt(decl.index)].scope });
     };
     if (times.items.len == 0) return;
+    // A value of std's time made other than by its own code (`Governed.madeByCall`,
+    // `madeByCast`): by a reflective constructor (`std.mem.zeroInit(std.Io.Duration, .{
+    // .nanoseconds = n })`), or reinterpreted from another type, holds a raw count no door saw.
+    // aegis's units are the answer, and make it by their own doors.
+    for (0..tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const outside = if (Facts.calls.written(tree, node)) try Governed.madeByCall(c, node, times.items) else try Governed.madeByCast(c, node, times.items);
+        const token = tree.nodeMainToken(node);
+        if (outside == .no or c.inTest(token)) continue;
+        switch (outside) {
+            .no => {},
+            .unknown => try c.undecided(rule, tree.tokenStart(token), .unresolved, "a reflective constructor or a cast whose result does not resolve may make std's time from a raw count"),
+            .yes => |callee| {
+                if (callee) |function| if (try c.inLibrary(Contract.library, function.file)) continue;
+                try c.at(rule, token, "std's time made other than by its doors holds a raw count; aegis units.Duration and Instant carry the unit and convert with toIoDuration and fromIoDuration");
+            },
+        }
+    }
     for (0..tree.nodes.len) |i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const copy = (try Facts.accesses.copyAt(c.facts, c.file, node)) orelse continue;

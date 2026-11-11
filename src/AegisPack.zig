@@ -184,8 +184,11 @@ fn checkAccess(c: *Context) Context.Error!void {
     for (0..tree.nodes.len) |i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const form = Facts.accesses.formOf(tree.nodeTag(node));
+        try checkWhole(c, tree, node);
+        try checkGenericBinding(c, tree, node);
         if (made_by_constructor.len != 0) {
             try checkLiteral(c, tree, node, made_by_constructor);
+            try checkMade(c, tree, node, made_by_constructor);
             if (form == .address_of) {
                 try checkFieldWrite(c, tree, tree.nodeData(node).node, node, made_by_constructor);
                 try checkWholeAddress(c, tree, node);
@@ -220,28 +223,32 @@ fn reportInternal(c: *Context, token: Ast.TokenIndex, found: Internal) Context.E
     }
 }
 
-/// A backing field named by `@field`, as a member access names it: by a name it spells
-/// (`@field(g, "data")`, `"\x64ata"`, a `const` that holds it), by each field of a struct
-/// whose `field_names` it ranges over that is one; by a name it computes, any field of the
-/// holder, undecided where the holder keeps a backing field.
+/// A backing field named by a builtin that names a field by a string (`Governed.fieldBuiltin`:
+/// `@field`, `@offsetOf`, `@bitOffsetOf`, `@fieldParentPtr`), as a member access names it: by a
+/// name it spells (`@field(g, "data")`, `"\x64ata"`, a `const` that holds it), by each field
+/// of a struct whose `field_names` it ranges over that is one; by a name it computes, any field
+/// of the holder, undecided where the holder keeps a backing field. `@field` of a type names a
+/// declaration; the others name a field of the type they are given or point into.
 fn checkFieldBuiltin(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!void {
-    if (!Facts.isBuiltin(tree, node, "@field")) return;
-    var buffer: [2]Ast.Node.Index = undefined;
-    const args = Facts.builtinArgs(tree, node, &buffer);
-    if (args.len != 2) return;
-    const holder = args[0];
+    const by = Governed.fieldBuiltin(tree, node) orelse return;
     const token = tree.nodeMainToken(node);
-    const named = try c.facts.fieldName(c.file, args[1]);
+    const named = try c.facts.fieldName(c.file, by.name);
     switch (named) {
         .name => |name| if (!try anyInternal(c, name)) return,
         .each_of, .names => if (!try anyNamedInternal(c, named)) return,
         .computed => {},
     }
-    if (try typeValue(c, holder)) return;
-    const k = (try requiredOwner(c, holder, access, token)) orelse return;
-    const value = try c.facts.resolve(c.file, holder);
+    const value = try Governed.fieldHolder(c, node, by);
+    const k: Contract.Kind = if (by.holder) |holder| blk: {
+        if (Facts.isBuiltin(tree, node, "@field") and try typeValue(c, holder)) return;
+        break :blk (try requiredOwner(c, holder, access, token)) orelse return;
+    } else switch (try perBuild(c, value)) {
+        .owner => |k| k,
+        .other => return,
+        .unknown => return c.undecided(access, tree.tokenStart(token), .unresolved, "candidate receiver/value has no resolved operation contract"),
+    };
     if (named == .computed) {
-        if (try keepsInternal(c, value, k) != .no) try c.undecided(access, tree.tokenStart(token), .unresolved, "a name @field computes may be a published aegis backing field");
+        if (try keepsInternal(c, value, k) != .no) try c.undecided(access, tree.tokenStart(token), .unresolved, "a name a builtin computes may be a published aegis backing field");
         return;
     }
     try reportInternal(c, token, try namedInternal(c, named, value, k));
@@ -275,18 +282,27 @@ fn namedInternal(c: *Context, named: Facts.FieldName, holder: Facts.Value, k: Co
 }
 
 /// The bytes of a published owner read outside aegis: a std byte view of it
-/// (`std.mem.asBytes(s)`, `toBytes`, `sliceAsBytes`) or `@bitCast` of it reads every field
-/// it keeps behind its operations at once. A byte view of what does not resolve is undecided
-/// where it may be an owner, as is an owner given to a call that may be a byte view.
+/// (`std.mem.asBytes(s)`, `toBytes`, `sliceAsBytes`), `@bitCast` of it, or `@ptrCast` of a
+/// pointer to it into a pointer to another type, reads every field it keeps behind its
+/// operations at once. A byte view of what does not resolve is undecided where it may be an
+/// owner, as is an owner given to a call that may be a byte view, or cast to a pointer whose
+/// type does not resolve.
 fn checkByteRead(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!void {
     // Why the call may be a byte view or not, where it is not known to be one.
     var maybe: ?Facts.Unknown = null;
     const operand: Ast.Node.Index = blk: {
         if (Facts.builtinName(tree, node)) |name| {
-            if (!std.mem.eql(u8, name, "@bitCast")) return;
+            const pointer = std.mem.eql(u8, name, "@ptrCast");
+            if (!pointer and !std.mem.eql(u8, name, "@bitCast")) return;
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, node, &buffer);
             if (args.len != 1) return;
+            // A pointer cast to the owner's own type reads nothing (`@ptrCast(@alignCast(p))`).
+            if (pointer) switch (sameType(try c.facts.castTypeIn(null, c.file, node), try c.facts.resolve(c.file, args[0]))) {
+                .yes => return,
+                .no => {},
+                .unknown => |why| maybe = why,
+            };
             break :blk args[0];
         }
         const call = (try Facts.calls.at(c.facts, c.file, node)) orelse return;
@@ -323,6 +339,36 @@ fn checkByteRead(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Er
         .other, .unknown => {},
     }
 }
+/// Whether two values are, past their pointers, optionals and error unions, one container:
+/// unknown where either does not resolve.
+const Same = union(enum) { yes, no, unknown: Facts.Unknown };
+fn sameType(a: Facts.Value, b: Facts.Value) Same {
+    const x = switch (pointee(a)) {
+        .instance, .container => |found| found,
+        .unknown => |why| return .{ .unknown = why },
+        // A choice of types: one of them may be another.
+        .alternatives => return .{ .unknown = .unsupported },
+        else => return .no,
+    };
+    const y = switch (pointee(b)) {
+        .instance, .container => |found| found,
+        .unknown => |why| return .{ .unknown = why },
+        .alternatives => return .{ .unknown = .unsupported },
+        else => return .no,
+    };
+    return if (x.file == y.file and x.scope == y.scope) .yes else .no;
+}
+/// A value past its pointers, optionals and error unions.
+fn pointee(value: Facts.Value) Facts.Value {
+    var at = value;
+    while (true) at = switch (at) {
+        .pointer => |inner| inner.child.*,
+        .optional, .error_union => |inner| inner.*,
+        // A choice is read by its caller.
+        .alternatives => return at,
+        else => return at,
+    };
+}
 /// The published types only their own constructor may make: `err.PublicSource`, whose
 /// `classify` takes the reviewed reason that a literal of it skips.
 fn constructed(c: *Context) Context.Error![]const Facts.Container {
@@ -345,6 +391,129 @@ fn checkLiteral(c: *Context, tree: *const Ast, node: Ast.Node.Index, targets: []
         .other => {},
         .unknown => try c.undecided(access, tree.tokenStart(tree.firstToken(node)), .unresolved, "a literal that may be a public source has no resolved result type"),
     }
+}
+/// A value of a type only its constructor makes, made outside the library other than by a
+/// literal (`checkLiteral`): by a call outside the program that is no function of the type's
+/// package, or a reflective one of it (`Governed.madeByCall`: `std.mem.zeroInit(PublicSource,
+/// .{ .bytes = b })`), or by reinterpreting another type (`Governed.madeByCast`: `@ptrCast` of
+/// a `*const Text`). The program's own function is judged by its body.
+fn checkMade(c: *Context, tree: *const Ast, node: Ast.Node.Index, targets: []const Facts.Container) Context.Error!void {
+    const made = if (Facts.calls.written(tree, node)) try Governed.madeByCall(c, node, targets) else try Governed.madeByCast(c, node, targets);
+    const token = tree.nodeMainToken(node);
+    switch (made) {
+        .no => {},
+        .unknown => try c.undecided(access, tree.tokenStart(token), .unresolved, "a reflective constructor or a cast whose result does not resolve may make a public source without its reviewed classification"),
+        .yes => |callee| {
+            if (callee) |function| if (try c.inLibrary(Contract.library, function.file)) return;
+            try c.at(access, token, "public text made other than by its constructor skips its reviewed classification; use err.PublicSource.classify(reason, bytes)");
+        },
+    }
+}
+/// A whole value read of a published owner that keeps fields behind its operations: `p.*` of a
+/// pointer to one, used as a value (copied into a variable, a store, an argument, a literal, a
+/// result), reads every one of those fields at once, outside the owner's package (std's
+/// `autoHash(&h, s.*)`, `meta.eql(a.*, b.*)`, a `{any}` print of `g.*`). Taking its address, a
+/// member of it, or storing into it reads none. A pointer whose type does not resolve is
+/// judged where its fields are named.
+fn checkWhole(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!void {
+    if (Facts.accesses.formOf(tree.nodeTag(node)) != .deref) return;
+    const operand = tree.nodeData(node).node;
+    if (try typeValue(c, operand)) return;
+    const k = switch (try ownerKind(c, operand, access)) {
+        .owner => |k| k,
+        .other, .unknown => return,
+    };
+    const token = tree.nodeMainToken(node);
+    const internal = try keepsInternal(c, try c.facts.resolve(c.file, operand), k);
+    if (internal == .no) return;
+    switch (try wholeRead(c, tree, node)) {
+        .no => {},
+        .unknown => |why| try c.unknown(access, node, why),
+        .yes => if (internal == .yes)
+            try c.at(access, token, "a published aegis owner read whole reads every field it keeps behind its exposure/guard/ownership contract; use its operations")
+        else
+            try c.undecided(access, tree.tokenStart(token), .unresolved, "a value of an aegis role only some of whose types keep fields behind their operations, read whole"),
+    }
+}
+/// Whether the value at `node` is taken where it stands, through what carries it (parentheses,
+/// a branch, a `break`): copied, stored, handed, returned or operated on, as opposed to a
+/// member read of it, its address, a store into it, or a discard.
+fn wholeRead(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!Same {
+    var at = node;
+    for (0..64) |_| switch (try Facts.accesses.useOf(c.facts, c.file, at)) {
+        .carried => |on| at = on.into,
+        .statement, .typed, .written, .updated, .discarded, .member, .element, .sliced, .dereferenced, .index, .address, .callee, .matched, .logic => return .no,
+        // What only a type reads takes no value (`@TypeOf(p.*)`, `@sizeOf`).
+        .builtin_argument => |argument| {
+            const name = Facts.builtinName(tree, argument.call) orelse return .yes;
+            for ([_][]const u8{ "@TypeOf", "@sizeOf", "@alignOf", "@bitSizeOf" }) |each| if (std.mem.eql(u8, name, each)) return .no;
+            return .yes;
+        },
+        .unknown => |why| return .{ .unknown = why },
+        else => return .yes,
+    };
+    return .{ .unknown = .budget };
+}
+/// An owner that keeps fields behind its operations, handed to a call whose callee's body is
+/// not read here with it. By value to a function outside the program and outside aegis (std's
+/// `autoHash(&h, s)`): that function reads it whole, every one of those fields. Through a
+/// pointer, by value or in a literal, to a generic parameter (`anytype`, or a type written with
+/// the callee's own parameter) of a function outside aegis whose file this run does not check
+/// (another file of the program, a dependency, std): the binding is never judged, so it is
+/// undecided at the call (main's ruling, 2026-11-11).
+fn checkGenericBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!void {
+    if (!Facts.calls.written(tree, node)) return;
+    const call = (try Facts.calls.at(c.facts, c.file, node)) orelse return;
+    const args = switch (call.args) {
+        .known => |known| known,
+        .unknown => return,
+    };
+    const callees: []const Facts.Decl = switch (call.callee) {
+        .function => |function| &.{function},
+        .choice => |each| each,
+        .any => return,
+    };
+    for (callees) |callee| {
+        if (try c.inLibrary(Contract.library, callee.file)) continue;
+        if (c.project.at(callee.file).input.selected) continue;
+        const outside = !try c.facts.program(callee.file);
+        for (args, 0..) |arg, position| {
+            // A pointer's dereference handed whole is read whole (`checkWhole`).
+            if (Facts.accesses.formOf(tree.nodeTag(Facts.ungrouped(tree, arg))) == .deref) continue;
+            if (try typeValue(c, arg)) continue;
+            const value = try c.facts.resolve(c.file, arg);
+            const k = switch (try perBuild(c, value)) {
+                .owner => |k| k,
+                .other, .unknown => continue,
+            };
+            const internal = try keepsInternal(c, value, k);
+            if (internal == .no) continue;
+            const token = tree.firstToken(arg);
+            if (outside and value == .instance and internal == .yes) {
+                try c.at(access, token, "a published aegis owner handed by value to a function outside the program is read whole there, every field it keeps behind its exposure/guard/ownership contract; use its operations");
+                continue;
+            }
+            if (!genericParameter(c, callee, position)) continue;
+            try c.undecided(access, tree.tokenStart(token), .unresolved, "an aegis owner bound to a generic parameter of a function this run does not read with that binding: it may read the fields kept behind its operations");
+        }
+    }
+}
+/// Whether `function`'s parameter at `position` is generic: `anytype`, or a type written with
+/// one of the function's own parameters (`T`, `@TypeOf(a)`).
+fn genericParameter(c: *Context, function: Facts.Decl, position: usize) bool {
+    const tree = &c.project.at(function.file).file.tree;
+    const model = &c.project.at(function.file).model;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, model.declarations[@backingInt(function.index)].node) orelse return false;
+    var parameters = proto.iterate(tree);
+    var at: usize = 0;
+    while (parameters.next()) |parameter| : (at += 1) {
+        if (at != position) continue;
+        const written = parameter.type_expr orelse return true;
+        return Governed.refersToParameter(tree, model, proto, written);
+    }
+    // Past the last parameter: a variadic one's, read as `anytype`.
+    return true;
 }
 /// A field of a type only its constructor makes, written in place (`p.bytes = x`,
 /// `@field(p, "bytes") = x`) or its address taken (`&p.bytes`), outside the library: its
