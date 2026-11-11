@@ -4,7 +4,7 @@
 //! placed in one of those. Plain data, so the build script reads it as layers.zig does.
 pub const Layer = struct { name: []const u8, patterns: []const []const u8 };
 pub const layers = [_]Layer{
-    .{ .name = "tokens", .patterns = &.{ "src/Token.zig", "src/Token/**" } },
+    .{ .name = "tokens", .patterns = &.{ "src/Token.zig", "src/Token/**", "src/version.zig" } },
     .{ .name = "front end and selection", .patterns = &.{ "src/File.zig", "src/Constructs.zig", "src/Rule.zig", "src/names.zig", "src/Completion.zig" } },
     .{ .name = "bindings and comments", .patterns = &.{ "src/Model.zig", "src/Suppression.zig" } },
     .{ .name = "project", .patterns = &.{"src/Project.zig"} },

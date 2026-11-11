@@ -1,5 +1,9 @@
 const std = @import("std");
 const zon = @import("build.zig.zon");
+comptime {
+    // src/version.zig carries the version glint reports about itself (SARIF's driver version).
+    if (!std.mem.eql(u8, zon.version, @import("src/version.zig").version)) @compileError("src/version.zig names " ++ @import("src/version.zig").version ++ "; build.zig.zon names " ++ zon.version);
+}
 
 /// What a project that depends on glint builds: the `glint` module, the `glint`
 /// program, and `addLinter` and `addLint` for a project's own linter.
@@ -11,7 +15,6 @@ pub fn build(b: *std.Build) void {
     const module = b.addModule("glint", .{ .root_source_file = b.path("src/glint.zig"), .target = target, .optimize = optimize });
     module.addImport("aegis", aegis);
     module.addImport("ensign", b.dependency("ensign", .{ .target = target, .optimize = optimize }).module("ensign"));
-    module.addImport("release", release(b));
 
     const executable = b.addExecutable(.{ .name = "glint", .root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -244,14 +247,6 @@ pub fn dev(b: *std.Build, tools: type) void {
     tools.preflight.addConsumerCheck(b, p, .{ .package = "glint", .program = p.path("ci/consumer.zig"), .modules = &.{"glint"}, .packages = &packages });
 }
 
-/// glint's version, as its manifest names it, for what glint reports about itself
-/// (SARIF's `tool.driver.version`). Made in `b`, the build that owns glint's sources.
-fn release(b: *std.Build) *std.Build.Module {
-    const options = b.addOptions();
-    options.addOption([]const u8, "version", zon.version);
-    return options.createModule();
-}
-
 /// `b` is the development build.
 fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) []const std.Build.Module.Import {
     const p = b.dependency("glint", .{ .target = target, .optimize = optimize }).builder;
@@ -259,7 +254,6 @@ fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.l
     const aegis_dependency = p.dependency("aegis", .{ .target = target, .optimize = optimize });
     module.addImport("aegis", aegis_dependency.module("aegis"));
     module.addImport("ensign", p.dependency("ensign", .{ .target = target, .optimize = optimize }).module("ensign"));
-    module.addImport("release", release(p));
     return b.allocator.dupe(std.Build.Module.Import, &.{ .{ .name = "glint", .module = module }, .{ .name = "aegis_sources", .module = aegisSources(b, p, module, aegis_dependency, target, .{}) } }) catch @panic("OOM");
 }
 

@@ -1,6 +1,6 @@
 //! Owned diagnostics and independent coverage. Rendering cannot alter model results.
 const std = @import("std");
-const release = @import("release");
+const release = @import("version.zig");
 const Project = @import("Project.zig");
 const rules = @import("Rule.zig");
 const Report = @This();

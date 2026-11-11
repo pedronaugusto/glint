@@ -10,7 +10,7 @@ const Fix = @import("Fix.zig");
 const Result = @import("Result.zig");
 const aegis = @import("aegis");
 const ensign = @import("ensign");
-const release = @import("release");
+const release = @import("version.zig");
 
 const Module = struct { name: []const u8, path: []const u8 };
 const Options = struct {
