@@ -32,31 +32,18 @@ const Allowed = struct { file: []const u8, function: []const u8, reason: []const
 /// The reads that stay syntactic, each with its reason. A session adds an entry for its rule
 /// with the guard's owner.
 const allowed = [_]Allowed{
-    .{ .file = "src/DangerFlow.zig", .function = "namesCanceled", .reason = "Zig's error names are global identities, one `error.X` program-wide whatever set spells it: no declaration stands behind one" },
-    .{ .file = "src/Discards.zig", .function = "refusal", .reason = "Zig's error names are global identities, one `error.X` program-wide whatever set spells it: no declaration stands behind one" },
     .{ .file = "src/Builtins.zig", .function = "unusedImports", .reason = "a member read is written `a.b` or `@field` (read apart by Facts.reflected); Facts.definition decides what each names" },
     .{ .file = "src/Builtins.zig", .function = "priorityRules", .reason = "picks the token a finding is reported at; Facts.calls and Facts.definition decide the callee" },
-    .{ .file = "src/Builtins.zig", .function = "inert", .reason = "Zig has no getters or overloading: a name, member, literal or reading builtin as written has no effect" },
-    .{ .file = "src/Builtins.zig", .function = "privateType", .reason = "Z012 judges a signature as written: a type written there is what callers must name; each name is decided by Facts.definition and Facts.resolve" },
-    .{ .file = "src/Builtins.zig", .function = "exposedArgument", .reason = "Z012 judges a type function's argument as written in the signature; each name is decided by Facts.definition and Facts.resolve" },
-    .{ .file = "src/Builtins.zig", .function = "selfNamed", .reason = "a literal written in a signature names itself: no declaration stands behind it" },
+    .{ .file = "src/Builtins.zig", .function = "privateType", .reason = "Z012 judges a signature as written: a type written there is what callers must name; each name is decided by Facts.definition" },
     .{ .file = "src/Builtins.zig", .function = "genericReads", .reason = "a generic reads its type parameter's member by name: Zig resolves `T.name` in whatever type T is" },
     .{ .file = "src/Metrics.zig", .function = "spelledLike", .reason = "the metric counts calls spelled like an assertion that no resolution decides: the spelling is what it reports" },
-    .{ .file = "src/AegisRecursion.zig", .function = "monotone", .reason = "the compound assignment's operator is the step's direction; Zig's operators cannot be overloaded" },
-    .{ .file = "src/AegisRecursion.zig", .function = "fieldStep", .reason = "the compound assignment's operator is the step's direction; Zig's operators cannot be overloaded" },
-    .{ .file = "src/AegisRecursion.zig", .function = "hasReceiver", .reason = "Zig binds a receiver only in the method-call form `x.f(…)`; whether x is a value is read by Facts.resolve" },
     .{ .file = "src/Escapes.zig", .function = "Walk.enclosing", .reason = "the function a node runs in is the declaration its syntax sits in" },
     .{ .file = "src/Escapes.zig", .function = "Walk.escaping", .reason = "Zig makes a pointer into a frame only by `&` or slicing a local; a name for one is followed by Facts.givenTo" },
     .{ .file = "src/Danger.zig", .function = "insertAegis", .reason = "Zig's scoping is by name: the inserted declaration must not clash with or be shadowed by one already in the file" },
     .{ .file = "src/Danger.zig", .function = "secretName", .reason = "std's crypto names its secret types by convention: SecretKey, KeyPair, BlindSecretKey, BlindKeyPair" },
-    .{ .file = "src/AegisPack.zig", .function = "Flow.moves", .reason = "`else null` is the language's null literal, which no declaration stands behind" },
     .{ .file = "src/AegisPack.zig", .function = "rawCall", .reason = "the callee is resolved through what names it to its declaration (Facts.definition, Facts.origin); one that does not resolve is read as Zig finds it, by name in the method-call form `s.raw()`" },
     .{ .file = "src/AegisPack.zig", .function = "refuted", .reason = "a slice's `len` and `ptr` are the language's own fields, which no declaration stands behind" },
-    .{ .file = "src/AegisPack.zig", .function = "allocationUse", .reason = "a slice's `len` and `ptr` are the language's own fields, which no declaration stands behind" },
-    .{ .file = "src/AegisPack.zig", .function = "Flow.decided", .reason = "Zig's `!` can't be overloaded: the node tag is the negation of the flag the walk knows" },
-    .{ .file = "src/AegisPack.zig", .function = "Flow.repeat", .reason = "`while (true)` is the language's literal, which no declaration stands behind" },
     .{ .file = "src/Escapes.zig", .function = "compiledIn", .reason = "a literal as written is compiled into the program, never the frame's memory" },
-    .{ .file = "src/DangerFlow.zig", .function = "input", .reason = "std's parameter name is part of std's declared contract (A012's size parameters are read the same way, docs/design.md), read only from the resolved std declaration, never from program code" },
 };
 
 /// VALUE_SWITCHES: a switch on a value Facts resolved (`Facts.Value`) that names no `.alternatives`
@@ -173,15 +160,9 @@ const text_maps = [_]struct { []const u8, usize }{ .{ "StringHashMapUnmanaged", 
 /// The text tables that name no declaration, each with its reason, by the place that makes the
 /// table (`place`). An entry no table of its file's is at is a finding itself.
 const tables = [_]Allowed{
-    .{ .file = "src/Discards.zig", .function = "refusal", .reason = "Zig's error names are global identities, one `error.X` program-wide whatever set spells it: no declaration stands behind one" },
-    .{ .file = "src/Discards.zig", .function = "SystemNames.names", .reason = "Zig's error names are global identities, one `error.X` program-wide whatever set spells it: no declaration stands behind one" },
-    .{ .file = "src/Discards.zig", .function = "systemNames", .reason = "Zig's error names are global identities, one `error.X` program-wide whatever set spells it: no declaration stands behind one" },
-    .{ .file = "src/Discards.zig", .function = "setNames", .reason = "Zig's error names are global identities, one `error.X` program-wide whatever set spells it: no declaration stands behind one" },
     .{ .file = "src/Model.zig", .function = "Scope.names", .reason = "Zig's own scope lookup: the resolver itself finds a declaration by its name in its scope" },
     .{ .file = "src/cli.zig", .function = "Loader.paths", .reason = "file paths: a loaded file's canonical path is its identity" },
     .{ .file = "src/cli.zig", .function = "Loader.manifests", .reason = "directory paths: each package directory's manifest" },
-    .{ .file = "src/Summary.zig", .function = "Names.files", .reason = "file names: the run's file under each name a summary writes" },
-    .{ .file = "src/Summary.zig", .function = "Writer.strings", .reason = "the summary's own string table: the text is what is written" },
     .{ .file = "src/Runner.zig", .function = "emitted", .reason = "a finding's identity: its rule, span and message text" },
     .{ .file = "src/Token.zig", .function = "recoverShaped", .reason = "import spellings: the token-level import walk before any model exists" },
     .{ .file = "src/Token.zig", .function = "classify", .reason = "import spellings: the token-level import walk before any model exists" },
