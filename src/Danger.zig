@@ -1063,20 +1063,10 @@ pub fn inputSources(c: *Context, rule: Rule) Context.Error!void {
 const reader_reads = [_][]const u8{ "allocRemaining", "allocRemainingAlignedSentinel", "appendExact", "appendRemaining", "appendRemainingAligned", "appendRemainingUnlimited", "buffered", "peek", "peekArray", "peekByte", "peekDelimiterExclusive", "peekDelimiterInclusive", "peekGreedy", "peekInt", "peekSentinel", "peekStruct", "peekStructPointer", "readAllocAll", "readAllocShort", "readSliceAll", "readSliceEndian", "readSliceEndianAlloc", "readSliceShort", "readVec", "readVecAll", "take", "takeArray", "takeByte", "takeByteSigned", "takeDelimiter", "takeDelimiterExclusive", "takeDelimiterInclusive", "takeEnum", "takeEnumNonexhaustive", "takeInt", "takeLeb128", "takeSentinel", "takeStruct", "takeStructPointer", "takeVarInt" };
 
 /// A013 (0.8 cut: the input condition is gone): every `std.debug.assert` call at runtime outside
-/// tests, and every `catch unreachable` / `orelse unreachable`. TODO(0.8): the written reason
-/// that answers the latter, and the package's declared assert.
+/// tests. `catch unreachable` and `orelse unreachable` are Z026's. TODO(0.8): the package's
+/// declared assert.
 pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
     try asserts(c, rule);
-    const tree = &c.project.at(c.file).file.tree;
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .@"catch" and tag != .@"orelse") continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const answer = Facts.ungrouped(tree, tree.nodeData(node).node_and_node[1]);
-        if (tree.nodeTag(answer) != .unreachable_literal) continue;
-        const token = tree.nodeMainToken(answer);
-        if (c.inTest(token) or !try atRuntime(c, node)) continue;
-        try c.at(rule, token, if (tag == .@"catch") "catch unreachable: a panic, or undefined behaviour in a consumer's ReleaseFast build; return the error" else "orelse unreachable: a panic, or undefined behaviour in a consumer's ReleaseFast build; return an error");
-    }
 }
 
 /// A013's `std.debug.assert` calls, each with its fix where the file's code alone decides it:
