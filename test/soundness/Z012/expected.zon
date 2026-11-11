@@ -1,6 +1,26 @@
 .{
-    .no_hole = .{ .inline_loop, .operator, .unwrap },
-    .no_twin = .{ .inline_loop, .operator, .unwrap },
+    .no_hole = .{
+        .inline_loop,
+        .operator,
+        .unwrap,
+        // The rule reads a type written by name in the signature.
+        .branch,
+        .call,
+        .compile_time,
+        .conversion,
+        .field,
+        .jump,
+    },
+    .no_twin = .{
+        .inline_loop,
+        .operator,
+        .unwrap,
+        // The rule reads a type written by name in the signature.
+        .branch,
+        .conversion,
+        .field,
+        .jump,
+    },
     .na = .{
         // A destructure writes places in a body; no public declaration takes its type from one.
         .destructure,

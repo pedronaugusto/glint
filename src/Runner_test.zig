@@ -341,46 +341,29 @@ test "an import of Zig's own builtin is no file glint lacks; a missing one is" {
     }
 }
 
-test "Z012 judges the whole public surface: constants' types, reached fields, aliases of functions" {
-    // A public constant's type, written or inferred, and a public alias of a private function.
+test "Z012 judges the public surface as written: constants' written types, reached fields" {
+    // A public constant's written type, or a type written in place as its value.
     try check(.Z012, "const Hidden = struct { x: u8 }; pub const default: Hidden = .{ .x = 1 };", 1);
-    try check(.Z012, "const Hidden = struct { x: u8 }; pub const default = Hidden{ .x = 1 };", 1);
-    try check(.Z012, "pub const Hidden = struct { x: u8 }; pub const default = Hidden{ .x = 1 };", 0);
-    try check(.Z012, "const Hidden = struct { x: u8 }; fn makeHidden() Hidden { return .{ .x = 1 }; } pub const make = makeHidden;", 1);
-    try check(.Z012, "pub const Hidden = struct { x: u8 }; fn makeHidden() Hidden { return .{ .x = 1 }; } pub const make = makeHidden;", 0);
+    try check(.Z012, "const Hidden = struct { x: u8 }; pub const Many = []const Hidden;", 1);
+    try check(.Z012, "pub const Hidden = struct { x: u8 }; pub const Many = []const Hidden;", 0);
+    // An inferred type, and a public alias of a private function, are not read.
+    try check(.Z012, "const Hidden = struct { x: u8 }; pub const default = Hidden{ .x = 1 };", 0);
+    try check(.Z012, "const Hidden = struct { x: u8 }; fn makeHidden() Hidden { return .{ .x = 1 }; } pub const make = makeHidden;", 0);
     // A field of a container the surface reaches; one nothing public reaches is not surface.
     try check(.Z012, "const Hidden = struct { x: u8 }; pub const Api = struct { inner: Hidden };", 1);
     try check(.Z012, "const Hidden = struct { x: u8 }; const Api = struct { inner: Hidden }; pub fn use() void { _ = Api; }", 0);
-    // A container is held by the declaration around it, whatever expression writes it.
+    // A container written in parentheses is still a container written in place.
     try check(.Z012, "const Hidden = (struct { x: u8 }); pub fn make() Hidden { return .{ .x = 1 }; }", 1);
     try check(.Z012, "pub const Hidden = (struct { x: u8 }); pub fn make() Hidden { return .{ .x = 1 }; }", 0);
-    // A type function's call written in a signature, with a value argument named by a private
-    // declaration: a caller cannot spell the type.
-    try check(.Z012, "pub fn Wrap(comptime g: fn () u8) type { return struct { pub fn get() u8 { return g(); } }; } fn helper() u8 { return 1; } pub fn make() Wrap(helper) { return .{}; }", 1);
-    try check(.Z012, "pub fn Wrap(comptime g: fn () u8) type { return struct { pub fn get() u8 { return g(); } }; } pub fn helper() u8 { return 1; } pub fn make() Wrap(helper) { return .{}; }", 0);
-    // The same call held by a public constant: the constant is the name a user spells, and a value
-    // argument is read by its type, what of it comes back through the result.
-    try check(.Z012, "pub fn Owned(comptime T: type, comptime cleanup: fn (*T) void) type { return struct { v: T, pub fn deinit(s: *@This()) void { cleanup(&s.v); } }; } fn closeIt(v: *u32) void { v.* = 0; } pub const File = Owned(u32, closeIt);", 0);
-    try check(.Z012, "const Hidden = struct { x: u8 }; pub fn Wrap(comptime g: anytype) type { return struct { pub const get = g; }; } fn helper() Hidden { return .{ .x = 1 }; } pub const W = Wrap(helper);", 1);
-    try check(.Z012, "pub fn Keep(comptime v: anytype) type { return struct { pub const value = v; }; } const Setting = struct { level: u32 }; const chosen: Setting = .{ .level = 1 }; pub const K = Keep(chosen);", 1);
-    try check(.Z012, "pub fn Keep(comptime v: anytype) type { return struct { pub const value = v; }; } pub const Setting = struct { level: u32 }; const chosen: Setting = .{ .level = 1 }; pub const K = Keep(chosen);", 0);
-    // Inside a held call alike: a literal's fields and a nested call's arguments are read by their type.
-    try check(.Z012, "pub fn Keep(comptime v: anytype) type { return struct { pub const value = v; }; } const Setting = struct { level: u32 }; const chosen: Setting = .{ .level = 1 }; pub const K = Keep(.{ .v = chosen });", 1);
-    try check(.Z012, "pub fn Keep(comptime v: anytype) type { return struct { pub const value = v; }; } pub const Setting = struct { level: u32 }; const chosen: Setting = .{ .level = 1 }; pub const K = Keep(.{ .v = chosen });", 0);
-    try check(.Z012, "pub fn Keep(comptime v: anytype) type { return struct { pub const value = v; }; } pub fn Same(comptime v: anytype) @TypeOf(v) { return v; } const Setting = struct { level: u32 }; const chosen: Setting = .{ .level = 1 }; pub const K = Keep(Same(chosen));", 1);
-    try check(.Z012, "pub fn Keep(comptime v: anytype) type { return struct { pub const value = v; }; } pub fn Same(comptime v: anytype) @TypeOf(v) { return v; } pub const Setting = struct { level: u32 }; const chosen: Setting = .{ .level = 1 }; pub const K = Keep(Same(chosen));", 0);
-    // A call in a signature names what it takes at every level.
-    try check(.Z012, "pub fn Keep(comptime v: anytype) type { return struct { pub const value = v; }; } pub const Setting = struct { level: u32 }; const chosen: Setting = .{ .level = 1 }; pub fn make() Keep(.{ .v = chosen }) { return undefined; }", 1);
-    try check(.Z012, "pub fn Owned(comptime T: type, comptime cleanup: fn (*T) void) type { return struct { v: T, pub fn deinit(s: *@This()) void { cleanup(&s.v); } }; } fn closeIt(v: *u32) void { v.* = 0; } pub const File = Owned(u32, closeIt); pub fn open() File { return .{ .v = 0 }; }", 0);
-    // What a generic's parameter gives is the caller's: a part of it, `@TypeOf` of it.
+    // A public declaration inside a private container a public alias names is named through it.
+    try check(.Z012, "const Impl = struct { pub const Item = struct {}; pub fn get() Item { return .{}; } }; pub const Api = Impl;", 0);
+    // A type function's call is not read, written in a signature or held by a public constant.
+    try check(.Z012, "pub fn Wrap(comptime g: fn () u8) type { return struct { pub fn get() u8 { return g(); } }; } fn helper() u8 { return 1; } pub fn make() Wrap(helper) { return .{}; }", 0);
+    try check(.Z012, "const Hidden = struct { x: u8 }; fn StepOf(comptime T: type) type { return struct { t: T }; } pub const Step = StepOf(Hidden);", 0);
+    // What a generic's parameter gives is the caller's: the parameter, a part of it, `@TypeOf` of it.
+    try check(.Z012, "pub fn first(comptime T: type, items: []const T) ?T { return if (items.len == 0) null else items[0]; }", 0);
     try check(.Z012, "pub fn Gen(comptime h: anytype) type { return struct { pub const n = h.n; }; }", 0);
     try check(.Z012, "pub fn get(x: anytype) @TypeOf(x) { return x; }", 0);
-    // A public constant holding a type function's call names the type.
-    try check(.Z012, "fn StepOf(comptime T: type) type { return struct { t: T }; } pub const Step = StepOf(u8);", 0);
-    try check(.Z012, "const Hidden = struct { x: u8 }; fn StepOf(comptime T: type) type { return struct { t: T }; } pub const Step = StepOf(Hidden);", 1);
-    // A private alias whose value does not resolve is read as what it is written as.
-    try check(.Z012, "fn Backing(comptime T: type) type { return T; } pub fn Atomic(comptime T: type) type { const Repr = Backing(T); return struct { cell: [1]Repr }; }", 1);
-    try check(.Z012, "pub fn Backing(comptime T: type) type { return T; } pub fn Atomic(comptime T: type) type { const Repr = Backing(T); return struct { cell: [1]Repr }; }", 0);
 }
 
 test "G2 Z012 family API report respects public aliases receivers and suppression" {
@@ -395,12 +378,11 @@ test "G2 Z012 family API report respects public aliases receivers and suppressio
     try check(.Z012, "const Hidden = struct {};\n// glint-ignore: Z012 -- inference-only factory intentionally hides representation\npub fn create() Hidden { return .{}; }", 0);
 }
 
-test "Z012 reads the type a signature names by what it is, each type a caller has to name" {
-    // An array's element, through an alias or written in place.
+test "Z012 reads the type a signature writes by name, through its written wrappers" {
+    // An array's element written in place; a private alias of an array is no container.
     try check(.Z012, "const Hidden = struct {}; pub fn all() [4]Hidden { return undefined; }", 1);
     try check(.Z012, "pub const Hidden = struct {}; pub fn all() [4]Hidden { return undefined; }", 0);
-    try check(.Z012, "const Hidden = struct {}; const Four = [4]Hidden; pub fn all() Four { return undefined; }", 1);
-    try check(.Z012, "const Four = [4]u8; pub fn all() Four { return undefined; }", 0);
+    try check(.Z012, "const Hidden = struct {}; const Four = [4]Hidden; pub fn all() Four { return undefined; }", 0);
     // A function type's parameters and result.
     try check(.Z012, "const Hidden = struct {}; pub fn on(callback: *const fn (Hidden) void) void { _ = callback; }", 1);
     try check(.Z012, "pub fn on(callback: *const fn (u8) void) void { _ = callback; }", 0);
@@ -410,13 +392,9 @@ test "Z012 reads the type a signature names by what it is, each type a caller ha
     // A public declaration inside a private container is named by nobody outside.
     try check(.Z012, "const Sink = struct { pub const Item = struct {}; }; pub fn get() Sink.Item { return .{}; }", 1);
     try check(.Z012, "pub const Sink = struct { pub const Item = struct {}; }; pub fn get() Sink.Item { return .{}; }", 0);
-    // A builtin's type, as Zig computes it.
-    try check(.Z012, "const Hidden = struct {}; const h: Hidden = .{}; pub fn get() @TypeOf(h) { return h; }", 1);
-    try check(.Z012, "pub const Hidden = struct {}; const h: Hidden = .{}; pub fn get() @TypeOf(h) { return h; }", 0);
-    // A made container is named by its type function's call.
-    try check(.Z012, "fn Box(comptime T: type) type { return struct { t: T }; } pub fn get() Box(u8) { return undefined; }", 1);
-    try check(.Z012, "const Hidden = struct {}; pub fn Box(comptime T: type) type { return struct { t: T }; } pub fn get() Box(Hidden) { return undefined; }", 1);
-    try check(.Z012, "pub const Hidden = struct {}; pub fn Box(comptime T: type) type { return struct { t: T }; } pub fn get() Box(Hidden) { return undefined; }", 0);
+    // A builtin's type and a type function's call are not read.
+    try check(.Z012, "const Hidden = struct {}; const h: Hidden = .{}; pub fn get() @TypeOf(h) { return h; }", 0);
+    try check(.Z012, "const Hidden = struct {}; pub fn Box(comptime T: type) type { return struct { t: T }; } pub fn get() Box(Hidden) { return undefined; }", 0);
     // A generic's own container is named through the call that names its function.
     try check(.Z012, "pub fn List(comptime T: type) type { return struct { const Self = @This(); items: []T, pub fn init() Self { return .{ .items = &.{} }; } }; }", 0);
 }
