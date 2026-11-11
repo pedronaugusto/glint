@@ -15458,10 +15458,12 @@ pub const calls = struct {
         // Most calls call one function: the list goes with the answer, kept only for a choice.
         var found: std.ArrayList(Facts.Decl) = .empty;
         defer found.deinit(std.heap.smp_allocator);
-        if (try functionsIn(try facts.resolveIn(env, file, node), &found)) |why| {
+        // A cast that keeps an address calls what it points at (`@as(*const fn () void, &f)()`).
+        const callee = try facts.throughCasts(file, node);
+        if (try functionsIn(try facts.resolveIn(env, file, callee), &found)) |why| {
             // A function-pointer field read whose functions are not known: `fieldOf` gives its
             // type (`erased`), as for any value of a function type, so the read says which.
-            if (why == .unresolved and calledField(&facts.project.at(file).file.tree, node)) return .{ .any = .erased_field };
+            if (why == .unresolved and calledField(&facts.project.at(file).file.tree, callee)) return .{ .any = .erased_field };
             return .{ .any = why };
         }
         return switch (found.items.len) {

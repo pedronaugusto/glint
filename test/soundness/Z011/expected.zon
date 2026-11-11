@@ -5,8 +5,7 @@
         .operator,
     },
     .open = .{
-        // matrix Z011 precision: a callee read through @as or loaded by an atomic is undecided whatever it calls
-        "conversion/mx-z11-as_call/twin.zig",
+        // matrix Z011 precision: a callee loaded by an atomic is undecided whatever it calls
         "memory/mx-z11-atomic_store/twin.zig",
     },
 }

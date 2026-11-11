@@ -2149,8 +2149,9 @@ fn decides(c: *Context, condition: Ast.Node.Index, payload: bool, into: *Decided
 
 /// The conditions an assignment to `declared` runs under, up to that variable's block or the loop
 /// judged, each read as `decides` reads a loop's: an `if` or `while` condition, a `for`'s inputs, a `switch`'s
-/// operand, and the left of a `catch`, `orelse`, `and` or `or` whose right side holds it. A
-/// jump (a `break` or `return` before it) is not read here.
+/// operand, and the left of a `catch`, `orelse`, `and` or `or` whose right side holds it; and
+/// the condition of an earlier `if`, `while` or `switch` of each block around it that may jump
+/// (`leavesIn`) past it.
 fn controls(c: *Context, assignment: Ast.Node.Index, declared: Model.Declaration.Id, payload: bool, into: *Decided, depth: u8) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
@@ -2158,6 +2159,18 @@ fn controls(c: *Context, assignment: Ast.Node.Index, declared: Model.Declaration
     var at = assignment;
     while (model.parentOf(at)) |parent| : (at = parent) {
         if (parent == block or tree.nodeTag(parent) == .fn_decl or parent == into.loop) return;
+        // An earlier statement of its block that may jump past it decides whether it runs too
+        // (`if (total != seed) break :blk;` before `more = false`).
+        var statements_buffer: [2]Ast.Node.Index = undefined;
+        if (tree.blockStatements(&statements_buffer, parent)) |statements| for (statements) |statement| {
+            if (statement == at) break;
+            if (!leavesIn(tree, statement)) continue;
+            if (tree.fullIf(statement)) |branch| {
+                try controlled(c, branch.ast.cond_expr, declared, payload, into, depth);
+            } else if (tree.fullWhile(statement)) |loop| {
+                try controlled(c, loop.ast.cond_expr, declared, payload, into, depth);
+            } else if (tree.fullSwitch(statement)) |choice| try controlled(c, choice.ast.condition, declared, payload, into, depth);
+        };
         if (tree.fullIf(parent)) |branch| {
             if (branch.ast.cond_expr != at) try controlled(c, branch.ast.cond_expr, declared, payload, into, depth);
         } else if (tree.fullWhile(parent)) |loop| {

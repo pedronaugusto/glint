@@ -2,9 +2,5 @@
     .open = .{
         // matrix precision: Range does not count an inline for's passes, so a u8 and a u16 summed into a u64 read as able to overflow
         "inline_loop/m-a10-inline_sum/twin.zig",
-        // precision held (precision-p3-wip pattern 3, folded): a switch's else prong is not read as differing from each constant the other prongs match
-        "branch/pr-a10-switch_else_differs/twin.zig",
-        // precision held (precision-p3-wip pattern 3, folded): a difference after a check on the same value (`depth != 0` of an unsigned depth) is not read as within range
-        "operator/pr-a10-diff_after_check/twin.zig",
     },
 }

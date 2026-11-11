@@ -1363,6 +1363,15 @@ fn nonzeroAt(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: Ast.No
             } else true;
             if (parts and (try nonzeroAt(c, file, lhs, at, depth + 1) or try nonzeroAt(c, file, rhs, at, depth + 1))) return true;
         },
+        // A difference (`-`, which stops where it leaves the type) is zero only where its two
+        // sides are one value: other than zero where they differ (`if (a == b) return`).
+        .sub => {
+            const lhs, const rhs = tree.nodeData(value).node_and_node;
+            for (try gather(c, file, at)) |fact| {
+                if (!fact.differs) continue;
+                if ((same(tree, fact.small, lhs) and same(tree, fact.large, rhs)) or (same(tree, fact.small, rhs) and same(tree, fact.large, lhs))) return true;
+            }
+        },
         else => {},
     };
     for (try gather(c, file, at)) |fact| {
@@ -2141,6 +2150,7 @@ fn gatherAt(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
                 if (operand != at) {
                     try read(c, file, &out, operand, node, null);
                     try succeeded(c, file, &out, operand, node);
+                    try unmatched(c, file, &out, parent, at, node);
                 }
             },
             else => {
@@ -2162,6 +2172,42 @@ fn gatherAt(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
         }
     }
     return out.items;
+}
+
+/// What a switch's `else` prong (`case`) holds of an unsigned operand: it matched none of the
+/// other prongs' literal items, so it is above each value from zero up that they all match
+/// (`0, 1 => …, else => n - 2` puts `n` above 1), while nothing between assigns it. A labeled
+/// switch is not read: its `continue` enters a prong with another value than the operand's.
+fn unmatched(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), choice: Ast.Node.Index, case: Ast.Node.Index, use: Ast.Node.Index) Context.Error!void {
+    const tree = &c.project.at(file).file.tree;
+    const full = tree.fullSwitch(choice) orelse return;
+    if (full.label_token != null) return;
+    const prong_case = tree.fullSwitchCase(case) orelse return;
+    if (prong_case.ast.values.len != 0) return;
+    const operand = full.ast.condition;
+    if (!try unsignedAll(c, file, operand) or !try kept(c, file, operand, operand, use)) return;
+    // The least value no prong matches, and the item that matched the one below it.
+    var least: u64 = 0;
+    var last_item: ?Ast.Node.Index = null;
+    var moved = true;
+    while (moved) {
+        moved = false;
+        for (full.ast.cases) |other| {
+            if (other == case) continue;
+            const items = tree.fullSwitchCase(other) orelse continue;
+            for (items.ast.values) |item| {
+                const low, const high = if (tree.nodeTag(item) == .switch_range) tree.nodeData(item).node_and_node else .{ item, item };
+                const a = literal(tree, low) orelse continue;
+                const b = literal(tree, high) orelse continue;
+                if (a > least or b < least) continue;
+                least = std.math.add(u64, b, 1) catch return;
+                last_item = high;
+                moved = true;
+            }
+        }
+    }
+    const top = last_item orelse return;
+    try out.append(c.allocator, .{ .small = top, .large = operand, .strict = true });
 }
 
 /// The position `access` reads, where it is `m[i]`: evaluated before the use, so `i` is below
@@ -3694,16 +3740,46 @@ fn indexes(c: *Context, file: Project.FileId, node: Ast.Node.Index, memory: ?Ast
 fn alias(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Ast.Node.Index {
     const tree = &c.project.at(file).file.tree;
     if (try captured(c, file, bare(tree, node))) |search| return search;
-    const variable = constantOf(c, file, bare(tree, node)) orelse return null;
-    if (try searched(c, file, variable.ast.init_node.unwrap() orelse return null)) |search| return search;
-    const init = bare(tree, variable.ast.init_node.unwrap() orelse return null);
+    // A field a constant struct literal sets (`h.at` of `const h = .{ .at = b }`) is that value.
+    const field_value = try literalField(c, file, bare(tree, node));
+    const init = if (field_value) |value| bare(tree, value) else init: {
+        const variable = constantOf(c, file, bare(tree, node)) orelse return null;
+        if (try searched(c, file, variable.ast.init_node.unwrap() orelse return null)) |search| return search;
+        break :init bare(tree, variable.ast.init_node.unwrap() orelse return null);
+    };
     var base = init;
     while (formAt(tree, base) == .member) base = tree.nodeData(base).node_and_token[0];
+    // A field's value only as a name itself: one read through a member may change after the
+    // literal took it.
+    if (field_value != null and base != init) return null;
     const ref = nameRef(&c.project.at(file).model, base) orelse return null;
     const d = ref.declaration orelse return null;
     const kind = c.project.at(file).model.declarations[@backingInt(d)].kind;
     if (kind != .parameter and constantOf(c, file, base) == null) return null;
     return init;
+}
+
+/// What the struct literal a constant local holds gives the field `node` reads (`h.at` of
+/// `const h: At = .{ .at = b, .kind = 3 };` is `b`): the read and the literal's entry resolve
+/// to one field declaration.
+fn literalField(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Ast.Node.Index {
+    const tree = &c.project.at(file).file.tree;
+    if (formAt(tree, node) != .member) return null;
+    const holder = tree.nodeData(node).node_and_token[0];
+    const variable = constantOf(c, file, bare(tree, holder)) orelse return null;
+    const literal_node = bare(tree, variable.ast.init_node.unwrap() orelse return null);
+    var buffer: [2]Ast.Node.Index = undefined;
+    const full = tree.fullStructInit(&buffer, literal_node) orelse return null;
+    // A read that does not resolve names no entry: nothing is cleared by it.
+    const read_field = switch (try c.facts.definition(file, node)) {
+        .decl => |decl| decl,
+        .none, .unknown => return null,
+    };
+    for (full.ast.fields) |value| {
+        const set = (try field(c, file, literal_node, value)) orelse continue;
+        if (std.meta.eql(set, read_field)) return value;
+    }
+    return null;
 }
 
 /// The search a capture names: `|x|` of `while (search) |x|` or `if (search) |x|`, the call's
@@ -4533,6 +4609,18 @@ fn keeps(c: *Context, file: Project.FileId, held_here: []const Fact, index: Ast.
     const index_base, const j = shift(tree, index);
     // `index_base + most` is at most the length.
     var most: ?i128 = null;
+    // A constant least of a value and the length (`const i = @min(n, buf.len);`) is at most
+    // the length, while the memory stays as it was there.
+    if (constantOf(c, file, index_base)) |local| if (local.ast.init_node.unwrap()) |init| {
+        const least = bare(tree, init);
+        if (Facts.isBuiltin(tree, least, "@min")) {
+            var buffer: [2]Ast.Node.Index = undefined;
+            for (Facts.builtinArgs(tree, least, &buffer)) |arg| if (try lengthOf(c, file, arg, memory) and try kept(c, file, memory, init, index)) {
+                most = 0;
+                break;
+            };
+        }
+    };
     for (held_here) |fact| {
         if (fact.differs) continue;
         if (try covered(c, file, fact, index, memory, end)) return true;

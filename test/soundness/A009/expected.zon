@@ -1,12 +1,8 @@
 .{
     .open = .{
-        // matrix precision: Bounds does not carry a checked value through a struct literal's field to its read (`h.at`)
-        "aggregate/m-a09-struct_literal/twin.zig",
         // precision held (precision-0.8, folded): a parser's array-literal and optional result fields built from two bytes are not read as narrower than their type
         "aggregate/pr-a09-parser_narrow_fields/twin.zig",
         // precision held (precision-0.8, folded): a field of a constant the compiler evaluates reads what a decoder stores in that field's type elsewhere
         "compile_time/pr-a09-const_table_field/twin.zig",
-        // precision held (precision-p3-wip pattern 3, folded): two values unequal where the state already orders them are not read as strictly ordered
-        "operator/pr-a09-index_differs/twin.zig",
     },
 }

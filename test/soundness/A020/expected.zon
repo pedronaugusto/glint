@@ -2,7 +2,5 @@
     .open = .{
         // review 6 precision: A020 flags a stored step whose only function cancels; Facts' stored functions are not read
         "call/r6-fp-g01_seen_cancel/twin.zig",
-        // review 5 T1 in A020: a labeled block's break before `more = false`
-        "jump/r6-a20-e25_flag_break_cond/hole.zig",
     },
 }
