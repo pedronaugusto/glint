@@ -992,7 +992,7 @@ test "every published type after the guards is recognized where aegis is importe
 test "an aegis with one name each for its ring and ring buffer, as 0.3 has, is recognized in full; one whose lint_rules names a ring it no longer declares drifts" {
     const gpa = std.testing.allocator;
     const pinned = aegis_sources.pinned("src/bounded.zig").?;
-    try std.testing.expect(std.mem.find(u8, pinned, "pub const Queue") == null);
+    try std.testing.expectEqual(null, std.mem.find(u8, pinned, "pub const Queue"));
     const program = "const bounded = @import(\"aegis\").bounded;\npub fn f(r: *bounded.Ring(u8, 4), b: *bounded.RingBuffer(u8)) void { _ = r.head; _ = b.used; }";
     // Clean of drift: both backing reads found through the one name each.
     {

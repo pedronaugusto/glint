@@ -206,7 +206,7 @@ test "front end invalid syntax and lowering are distinct" {
     var syntax = try init(std.testing.allocator, "const x = ;", .{});
     defer syntax.deinit();
     try std.testing.expectEqual(Status.invalid_syntax, syntax.status);
-    try std.testing.expect(syntax.zir == null);
+    try std.testing.expectEqual(null, syntax.zir);
     var lowering = try init(std.testing.allocator, "fn f(x: u8) void {}", .{});
     defer lowering.deinit();
     try std.testing.expectEqual(Status.invalid_lowering, lowering.status);
@@ -246,7 +246,7 @@ test "a ZON file is parsed and checked as ZON, never lowered" {
     var data = try initWithLowering(std.testing.allocator, ".{ .bytes = .{ 1, 2 }, .name = \"k\" }", .{}, true, .zon);
     defer data.deinit();
     try std.testing.expectEqual(Status.parsed, data.status);
-    try std.testing.expect(data.zir == null);
+    try std.testing.expectEqual(null, data.zir);
     try std.testing.expectEqual(Kind.zon, data.tree.mode);
     // A syntax error, and an expression ZON is not (a call std's parser takes), are refused alike.
     var syntax = try initWithLowering(std.testing.allocator, ".{ .bytes = }", .{}, true, .zon);
@@ -255,5 +255,5 @@ test "a ZON file is parsed and checked as ZON, never lowered" {
     var code = try initWithLowering(std.testing.allocator, "f(1)", .{}, true, .zon);
     defer code.deinit();
     try std.testing.expectEqual(Status.invalid_syntax, code.status);
-    try std.testing.expect(code.zir == null);
+    try std.testing.expectEqual(null, code.zir);
 }

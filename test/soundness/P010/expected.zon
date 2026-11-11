@@ -1,0 +1,5 @@
+.{
+    // The rule reads syntax and written types where it says; other rows carry no case of it yet.
+    .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .aggregate, .memory, .branch },
+    .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .aggregate, .memory, .branch },
+}

@@ -1425,7 +1425,7 @@ test "the fix names an escape in the older form only where a run before recorded
         const out = try fixedBy(&.{ pack.untrusted_input, pack.integers }, named, "");
         defer std.testing.allocator.free(out.bytes);
         try std.testing.expectEqual(@as(usize, 1), out.stale);
-        try std.testing.expect(std.mem.find(u8, out.bytes, "aegis:") == null);
+        try std.testing.expectEqual(null, std.mem.find(u8, out.bytes, "aegis:"));
     }
     // A record line that names an escape and is not one is refused.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

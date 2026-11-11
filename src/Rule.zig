@@ -21,12 +21,41 @@ pub const Rule = enum(u16) {
     P005 = 44,
     P006 = 45,
     D001 = 46,
+    // The breadth rules (glint 0.8). Their numbers meet the ones above (Z042 and P003, Z046 and
+    // D001), so their ids are 100 + the number for a Z, 200 + the number for a P.
+    Z035 = 135,
+    Z036 = 136,
+    Z037 = 137,
+    Z038 = 138,
+    Z039 = 139,
+    Z040 = 140,
+    Z041 = 141,
+    Z042 = 142,
+    Z043 = 143,
+    Z044 = 144,
+    Z045 = 145,
+    Z046 = 146,
+    Z047 = 147,
+    Z048 = 148,
+    Z049 = 149,
+    Z051 = 151,
+    Z052 = 152,
+    Z053 = 153,
+    Z054 = 154,
+    Z055 = 155,
+    Z056 = 156,
+    P010 = 210,
+    P011 = 211,
+    P012 = 212,
+    P013 = 213,
     _,
 
     pub fn group(self: Rule) Group {
         return switch (self) {
             .Z003, .Z011, .Z013, .Z026, .Z034, .D001 => .correctness,
+            .Z035, .Z036, .Z037, .Z038, .Z039, .Z041, .Z043, .Z044, .Z047, .Z048, .Z049, .Z051, .Z052, .Z053, .Z054 => .correctness,
             .Z012, .Z016, .P003, .P005, .P006 => .family_policy,
+            .P010, .P011, .P012, .P013 => .family_policy,
             else => .zig_style,
         };
     }
@@ -43,7 +72,40 @@ pub const Rule = enum(u16) {
             .Z012 => "public API type cannot be named by its caller",
             .Z026 => "discarded error needs a site-written reason",
             .Z016 => "assertion failure localization (advisory)",
+            .Z035 => "operation on two operands written alike",
+            .Z036 => "if whose condition or branches decide nothing",
+            .Z037 => "narrow arithmetic widened only after it can overflow",
+            .Z038 => "local array larger than the configured stack budget",
+            .Z039 => "comparison its operand's type decides",
+            .Z040 => "expect of an equality that expectEqual says better",
+            .Z041 => "partial read or write count discarded",
+            .Z042 => "expectEqual with the expected value second",
+            .Z043 => "loop that leaves on its first pass",
+            .Z044 => "function that recurses before anything can stop it",
+            .Z045 => "public declaration without a doc comment",
+            .Z046 => "field or tag not named as the style guide names it",
+            .Z047 => "condition written as a literal",
+            .Z048 => "float compared to a decimal literal it cannot hold exactly",
+            .Z049 => "comparison with NaN",
+            .Z051 => "loop counter narrower than its bound",
+            .Z052 => "constant initialised to undefined",
+            .Z053 => "errdefer in a function that cannot return an error",
+            .Z054 => "build module that ignores -Doptimize or -Dtarget",
+            .Z055 => "public function taking anytype",
+            .Z056 => "empty if or else body with no comment",
+            .P010 => "unwrap that traps where the optional is null",
+            .P011 => "undefined outside a test",
+            .P012 => "debugging left in the code",
+            .P013 => "function over the configured parameter or nesting limit",
             else => "Zig style naming or readability (no runtime bug claimed)",
+        };
+    }
+    /// Whether a run leaves the rule off until it is asked for by name: the opt-in rules no
+    /// profile turns on.
+    pub fn optIn(self: Rule) bool {
+        return switch (self) {
+            .Z045, .Z046, .Z054, .Z055, .Z056, .P010, .P011, .P012, .P013 => true,
+            else => false,
         };
     }
     pub fn parse(name: []const u8) ?Rule {
@@ -61,6 +123,11 @@ pub const Config = struct {
     max_line_length: u32 = 100,
     strict_suppressions: bool = false,
     max_function_lines: u32 = 120,
+    /// The parameters and the nesting depth P013 allows a function.
+    max_parameters: u32 = 7,
+    max_nesting: u32 = 5,
+    /// The bytes Z038 allows one local array.
+    max_stack_array: u64 = 64 * 1024,
     function_exceptions: []const FunctionException = &.{},
     disallowed: []const Disallowed = &.{},
     selections: []const Selection = &.{},
@@ -141,10 +208,10 @@ pub const Config = struct {
     pub fn none() Config {
         return .{ .enabled = .empty };
     }
-    /// All reviewed rules for reporting. A caller decides which groups gate.
+    /// All reviewed rules for reporting but the opt-in ones. A caller decides which groups gate.
     pub fn reviewed() Config {
         var config = none();
-        for (std.meta.tags(Rule)) |rule| config.set(rule, true);
+        for (std.meta.tags(Rule)) |rule| config.set(rule, !rule.optIn());
         return config;
     }
     /// Selects a stable rule ID.
@@ -165,12 +232,12 @@ pub const Config = struct {
 };
 
 test "review inventory excludes removed identities without compatibility aliases" {
-    try std.testing.expectEqual(@as(usize, 19), std.meta.tags(Rule).len); // safe: explicit compile-time type selection; the value is representable in that type.
-    try std.testing.expect(Rule.parse("Z008") == null);
+    try std.testing.expectEqual(@as(usize, 44), std.meta.tags(Rule).len); // safe: explicit compile-time type selection; the value is representable in that type.
+    try std.testing.expectEqual(null, Rule.parse("Z008"));
     // Folded into the aegis pack's danger rules (A010, A013, A014, A019), never aliased.
-    for ([_][]const u8{ "P001", "P002", "P004", "E001" }) |id| try std.testing.expect(Rule.parse(id) == null);
-    try std.testing.expect(Rule.parse("Z013-extra") == null);
-    for ([_][]const u8{ "Z002", "Z004", "Z019", "Z020", "Z021", "Z022", "Z029", "Z030", "Z033" }) |id| try std.testing.expect(Rule.parse(id) == null);
+    for ([_][]const u8{ "P001", "P002", "P004", "E001" }) |id| try std.testing.expectEqual(null, Rule.parse(id));
+    try std.testing.expectEqual(null, Rule.parse("Z013-extra"));
+    for ([_][]const u8{ "Z002", "Z004", "Z019", "Z020", "Z021", "Z022", "Z029", "Z030", "Z033" }) |id| try std.testing.expectEqual(null, Rule.parse(id));
     try std.testing.expect(!@as(Config, .{}).has(.Z011)); // safe: explicit compile-time type selection; the value is representable in that type.
 }
 
@@ -184,6 +251,16 @@ test "a configuration turns on any rule id, a package's from 1000 among them, wi
     try config.validate();
     config.set(declared, false);
     try std.testing.expect(!config.has(declared));
+}
+
+test "the reviewed profile turns on every rule but the opt-in ones, which a selection by name turns on" {
+    const reviewed = Config.reviewed();
+    try std.testing.expect(reviewed.has(.Z035) and reviewed.has(.Z053) and reviewed.has(.Z026));
+    for ([_]Rule{ .Z045, .Z046, .Z054, .Z055, .Z056, .P010, .P011, .P012, .P013 }) |rule| try std.testing.expect(!reviewed.has(rule));
+    var asked = reviewed;
+    asked.set(.P013, true);
+    try std.testing.expect(asked.has(.P013));
+    try asked.validate();
 }
 
 test "inventory rejects unknown selection slots through public configuration" {

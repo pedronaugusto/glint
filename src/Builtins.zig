@@ -11,6 +11,31 @@ const Report = @import("Report.zig");
 const DeadDeclarations = @import("DeadDeclarations.zig");
 const Disallowed = @import("Disallowed.zig");
 const Governed = @import("Governed.zig");
+const BuildOption = @import("BuildOption.zig");
+const ConstantCondition = @import("ConstantCondition.zig");
+const DeadErrdefer = @import("DeadErrdefer.zig");
+const DiscardedCount = @import("DiscardedCount.zig");
+const DocComment = @import("DocComment.zig");
+const EmptyBranch = @import("EmptyBranch.zig");
+const ExpectComparison = @import("ExpectComparison.zig");
+const ExpectEqualOrder = @import("ExpectEqualOrder.zig");
+const FieldNaming = @import("FieldNaming.zig");
+const FixedComparison = @import("FixedComparison.zig");
+const FunctionShape = @import("FunctionShape.zig");
+const InexactFloat = @import("InexactFloat.zig");
+const LargeStackArray = @import("LargeStackArray.zig");
+const LeftoverDebugging = @import("LeftoverDebugging.zig");
+const NanComparison = @import("NanComparison.zig");
+const NarrowCounter = @import("NarrowCounter.zig");
+const NarrowWidened = @import("NarrowWidened.zig");
+const NeverLoops = @import("NeverLoops.zig");
+const PublicAnytype = @import("PublicAnytype.zig");
+const RepeatedCondition = @import("RepeatedCondition.zig");
+const SameOperands = @import("SameOperands.zig");
+const SelfRecursion = @import("SelfRecursion.zig");
+const UndefinedConst = @import("UndefinedConst.zig");
+const UndefinedReason = @import("UndefinedReason.zig");
+const UnwrapTrap = @import("UnwrapTrap.zig");
 const RunError = Context.Error;
 
 pub fn check(context: *Context) RunError!void {
@@ -28,7 +53,37 @@ pub fn check(context: *Context) RunError!void {
     try functionLengths(context);
     try Disallowed.check(context);
     try DeadDeclarations.check(context);
+    try breadth(context);
     try unknownCoverage(context);
+}
+
+/// The breadth rules (glint 0.8), each in its own file, each run where it is selected.
+fn breadth(context: *Context) RunError!void {
+    if (context.config.has(.Z035)) try SameOperands.check(context, .Z035);
+    if (context.config.has(.Z036)) try RepeatedCondition.check(context, .Z036);
+    if (context.config.has(.Z037)) try NarrowWidened.check(context, .Z037);
+    if (context.config.has(.Z038)) try LargeStackArray.check(context, .Z038);
+    if (context.config.has(.Z039)) try FixedComparison.check(context, .Z039);
+    if (context.config.has(.Z040)) try ExpectComparison.check(context, .Z040);
+    if (context.config.has(.Z041)) try DiscardedCount.check(context, .Z041);
+    if (context.config.has(.Z042)) try ExpectEqualOrder.check(context, .Z042);
+    if (context.config.has(.Z043)) try NeverLoops.check(context, .Z043);
+    if (context.config.has(.Z044)) try SelfRecursion.check(context, .Z044);
+    if (context.config.has(.Z045)) try DocComment.check(context, .Z045);
+    if (context.config.has(.Z046)) try FieldNaming.check(context, .Z046);
+    if (context.config.has(.Z047)) try ConstantCondition.check(context, .Z047);
+    if (context.config.has(.Z048)) try InexactFloat.check(context, .Z048);
+    if (context.config.has(.Z049)) try NanComparison.check(context, .Z049);
+    if (context.config.has(.Z051)) try NarrowCounter.check(context, .Z051);
+    if (context.config.has(.Z052)) try UndefinedConst.check(context, .Z052);
+    if (context.config.has(.Z053)) try DeadErrdefer.check(context, .Z053);
+    if (context.config.has(.Z054)) try BuildOption.check(context, .Z054);
+    if (context.config.has(.Z055)) try PublicAnytype.check(context, .Z055);
+    if (context.config.has(.Z056)) try EmptyBranch.check(context, .Z056);
+    if (context.config.has(.P010)) try UnwrapTrap.check(context, .P010);
+    if (context.config.has(.P011)) try UndefinedReason.check(context, .P011);
+    if (context.config.has(.P012)) try LeftoverDebugging.check(context, .P012);
+    if (context.config.has(.P013)) try FunctionShape.check(context, .P013);
 }
 
 fn parser(self: *Context) RunError!void {

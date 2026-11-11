@@ -15542,10 +15542,10 @@ test "a function handed to code outside the program as a value escapes: its call
         if (std.mem.eql(u8, decl.name, "twice")) twice = id;
         if (std.mem.eql(u8, decl.name, "f")) entry = id;
     }
-    try std.testing.expect(try facts.callSites(less.?) == null);
+    try std.testing.expectEqual(null, try facts.callSites(less.?));
     try std.testing.expect(try facts.callSites(twice.?) != null);
     // Only `less` is handed out to be called with anything: `f` is called by its name alone.
-    try std.testing.expect(try facts.namedCalls(less.?) == null);
+    try std.testing.expectEqual(null, try facts.namedCalls(less.?));
     try std.testing.expect(try facts.namedCalls(entry.?) != null and try facts.namedCalls(twice.?) != null);
 }
 
@@ -15711,7 +15711,7 @@ test "a library's call through a field whose type names none of its generic's pa
         if (std.mem.eql(u8, decl.name, "hash")) hash = id;
     }
     try std.testing.expect(try facts.namedCalls(load.?) != null);
-    try std.testing.expect(try facts.namedCalls(hash.?) == null);
+    try std.testing.expectEqual(null, try facts.namedCalls(hash.?));
 }
 
 test "reachedUnder: a site past a condition a binding decides is no site of that binding" {

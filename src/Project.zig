@@ -402,7 +402,7 @@ test "project maps opaque module identities without filesystem access" {
     }, &.{.{ .from = 0, .spelling = "dep", .target = 1 }}, .{});
     defer project.deinit();
     try std.testing.expectEqual(@as(?FileId, try project.fileAt(1)), project.imported(try project.fileAt(0), "dep"));
-    try std.testing.expect(project.imported(try project.fileAt(0), "missing") == null);
+    try std.testing.expectEqual(null, project.imported(try project.fileAt(0), "missing"));
 }
 
 test "a name a file both compilations compile binds apart reaches each compilation's target" {
@@ -478,7 +478,7 @@ test "a ZON input is read as ZON, and the same bytes as Zig are another file" {
     defer project.deinit();
     try std.testing.expect(project.sources[0].file != project.sources[1].file);
     try std.testing.expectEqual(File.Status.parsed, project.sources[0].file.status);
-    try std.testing.expect(project.sources[0].file.zir == null);
+    try std.testing.expectEqual(null, project.sources[0].file.zir);
     try std.testing.expectEqual(0, project.sources[0].model.declarations.len);
     try std.testing.expectEqual(File.Status.invalid_lowering, project.sources[1].file.status);
     // Read again as ZON: the store's entry.
