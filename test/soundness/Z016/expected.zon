@@ -1,4 +1,22 @@
 .{
-    .no_hole = .{ .destructure, .capture, .field, .address, .call, .deferred, .inline_loop, .unwrap, .aggregate, .memory, .branch },
-    .no_twin = .{ .destructure, .capture, .field, .address, .call, .deferred, .inline_loop, .unwrap, .aggregate, .memory, .branch },
+    // compile_time/ps2-z016-generic_namespace_alias is deleted: a callee through a type
+    // parameter (`C.holds` of `comptime C: type`) may go unresolved; a miss is allowed.
+    .no_hole = .{
+        // The rule reads the argument as written; nothing is followed.
+        .assignment,
+        .conversion,
+        .jump,
+        .destructure,
+        .capture,
+        .field,
+        .address,
+        .call,
+        .deferred,
+        .inline_loop,
+        .unwrap,
+        .aggregate,
+        .memory,
+        .branch,
+    },
+    .no_twin = .{ .destructure, .capture, .field, .address, .deferred, .inline_loop, .unwrap, .aggregate, .memory, .branch },
 }
