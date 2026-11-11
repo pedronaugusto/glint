@@ -5,4 +5,6 @@
         // precision held (precision-0.8, folded): a field of a constant the compiler evaluates reads what a decoder stores in that field's type elsewhere
         "compile_time/pr-a09-const_table_field/twin.zig",
     },
+    .no_hole = .{ .field, .branch },
+    .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .deferred, .jump, .inline_loop, .operator, .conversion, .unwrap, .branch },
 }

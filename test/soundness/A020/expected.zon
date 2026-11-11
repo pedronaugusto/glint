@@ -3,4 +3,6 @@
         // review 6 precision: A020 flags a stored step whose only function cancels; Facts' stored functions are not read
         "call/r6-fp-g01_seen_cancel/twin.zig",
     },
+    .no_hole = .{ .field, .operator },
+    .no_twin = .{ .capture, .field, .inline_loop, .compile_time, .operator, .unwrap, .branch },
 }

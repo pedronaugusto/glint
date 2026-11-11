@@ -1,8 +1,8 @@
 .{
     .open = .{
         // review 6 precision: a call through a function-pointer field whose only stored function writes whole
-        "assignment/r6-fp-f05_field_whole/twin.zig",
         // review 6 precision: the safe holder of a function-pointer field
-        "call/r6-fp-h01c_holder_none_only/twin.zig",
     },
+    .no_hole = .{ .destructure, .deferred, .jump, .inline_loop, .operator, .conversion, .unwrap, .branch },
+    .no_twin = .{ .field, .deferred, .inline_loop, .operator, .conversion, .aggregate, .branch },
 }

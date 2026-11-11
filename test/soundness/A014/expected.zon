@@ -9,4 +9,6 @@
         // matrix A014: @atomicStore is no store the rule reads
         "memory/mx-atomic_store_global/hole.zig",
     },
+    .no_hole = .{ .assignment, .deferred, .jump, .inline_loop, .branch },
+    .no_twin = .{ .assignment, .deferred, .jump, .inline_loop, .branch },
 }
