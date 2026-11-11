@@ -1,7 +1,9 @@
-// matrix: Z011 inline_loop: a deprecated function called by an inline loop over a tuple of functions
+// matrix: Z011 inline_loop: an inline loop over a tuple of deprecated functions, each called
 /// Deprecated: use `fresh`.
 fn old() void {}
+/// Deprecated: use `fresh`.
+fn older() void {}
 fn fresh() void {}
 pub fn run() void {
-    inline for (.{ old, fresh }) |f| f();
+    inline for (.{ old, older }) |f| f();
 }

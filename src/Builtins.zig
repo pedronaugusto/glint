@@ -193,7 +193,8 @@ fn unknown(self: *Context, rule: rules.Rule, node: Ast.Node.Index, reason: Facts
 
 /// Z011: each call by meaning (`Facts.calls`: a direct call, a method's, `@call`, a callee
 /// through `@field` or a function pointer) of a deprecated declaration, or through an alias
-/// that is one; one whose callee may be any function is undecided.
+/// that is one. A choice of callees counts only when every one is deprecated. A callee that
+/// does not resolve is silent: a miss is allowed, a wrong report is not.
 fn priorityRules(self: *Context) RunError!void {
     if (!self.config.has(.Z011)) return;
     const tree = &self.project.at(self.file).file.tree;
@@ -209,11 +210,10 @@ fn priorityRules(self: *Context) RunError!void {
         }
         switch (call.callee) {
             .function => |function| if (deprecated(self, function)) try self.atDefinition(.Z011, token, "call uses a deprecated declaration", function),
-            .choice => |each| for (each) |function| if (deprecated(self, function)) {
-                try self.atDefinition(.Z011, token, "call uses a deprecated declaration", function);
-                break;
-            },
-            .any => |why| try unknown(self, .Z011, call.callee_expr, why),
+            .choice => |each| if (each.len != 0 and for (each) |function| {
+                if (!deprecated(self, function)) break false;
+            } else true) try self.atDefinition(.Z011, token, "call uses a deprecated declaration", each[0]),
+            .any => {},
         }
     }
 }
