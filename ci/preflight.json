@@ -20,14 +20,10 @@
     ],
     "escapes": {
       "no-danger": {
-        "A004": 2,
-        "A013": 1
+        "A004": 2
       },
       "internal": {
         "A019": 2
-      },
-      "design": {
-        "A019": 4
       }
     },
     "unresolved": {
