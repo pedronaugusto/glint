@@ -29,6 +29,14 @@ const Options = struct {
     /// Whether the aegis pack runs: on by itself where a file imports aegis, on whatever the
     /// files import (`--aegis`, the `aegis` profile), or as `--only` selects its rules.
     aegis: enum { imported, forced, selected } = .imported,
+    /// The rules asked by name, resolved once the packages' own rules are read (`resolve`), in
+    /// this order: the aegis pack where asked, the packages' rules that are on unasked, the
+    /// configuration's settings, `--only`, then each level's names.
+    pack_on: bool = false,
+    package_defaults: bool = true,
+    settings: []const Configuration.Setting = &.{},
+    only: []const []const u8 = &.{},
+    levels: [3]struct { []const []const u8, Rule.Config.Level } = .{ .{ &.{}, .report }, .{ &.{}, .gate }, .{ &.{}, .off } },
 };
 
 const Loader = struct {
@@ -281,32 +289,38 @@ pub const Arguments = struct {
     };
 };
 
-/// What the arguments ask: the rules from the profile chosen, then each rule's level as asked.
+/// What the arguments ask: the profile chosen, the rules named (resolved by `resolve` once the
+/// packages' rules are read), the code options and the inputs.
 fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, definitions: []const Rule.Definition) !Options {
     var result: Options = .{ .format = arguments.format, .zig_lib_path = arguments.zig_lib_path };
     if (arguments.config) |path| {
         const bytes = try aegis.own.readFile(io, std.Io.Dir.cwd(), path, a, .fromRaw(4 * 1024 * 1024));
         // A configuration file is the checked repository's content: input until parsed.
-        const configured = try aegis.input.Untrusted([]const u8).init(bytes).parse(Configuring{ .a = a, .definitions = definitions }, configure);
+        const configured = try aegis.input.Untrusted([]const u8).init(bytes).parse(a, configure);
         result.config = configured.config;
-        if (configured.aegis) result.aegis = .forced;
+        result.settings = configured.settings;
+        result.package_defaults = configured.package_defaults;
+        if (configured.aegis) {
+            result.aegis = .forced;
+            result.pack_on = true;
+        }
     } else if (arguments.reviewed) {
         result.config = Rule.Config.reviewed();
     } else if (arguments.aegis) {
         result.config = Rule.Config.reviewed();
-        try packOn(a, &result.config, definitions);
+        result.pack_on = true;
         result.aegis = .forced;
     }
     // --only names the rules that run; a configuration beside it lends only its options (the
     // declarations a project disallows, its peer writers, its limits), never its rules.
-    if (arguments.only.len != 0) {
-        result.aegis = .selected;
-        result.config.enabled = Rule.Config.none().enabled;
-        result.config.selections = &.{};
-        for (arguments.only) |id| try select(a, &result.config, Rule.parseConfigured(id, definitions) orelse return error.UnknownRule, .report);
-    }
-    const levels = [_]struct { []const []const u8, Rule.Config.Level }{ .{ arguments.report, .report }, .{ arguments.gate, .gate }, .{ arguments.disable, .off } };
-    for (levels) |level| for (level[0]) |id| try select(a, &result.config, Rule.parseConfigured(id, definitions) orelse return error.UnknownRule, level[1]);
+    if (arguments.only.len != 0) result.aegis = .selected;
+    result.only = arguments.only;
+    result.levels = .{ .{ arguments.report, .report }, .{ arguments.gate, .gate }, .{ arguments.disable, .off } };
+    // A name of glint's own form (Z, P, D) that glint and the caller do not have is unknown now:
+    // no package may declare one, so it waits for nothing the project holds.
+    for (result.settings) |setting| try knownForm(setting.id, definitions);
+    for (result.only) |id| try knownForm(id, definitions);
+    for (result.levels) |level| for (level[0]) |id| try knownForm(id, definitions);
     if (arguments.max_line_length) |n| result.config.max_line_length = n;
     if (arguments.max_function_lines) |n| result.config.max_function_lines = n;
     if (arguments.fact_budget) |n| result.config.fact_budget = n;
@@ -329,6 +343,34 @@ fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, definitions: 
         try result.files.appendSlice(a, try aegis.input.Untrusted([]const u8).init(read).parse(a, fileList));
     }
     return result;
+}
+
+fn knownForm(name: []const u8, definitions: []const Rule.Definition) error{UnknownRule}!void {
+    if (name.len == 0 or std.mem.findScalar(u8, "ZPD", name[0]) == null) return;
+    if (Rule.parseConfigured(name, definitions) == null) return error.UnknownRule;
+}
+
+/// The rules `options` asked by name, now that `definitions` holds every rule of the run (the
+/// caller's and the packages'): the aegis pack where asked, each package rule that is on unasked
+/// and nothing set, the configuration's settings, `--only` (which starts from none), then each
+/// level's names. A name no rule has is `UnknownRule`.
+fn resolve(a: std.mem.Allocator, result: *Options, definitions: []const Rule.Definition) !void {
+    if (result.pack_on) try packOn(a, &result.config, definitions);
+    if (result.package_defaults) for (definitions) |definition| {
+        const declared = definition.declared orelse continue;
+        if (declared.default and !result.config.has(definition.id)) try select(a, &result.config, definition.id, .report);
+    };
+    for (result.settings, 0..) |setting, i| {
+        for (result.settings[0..i]) |earlier| if (std.mem.eql(u8, setting.id, earlier.id)) return error.InvalidSelection;
+        try select(a, &result.config, Rule.parseConfigured(setting.id, definitions) orelse return error.UnknownRule, setting.level);
+    }
+    if (result.only.len != 0) {
+        result.config.enabled = Rule.Config.none().enabled;
+        result.config.selections = &.{};
+        for (result.only) |id| try select(a, &result.config, Rule.parseConfigured(id, definitions) orelse return error.UnknownRule, .report);
+    }
+    for (result.levels) |level| for (level[0]) |id| try select(a, &result.config, Rule.parseConfigured(id, definitions) orelse return error.UnknownRule, level[1]);
+    try result.config.validate();
 }
 
 /// The files a `--files-from` list names, one a line, blank lines aside: each a relative path
@@ -422,7 +464,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
         // outcome no parse of them gives is a refusal, not a state the program cannot reach.
         .complete => return error.InvalidArguments,
     };
-    const configured = try options(a, io, arguments, definitions);
+    var configured = try options(a, io, arguments, definitions);
     if (configured.files.items.len == 0) return error.MissingSource;
     record.outcome = .input_failure;
     var loader: Loader = .{ .a = a, .io = io, .options = &configured };
@@ -443,9 +485,15 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     record.outcome = .tool_failure;
     var project = try Project.init(gpa, loader.inputs.items, loader.mappings.items, .{ .io = io, .store = store });
     defer project.deinit();
+    // The rules the project's packages declare, then every name asked, now resolvable.
+    const declared = try Runner.packageRules(a, &project);
+    const all = try std.mem.concat(a, Rule.Definition, &.{ definitions, declared });
+    record.outcome = .argument_failure;
+    try resolve(a, &configured, all);
+    record.outcome = .tool_failure;
     var config = configured.config;
     const importer = if (configured.aegis == .imported) try AegisPack.importer(gpa, &project) else null;
-    if (importer != null) try packOn(a, &config, definitions);
+    if (importer != null) try packOn(a, &config, all);
     var report = try Runner.runConfigured(gpa, &project, config, .{ .project_rules = project_rules, .io = io });
     defer report.deinit();
     record.outcome = .output_failure;
@@ -526,7 +574,11 @@ test "fuzz: the configuration JSON" {
 test "CLI invalid selections and unknown formats fail" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
+    // A name of glint's own form is known or not before the project is read; any other waits
+    // for the packages' rules.
     try std.testing.expectError(error.UnknownRule, options(arena.allocator(), std.testing.io, .{ .only = &.{"Z008"} }, &.{}));
+    var asked = try options(arena.allocator(), std.testing.io, .{ .only = &.{"X008"} }, &.{});
+    try std.testing.expectError(error.UnknownRule, resolve(arena.allocator(), &asked, &.{}));
     try std.testing.expectError(error.InvalidValue, ensign.parse(Arguments, arena.allocator(), &.{ "--format", "other" }, .{}));
     // A run of some rules never names an older escape from a record.
     try std.testing.expectError(error.Conflict, ensign.parse(Arguments, arena.allocator(), &.{ "--only", "A009", "--escapes-before", "escapes.txt", "--fix" }, .{}));
@@ -560,19 +612,16 @@ fn select(a: std.mem.Allocator, config: *Rule.Config, id: Rule.Rule, level: Rule
     selections[config.selections.len] = .{ .rule = id, .level = level };
     config.selections = selections;
 }
-const Configuring = struct { a: std.mem.Allocator, definitions: []const Rule.Definition };
-const ConfigureError = std.json.ParseError(std.json.Scanner) || error{ InvalidSelection, UnknownRule };
-const Configured = struct { config: Rule.Config, aegis: bool };
-fn configure(context: Configuring, bytes: []const u8) ConfigureError!Configured {
-    const a = context.a;
-    const definitions = context.definitions;
+const ConfigureError = std.json.ParseError(std.json.Scanner) || error{InvalidSelection};
+const Configured = struct { config: Rule.Config, aegis: bool, package_defaults: bool, settings: []const Configuration.Setting };
+/// A configuration's profile and code options; its rule settings are named, for `resolve`.
+fn configure(a: std.mem.Allocator, bytes: []const u8) ConfigureError!Configured {
     const document = try std.json.parseFromSliceLeaky(Configuration, a, bytes, .{});
     var config: Rule.Config = switch (document.profile) {
         .core => .{},
         .none => Rule.Config.none(),
         .reviewed, .aegis => Rule.Config.reviewed(),
     };
-    if (document.profile == .aegis) try packOn(a, &config, definitions);
     config.max_line_length = document.max_line_length;
     config.max_function_lines = document.max_function_lines;
     config.function_exceptions = document.function_exceptions;
@@ -582,13 +631,8 @@ fn configure(context: Configuring, bytes: []const u8) ConfigureError!Configured 
     config.fact_budget = document.fact_budget;
     config.peer_writers = document.peer_writers;
     config.pointer_widths = document.pointer_widths;
-    for (document.rules, 0..) |setting, i| {
-        for (document.rules[0..i]) |earlier| if (std.mem.eql(u8, setting.id, earlier.id)) return error.InvalidSelection;
-        const id = Rule.parseConfigured(setting.id, definitions) orelse return error.UnknownRule;
-        try select(a, &config, id, setting.level);
-    }
     try config.validate();
-    return .{ .config = config, .aegis = document.profile == .aegis };
+    return .{ .config = config, .aegis = document.profile == .aegis, .package_defaults = document.profile != .none, .settings = document.rules };
 }
 
 /// Every rule of the aegis pack among `definitions` that nothing set yet, at report level.
@@ -603,4 +647,22 @@ fn packOn(a: std.mem.Allocator, config: *Rule.Config, definitions: []const Rule.
         } else false;
         if (defined and !set and !config.has(id)) try select(a, config, id, .report);
     }
+}
+
+test "a package rule on by default is selected unless a profile of none or --only says otherwise, and its name resolves once the packages' rules are read" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const declared = [_]Rule.Definition{
+        .{ .id = @fromBackingInt(2000), .name = "X001", .group = .family_policy, .purpose = "p", .declared = .{ .package = "pkg", .kind = .ban, .reads = .replaces, .default = true } },
+        .{ .id = @fromBackingInt(2001), .name = "X002", .group = .family_policy, .purpose = "q", .declared = .{ .package = "pkg", .kind = .ban, .reads = .replaces, .default = false } },
+    };
+    var plain = try options(a, std.testing.io, .{}, &declared);
+    try resolve(a, &plain, &declared);
+    try std.testing.expectEqual(Rule.Config.Level.report, plain.config.level(declared[0].id));
+    try std.testing.expectEqual(Rule.Config.Level.off, plain.config.level(declared[1].id));
+    var only = try options(a, std.testing.io, .{ .only = &.{"X002"} }, &declared);
+    try resolve(a, &only, &declared);
+    try std.testing.expectEqual(Rule.Config.Level.off, only.config.level(declared[0].id));
+    try std.testing.expectEqual(Rule.Config.Level.report, only.config.level(declared[1].id));
 }

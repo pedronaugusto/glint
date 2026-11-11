@@ -11,7 +11,7 @@ fn uncertain(context: *glint.RuleContext) glint.RuleContext.Error!void {
     try context.undecided(own, 0, .unresolved, "generic target lacks a concrete operation contract");
 }
 fn configuration(level: glint.Config.Level) glint.Config {
-    return .{ .enabled = @splat(false), .selections = switch (level) {
+    return .{ .enabled = .empty, .selections = switch (level) {
         .off => &.{.{ .rule = own, .level = .off }},
         .report => &.{.{ .rule = own, .level = .report }},
         .gate => &.{.{ .rule = own, .level = .gate }},

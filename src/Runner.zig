@@ -12,6 +12,7 @@ const Fix = @import("Fix.zig");
 const Builtins = @import("Builtins.zig");
 const Metrics = @import("Metrics.zig");
 const Contract = @import("AegisContract.zig");
+const PackageRules = @import("PackageRules.zig");
 const AegisPack = @import("AegisPack.zig");
 
 a: std.mem.Allocator,
@@ -66,16 +67,22 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
         if (@backingInt(setting.file) >= project.count()) return error.InvalidHandle;
         for (options.files[0..i]) |earlier| if (setting.file == earlier.file) return error.InvalidSelection;
     }
-    const definitions = try a.alloc(rules.Definition, options.project_rules.len);
-    for (options.project_rules, 0..) |rule, i| {
-        definitions[i] = rule.definition;
-        definitions[i].name = try a.dupe(u8, rule.definition.name);
-        definitions[i].purpose = try a.dupe(u8, rule.definition.purpose);
+    var runner: Runner = .{ .a = a, .project = project, .config = config, .base = config, .files = options.files, .facts = .{ .project = project, .gpa = a, .backing = gpa, .known = Contract.package, .role_names = try roleNames(a, options.project_rules), .remaining = config.fact_budget } };
+    defer runner.facts.deinit();
+    // The caller's rules, then those the project's packages declare (`PackageRules.table`).
+    const declared = try declaredRules(&runner.facts);
+    const definitions = try a.alloc(rules.Definition, options.project_rules.len + declared.len);
+    for (options.project_rules, 0..) |rule, i| definitions[i] = rule.definition;
+    @memcpy(definitions[options.project_rules.len..], declared);
+    // The report outlives the caller's rule table and the project's sources it names.
+    for (definitions) |*definition| {
+        definition.name = try a.dupe(u8, definition.name);
+        definition.purpose = try a.dupe(u8, definition.purpose);
+        if (definition.declared) |*declared_by| declared_by.package = try a.dupe(u8, declared_by.package);
     }
     try validateRules(config, definitions);
+    runner.definitions = definitions;
     const known = try knownRules(a, definitions);
-    var runner: Runner = .{ .a = a, .project = project, .config = config, .base = config, .files = options.files, .definitions = definitions, .facts = .{ .project = project, .gpa = a, .backing = gpa, .known = Contract.package, .role_names = try roleNames(a, options.project_rules), .remaining = config.fact_budget } };
-    defer runner.facts.deinit();
     var metrics: std.ArrayList(Report.Metrics.File) = .empty;
     var total: Report.Metrics.Counts = .{};
     // A rule's own memory for one file (`Context.allocator`), given back when the rule is done
@@ -152,6 +159,21 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     if (config.strict_suppressions and runner.stale.items.len != 0) runner.complete = false;
     std.mem.sort(Report.Diagnostic, runner.diagnostics.items, project, diagnosticLess);
     return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .coverage = runner.coverage.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale.items.len, .stale = runner.stale.items, .escapes = runner.escapes.items, .malformed = runner.malformed.items, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null };
+}
+
+/// The rules the project's packages declare (`PackageRules.table`), with the ids the run gives
+/// them, for a caller that resolves rule names before the run (glint's command line).
+pub fn packageRules(a: std.mem.Allocator, project: *const Project) RunError![]const rules.Definition {
+    var facts: Facts = .{ .project = project, .gpa = a };
+    defer facts.deinit();
+    return declaredRules(&facts);
+}
+/// Two packages declaring one rule id, or more rules than ids, is no selection a run can make.
+fn declaredRules(facts: *Facts) RunError![]const rules.Definition {
+    return PackageRules.table(facts) catch |err| switch (err) {
+        error.DuplicateRule, error.TooManyRules => error.InvalidSelection,
+        else => |other| other,
+    };
 }
 
 /// Only a rule that ran shows that a suppression of it suppresses nothing; an escape is
@@ -364,6 +386,12 @@ fn validateRules(config: rules.Config, definitions: []const rules.Definition) er
         const metadata = rules.definition(selection.rule, definitions) orelse return error.InvalidSelection;
         if (metadata.report_only and selection.level == .gate) return error.InvalidSelection;
     }
+    // A rule turned on by id from 1000 is one the caller compiled in or a package declares.
+    var on = config.enabled.iterator(.{});
+    while (on.next()) |index| {
+        if (index < 1000) continue;
+        if (rules.definition(@fromBackingInt(@as(u16, @intCast(index))), definitions) == null) return error.InvalidSelection;
+    }
 }
 
 test "core diagnostics distinguish invalid parsing and unused imports" {
@@ -396,4 +424,24 @@ test "a ZON file is data: no rule runs on it and no coverage is reported for it"
     try std.testing.expect(report.complete);
     try std.testing.expectEqual(0, report.coverage.len);
     try std.testing.expectEqual(0, report.diagnostics.len);
+}
+
+test "the rules a package declares join the run's rules: selectable by id, and an id no rule has is refused" {
+    var project = try Project.init(std.testing.allocator, &.{
+        .{ .name = "root", .bytes = "pub fn f() void {}\n" },
+        .{ .name = "pkg/root.zig", .package = "pkg", .fingerprint = 7, .selected = false, .bytes = "pub const lint_rules = .{ .version = 2, .rules = .{.{ .id = .X001, .name = \"raw\", .kind = .ban, .reads = .replaces, .default = true, .purpose = \"std's raw form\" }} };\n" },
+    }, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const declared = try packageRules(arena.allocator(), &project);
+    try std.testing.expectEqual(@as(usize, 1), declared.len);
+    try std.testing.expectEqualStrings("X001", declared[0].name);
+    try std.testing.expect(rules.parseConfigured("X001", declared).? == declared[0].id);
+    var report = try runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = declared[0].id, .level = .report }} }, .{});
+    defer report.deinit();
+    try std.testing.expect(report.complete);
+    var config: rules.Config = .{ .enabled = .empty };
+    config.set(@fromBackingInt(2005), true);
+    try std.testing.expectError(error.InvalidSelection, runConfigured(std.testing.allocator, &project, config, .{}));
 }

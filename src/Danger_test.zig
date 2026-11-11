@@ -307,7 +307,7 @@ fn runWith(rule: glint.Rule, program: []const u8, extra: []const sources.Extra, 
 fn runAs(rule: glint.Rule, program: []const u8, as: sources.Consumer, extra: []const sources.Extra, imports: []const sources.ExtraImport) !Run {
     var project = try sources.projectAs(std.testing.allocator, program, as, extra, imports);
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .report }} }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .report }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     var result: Run = .{ .findings = 0, .undecided = 0 };
     // A fixture std's AstGen refuses is not checked at all: it would pass any count of none.
@@ -835,7 +835,7 @@ test "the aegis escape covers the pack's findings on its line, is listed with th
         \\pub fn g() void {} // aegis: design(A010): nothing here
     , &std_files, &std_imports);
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{ .{ .rule = pack.shared_state, .level = .gate }, .{ .rule = pack.integers, .level = .gate } } }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{ .{ .rule = pack.shared_state, .level = .gate }, .{ .rule = pack.integers, .level = .gate } } }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: fixture counts are representable.
     try std.testing.expectEqual(@as(usize, 2), report.escapes.len); // safe: fixture counts are representable.
@@ -859,7 +859,7 @@ test "the aegis escape covers the pack's findings on its line, is listed with th
         \\}
     , &std_files, &std_imports);
     defer other.deinit();
-    var named = try glint.runConfigured(std.testing.allocator, &other, .{ .enabled = @splat(false), .selections = &.{ .{ .rule = pack.untrusted_input, .level = .gate }, .{ .rule = pack.integers, .level = .gate } } }, .{ .project_rules = &pack.rules });
+    var named = try glint.runConfigured(std.testing.allocator, &other, .{ .enabled = .empty, .selections = &.{ .{ .rule = pack.untrusted_input, .level = .gate }, .{ .rule = pack.integers, .level = .gate } } }, .{ .project_rules = &pack.rules });
     defer named.deinit();
     // f's escape covers A009 alone, so A010 stays on its line; g's covers nothing it names.
     try std.testing.expectEqual(@as(usize, 3), named.diagnostics.len); // safe: fixture counts are representable.
@@ -873,7 +873,7 @@ test "the aegis escape covers the pack's findings on its line, is listed with th
     try std.testing.expectEqual(@as(usize, 1), named.malformed.len); // safe: fixture counts are representable.
     var refused = try sources.projectWithSources(std.testing.allocator, "var hits: u32 = 0; // glint-ignore: A007 -- no-danger: one thread\n", &std_files, &std_imports);
     defer refused.deinit();
-    var rejected = try glint.runConfigured(std.testing.allocator, &refused, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.shared_state, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    var rejected = try glint.runConfigured(std.testing.allocator, &refused, .{ .enabled = .empty, .selections = &.{.{ .rule = pack.shared_state, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer rejected.deinit();
     try std.testing.expect(!rejected.complete);
     try std.testing.expectEqual(@as(usize, 1), rejected.malformed.len); // safe: fixture count is representable.
@@ -888,7 +888,7 @@ fn runWithStd(rule: glint.Rule, program: []const u8, root: []const u8) !Run {
     const imports = [_]sources.ExtraImport{.{ .spelling = "std", .target = 0 }};
     var project = try sources.projectWithSources(std.testing.allocator, program, &files, &imports);
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .report }} }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .report }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     var result: Run = .{ .findings = report.diagnostics.len, .undecided = 0 };
     result.countUndecided(report, rule);
@@ -1335,7 +1335,7 @@ test "A012 gives a function handed out no length for a parameter whose type has 
 fn fixed(rule: glint.Rule, program: []const u8) ![]u8 {
     var project = try sources.projectWithSources(std.testing.allocator, program, &std_files, &std_imports);
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1351,7 +1351,7 @@ fn fixedBy(rules: []const glint.Rule, program: []const u8, record: []const u8) !
     defer project.deinit();
     var selections: [8]glint.Config.Selection = undefined;
     for (rules, 0..) |rule, i| selections[i] = .{ .rule = rule, .level = .gate };
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = selections[0..rules.len] }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = selections[0..rules.len] }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1654,7 +1654,7 @@ fn runWithDependency(rule: glint.Rule, program: []const u8, dependency: []const 
     const imports = std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "dep", .target = std_files.len }, .{ .from = std_files.len, .spelling = "std", .target = 0 } };
     var project = try sources.projectWithSources(std.testing.allocator, program, &files, &imports);
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .report }} }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .report }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     var result: Run = .{ .findings = 0, .undecided = 0 };
     for (report.diagnostics) |d| if (d.rule == rule) {
@@ -2071,7 +2071,7 @@ fn runWithFile(rule: glint.Rule, program: []const u8, other: []const u8) !Run {
     imports[std_imports.len + 1] = .{ .from = std_files.len, .spelling = "std", .target = 0 };
     var project = try sources.projectWithSources(std.testing.allocator, program, &files, &imports);
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .report }} }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .report }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     var result: Run = .{ .findings = 0, .undecided = 0 };
     for (report.diagnostics) |d| if (d.rule == rule) {
@@ -2201,7 +2201,7 @@ fn findingsAmong(rule: glint.Rule, selected: []const glint.Rule, program: []cons
     defer project.deinit();
     var selections: [pack.rules.len]glint.Config.Selection = undefined;
     for (selected, 0..) |each, i| selections[i] = .{ .rule = each, .level = .report };
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = selections[0..selected.len] }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = selections[0..selected.len] }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     for (report.diagnostics) |d| if (d.rule == rule) try out.append(std.testing.allocator, @as(u64, d.span.line) * 4096 + d.span.column);
     std.mem.sort(u64, out.items, {}, std.sort.asc(u64));

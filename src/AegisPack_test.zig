@@ -6,7 +6,7 @@ const aegis_sources = @import("aegis_sources");
 fn fixture(bytes: []const u8) !P {
     return aegis_sources.project(std.testing.allocator, bytes);
 }
-const config: glint.Config = .{ .enabled = @splat(false), .selections = &.{
+const config: glint.Config = .{ .enabled = .empty, .selections = &.{
     .{ .rule = pack.access, .level = .report },
     .{ .rule = pack.scalar, .level = .report },
 } };
@@ -67,7 +67,7 @@ test "aegis pack report acceptance never completes invalid input even with file 
 test "morning adopted aegis gate accepts selection and preserves finding levels" {
     var project = try fixture("const S = @import(\"aegis\").Secret; pub fn f(s: *S(u32)) void { _ = s.material; }");
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: one direct backing access.
     try std.testing.expectEqual(glint.Config.Level.gate, report.diagnostics[0].level);
@@ -76,7 +76,7 @@ test "morning adopted aegis gate accepts selection and preserves finding levels"
 test "morning adopted scalar gate reports bypasses and blocks unresolved receivers" {
     var project = try fixture("const Checked = @import(\"aegis\").int.Checked; pub fn f() void { const v = Checked(u32).init(1); _ = v.raw() + 2; }");
     defer project.deinit();
-    const gated: glint.Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.scalar, .level = .gate }} };
+    const gated: glint.Config = .{ .enabled = .empty, .selections = &.{.{ .rule = pack.scalar, .level = .gate }} };
     var report = try glint.runConfigured(std.testing.allocator, &project, gated, .{ .project_rules = &pack.rules });
     defer report.deinit();
     try std.testing.expect(report.complete);
@@ -97,14 +97,14 @@ test "adopted gates retain unresolved obligations and known unrelated receivers"
     inline for (cases) |case| {
         var project = try fixture(case[1]);
         defer project.deinit();
-        var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = case[0], .level = .gate }} }, .{ .project_rules = &pack.rules });
+        var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = case[0], .level = .gate }} }, .{ .project_rules = &pack.rules });
         defer report.deinit();
         try std.testing.expect(!report.complete);
         try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: unresolved ownership records coverage rather than an allegation.
     }
     var plain = try fixture("const Plain = struct { material: u32 }; pub fn f(v: Plain) void { _ = v.material; }");
     defer plain.deinit();
-    var clean = try glint.runConfigured(std.testing.allocator, &plain, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    var clean = try glint.runConfigured(std.testing.allocator, &plain, .{ .enabled = .empty, .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer clean.deinit();
     try std.testing.expect(clean.complete);
     try std.testing.expectEqual(@as(usize, 0), clean.diagnostics.len); // safe: resolved unrelated containers carry no published operation obligation.
@@ -170,7 +170,7 @@ test "escaped acquisition cleanup and guard type keep direct gate witnesses" {
         var project = try fixture(case[1]);
         defer project.deinit();
         try std.testing.expectEqual(.parsed, project.sources[0].file.status);
-        var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = case[0], .level = .gate }} }, .{ .project_rules = &pack.rules });
+        var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = case[0], .level = .gate }} }, .{ .project_rules = &pack.rules });
         defer report.deinit();
         try std.testing.expect(report.complete);
         try std.testing.expectEqual(@as(usize, 1), count(report, case[0])); // safe: each source has one direct obligation witness.
@@ -358,7 +358,7 @@ test "A004 reads a scalar's raw integer by meaning, through every place it is pu
 test "a standalone aegis namespace module is recognized" {
     var project = try fixture("const Id = @import(\"aegis\").id.Id; const Tag = struct {}; pub fn f() void { const v = Id(Tag, u32).fromRaw(1); _ = v.raw() + 2; }");
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.scalar, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = pack.scalar, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     try std.testing.expect(report.complete);
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: one raw arithmetic bypass.
@@ -366,7 +366,7 @@ test "a standalone aegis namespace module is recognized" {
 test "identical source under another module is not aegis" {
     var project = try flatFixture("const S = @import(\"vault\").Secret; pub fn f(s: *S(u32)) void { _ = s.material; }", .{ .vault = "pub const Secret = @import(\"Secret.zig\").Secret;" });
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: the vault module's Secret is not aegis's.
 }
@@ -375,7 +375,7 @@ test "a role aegis declares that does not resolve is reported where aegis is imp
     // only the reader sees it.
     var project = try flatFixture("const S = @import(\"aegis\").Secret; pub fn f(s: *S(u32)) void { _ = s.material; }", .{ .root = comptime flat_declared ++ "\n" ++ flatRules("Gaurd") });
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     // The secret is still found, so its finding stands; the run cannot claim the library was recognized in full.
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: the secret's backing access.
@@ -389,7 +389,7 @@ test "a role aegis declares that does not resolve is reported where aegis is imp
 test "an aegis that declares no lint_rules is undecided where it is imported, never plain" {
     var project = try flatFixture("const S = @import(\"aegis\").Secret; pub fn f(s: *S(u32)) void { _ = s.material; }", .{ .root = flat_declared });
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     try std.testing.expect(!report.complete);
     var detail: ?[]const u8 = null;
@@ -418,7 +418,7 @@ test "a build script's import of aegis's name is aegis's build script, never its
 fn driftReport(consumer: []const u8, build_scripts: ?P.Compilations) ![]const u8 {
     var project = try flatFixture(consumer, .{ .build_scripts = build_scripts });
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: the secret's backing access.
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -436,7 +436,7 @@ test "aegis's own files are its safe-type internals" {
 }
 
 fn scalarFindings(project: *P) !usize {
-    const gated: glint.Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.scalar, .level = .gate }} };
+    const gated: glint.Config = .{ .enabled = .empty, .selections = &.{.{ .rule = pack.scalar, .level = .gate }} };
     var report = try glint.runConfigured(std.testing.allocator, project, gated, .{ .project_rules = &pack.rules });
     defer report.deinit();
     try std.testing.expect(report.complete);
@@ -517,7 +517,7 @@ fn expectReinterpreted(source: []const u8, findings: usize) !void {
 fn expectWithBytes(source: []const u8, rule: glint.Rule, complete: bool, findings: usize) !void {
     var project = try aegis_sources.projectWithSources(std.testing.allocator, source, &reinterpreting_std, &reinterpreting_imports);
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     try expectReport(report, rule, complete, findings);
 }
@@ -576,7 +576,7 @@ test "A004 reports a binding once, naming each of the generic's casts it makes a
     inline for (rows) |row| {
         var project = try aegis_sources.projectWithSources(std.testing.allocator, head ++ row[0], &reinterpreting_std, &reinterpreting_imports);
         defer project.deinit();
-        var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.scalar, .level = .gate }} }, .{ .project_rules = &pack.rules });
+        var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = pack.scalar, .level = .gate }} }, .{ .project_rules = &pack.rules });
         defer report.deinit();
         if (count(report, pack.scalar) != row[1]) std.debug.print("{s}: {d} findings\n", .{ row[0], count(report, pack.scalar) });
         try std.testing.expectEqual(row[1], count(report, pack.scalar));
@@ -635,7 +635,7 @@ fn judged(source: []const u8, rule: glint.Rule) !struct { complete: bool, findin
     var project = try fixture(source);
     defer project.deinit();
     try std.testing.expectEqual(.parsed, project.sources[0].file.status);
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     return .{ .complete = report.complete, .findings = count(report, rule), .undecided = undecidedOf(report, rule) };
 }
@@ -643,7 +643,7 @@ fn expectJudged(source: []const u8, rule: glint.Rule, complete: bool, findings: 
     var project = try fixture(source);
     defer project.deinit();
     try std.testing.expectEqual(.parsed, project.sources[0].file.status);
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     try expectReport(report, rule, complete, findings);
 }
@@ -705,7 +705,7 @@ test "receivers bound by captures are decided by what they bind" {
 fn expectJudgedWithDependency(source: []const u8, dependency: []const u8, rule: glint.Rule, complete: bool, findings: usize) !void {
     var project = try aegis_sources.projectWithDependency(std.testing.allocator, source, dependency);
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     try expectReport(report, rule, complete, findings);
 }
@@ -713,7 +713,7 @@ fn expectJudgedWithDependency(source: []const u8, dependency: []const u8, rule: 
 fn expectJudgedWithLib(source: []const u8, lib: []const u8, rule: glint.Rule, complete: bool, findings: usize) !void {
     var project = try aegis_sources.projectWith(std.testing.allocator, source, lib);
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     try expectReport(report, rule, complete, findings);
 }
@@ -778,7 +778,7 @@ test "a generic method std may call on a type the program hands it binds what st
         defer std.testing.allocator.free(source);
         var project = try aegis_sources.projectWithSources(std.testing.allocator, source, &extra, &imports);
         defer project.deinit();
-        var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
+        var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
         defer report.deinit();
         try std.testing.expectEqual(case[1], report.complete);
         try std.testing.expectEqual(@as(usize, 0), count(report, pack.access));
@@ -801,7 +801,7 @@ test "a generic std may call on a context the program hands it is judged where i
         defer std.testing.allocator.free(source);
         var project = try aegis_sources.projectWithSources(std.testing.allocator, source, &extra, &imports);
         defer project.deinit();
-        var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = case[0], .level = .gate }} }, .{ .project_rules = &pack.rules });
+        var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = case[0], .level = .gate }} }, .{ .project_rules = &pack.rules });
         defer report.deinit();
         try std.testing.expectEqual(case[2], report.complete);
         try std.testing.expectEqual(@as(usize, 0), count(report, case[0]));
@@ -873,7 +873,7 @@ test "a field of a container another module's type function makes is that contai
         \\}
     );
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     try std.testing.expect(report.complete);
     try std.testing.expectEqual(@as(usize, 0), count(report, pack.access)); // safe: fixture count is representable.
@@ -972,7 +972,7 @@ const tabled =
 test "every type glint's tables named before aegis declared its roles has its role in aegis's lint_rules" {
     var project = try fixture(tabled);
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = role_probe_id, .level = .gate }} }, .{ .project_rules = &.{role_probe} });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = role_probe_id, .level = .gate }} }, .{ .project_rules = &.{role_probe} });
     defer report.deinit();
     try std.testing.expect(report.complete);
     const expected = [_][]const u8{ "secret", "bytes", "bytes_writer", "guarded", "guarded", "guarded", "guarded", "condition", "once", "once", "confined", "scalar", "scalar", "scalar", "scalar", "scalar", "issuer", "scalar", "scalar", "scalar", "scalar", "scalar", "choice", "shared", "atomic", "context", "context", "guarded", "inline_store", "inline_store", "buffer", "buffer", "limit", "budget", "reservation", "owned", "owned", "must_use", "slots", "slots", "slots", "slots", "issuer", "scalar", "stage", "machine", "table", "scope", "ref", "untrusted", "public_source" };
@@ -998,7 +998,7 @@ test "an aegis with one name each for its ring and ring buffer, as 0.3 has, is r
     {
         var project = try aegis_sources.project(gpa, program);
         defer project.deinit();
-        var report = try glint.runConfigured(gpa, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
+        var report = try glint.runConfigured(gpa, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
         defer report.deinit();
         try std.testing.expect(report.complete);
         try std.testing.expectEqual(@as(usize, 2), count(report, pack.access));
@@ -1010,7 +1010,7 @@ test "an aegis with one name each for its ring and ring buffer, as 0.3 has, is r
     {
         var project = try aegis_sources.projectRevised(gpa, program, "src/bounded.zig", no_ring);
         defer project.deinit();
-        var report = try glint.runConfigured(gpa, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
+        var report = try glint.runConfigured(gpa, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
         defer report.deinit();
         try std.testing.expect(!report.complete);
         var drifted = false;
@@ -1028,7 +1028,7 @@ test "an aegis whose pools are 0.3's SlotPool and RunPool, with no Pool or SlotM
     const program = "const handle = @import(\"aegis\").handle;\nconst Tag = struct {};\npub fn f(p: *handle.SlotPool(u8, Tag, .{}), r: *handle.RunPool(u8, Tag)) u32 { return p.count + p.used + r.end; }";
     var project = try aegis_sources.project(gpa, program);
     defer project.deinit();
-    var report = try glint.runConfigured(gpa, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(gpa, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     try std.testing.expect(report.complete);
     try std.testing.expectEqual(@as(usize, 3), count(report, pack.access));
@@ -1245,7 +1245,7 @@ fn wrappedLocks(program: []const u8) !struct { findings: usize, complete: bool }
         .{ .name = "root.zig", .bytes = wrapped_root, .selected = false, .package = own.name, .fingerprint = own.fingerprint },
     }, &.{.{ .from = 0, .spelling = "aegis", .target = 1 }}, .{});
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.lock_order, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = pack.lock_order, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     return .{ .findings = count(report, pack.lock_order), .complete = report.complete };
 }
