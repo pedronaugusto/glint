@@ -6,10 +6,10 @@ pub fn main(init: std.process.Init) !void {
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch std.process.exit(2);
     var buffer: [8192]u8 = undefined;
     // aegis: design(A019): read only below what it wrote; ensign's Page calls it through a function-pointer field that std's generic reflective writers may store into until glint reaches them per instantiation
-    var output = std.Io.File.stdout().writer(init.io, &buffer);
+    var output = std.Io.File.stdout().writerStreaming(init.io, &buffer);
     var error_buffer: [4096]u8 = undefined;
     // aegis: design(A019): read only below what it wrote; ensign's Page calls it through a function-pointer field that std's generic reflective writers may store into until glint reaches them per instantiation
-    var errors = std.Io.File.stderr().writer(init.io, &error_buffer);
+    var errors = std.Io.File.stderr().writerStreaming(init.io, &error_buffer);
     const status = cli.execute(init.gpa, init.io, args, &output.interface, &errors.interface) catch |err| switch (err) {
         // A write that failed has its cause on its file's writer: a cancel in either ends main as one.
         error.WriteFailed => {

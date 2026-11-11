@@ -498,9 +498,9 @@ fn heldCall(context: *glint.RuleContext, tree: *const std.zig.Ast, node: std.zig
 pub fn main(init: std.process.Init) !void {
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch std.process.exit(2);
     var buffer: [4096]u8 = @splat(0);
-    var output = std.Io.File.stdout().writer(init.io, &buffer);
+    var output = std.Io.File.stdout().writerStreaming(init.io, &buffer);
     var problems_buffer: [1024]u8 = @splat(0);
-    var problems = std.Io.File.stderr().writer(init.io, &problems_buffer);
+    var problems = std.Io.File.stderr().writerStreaming(init.io, &problems_buffer);
     const status = cli.executeConfigured(init.gpa, init.io, args, &output.interface, &problems.interface, &rules) catch |err| switch (err) {
         // A write that failed has its cause on its file's writer: a cancel in either ends main as one.
         error.WriteFailed => {

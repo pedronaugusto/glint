@@ -216,6 +216,20 @@ pub fn dev(b: *std.Build, tools: type) void {
     portable_smoke.addArgs(&.{ "--only", "LOCAL_EXPORT", "examples/project.zig" });
     portable_smoke.addFileInput(p.path("examples/project.zig"));
     test_step.dependOn(&portable_smoke.step);
+    // glint's output on a file opened for append, and on one it shares with writes around it:
+    // each run lands at the file's offset, after what is there.
+    const streams_programs = b.addOptions();
+    tools.preflight.addTestProgram(b, streams_programs, "glint", executable);
+    const streams = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = p.path("ci/process_streams.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "programs", .module = streams_programs.createModule() }},
+    }), .filters = if (filter) |f| &.{f} else &.{} });
+    const streams_run = b.addRunArtifact(streams);
+    test_step.dependOn(&streams_run.step);
+    check.dependOn(&streams.step);
+    b.step("check-process-streams", "Run glint with its stdout on a file opened for append and on one shared in order").dependOn(&streams_run.step);
     check.dependOn(&executable.step);
     check.dependOn(&project_linter.step);
     tools.preflight.addCi(b, p, .{ .tests = test_step, .portable_tests = true, .bench = .{
