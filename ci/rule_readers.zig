@@ -541,7 +541,7 @@ fn judge(root: []const u8, rule: glint.Rule, with: []const glint.ProjectRule) !s
         , .selected = false },
     }, &.{.{ .from = 0, .target = 1, .spelling = "std" }}, .{}); // safe: fixture constants fit the asserted integer widths.
     defer project.deinit();
-    const config: glint.Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .report }} };
+    const config: glint.Config = .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .report }} };
     var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = with });
     defer report.deinit();
     var undecided: usize = 0;
@@ -675,7 +675,7 @@ fn switchesAllowing(root: []const u8, comptime list: []const Allowed) !struct { 
         .{ .name = "src/Facts.zig", .bytes = "pub const Value = union(enum) { unknown: u8, alternatives: []const Value, instance: u32, primitive: []const u8 };\n", .selected = false },
     }, &.{.{ .from = 0, .target = 1, .spelling = "Facts.zig" }}, .{}); // safe: fixture constants fit the asserted integer widths.
     defer project.deinit();
-    const config: glint.Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = value_switches, .level = .report }} };
+    const config: glint.Config = .{ .enabled = .empty, .selections = &.{.{ .rule = value_switches, .level = .report }} };
     var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = &switched(list) });
     defer report.deinit();
     var undecided: usize = 0;

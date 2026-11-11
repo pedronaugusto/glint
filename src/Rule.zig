@@ -51,9 +51,13 @@ pub const Rule = enum(u16) {
     }
 };
 
+/// The rules a configuration turns on, by id: glint's own (below 1000) and the rules packages
+/// declare in their `lint_rules` (`PackageRules`, from 1000), every id a `Rule` can hold.
+pub const Set = std.bit_set.Array(usize, 1 << 16);
+
 /// Explicit rule selection. Only the two inspected inherited core rules default on.
 pub const Config = struct {
-    enabled: [64]bool = core,
+    enabled: Set = core,
     max_line_length: u32 = 100,
     strict_suppressions: bool = false,
     max_function_lines: u32 = 120,
@@ -97,9 +101,9 @@ pub const Config = struct {
     };
 
     const core = blk: {
-        var selection: [64]bool = @splat(false);
-        selection[3] = true;
-        selection[13] = true;
+        var selection: Set = .empty;
+        selection.set(3);
+        selection.set(13);
         break :blk selection;
     };
 
@@ -121,10 +125,13 @@ pub const Config = struct {
         }
         for (self.selections, 0..) |selection, i| for (self.selections[0..i]) |earlier| if (selection.rule == earlier.rule) return error.InvalidSelection;
         for (self.pointer_widths) |width| if (width != 16 and width != 32 and width != 64) return error.InvalidSelection;
-        for (self.enabled, 0..) |enabled, index| {
-            if (!enabled) continue;
+        // An id below 1000 is glint's own and must be one it has; one from 1000 is a package's,
+        // which the run checks against the rules the packages declare (Runner).
+        var on = self.enabled.iterator(.{});
+        while (on.next()) |index| {
+            if (index >= 1000) continue;
             var known = false;
-            for (std.meta.tags(Rule)) |rule| if (@backingInt(rule) == index) { // safe: frozen rule identities fit the selection table.
+            for (std.meta.tags(Rule)) |rule| if (@backingInt(rule) == index) {
                 known = true;
             };
             if (!known) return error.InvalidSelection;
@@ -132,7 +139,7 @@ pub const Config = struct {
     }
     /// An empty selection for callers migrating explicit policy.
     pub fn none() Config {
-        return .{ .enabled = @splat(false) };
+        return .{ .enabled = .empty };
     }
     /// All reviewed rules for reporting. A caller decides which groups gate.
     pub fn reviewed() Config {
@@ -142,8 +149,7 @@ pub const Config = struct {
     }
     /// Selects a stable rule ID.
     pub fn set(self: *Config, rule: Rule, enabled: bool) void {
-        std.debug.assert(@backingInt(rule) < self.enabled.len);
-        self.enabled[@backingInt(rule)] = enabled; // safe: enum identities index their owning frozen tables without narrowing.
+        self.enabled.setValue(@backingInt(rule), enabled);
     }
     /// A required semantic fact for a gating rule cannot be ignored or suppressed.
     pub fn level(self: Config, rule: Rule) Level {
@@ -154,9 +160,7 @@ pub const Config = struct {
     /// Whether a rule was selected.
     pub fn has(self: Config, rule: Rule) bool {
         for (self.selections) |selection| if (selection.rule == rule) return selection.level != .off;
-        const index = @backingInt(rule);
-        if (index >= self.enabled.len) return false;
-        return self.enabled[index];
+        return self.enabled.isSet(@backingInt(rule));
     }
 };
 
@@ -170,14 +174,53 @@ test "review inventory excludes removed identities without compatibility aliases
     try std.testing.expect(!@as(Config, .{}).has(.Z011)); // safe: explicit compile-time type selection; the value is representable in that type.
 }
 
+test "a configuration turns on any rule id, a package's from 1000 among them, with no table to outgrow" {
+    var config = Config.none();
+    const declared: Rule = @fromBackingInt(2000);
+    config.set(declared, true);
+    config.set(.D001, true);
+    try std.testing.expect(config.has(declared) and config.has(.D001) and !config.has(.Z003));
+    // Whether a package declares it is the run's to check, against the packages' rules.
+    try config.validate();
+    config.set(declared, false);
+    try std.testing.expect(!config.has(declared));
+}
+
 test "inventory rejects unknown selection slots through public configuration" {
     var config = Config.none();
-    config.enabled[8] = true;
+    config.enabled.set(8);
     try std.testing.expectError(error.InvalidSelection, config.validate());
 }
 
+/// A ban reports every site of what it names outside a seam; a hygiene rule only what it is
+/// certain of (glint-0.8-shape, "The principle").
+pub const Kind = enum { ban, hygiene };
+/// What a package's rule reads of its `lint_rules`: the governed types' internal fields, their
+/// exits, or the `.replaces` entries naming it.
+pub const Reads = enum { governed, exits, replaces };
+
 /// Stable metadata for both built-in and compiled project rules.
-pub const Definition = struct { id: Rule, name: []const u8, group: Group, purpose: []const u8, version: u32 = 1, report_only: bool = false, exception: enum { generic, aegis } = .generic };
+pub const Definition = struct {
+    id: Rule,
+    name: []const u8,
+    group: Group,
+    purpose: []const u8,
+    version: u32 = 1,
+    report_only: bool = false,
+    exception: enum { generic, aegis } = .generic,
+    /// Where a package declares the rule in its `lint_rules`; null for glint's own and a
+    /// caller's compiled rules.
+    declared: ?Declared = null,
+
+    pub const Declared = struct {
+        /// The package, as its `build.zig.zon` names it.
+        package: []const u8,
+        kind: Kind,
+        reads: Reads,
+        /// Whether a run selects it unasked.
+        default: bool,
+    };
+};
 /// Metadata is shared by suppression, reporting and project rule registration.
 pub fn definition(id: Rule, project: []const Definition) ?Definition {
     for (std.meta.tags(Rule)) |builtin| if (builtin == id) return .{ .id = id, .name = @tagName(builtin), .group = builtin.group(), .purpose = builtin.purpose(), .version = 3 };

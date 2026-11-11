@@ -97,7 +97,7 @@ test "compatibility strict stale suppressions and exhausted facts are incomplete
     try std.testing.expectEqualStrings("Z013", report.stale[0].name);
     try std.testing.expectEqual(@as(u32, 1), report.stale[0].span.line); // safe: explicit compile-time type selection; the value is representable in that type.
     // A rule that does not run shows nothing about its suppressions.
-    var unjudged = try glint.run(std.testing.allocator, &project, .{ .strict_suppressions = true, .enabled = @splat(false) });
+    var unjudged = try glint.run(std.testing.allocator, &project, .{ .strict_suppressions = true, .enabled = .empty });
     defer unjudged.deinit();
     try std.testing.expectEqual(@as(usize, 0), unjudged.stale_suppressions); // safe: explicit compile-time type selection; the value is representable in that type.
     config.strict_suppressions = false;
@@ -111,7 +111,7 @@ test "each file's analysis has its own fact budget" {
     // A019 follows the pointer a parent is recovered from: facts each file's analysis spends.
     const source = "const W = struct { x: u32 };\nconst H = struct { n: u32, w: W };\nfn of(w: *W) *H {\n    return @fieldParentPtr(\"w\", w);\n}\npub fn run(h: *H) u32 {\n    return of(&h.w).n;\n}\n";
     const pack = glint.AegisPack;
-    const selected: glint.Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.unsafe_set, .level = .report }} };
+    const selected: glint.Config = .{ .enabled = .empty, .selections = &.{.{ .rule = pack.unsafe_set, .level = .report }} };
     var one = try glint.Project.init(std.testing.allocator, &.{.{ .name = "one", .bytes = source }}, &.{}, .{});
     defer one.deinit();
     // The least budget one file completes in.
@@ -923,7 +923,7 @@ test "Z013 withholds a file's reports where a @field name is computed, and stays
     const bytes = "const Self = @This(); const dep = @import(\"dep\"); pub fn run(comptime name: []const u8) void { _ = @field(Self, name); }";
     var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = bytes }}, &.{}, .{});
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = .Z013, .level = .gate }} }, .{});
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = .Z013, .level = .gate }} }, .{});
     defer report.deinit();
     try std.testing.expect(report.complete);
     try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: a computed name may be the import's.
@@ -1060,7 +1060,7 @@ test "a rule's memory for one file is given back when the rule is done with the 
     var project = try glint.Project.init(std.testing.allocator, &inputs, &.{}, .{});
     defer project.deinit();
     const rule: glint.ProjectRule = .{ .definition = .{ .id = touching, .name = "TOUCHES_MEMORY", .group = .family_policy, .purpose = "fills memory of its own in each file", .version = 1 }, .check = touch };
-    const config: glint.Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = touching, .level = .report }} };
+    const config: glint.Config = .{ .enabled = .empty, .selections = &.{.{ .rule = touching, .level = .report }} };
     var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = &.{rule} });
     defer report.deinit();
     const grown = (peakResident() orelse return error.SkipZigTest) -| before;

@@ -22,7 +22,7 @@ fn probe(context: *glint.RuleContext) glint.RuleContext.Error!void {
         try context.at(own, decl.token, if (found) |role| @tagName(role) else "none");
     }
 }
-const config: glint.Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = own, .level = .gate }} };
+const config: glint.Config = .{ .enabled = .empty, .selections = &.{.{ .rule = own, .level = .gate }} };
 
 const Layout = struct { name: []const u8, bytes: []const u8 };
 /// The consumer, then `layout`'s files, each of the gadgets package; entry 0 is its root.
@@ -225,7 +225,7 @@ test "a role no pack of the run reads is drift where the package is imported, an
     // The package's own lint: its root is the program's file, and A001 reports the role there.
     var own_lint = try P.init(std.testing.allocator, &.{.{ .name = "gadgets.zig", .bytes = misspelt[0].bytes, .package = gadgets.name, .fingerprint = gadgets.fingerprint }}, &.{}, .{});
     defer own_lint.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &own_lint, .{ .enabled = @splat(false), .selections = &.{.{ .rule = glint.AegisPack.access, .level = .gate }} }, .{ .project_rules = &(glint.AegisPack.rules ++ [_]glint.ProjectRule{rule}) });
+    var report = try glint.runConfigured(std.testing.allocator, &own_lint, .{ .enabled = .empty, .selections = &.{.{ .rule = glint.AegisPack.access, .level = .gate }} }, .{ .project_rules = &(glint.AegisPack.rules ++ [_]glint.ProjectRule{rule}) });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len);
     try std.testing.expectEqualStrings("lint_rules: unknown_role: glint does not read this part, so the programs that import this package do not know what it declares", report.diagnostics[0].message);

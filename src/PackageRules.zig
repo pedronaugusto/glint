@@ -10,6 +10,7 @@ const std = @import("std");
 const Ast = std.zig.Ast;
 const Facts = @import("Facts.zig");
 const Project = @import("Project.zig");
+const Inventory = @import("Rule.zig");
 
 /// The vocabulary's version this reader knows. A root declaring another is read as no rules,
 /// with the version a problem: a finding in the declarer.
@@ -29,13 +30,8 @@ pub const Declared = struct {
     file: Project.FileId,
     node: Ast.Node.Index,
 
-    /// A ban reports every site of what it names outside a seam; a hygiene rule only what it is
-    /// certain of.
-    pub const Kind = enum { ban, hygiene };
-    /// `governed`: touches of internal fields, literals naming them, casts and reflection over a
-    /// governed type. `exits`: an exit's result used raw. `replaces`: the `.replaces` entries
-    /// naming the rule.
-    pub const Reads = enum { governed, exits, replaces };
+    pub const Kind = Inventory.Kind;
+    pub const Reads = Inventory.Reads;
 };
 
 /// A type only its package touches inside (`.governed`).
@@ -274,6 +270,45 @@ pub fn of(facts: *Facts, root: Project.FileId) Facts.ResolveError!*const Rules {
     }
     try memo.roots.put(facts.gpa, root, found);
     return found;
+}
+
+/// The first id the run gives a package's rule: below it are glint's own (under 1000) and the
+/// rules a caller compiles in.
+pub const first_package_id: u16 = 2000;
+
+/// The rules the run's packages declare (`.rules`), as the run's rule table holds them: each
+/// root-level `lint_rules` in the project read once (`of`, its includes merged), a rule its
+/// includes reach from two roots counted once, ordered by id and given ids from
+/// `first_package_id`. Two packages declaring one id is `DuplicateRule`: a run reads one rule
+/// under a name; more rules than ids are left is `TooManyRules`.
+pub fn table(facts: *Facts) (Facts.ResolveError || error{ DuplicateRule, TooManyRules })![]const Inventory.Definition {
+    var found: std.ArrayList(Declared) = .empty;
+    for (facts.project.sources) |*source| {
+        if (source.input.kind == .zon) continue;
+        if (facts.member(facts.rootOf(source.id), "lint_rules") == null) continue;
+        for ((try of(facts, source.id)).rule_table) |declared| {
+            const same = for (found.items) |known| {
+                if (known.file == declared.file and known.node == declared.node) break true;
+            } else false;
+            if (same) continue;
+            for (found.items) |known| if (std.mem.eql(u8, known.id, declared.id)) return error.DuplicateRule;
+            try found.append(facts.gpa, declared);
+        }
+    }
+    std.mem.sort(Declared, found.items, {}, idLess);
+    if (found.items.len > std.math.maxInt(u16) - first_package_id) return error.TooManyRules;
+    const definitions = try facts.gpa.alloc(Inventory.Definition, found.items.len);
+    for (found.items, definitions, 0..) |declared, *definition, i| definition.* = .{
+        .id = @fromBackingInt(first_package_id + @as(u16, @intCast(i))),
+        .name = declared.id,
+        .group = .family_policy,
+        .purpose = declared.purpose,
+        .declared = .{ .package = facts.project.at(declared.file).input.package, .kind = declared.kind, .reads = declared.reads, .default = declared.default },
+    };
+    return definitions;
+}
+fn idLess(_: void, a: Declared, b: Declared) bool {
+    return std.mem.lessThan(u8, a.id, b.id);
 }
 
 /// The module roots the program imports by a module's name (not a file's path), each once.
@@ -1720,4 +1755,35 @@ test "a pair is refused as written where its operations do not settle: a transfe
         try std.testing.expectEqual(@as(usize, 1), rules.problems.len);
         try std.testing.expectEqual(case[1], rules.problems[0].why);
     }
+}
+
+test "the run's rule table: every package's declared rules once, ordered by id, given ids from the first package id; one id declared by two packages is refused" {
+    const rule = ".{ .id = .ID, .name = \"n\", .kind = .ban, .reads = .replaces, .default = true, .purpose = \"p\" }";
+    var f: Fixture = undefined;
+    try f.init(&.{
+        .{ .name = "a/root.zig", .package = "a", .fingerprint = 1, .bytes = "const inner = @import(\"inner.zig\");\npub const lint_rules = .{ .version = 2, .include = .{inner.lint_rules}, .rules = .{" ++ rule ++ "} };\n" },
+        // Read from its own root and through the include: one rule.
+        .{ .name = "a/inner.zig", .package = "a", .fingerprint = 1, .bytes = "pub const lint_rules = .{ .version = 2, .rules = .{.{ .id = .A002, .name = \"m\", .kind = .hygiene, .reads = .exits, .default = false, .purpose = \"q\" }} };\n" },
+        .{ .name = "b/root.zig", .package = "b", .fingerprint = 2, .bytes = "pub const lint_rules = .{ .version = 2, .rules = .{.{ .id = .B001, .name = \"o\", .kind = .ban, .reads = .governed, .default = true, .purpose = \"r\" }} };\n" },
+    }, &.{.{ .from = 0, .spelling = "inner.zig", .target = 1 }});
+    defer f.deinit();
+    // `.ID` stands in the first root for a rule whose id sorts last.
+    const found = table(&f.facts) catch |err| return err;
+    try std.testing.expectEqual(@as(usize, 3), found.len);
+    try std.testing.expectEqualStrings("A002", found[0].name);
+    try std.testing.expectEqualStrings("B001", found[1].name);
+    try std.testing.expectEqualStrings("ID", found[2].name);
+    try std.testing.expectEqual(first_package_id, @backingInt(found[0].id));
+    try std.testing.expectEqual(first_package_id + 2, @backingInt(found[2].id));
+    try std.testing.expectEqualStrings("b", found[1].declared.?.package);
+    try std.testing.expectEqual(Inventory.Reads.governed, found[1].declared.?.reads);
+    try std.testing.expect(!found[0].declared.?.default);
+
+    var twice: Fixture = undefined;
+    try twice.init(&.{
+        .{ .name = "a/root.zig", .package = "a", .fingerprint = 1, .bytes = "pub const lint_rules = .{ .version = 2, .rules = .{" ++ rule ++ "} };\n" },
+        .{ .name = "b/root.zig", .package = "b", .fingerprint = 2, .bytes = "pub const lint_rules = .{ .version = 2, .rules = .{" ++ rule ++ "} };\n" },
+    }, &.{});
+    defer twice.deinit();
+    try std.testing.expectError(error.DuplicateRule, table(&twice.facts));
 }
