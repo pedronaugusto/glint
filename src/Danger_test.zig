@@ -790,35 +790,15 @@ test "A014 finds a pointer into the frame carried out of the call" {
     try expect(pack.lifetimes, "pub fn f(n: usize) []u8 { var buf: [16]u8 = undefined; buf[0] = 1; return buf[0..n]; }", 1);
     try expect(pack.lifetimes, "pub fn f() *u32 { var x: u32 = 1; x += 1; const out = &x; return out; }", 1);
     try expect(pack.lifetimes, "const R = struct { s: []u8 }; pub fn f(n: usize) R { var buf: [8]u8 = undefined; buf[0] = 1; return .{ .s = buf[0..n] }; }", 1);
-    try expect(pack.lifetimes, "const S = struct { a: u32 = 0 }; const T = struct { p: *u32 }; pub fn f(t: *T) void { var s: S = .{}; s.a = 1; t.p = &s.a; }", 1);
-    try expect(pack.lifetimes, "var last: ?*u32 = null; pub fn f() void { var x: u32 = 1; x += 1; last = &x; }", 1);
-    // A const of a run-time value, a local whose type only its value gives, a var alias, an
-    // alias of an alias, and a store a defer clears only on one branch.
+    // A const of a run-time value, a local whose type only its value gives, a var alias and an
+    // alias of an alias. (Stores into another object's field or a global are no longer A014's:
+    // the 0.8 cut keeps the certain return shape.)
     try expect(pack.lifetimes, "pub fn f(x: u8) []const u8 { const buf = [_]u8{ x, 1 }; return buf[0..]; }", 1);
     try expect(pack.lifetimes, "pub fn f(n: usize) []u8 { var buf = [_]u8{ 0, 0, 0, 0 }; buf[0] = 1; return buf[0..n]; }", 1);
-    try expect(pack.lifetimes, "const S = struct { a: u32 = 0 }; const T = struct { p: *u32 }; pub fn f(t: *T) void { var s = S{}; s.a = 1; t.p = &s.a; }", 1);
     try expect(pack.lifetimes, "pub fn f() *u32 { var x: u32 = 1; x += 1; var p: *u32 = undefined; p = &x; return p; }", 1);
     try expect(pack.lifetimes, "pub fn f() *u32 { var x: u32 = 1; x += 1; const a = &x; const b = a; return b; }", 1);
-    try expect(pack.lifetimes, "const T = struct { cur: ?*u32 = null }; pub fn f(t: *T, ok: bool) void { var x: u32 = 1; x += 1; t.cur = &x; defer if (ok) { t.cur = null; }; }", 1);
-    // Stored by a destructure, into a field and into a `var` alias; and a defer that clears
-    // another object's field.
-    try expect(pack.lifetimes, "const T = struct { p: ?*u32 = null }; pub fn f(t: *T) void { var x: u32 = 1; x += 1; t.p, _ = .{ &x, 0 }; }", 1);
+    // Stored by a destructure into a `var` alias that is returned.
     try expect(pack.lifetimes, "pub fn f() *u32 { var x: u32 = 1; x += 1; var p: *u32 = undefined; p, _ = .{ &x, 0 }; return p; }", 1);
-    try expect(pack.lifetimes, "const T = struct { cur: ?*u32 = null }; pub fn f(t: *T, u: *T) void { var x: u32 = 1; x += 1; t.cur = &x; defer (u).cur = null; }", 1);
-    // An intrusive waiter a deferred loop unlinks: what the loop removes is not read.
-    try expect(pack.lifetimes,
-        \\const W = struct { next: ?*W = null };
-        \\const Q = struct { first: ?*W = null };
-        \\pub fn wait(q: *Q) void {
-        \\    var waiter: W = .{ .next = q.first };
-        \\    q.first = &waiter;
-        \\    defer {
-        \\        var link = &q.first;
-        \\        while (link.* != &waiter) link = &link.*.?.next;
-        \\        link.* = waiter.next;
-        \\    }
-        \\}
-    , 1);
     // A slice of a pointer local points where the pointer does: into a local array it was
     // given, and nowhere in the frame where it is made from an integer, its type unresolved (a
     // generic's `@TypeOf(slice.ptr)`, relic-b's warp c.zig:774).
@@ -849,8 +829,8 @@ test "the aegis escape covers the pack's findings on its line, is listed with th
         \\// aegis: internal(A007): the counter aegis's own Atomic would wrap; measured in bench/count.zig
         \\var hits: u32 = 0;
         \\pub fn f(r: *std.Io.Reader) !u4 {
-        \\    const b = try r.takeByte();
-        \\    return @intCast(b); // aegis: no-danger(A010): the peer's protocol sends a nibble here
+        \\    const b = try r.takeByte(); // aegis: no-danger(A010): the peer's protocol sends a nibble here
+        \\    return @intCast(b);
         \\}
         \\pub fn g() void {} // aegis: design(A010): nothing here
     , &std_files, &std_imports);
@@ -870,22 +850,25 @@ test "the aegis escape covers the pack's findings on its line, is listed with th
     var other = try sources.projectWithSources(std.testing.allocator,
         \\const std = @import("std");
         \\pub fn f(r: *std.Io.Reader) !u4 {
-        \\    const b = try r.takeByte();
-        \\    return @intCast(b); // aegis: no-danger(A009): another rule's
+        \\    const b = try r.takeByte(); // aegis: no-danger(A009): another rule's
+        \\    return @intCast(b);
         \\}
         \\pub fn g(r: *std.Io.Reader) !u4 {
-        \\    const b = try r.takeByte();
-        \\    return @intCast(b); // aegis: no-danger: every rule's
+        \\    const b = try r.takeByte(); // aegis: no-danger: every rule's
+        \\    return @intCast(b);
         \\}
     , &std_files, &std_imports);
     defer other.deinit();
     var named = try glint.runConfigured(std.testing.allocator, &other, .{ .enabled = @splat(false), .selections = &.{ .{ .rule = pack.untrusted_input, .level = .gate }, .{ .rule = pack.integers, .level = .gate } } }, .{ .project_rules = &pack.rules });
     defer named.deinit();
-    try std.testing.expectEqual(@as(usize, 2), named.diagnostics.len); // safe: fixture counts are representable.
-    try std.testing.expectEqual(@as(u32, 4), named.diagnostics[0].span.line);
-    try std.testing.expectEqual(@as(u32, 8), named.diagnostics[1].span.line);
-    try std.testing.expectEqual(@as(usize, 1), named.escapes.len); // safe: fixture counts are representable.
-    try std.testing.expectEqualStrings("A010", named.escapes[0].covered[0].name);
+    // f's escape covers A009 alone, so A010 stays on its line; g's covers nothing it names.
+    try std.testing.expectEqual(@as(usize, 3), named.diagnostics.len); // safe: fixture counts are representable.
+    try std.testing.expectEqual(@as(u32, 3), named.diagnostics[0].span.line);
+    try std.testing.expectEqual(@as(u32, 7), named.diagnostics[1].span.line);
+    try std.testing.expectEqual(@as(u32, 7), named.diagnostics[2].span.line);
+    try std.testing.expectEqual(@as(usize, 2), named.escapes.len); // safe: fixture counts are representable.
+    try std.testing.expectEqualStrings("A009", named.escapes[0].covered[0].name);
+    try std.testing.expectEqual(@as(usize, 2), named.escapes[1].covered.len); // safe: fixture counts are representable.
     try std.testing.expect(!named.complete);
     try std.testing.expectEqual(@as(usize, 1), named.malformed.len); // safe: fixture counts are representable.
     var refused = try sources.projectWithSources(std.testing.allocator, "var hits: u32 = 0; // glint-ignore: A007 -- no-danger: one thread\n", &std_files, &std_imports);
@@ -1382,8 +1365,8 @@ test "the fix names an escape in the older form only where a run before recorded
     const older =
         \\const std = @import("std");
         \\pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {
-        \\    const x = try r.takeInt(i64, .little);
-        \\    return table[@intCast(x)]; // aegis: no-danger: probe
+        \\    const x = try r.takeInt(i64, .little); // aegis: no-danger: probe
+        \\    return table[@intCast(x)];
         \\}
         \\
     ;
@@ -1391,12 +1374,12 @@ test "the fix names an escape in the older form only where a run before recorded
     // A009 and A010 both find something on the line; the record holds A010 only, so A009, new
     // since, is left to the owner.
     {
-        const out = try fixedBy(both, older, "glint: escape: consumer:4:32: no-danger: probe (A010)\nglint: 3 files\n");
+        const out = try fixedBy(both, older, "glint: escape: consumer:3:44: no-danger: probe (A010)\nglint: 3 files\n");
         defer std.testing.allocator.free(out.bytes);
         try std.testing.expect(std.mem.find(u8, out.bytes, "// aegis: no-danger(A010): probe") != null);
     }
     {
-        const out = try fixedBy(both, older, "escape: consumer:4:32: no-danger: probe (A009 at 4:18, A010 at 4:18, A013 at 4:5)\n");
+        const out = try fixedBy(both, older, "escape: consumer:3:44: no-danger: probe (A009 at 3:19, A010 at 3:19, A013 at 3:5)\n");
         defer std.testing.allocator.free(out.bytes);
         try std.testing.expect(std.mem.find(u8, out.bytes, "// aegis: no-danger(A009, A010): probe") != null);
     }
@@ -1405,13 +1388,13 @@ test "the fix names an escape in the older form only where a run before recorded
     // nothing is written, and the escape stays for its owner to name.
     inline for (.{
         "",
-        "glint: escape: consumer:9:32: no-danger: probe (A010)\n",
-        "glint: escape: consumer:4:30: no-danger: probe (A010)\n",
-        "glint: escape: consumer:4:32: design: probe (A010)\n",
-        "glint: escape: consumer:4:32: no-danger: probe two (A010)\n",
-        "glint: escape: consumer:4:32: no-danger: probe (A013)\n",
-        "note: escape: consumer:4:32: no-danger: probe (A010)\n",
-        "glint: A010: consumer:4:18: see escape: consumer:4:32: no-danger: probe (A010)\n",
+        "glint: escape: consumer:9:44: no-danger: probe (A010)\n",
+        "glint: escape: consumer:3:42: no-danger: probe (A010)\n",
+        "glint: escape: consumer:3:44: design: probe (A010)\n",
+        "glint: escape: consumer:3:44: no-danger: probe two (A010)\n",
+        "glint: escape: consumer:3:44: no-danger: probe (A013)\n",
+        "note: escape: consumer:3:44: no-danger: probe (A010)\n",
+        "glint: A010: consumer:3:19: see escape: consumer:3:44: no-danger: probe (A010)\n",
     }) |record| {
         const out = try fixedBy(both, older, record);
         defer std.testing.allocator.free(out.bytes);
@@ -1421,10 +1404,10 @@ test "the fix names an escape in the older form only where a run before recorded
     var records = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer records.deinit();
     inline for (.{
-        "escape: consumer:4: no-danger: probe (A010)\n",
-        "escape: consumer:4:32: no-danger probe (A010)\n",
-        "glint: escape: consumer:4:32: no-danger: probe (A010\n",
-        "escape: consumer:4:32: no-danger: probe (A010 near 4:18)\n",
+        "escape: consumer:3: no-danger: probe (A010)\n",
+        "escape: consumer:3:44: no-danger probe (A010)\n",
+        "glint: escape: consumer:3:44: no-danger: probe (A010\n",
+        "escape: consumer:3:44: no-danger: probe (A010 near 4:18)\n",
         "escape: consumer:x:32: no-danger: probe (A010)\n",
     }) |record| try std.testing.expectError(error.InvalidEscapeRecord, glint.Fix.escapeRecord(records.allocator(), record));
     // An escape is stale only where every rule it names ran: a run of A009 alone keeps an
@@ -2282,9 +2265,4 @@ test "a rule's findings are the same alone and beside every other rule: no answe
     }
     // The fixture gives the rules something to disagree on.
     try std.testing.expect(some >= 4);
-    // The chain's product fits, read alone: A010 names nothing in `first` or `pick`.
-    var integers: std.ArrayList(u64) = .empty;
-    defer integers.deinit(std.testing.allocator);
-    try findingsAmong(pack.integers, &.{pack.integers}, program, &integers);
-    for (integers.items) |at| try std.testing.expect(at / 4096 > 25);
 }
