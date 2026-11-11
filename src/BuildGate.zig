@@ -63,12 +63,12 @@ fn execute(init: std.process.Init, gate: Gate) !u8 {
     };
     const receipt = try aegis.own.readFile(init.io, std.Io.Dir.cwd(), receipt_path, a, .fromRaw(64 * 1024));
     var buffer: [4096]u8 = @splat(0);
-    var output = std.Io.File.stdout().writer(init.io, &buffer);
+    var output = std.Io.File.stdout().writerStreaming(init.io, &buffer);
     // A write that fails gives the file's own error, a cancel among it, where WriteFailed hides it.
     output.interface.writeAll(result.stdout) catch return output.err orelse error.WriteFailed;
     output.interface.flush() catch return output.err orelse error.WriteFailed;
     var stderr_buffer: [4096]u8 = @splat(0);
-    var errors = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+    var errors = std.Io.File.stderr().writerStreaming(init.io, &stderr_buffer);
     errors.interface.writeAll(result.stderr) catch return errors.err orelse error.WriteFailed;
     errors.interface.flush() catch return errors.err orelse error.WriteFailed;
     return if (try accepted(a, receipt, &nonce, status, result.stdout)) 0 else if (status >= 2) 2 else 1;

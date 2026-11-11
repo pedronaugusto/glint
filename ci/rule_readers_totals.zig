@@ -45,7 +45,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     var buffer: [4096]u8 = undefined;
-    var out = std.Io.File.stdout().writer(io, &buffer);
+    var out = std.Io.File.stdout().writerStreaming(io, &buffer);
     const w = &out.interface;
     try w.writeAll("rule readers: totals\n");
     for ([_]*std.ArrayList(Count){ &rules, &classes, &files }) |list| {
