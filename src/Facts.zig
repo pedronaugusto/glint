@@ -11736,25 +11736,6 @@ pub const accesses = struct {
         return null;
     }
 
-    /// What memory the store into `target` writes (`storeInto`): a variable's own, by its name
-    /// (`box.g = v`, `pair[0] = v`, `x = v`), memory reached through a pointer (`p.g = v`,
-    /// `p.* = v`), or memory that does not resolve.
-    pub const Stored = union(enum) { declaration: Facts.Decl, through, unresolved };
-
-    pub fn storedIn(facts: *Facts, file: Project.FileId, target: Ast.Node.Index) Error!Stored {
-        const store = (try storeInto(facts, file, target)) orelse return .unresolved;
-        if (store.through) return .through;
-        var it = (try writesOf(facts, file)).places.iterator();
-        while (it.next()) |entry| {
-            const d = switch (entry.key_ptr.*) {
-                .declaration => |d| d,
-                .field => continue,
-            };
-            for (entry.value_ptr.items) |site| if (site.node == store.node and site.kind != .read and site.kind != .address and !site.through) return .{ .declaration = d };
-        }
-        return .unresolved;
-    }
-
     /// The forms an expression stands in, one for each syntax tag that may hold it: every tag
     /// Zig has is named in `formOf`, with no default, so a tag a new Zig adds fails to build
     /// until it is placed; and each form is checked against the construct matrix's row of every
@@ -12202,18 +12183,6 @@ pub const accesses = struct {
             } else if (body) return up;
         }
         return null;
-    }
-
-    /// The expression whose value `node` gives on whole, the inverse of `Use.carried` for a form
-    /// with one operand: parentheses, `.?`, `try`, the payload side of `orelse` and `catch`,
-    /// `comptime`, `nosuspend`. Null for any other form.
-    pub fn carriedFrom(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
-        return switch (formOf(tree.nodeTag(node))) {
-            .grouped, .unwrap_optional => tree.nodeData(node).node_and_token[0],
-            .tried, .@"comptime", .@"nosuspend" => tree.nodeData(node).node,
-            .@"catch", .@"orelse" => tree.nodeData(node).node_and_node[0],
-            else => null,
-        };
     }
 
     /// The expressions a value comes from: what `node` gives, through parentheses, `try`, `.?`,
@@ -12718,8 +12687,6 @@ pub const accesses = struct {
         casts: std.AutoHashMapUnmanaged(Facts.Key, CastCovers) = .empty,
         /// Of each file, the write sites a query for a field of one name reads (`Filter`).
         fields: std.HashMapUnmanaged(Narrow, *const File, Narrow.Context, std.hash_map.default_max_load_percentage) = .empty,
-        /// Of each pointer handed to a call, the fields it reaches as a whole value or as bytes.
-        handed: std.AutoHashMapUnmanaged(Facts.Key, []const Facts.Decl) = .empty,
     };
 
     /// What a query for a field needs of a file's writes: the sites whose target or literal
@@ -12793,8 +12760,6 @@ pub const accesses = struct {
         /// How many sites each part held when the file's index was read: the sites the query
         /// gives, as a list made then would hold them.
         ends: [4]usize = @splat(0),
-        /// The open world's write (`Kind.open`) is given, after every file's.
-        opened: bool = false,
 
         pub const Of = enum { writes, field_writes, reads };
         /// A file's sites in the order a query reads them: those that name the place, then for
@@ -12875,15 +12840,6 @@ pub const accesses = struct {
     /// (with its element where the value is a literal).
     pub fn storesIn(facts: *Facts, file: Project.FileId) Error![]const Site {
         return (try writesOf(facts, file)).stores.items;
-    }
-
-    /// The fields the write at `node` stores through a pointer as part of a whole value or of
-    /// its bytes, each container's that the memory written holds by value (`h.* = other`,
-    /// `@memcpy(std.mem.asBytes(h), bytes)`, `std.mem.asBytes(h)[0] = b`): memory the place's
-    /// other names read. A field the store names is a site of its own, not among them.
-    pub fn fieldsThrough(facts: *Facts, file: Project.FileId, node: Ast.Node.Index) Error![]const Facts.Decl {
-        const shapes_written = (try writesOf(facts, file)).through.get(node) orelse return &.{};
-        return fieldsOfShapes(facts, shapes_written.items);
     }
 
     /// Whether the function declaring `param` may write the memory the parameter points at,
@@ -13087,37 +13043,6 @@ pub const accesses = struct {
             if (tree.tokenTag(token) == .asterisk) return true;
         };
         return false;
-    }
-
-    /// The fields a call may write through `pointer`, an argument it is handed, as a store
-    /// through it writes them (`fieldsThrough`): each container's the memory it points at holds
-    /// by value, where it reaches that memory through a pointer or as another type
-    /// (`r.readSliceAll(std.mem.asBytes(h))`, a helper's `put(std.mem.asBytes(h))`). A pointer
-    /// to a place reached by its own name (`&x`) reaches no field but the place's.
-    pub fn fieldsHanded(facts: *Facts, file: Project.FileId, pointer: Ast.Node.Index) Error![]const Facts.Decl {
-        const state = try facts.memo(State);
-        const key: Facts.Key = .{ .file = file, .node = pointer };
-        if (state.handed.get(key)) |kept| return kept;
-        const index = try facts.gpa.create(File);
-        index.* = .{};
-        var walk: Walk = .{ .facts = facts, .file = file, .index = index };
-        try walk.pointee(walk.make(pointer, pointer, .covered, null));
-        const fields = if (index.through.get(pointer)) |shapes_reached| try fieldsOfShapes(facts, shapes_reached.items) else &.{};
-        try state.handed.put(facts.gpa, key, fields);
-        return fields;
-    }
-
-    /// The fields of each container `shapes_held` names.
-    fn fieldsOfShapes(facts: *Facts, shapes_held: []const Shape) Error![]const Facts.Decl {
-        var out: std.ArrayList(Facts.Decl) = .empty;
-        for (shapes_held) |held_shape| {
-            const model = &facts.project.at(held_shape.file).model;
-            for (model.declarations, 0..) |record, d| {
-                if (record.kind != .field or record.scope != held_shape.scope) continue;
-                try out.append(facts.gpa, .{ .file = held_shape.file, .index = @fromBackingInt(@intCast(d)) });
-            }
-        }
-        return out.items;
     }
 
     /// The write sites of `file`, found the first time a query reaches it.
@@ -14537,9 +14462,6 @@ pub const calls = struct {
         /// `@call`'s modifier.
         modifier: ?Ast.Node.Index = null,
         callee: Callee,
-        /// A call another call makes later (`deferredOf`): it may run after the statement that
-        /// makes it, until the future that call gives is awaited, cancelled or joined.
-        deferred: bool = false,
     };
 
     pub const Error = Facts.ResolveError;
@@ -14609,145 +14531,6 @@ pub const calls = struct {
         if (tree.fullStructInit(&buffer, node)) |empty|
             return if (empty.ast.type_expr == .none and empty.ast.fields.len == 0) .{ .known = &.{} } else .{ .unknown = .unsupported };
         return .{ .unknown = .unsupported };
-    }
-
-    /// Which of a function's parameters (in its parameter order) it runs, and with which
-    /// tuple: a function-running function (`Io.concurrent(io, function, args)`).
-    pub const Runs = struct { function: usize, args: usize };
-
-    /// The call of its function argument that `call` makes later, if the function it calls
-    /// runs one (`runsWith`): `io.concurrent(f, .{ io, &s })` calls `f` with the tuple's
-    /// elements, read as `@call` reads them, `deferred`. Its result is the future `call` gives,
-    /// never `f`'s. Null where `call` runs no function it is given, or what it calls is not one
-    /// function.
-    pub fn deferredOf(facts: *Facts, call: Call) Error!?Call {
-        const callee = switch (call.callee) {
-            .function => |function| function,
-            .choice, .any => return null,
-        };
-        const runs = (try runsWith(facts, callee)) orelse return null;
-        const args = switch (call.args) {
-            .known => |each| each,
-            .unknown => return null,
-        };
-        if (runs.function >= args.len or runs.args >= args.len) return null;
-        const tree = &facts.project.at(call.file).file.tree;
-        return .{
-            .file = call.file,
-            .node = call.node,
-            .callee_expr = args[runs.function],
-            .args = try tupleArgs(facts, tree, args[runs.args]),
-            .callee = try calleeOf(facts, null, call.file, args[runs.function]),
-            .deferred = true,
-        };
-    }
-
-    const Running = struct { found: std.AutoHashMapUnmanaged(Facts.Decl, ?Runs) = .empty };
-
-    /// Whether `function` runs a function it is given with a tuple it is given, by meaning: its
-    /// tuple parameter is declared `std.meta.ArgsTuple(@TypeOf(f))` of its function parameter
-    /// `f` (std's `Io.async`, `Io.concurrent`, a group's), or its body runs the two: `@call` of
-    /// them, or a call of a function-running function handed them (`Thread.spawn` forwarding to
-    /// its target's). Null where it runs none known.
-    pub fn runsWith(facts: *Facts, function: Facts.Decl) Error!?Runs {
-        return runsWithAt(facts, function, 0);
-    }
-
-    fn runsWithAt(facts: *Facts, function: Facts.Decl, depth: u8) Error!?Runs {
-        const state = try facts.memo(Running);
-        if (state.found.get(function)) |kept| return kept;
-        // Until it is known, a function that reaches itself runs nothing it is given.
-        try state.found.put(facts.gpa, function, null);
-        const found = try runsFound(facts, function, depth);
-        try state.found.put(facts.gpa, function, found);
-        return found;
-    }
-
-    fn runsFound(facts: *Facts, function: Facts.Decl, depth: u8) Error!?Runs {
-        if (depth == 8) return null;
-        const model = &facts.project.at(function.file).model;
-        const tree = &facts.project.at(function.file).file.tree;
-        const record = model.declarations[@backingInt(function.index)];
-        if (record.kind != .function) return null;
-        var proto_buffer: [1]Ast.Node.Index = undefined;
-        const proto = tree.fullFnProto(&proto_buffer, record.node) orelse return null;
-        var names: [16]Ast.TokenIndex = @splat(0);
-        var types: [16]?Ast.Node.Index = @splat(null);
-        var count: usize = 0;
-        var it = proto.iterate(tree);
-        while (it.next()) |param| {
-            if (count == names.len) return null;
-            names[count] = param.name_token orelse return null;
-            types[count] = param.type_expr;
-            count += 1;
-        }
-        const params = names[0..count];
-        // Declared: `args: std.meta.ArgsTuple(@TypeOf(function))`.
-        const args_tuple = try facts.stdMember(&.{ "meta", "ArgsTuple" });
-        if (args_tuple == .function) for (types[0..count], 0..) |declared, position| {
-            const t = declared orelse continue;
-            var buffer: [1]Ast.Node.Index = undefined;
-            const made = tree.fullCall(&buffer, t) orelse continue;
-            if (made.ast.params.len != 1) continue;
-            const maker = try facts.resolve(function.file, made.ast.fn_expr);
-            if (maker != .function or !std.meta.eql(maker.function, args_tuple.function)) continue;
-            const of = made.ast.params[0];
-            if (!Facts.isBuiltin(tree, of, "@TypeOf")) continue;
-            var type_buffer: [2]Ast.Node.Index = undefined;
-            const operands = Facts.builtinArgs(tree, of, &type_buffer);
-            if (operands.len != 1) continue;
-            const ran = parameterNamed(model, tree, params, operands[0]) orelse continue;
-            return .{ .function = ran, .args = position };
-        };
-        // Its body runs them: `@call(_, function, args)`, or a call handing them on to a
-        // function that runs them, each it may call alike.
-        const whole = if (tree.nodeTag(record.node) == .fn_decl) record.node else model.parentOf(record.node) orelse return null;
-        if (tree.nodeTag(whole) != .fn_decl) return null;
-        const body = tree.nodeData(whole).node_and_node[1];
-        const first = tree.firstToken(body);
-        const last = tree.lastToken(body);
-        for (try in(facts, function.file)) |call| {
-            const token = tree.nodeMainToken(call.node);
-            if (token < first or token > last) continue;
-            if (call.modifier != null) {
-                var buffer: [2]Ast.Node.Index = undefined;
-                const operands = Facts.builtinArgs(tree, call.node, &buffer);
-                const ran = parameterNamed(model, tree, params, operands[1]) orelse continue;
-                const with = parameterNamed(model, tree, params, operands[2]) orelse continue;
-                return .{ .function = ran, .args = with };
-            }
-            const args = switch (call.args) {
-                .known => |each| each,
-                .unknown => continue,
-            };
-            const each: []const Facts.Decl = switch (call.callee) {
-                .function => |one| &.{one},
-                .choice => |choice| choice,
-                .any => continue,
-            };
-            var agreed: ?Runs = null;
-            for (each) |callee| {
-                const inner = (try runsWithAt(facts, callee, depth + 1)) orelse break;
-                if (inner.function >= args.len or inner.args >= args.len) break;
-                const ran = parameterNamed(model, tree, params, args[inner.function]) orelse break;
-                const with = parameterNamed(model, tree, params, args[inner.args]) orelse break;
-                const runs: Runs = .{ .function = ran, .args = with };
-                if (agreed) |one| if (!std.meta.eql(one, runs)) break;
-                agreed = runs;
-            } else if (agreed) |runs| return runs;
-        }
-        return null;
-    }
-
-    /// The position among `params` of the parameter `node` names, as written (`f`, `(f)`).
-    fn parameterNamed(model: *const Model, tree: *const Ast, params: []const Ast.TokenIndex, node: Ast.Node.Index) ?usize {
-        const named = ungrouped(tree, node);
-        const ref = model.reference(named) orelse return null;
-        const index = ref.declaration orelse return null;
-        const decl = model.declarations[@backingInt(index)];
-        if (decl.kind != .parameter) return null;
-        for (params, 0..) |name, position| if (name == decl.token) return position;
-        return null;
     }
 
     /// Every call `file` makes, as `at` reads each. Found once.

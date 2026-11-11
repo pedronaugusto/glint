@@ -471,12 +471,6 @@ test "accesses: a place's path, whether two name one place, a discarded value, a
     const discard = spelledNode(tree, "_ = d", 0).?;
     try std.testing.expectEqualStrings("d", tree.getNodeSource((try accesses.discardedBy(&facts, file, discard)).?));
     try std.testing.expect(try accesses.discardedBy(&facts, file, spelledNode(tree, "s.b[1..][0] = 2", 0).?) == null);
-    // `(o.?)` carries `o.?`, which carries `o`; `o` carries nothing.
-    const grouped = spelledNode(tree, "(o.?)", 0).?;
-    const unwrapped = accesses.carriedFrom(tree, grouped).?;
-    try std.testing.expectEqualStrings("o.?", tree.getNodeSource(unwrapped));
-    try std.testing.expectEqualStrings("o", tree.getNodeSource(accesses.carriedFrom(tree, unwrapped).?));
-    try std.testing.expect(accesses.carriedFrom(tree, accesses.carriedFrom(tree, unwrapped).?) == null);
 }
 
 test "Facts: an enum's and a union's tags written with no type are members" {
