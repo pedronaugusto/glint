@@ -1006,35 +1006,102 @@ fn neverRuns(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     return false;
 }
 
-/// How far input chooses the path to `node`: the conditions of the branches and loops it is
-/// in, the operands of the switches whose prongs hold it, and a `catch` or `orelse` it is the
-/// answer of, through the call before it (what the call reads and is given), up to its
-/// function.
+/// How far input chooses the path to `node`: what chooses it within each construct around it
+/// (`chooses`), up to its function, and each exit taken before it that passes it by
+/// (`exitedBefore`).
 fn chosenBy(c: *Context, flow: Taint.Fact, node: Ast.Node.Index) Context.Error!Taint.Level {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
     var out: Taint.Level = .clean;
+    var around: std.ArrayList(Ast.Node.Index) = .empty;
     var at = node;
     while (model.parentOf(at)) |parent| : (at = parent) {
-        switch (tree.nodeTag(parent)) {
-            .fn_decl => break,
-            .@"catch", .@"orelse" => {
-                const lhs, const rhs = tree.nodeData(parent).node_and_node;
-                if (rhs == at) out = out.join(try failedBy(c, flow, lhs));
-            },
-            else => {},
-        }
-        if (tree.fullIf(parent)) |branch| {
-            if (branch.ast.cond_expr != at) out = out.join(try Taint.conditionAt(c, flow, c.file, branch.ast.cond_expr));
-        } else if (tree.fullWhile(parent)) |loop| {
-            if (loop.ast.cond_expr != at) out = out.join(try Taint.conditionAt(c, flow, c.file, loop.ast.cond_expr));
-        } else if (tree.fullSwitchCase(parent) != null) {
-            const choice = model.parentOf(parent) orelse continue;
-            const whole = tree.fullSwitch(choice) orelse continue;
-            out = out.join(try Taint.levelAt(c, flow, c.file, whole.ast.condition));
+        if (tree.nodeTag(parent) == .fn_decl) break;
+        try around.append(c.allocator, parent);
+        out = out.join(try chooses(c, flow, parent, at));
+    }
+    return out.join(try exitedBefore(c, flow, node, around.items));
+}
+
+/// How far input chooses whether `at`, within `parent`, runs: the condition of a branch or a
+/// loop, a `for` loop's inputs (how many passes it makes), the operand of a switch whose prong
+/// it is, and a `catch` or `orelse` it is the answer of, through the call before it (what the
+/// call reads and is given).
+fn chooses(c: *Context, flow: Taint.Fact, parent: Ast.Node.Index, at: Ast.Node.Index) Context.Error!Taint.Level {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    switch (tree.nodeTag(parent)) {
+        .@"catch", .@"orelse" => {
+            const lhs, const rhs = tree.nodeData(parent).node_and_node;
+            return if (rhs == at) failedBy(c, flow, lhs) else .clean;
+        },
+        else => {},
+    }
+    if (tree.fullIf(parent)) |branch| {
+        if (branch.ast.cond_expr != at) return Taint.conditionAt(c, flow, c.file, branch.ast.cond_expr);
+    } else if (tree.fullWhile(parent)) |loop| {
+        if (loop.ast.cond_expr != at) return Taint.conditionAt(c, flow, c.file, loop.ast.cond_expr);
+    } else if (tree.fullFor(parent)) |loop| {
+        if (std.mem.findScalar(Ast.Node.Index, loop.ast.inputs, at) != null) return .clean;
+        var out: Taint.Level = .clean;
+        for (loop.ast.inputs) |input| out = out.join(try Taint.levelAt(c, flow, c.file, input));
+        return out;
+    } else if (tree.fullSwitchCase(parent) != null) {
+        const choice = model.parentOf(parent) orelse return .clean;
+        const whole = tree.fullSwitch(choice) orelse return .clean;
+        return Taint.levelAt(c, flow, c.file, whole.ast.condition);
+    }
+    return .clean;
+}
+
+/// How far input chooses an exit taken before `node` that passes it by, `around` the
+/// constructs that hold `node` up to its function: a `return`, or a `break` or `continue` that
+/// lands outside it, in a statement before the one that holds `node` in a block around it
+/// (`if (b == ':') return b; unreachable;`, a loop that returns or breaks out on one), and a
+/// `break` out of a loop whose `else` holds `node`; by what chooses the exit within that
+/// statement or loop body (`chooses`, from the exit up), as `Present.holds` reads a guard
+/// before a `.?`.
+fn exitedBefore(c: *Context, flow: Taint.Fact, node: Ast.Node.Index, around: []const Ast.Node.Index) Context.Error!Taint.Level {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    if (around.len == 0) return .clean;
+    const first = tree.firstToken(around[around.len - 1]);
+    const end = tree.firstToken(node);
+    var out: Taint.Level = .clean;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"return" and tag != .@"break" and tag != .@"continue") continue;
+        const jump: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(jump);
+        if (token < first or token >= end) continue;
+        var level: Taint.Level = .clean;
+        var below = jump;
+        while (model.parentOf(below)) |up| : (below = up) {
+            if (tree.nodeTag(up) == .fn_decl) break;
+            const index = std.mem.findScalar(Ast.Node.Index, around, up) orelse {
+                level = level.join(try chooses(c, flow, up, below));
+                continue;
+            };
+            // `up` holds `node` too: the exit is in the part of it before `node`'s, or holds it.
+            const toward = if (index == 0) node else around[index - 1];
+            if (toward == below) break;
+            var buffer: [2]Ast.Node.Index = undefined;
+            if (tree.blockStatements(&buffer, up) != null) {
+                if (tag == .@"return" or !landsIn(tree, model, jump, below)) out = out.join(level);
+            } else if (tag == .@"break" and Facts.accesses.breakTarget(tree, model, jump) == up) {
+                const body, const otherwise = if (tree.fullWhile(up)) |loop| .{ loop.ast.then_expr, loop.ast.else_expr } else if (tree.fullFor(up)) |loop| .{ loop.ast.then_expr, loop.ast.else_expr } else break;
+                if (below == body and otherwise.unwrap() == toward) out = out.join(level);
+            }
+            break;
         }
     }
     return out;
+}
+
+/// Whether the `break` or `continue` `jump` goes to a place within `node`
+/// (`Facts.accesses.breakTarget`); one whose target is not found leaves it.
+fn landsIn(tree: *const Ast, model: *const Model, jump: Ast.Node.Index, node: Ast.Node.Index) bool {
+    const target = Facts.accesses.breakTarget(tree, model, jump) orelse return false;
+    return tree.firstToken(target) >= tree.firstToken(node) and tree.lastToken(target) <= tree.lastToken(node);
 }
 
 /// How far input can make `expression` fail: what it holds, and what each call whose result

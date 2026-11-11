@@ -2270,7 +2270,7 @@ fn contextKept(c: *Context, file: Project.FileId, function: Ast.Node.Index, decl
     var up = record.node;
     while (model.parentOf(up)) |parent| : (up = parent) {
         if (parent == function) break;
-        if (tree.fullWhile(parent) != null or tree.fullFor(parent) != null) return false;
+        if (reentered(tree, model, parent)) return false;
     }
     const first = tree.firstToken(function);
     const last = tree.lastToken(function);
@@ -2432,15 +2432,34 @@ fn heldSpan(c: *Context, tree: *const Ast, model: *const Model, function: Ast.No
     return .{ .start = start, .end = end, .exit = if (exits) last else end };
 }
 
-/// The outermost loop around `node` within `function`.
+/// The outermost loop around `node` within `function` (`reentered`).
 fn outermostLoop(tree: *const Ast, model: *const Model, node: Ast.Node.Index, function: Ast.Node.Index) ?Ast.Node.Index {
     var found: ?Ast.Node.Index = null;
     var at = node;
     while (model.parentOf(at)) |parent| : (at = parent) {
         if (parent == function) break;
-        if (tree.fullWhile(parent) != null or tree.fullFor(parent) != null) found = parent;
+        if (reentered(tree, model, parent)) found = parent;
     }
     return found;
+}
+
+/// Whether control can enter `node` again from within it, so what it holds runs once more after
+/// what it holds later: a `while`, a `for`, or a labeled `switch` a `continue` names
+/// (`continue :sw next`, as `Facts.accesses.breakTarget` reads where a jump goes).
+fn reentered(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
+    if (tree.fullWhile(node) != null or tree.fullFor(node) != null) return true;
+    const choice = tree.fullSwitch(node) orelse return false;
+    if (choice.label_token == null) return false;
+    const first = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"continue") continue;
+        const jump: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(jump);
+        if (token < first or token > last) continue;
+        if (Facts.accesses.breakTarget(tree, model, jump) == node) return true;
+    }
+    return false;
 }
 
 /// A guard's binding (`boundBy`): the statement, the local, and the member of it that holds the
@@ -2585,7 +2604,7 @@ fn releaseOf(c: *Context, file: Project.FileId, bound: Bound) Context.Error!?Rel
     var loop: ?Ast.Node.Index = null;
     var at = statement;
     while (model.parentOf(at)) |parent| : (at = parent) {
-        if (tree.fullWhile(parent) != null or tree.fullFor(parent) != null) loop = parent;
+        if (reentered(tree, model, parent)) loop = parent;
         switch (tree.nodeTag(parent)) {
             .@"defer", .@"errdefer", .fn_decl => return null,
             .block, .block_semicolon, .block_two, .block_two_semicolon => {},
@@ -3067,7 +3086,8 @@ fn guardType(c: *Context, held: Facts.Container) Context.Error!Guard {
 
 /// A016: two or more identifying integers of one type meeting in one public signature or one
 /// public struct, where nothing keeps one from standing for the other. A signature is a
-/// function's or a function type's (`*const fn (parent_id: u32, child_id: u32) void`), and a
+/// function's or a function type's (`*const fn (parent_id: u32, child_id: u32) void`), a public
+/// function being a `pub` or an `export` one (`exported`), and a
 /// struct any container `reached` from outside the file: by a `pub` name, a name a reached
 /// declaration uses (`pub const Link = Edge;`), a public signature's (an anonymous struct
 /// parameter) or what a reached type function returns. Two names are one integer when their
@@ -3079,7 +3099,7 @@ pub fn identity(c: *Context, rule: Rule) Context.Error!void {
     const model = &c.project.at(c.file).model;
     const reaches = try reached(c, tree, model);
     for (model.declarations, 0..) |decl, index| {
-        if (decl.kind != .function or !(decl.public or reaches[index]) or c.inTest(decl.token)) continue;
+        if (decl.kind != .function or !(decl.public or reaches[index] or exported(tree, decl)) or c.inTest(decl.token)) continue;
         var buffer: [1]Ast.Node.Index = undefined;
         const proto = tree.fullFnProto(&buffer, decl.node) orelse continue;
         try signature(c, rule, tree, proto, decl.token);
@@ -3123,7 +3143,8 @@ fn signature(c: *Context, rule: Rule, tree: *const Ast, proto: Ast.full.FnProto,
     var it = proto.iterate(tree);
     while (it.next()) |param| {
         const name = param.name_token orelse continue;
-        if (param.comptime_noalias != null or !identifies(tree.tokenSlice(name))) continue;
+        // By the name it declares: `@"parent_id"` is `parent_id`.
+        if (param.comptime_noalias != null or !identifies(try Model.identifier(c.allocator, tree.tokenSlice(name)))) continue;
         // `anytype` is whatever a caller gives, an integer among them.
         const kind: Kind = if (param.type_expr) |written| (try kindOf(c, tree, written)) orelse continue else .{ .spelled = "anytype", .unknown = true };
         try names.append(c.allocator, name);
@@ -3203,7 +3224,7 @@ fn reached(c: *Context, tree: *const Ast, model: *const Model) Context.Error![]c
     while (changed) {
         changed = false;
         for (model.declarations, 0..) |decl, index| {
-            if (out[index] or !decl.public or !atContainerLevel(model, decl)) continue;
+            if (out[index] or !(decl.public or exported(tree, decl)) or !atContainerLevel(model, decl)) continue;
             if (model.parentOf(decl.node)) |parent| if (!try reachedFrom(c, tree, model, out, parent)) continue;
             out[index] = true;
             changed = true;
@@ -3217,6 +3238,19 @@ fn reached(c: *Context, tree: *const Ast, model: *const Model) Context.Error![]c
         }
     }
     return out;
+}
+
+/// Whether a declaration is an `export` one, which code outside the program reaches by its
+/// symbol: a function or a variable.
+fn exported(tree: *const Ast, decl: Model.Declaration) bool {
+    var buffer: [1]Ast.Node.Index = undefined;
+    const token = if (decl.kind == .function)
+        (tree.fullFnProto(&buffer, decl.node) orelse return false).extern_export_inline_token
+    else if (decl.kind == .variable)
+        (tree.fullVarDecl(decl.node) orelse return false).extern_export_token
+    else
+        return false;
+    return tree.tokenTag(token orelse return false) == .keyword_export;
 }
 
 /// Whether a declaration is a container's or the file's own: a constant, variable or function.
@@ -3253,8 +3287,9 @@ fn reachedFrom(c: *Context, tree: *const Ast, model: *const Model, out: []const 
     return true;
 }
 
-/// Whether a name says what it holds identifies something: `id`, `index` or `handle`, alone or
-/// as the last word (`node_id`, `nodeIndex`, `nodeID`).
+/// Whether a name says what it holds identifies something: `id`, `index`, `idx` or `handle`, in
+/// any case alone, or as the last word: after `_` in lower or upper case (`node_id`,
+/// `node_ID`, `NODE_ID`), or camelCase (`nodeIndex`, `nodeID`).
 fn identifies(name: []const u8) bool {
     for ([_][]const u8{ "id", "index", "handle", "idx" }) |word| {
         if (std.ascii.eqlIgnoreCase(name, word)) return true;
@@ -3263,7 +3298,7 @@ fn identifies(name: []const u8) bool {
         const tail = name[name.len - word.len ..];
         if (head.len == 0) continue;
         const before = head[head.len - 1];
-        if (before == '_' and std.mem.eql(u8, tail, word)) return true;
+        if (before == '_' and (std.mem.eql(u8, tail, word) or (upper(tail) and std.ascii.eqlIgnoreCase(tail, word)))) return true;
         // camelCase: the word starts upper case, or is all upper case (`parentID`), after a
         // lower-case letter or digit.
         if (std.ascii.isUpper(tail[0]) and std.ascii.eqlIgnoreCase(tail, word) and (std.mem.eql(u8, tail[1..], word[1..]) or upper(tail)) and (std.ascii.isLower(before) or std.ascii.isDigit(before))) return true;
@@ -3277,7 +3312,7 @@ fn upper(word: []const u8) bool {
     return true;
 }
 
-/// The integer type a resolved value names, by its spelling in Zig (`u32`, `usize`).
+/// The integer type a resolved value names, by its spelling in Zig (`u32`, `usize`, `c_uint`).
 fn integer(value: Facts.Value) ?[]const u8 {
     const name = switch (value) {
         .primitive => |name| name,
@@ -3285,10 +3320,12 @@ fn integer(value: Facts.Value) ?[]const u8 {
         .alternatives => return null,
         else => return null,
     };
-    if (std.mem.eql(u8, name, "usize") or std.mem.eql(u8, name, "isize")) return name;
-    if (name.len < 2 or (name[0] != 'u' and name[0] != 'i')) return null;
-    for (name[1..]) |byte| if (!std.ascii.isDigit(byte)) return null;
-    return name;
+    // By `Facts.integerType`, the one reading of a primitive integer: Zig's `uN`, `iN`,
+    // `usize`, `isize` and C's (`c_uint`); `comptime_int` is no type a value is held in.
+    return switch (Facts.integerType(value, 64)) {
+        .int => name,
+        .literal, .unknown => null,
+    };
 }
 
 /// Whether a container is declared `pub` (`pub const S = struct { ... }`).
@@ -3314,7 +3351,11 @@ fn publicContainer(tree: *const Ast, model: *const Model, node: Ast.Node.Index) 
 /// its integer plus one), there or where the function that writes it is called; each function
 /// that calls a writer writes it too, where the writer gives no one state fixed where it is
 /// made (`fixedFunctions`). A call that does not resolve, given the holder under such a
-/// condition, may call a writer: undecided. A kind set where its value is built or read (a
+/// condition, may call a writer: undecided. What is not known never clears: a field whose type
+/// does not resolve (or is reflected, or chosen per build among kinds) is read as an enum's, a
+/// read through a holder whose type does not resolve as one that may be this field's, and
+/// reads not all followed on as ones that may switch on it, each undecided where it would be
+/// found. A kind set where its value is built or read (a
 /// table's layout, a date's kind) is data. A field moved on the records a loop walks is moved
 /// on each of them: a record's states kept by hand all the same.
 pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
@@ -3323,19 +3364,46 @@ pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
     for (model.declarations, 0..) |decl, index| {
         if (decl.kind != .field or c.inTest(decl.token)) continue;
         const written = (model.containerField(tree, decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
-        const hold = (try stateHold(c, try c.facts.resolve(c.file, written))) orelse continue;
+        // A type that does not resolve may hold a state of any kind (`stateHold`): read as an
+        // enum's, whose switches and writes are the most, and undecided where that would report.
+        const held = try stateHold(c, try c.facts.resolve(c.file, written));
+        const hold: StateHold = switch (held) {
+            .state => |one| one,
+            .none => continue,
+            .unknown => .enumerated,
+        };
         const holder: Facts.Container = .{ .file = c.file, .scope = decl.scope };
         var uses: std.ArrayList(Facts.Key) = .empty;
         var writes: std.ArrayList(StateWrite) = .empty;
+        // A read through a holder whose type does not resolve may be this field's: kept apart
+        // (`doubtful`), it may switch on the state or choose a write, and makes what it would
+        // decide undecided.
+        var doubtful: std.ArrayList(Facts.Key) = .empty;
         for (try fieldUses(c, decl.name)) |use| {
-            const owner = byPointer(try c.facts.resolve(use.file, use.receiver)) orelse continue;
-            if (owner.file != holder.file or owner.scope != holder.scope) continue;
-            try uses.append(c.allocator, .{ .file = use.file, .node = use.node });
+            const key: Facts.Key = .{ .file = use.file, .node = use.node };
+            switch (pointsAt(try c.facts.resolve(use.file, use.receiver), holder) orelse {
+                try doubtful.append(c.allocator, key);
+                continue;
+            }) {
+                true => try uses.append(c.allocator, key),
+                false => {},
+            }
         }
-        try carried(c, &uses, decl.name);
+        // Reads not all followed on (`Followed`) leave the same doubt.
+        var followed = try carried(c, &uses, decl.name);
+        var all = uses;
+        if (doubtful.items.len != 0) {
+            all = try uses.clone(c.allocator);
+            for (doubtful.items) |use| try carry(c, &all, use);
+            followed = followed.with(try carried(c, &all, decl.name));
+        }
         var switched = false;
-        for (uses.items) |use| switched = switched or try switchedOn(c, use.file, use.node, hold);
-        if (!switched) continue;
+        for (uses.items) |use| switched = switched or try switchedOn(c, use.file, use.node, hold) or (held == .unknown and try switchedOn(c, use.file, use.node, .atomic));
+        var maybe_switched = false;
+        if (!switched and doubtful.items.len != 0) for (all.items) |use| {
+            maybe_switched = maybe_switched or try switchedOn(c, use.file, use.node, hold) or (held == .unknown and try switchedOn(c, use.file, use.node, .atomic));
+        };
+        if (!switched and !maybe_switched and !followed.lost and !followed.capped) continue;
         try stateWrites(c, .{ .file = c.file, .index = @fromBackingInt(@intCast(index)) }, hold, &writes);
         const state: LiteralState = if (hold == .enumerated) .state else try literalState(c, hold, decl.name, .{ .file = c.file, .node = written }, writes.items, uses.items);
         if (state == .value) continue;
@@ -3354,17 +3422,31 @@ pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
         }
         // With one writer, a call that does not resolve may be one more: its caller.
         if (writers.items.len == 0 or (writers.items.len == 1 and !unseen)) continue;
-        const verdict = try moved(c, uses.items, writes.items, holder);
+        var verdict = try moved(c, uses.items, writes.items, holder);
+        // A read past those followed, or one through a holder whose type does not resolve, may
+        // be the condition a write is made under. One handed to code not followed is no
+        // condition here: what that code gives back is not followed for a call that resolves
+        // either (`carried`).
+        const doubted = verdict == .no and (followed.capped or (doubtful.items.len != 0 and try moved(c, all.items, writes.items, holder) != .no));
+        if (doubted) verdict = .maybe;
         switch (if (writers.items.len == 1 and verdict == .yes) .maybe else verdict) {
             .no => continue,
             .maybe => {
-                try c.undecided(rule, tree.tokenStart(decl.token), .unresolved, "a state written through its address, by a destructure of a value not read or by a function a call that does not resolve may make, may be moved on its own value");
+                try c.undecided(rule, tree.tokenStart(decl.token), .unresolved, if (doubted) "a read of a field so named through a holder whose type does not resolve, or past the reads followed, may be the condition a write of this state is made under: whether it is moved on its own value is not known" else "a state written through its address, by a destructure of a value not read, by a function a call that does not resolve may make, or as a member so named on a holder whose type does not resolve or by a computed @field, may be moved on its own value");
                 continue;
             },
             .yes => {},
         }
         if (state == .unknown) {
             try c.undecided(rule, tree.tokenStart(decl.token), .unresolved, "a state written with a name that does not resolve: whether the program chooses among literals for it is not known");
+            continue;
+        }
+        if (held == .unknown) {
+            try c.undecided(rule, tree.tokenStart(decl.token), .unresolved, "a field whose type does not resolve, written in two or more functions, switched on and moved on its own value, may be a state kept by hand");
+            continue;
+        }
+        if (!switched) {
+            try c.undecided(rule, tree.tokenStart(decl.token), .unresolved, "a state written in two or more functions and moved on its own value may be switched on through a holder whose type does not resolve, or where its reads are not all followed");
             continue;
         }
         try c.at(rule, decl.token, try c.allocator.print("'{s}' is a state machine kept by hand: written in {d} functions, moved on its own value and switched on; aegis state.Machine states which transitions there are", .{ decl.name, writers.items.len }));
@@ -3440,9 +3522,21 @@ fn unaryOperator(tree: *const Ast, node: Ast.Node.Index) bool {
 /// an integer literal or an enum tag's integer (`@intFromEnum(Phase.idle)`), or a choice of
 /// them; in a literal of the field's holder (`.{ .len = 1 }`), what it gives the field, or
 /// `default` where it names it not.
-fn literalChoice(c: *Context, file: Project.FileId, node: Ast.Node.Index, hold: StateHold, name: []const u8, depth: u8) Context.Error!enum { literal, default, unknown, other } {
-    if (depth == 8) return .other;
+fn literalChoice(c: *Context, file: Project.FileId, node: Ast.Node.Index, hold: StateHold, name: []const u8, depth: u8) Context.Error!Choice {
+    // Past what is read, it may be one.
+    if (depth == 8) return .unknown;
     const tree = &c.project.at(file).file.tree;
+    // A labeled block: what each `break` out of it gives (`Facts.breaksOut`).
+    var statements: [2]Ast.Node.Index = undefined;
+    if (tree.blockStatements(&statements, node) != null) {
+        var unknown = false;
+        for (try c.facts.breaksOut(file, node)) |value| switch (try literalChoice(c, file, value, hold, name, depth + 1)) {
+            .literal => return .literal,
+            .unknown => unknown = true,
+            .other, .default => {},
+        };
+        return if (unknown) .unknown else .other;
+    }
     if (tree.fullIf(node)) |branch| {
         const then = try literalChoice(c, file, branch.ast.then_expr, hold, name, depth + 1);
         if (then == .literal) return .literal;
@@ -3463,7 +3557,8 @@ fn literalChoice(c: *Context, file: Project.FileId, node: Ast.Node.Index, hold: 
         // A literal of the holder: what it gives the field.
         for (init.ast.fields) |field| {
             const label = tree.firstToken(field) - 2;
-            if (tree.tokenTag(label) == .identifier and std.mem.eql(u8, tree.tokenSlice(label), name)) return literalChoice(c, file, field, hold, name, depth + 1);
+            // By the name it gives: `.@"state" = x` is `state`.
+            if (tree.tokenTag(label) == .identifier and std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(label)), name)) return literalChoice(c, file, field, hold, name, depth + 1);
         }
         // A union's own literal, of one tag; else the holder's, which gives the field its default.
         if (hold != .integral and init.ast.type_expr == .none and init.ast.fields.len == 1) return .literal;
@@ -3487,22 +3582,54 @@ fn literalChoice(c: *Context, file: Project.FileId, node: Ast.Node.Index, hold: 
                 .unknown => .unknown,
             };
         }
-        return .other;
+        return integralConstant(c, file, node, hold);
+    }
+    // A constant's name (`idle`, `Codes.open`): what its initializer gives, by the declaration
+    // it resolves to; one that does not resolve may name one.
+    const member = try Facts.accesses.memberRead(c.facts, file, node) != null;
+    switch (try c.facts.definition(file, node)) {
+        .decl => |decl| if (constantInitializer(c, decl)) |value| return literalChoice(c, decl.file, value, hold, name, depth + 1),
+        .unknown => return .unknown,
+        .none => {},
     }
     // A declared tag (`Phase.idle`), by the declaration the member read names.
-    if (try Facts.accesses.memberRead(c.facts, file, node) != null) return if (hold == .integral) .other else switch (try declaredTag(c, file, node)) {
+    if (member) return if (hold == .integral) .other else switch (try declaredTag(c, file, node)) {
         .yes => .literal,
         .no => .other,
         .unknown => .unknown,
     };
     // A literal (`Facts.literalOf`): an enum literal of a state held as a tag; a number or a
     // character of one held as an integer.
-    return switch ((try c.facts.literalOf(file, node)) orelse return .other) {
+    const literal = (try c.facts.literalOf(file, node)) orelse return integralConstant(c, file, node, hold);
+    return switch (literal) {
         .enum_literal => if (hold != .integral) .literal else .other,
         .number, .char => if (hold == .integral) .literal else .other,
         else => .other,
     };
 }
+
+/// For a state held as an integer, whether `node` is an integer the program fixes as it
+/// compiles (`Facts.comptimeValue`: `std.math.maxInt(u8)`, `@intCast(idle)`): a literal choice.
+fn integralConstant(c: *Context, file: Project.FileId, node: Ast.Node.Index, hold: StateHold) Context.Error!Choice {
+    if (hold != .integral) return .other;
+    const fixed = (try c.facts.comptimeValue(null, file, node)) orelse return .other;
+    return if (fixed == .integer) .literal else .other;
+}
+
+/// The initializer of a constant `decl` declares (`const idle: u8 = 0;`); null for a `var`, a
+/// field, a parameter, a capture, a function.
+fn constantInitializer(c: *Context, decl: Facts.Decl) ?Ast.Node.Index {
+    const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+    if (record.kind != .variable) return null;
+    const tree = &c.project.at(decl.file).file.tree;
+    const variable = tree.fullVarDecl(record.node) orelse return null;
+    if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
+    return variable.ast.init_node.unwrap();
+}
+
+/// What `literalChoice` finds a written value to be: a literal choice; the field's default, a
+/// literal of its holder naming it not; not known; or another value.
+const Choice = enum { literal, default, unknown, other };
 
 /// Whether `node` (`Phase.idle`) names an enum's tag by its declaration: a constant, not a
 /// value read from a place; not known where the name does not resolve.
@@ -3524,10 +3651,12 @@ fn declaredTag(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.
 /// initializes or is stored in (`const now = j.state;`, `const next = switch (j.state) ...`),
 /// one a destructure takes it into, what an `if` or a `while` captures of it, each parameter of
 /// a function of the program it is given as, and each call of a function that returns it (a
-/// getter, a predicate), and from those in turn.
-fn carried(c: *Context, uses: *std.ArrayList(Facts.Key), name: []const u8) Context.Error!void {
+/// getter, a predicate), and from those in turn; with what was not followed on (`Followed`).
+fn carried(c: *Context, uses: *std.ArrayList(Facts.Key), name: []const u8) Context.Error!Followed {
+    var lost = false;
     var next: usize = 0;
-    while (next < uses.items.len and uses.items.len < 256) : (next += 1) {
+    while (next < uses.items.len) : (next += 1) {
+        if (uses.items.len >= 256) return .{ .lost = lost, .capped = true };
         const use = uses.items[next];
         const tree = &c.project.at(use.file).file.tree;
         const model = &c.project.at(use.file).model;
@@ -3539,7 +3668,10 @@ fn carried(c: *Context, uses: *std.ArrayList(Facts.Key), name: []const u8) Conte
             .initializes => |declaration| local = declaredBy(model, declaration),
             .stored => |site| {
                 if (site.node != node) continue;
-                local = try declarationOf(c, use.file, site.target orelse continue);
+                local = try declarationOf(c, use.file, site.target orelse {
+                    lost = true;
+                    continue;
+                });
             },
             .returned => |ret| {
                 const function = enclosingFunction(model, tree, ret) orelse continue;
@@ -3548,7 +3680,7 @@ fn carried(c: *Context, uses: *std.ArrayList(Facts.Key), name: []const u8) Conte
             },
             .element_of => |element| {
                 const variable = (try destructured(c, use.file, element.literal, element.position)) orelse {
-                    try parameterOf(c, uses, use.file, node, at);
+                    lost = try parameterOf(c, uses, use.file, node, at) or lost;
                     continue;
                 };
                 local = declaredBy(model, variable) orelse try localOf(c, use.file, variable);
@@ -3558,14 +3690,27 @@ fn carried(c: *Context, uses: *std.ArrayList(Facts.Key), name: []const u8) Conte
                     local = @fromBackingInt(@intCast(i));
                 };
             } else {
-                try parameterOf(c, uses, use.file, node, at);
+                lost = try parameterOf(c, uses, use.file, node, at) or lost;
                 continue;
             },
         }
         const d = local orelse continue;
         for (model.references) |reference| if (reference.declaration == d) try carry(c, uses, .{ .file = use.file, .node = reference.node });
     }
+    return .{ .lost = lost };
 }
+
+/// What `carried` did not follow on: a read handed to what no expression names or to a call
+/// whose callee or arguments do not resolve (`parameterOf`), which may switch on it there
+/// (`lost`); and reads past the 256 it follows, any of which may also choose a write (`capped`).
+const Followed = struct {
+    lost: bool = false,
+    capped: bool = false,
+
+    fn with(a: Followed, b: Followed) Followed {
+        return .{ .lost = a.lost or b.lost, .capped = a.capped or b.capped };
+    }
+};
 
 /// What gives a value made of `at` that carries a read of the state `state` on (`carried`):
 /// `.?`, parentheses, `orelse`'s and `catch`'s left side, `.*`, `&`, a comparison and the logic
@@ -3644,27 +3789,35 @@ fn destructured(c: *Context, file: Project.FileId, tuple: Ast.Node.Index, positi
 }
 
 /// Adds the references to the parameter of each function of the program a call gives `at` to,
-/// a bound receiver first.
-fn parameterOf(c: *Context, uses: *std.ArrayList(Facts.Key), file: Project.FileId, node: Ast.Node.Index, at: Ast.Node.Index) Context.Error!void {
-    const call = (try Facts.calls.at(c.facts, file, node)) orelse return;
+/// a bound receiver first. Whether the call may give it to code not followed: its callee or its
+/// arguments do not resolve, or a callee is no function declared.
+fn parameterOf(c: *Context, uses: *std.ArrayList(Facts.Key), file: Project.FileId, node: Ast.Node.Index, at: Ast.Node.Index) Context.Error!bool {
+    const call = (try Facts.calls.at(c.facts, file, node)) orelse return false;
     const args = switch (call.args) {
         .known => |args| args,
-        .unknown => return,
+        .unknown => return true,
     };
-    const position = std.mem.findScalar(Ast.Node.Index, args, at) orelse return;
+    const position = std.mem.findScalar(Ast.Node.Index, args, at) orelse return false;
     const choices: []const Facts.Decl = switch (call.callee) {
         .function => |*one| one[0..1],
         .choice => |all| all,
-        .any => return,
+        .any => return true,
     };
     const program = try Program.get(c);
+    var lost = false;
     for (choices) |choice| {
-        const decl = (try originKnown(c, choice)) orelse continue;
+        const decl = (try originKnown(c, choice)) orelse {
+            lost = true;
+            continue;
+        };
         if (!program.own(decl.file)) continue;
         const callee_tree = &c.project.at(decl.file).file.tree;
         const callee_model = &c.project.at(decl.file).model;
         var buffer: [1]Ast.Node.Index = undefined;
-        const proto = callee_tree.fullFnProto(&buffer, callee_model.declarations[@backingInt(decl.index)].node) orelse continue;
+        const proto = callee_tree.fullFnProto(&buffer, callee_model.declarations[@backingInt(decl.index)].node) orelse {
+            lost = true;
+            continue;
+        };
         var it = proto.iterate(callee_tree);
         var i: usize = 0;
         while (it.next()) |param| : (i += 1) {
@@ -3676,6 +3829,7 @@ fn parameterOf(c: *Context, uses: *std.ArrayList(Facts.Key), file: Project.FileI
             break;
         }
     }
+    return lost;
 }
 
 /// The name token an `if` or a `while` captures its condition `condition` as, past `*`.
@@ -3722,8 +3876,10 @@ const StateWrite = struct { file: Project.FileId, node: Ast.Node.Index, target: 
 /// a tagged union's payload taken by address none. Memory code the program does not hold writes
 /// over it (bytes, `extern`) is a write that chooses no state on its own value; a call into the
 /// program's own functions (a comptime function's, as Facts.calls binds it) is none of its own,
-/// their writes found where they are made; one that does not resolve is `unseen`. A store of `undefined` gives it no state. A holder whose type does
-/// not resolve is read as no holder of it, as its uses are.
+/// their writes found where they are made; one that does not resolve is `unseen`. A store of `undefined` gives it no state. A member so named
+/// written on a holder whose type does not resolve, memory that does not resolve
+/// (`Facts.accesses`' `named` and `unresolved` sites) and a field `@field` names by a name it
+/// computes may write it: `unseen`.
 fn stateWrites(c: *Context, field: Facts.Decl, hold: StateHold, writes: *std.ArrayList(StateWrite)) Context.Error!void {
     const program = try Program.get(c);
     const field_tree = &c.project.at(field.file).file.tree;
@@ -3736,7 +3892,10 @@ fn stateWrites(c: *Context, field: Facts.Decl, hold: StateHold, writes: *std.Arr
     }
     var found_sites = Facts.accesses.writes(c.facts, .{ .field = field }, files.items);
     while (try found_sites.next()) |site| {
-        if (site.reach == .named or site.reach == .unresolved) continue;
+        // A member so spelled on a holder whose type does not resolve, memory that does not
+        // resolve, or a field `@field` names by a name it computes, may be this field: a write
+        // of it not seen.
+        const blind = site.reach == .named or site.reach == .unresolved or site.computed;
         const tree = &c.project.at(site.file).file.tree;
         const value: ?Ast.Node.Index = switch (site.kind) {
             .init, .read => continue,
@@ -3745,7 +3904,7 @@ fn stateWrites(c: *Context, field: Facts.Decl, hold: StateHold, writes: *std.Arr
             // atomic.Value's own operations do with it (`atomicWrite`).
             // A tagged union's payload taken by address (`.a => |*p|`) is written through it,
             // never its tag: no write of the state.
-            .address => if (site.reach == .holder or (hold == .tagged and payloadCapture(tree, site.node))) continue else if (hold == .atomic) switch (try atomicWrite(c, site.file, site.target orelse site.node)) {
+            .address => if ((site.reach == .holder and !blind) or (hold == .tagged and payloadCapture(tree, site.node))) continue else if (hold == .atomic) switch (try atomicWrite(c, site.file, site.target orelse site.node)) {
                 .read => continue,
                 .write => |value| value,
                 .unknown => null,
@@ -3753,18 +3912,18 @@ fn stateWrites(c: *Context, field: Facts.Decl, hold: StateHold, writes: *std.Arr
             .set => if (site.value) |value| written: {
                 // `undefined` gives it no state: reading it after is illegal.
                 if (try undefinedValue(c, site.file, value)) continue;
-                if (site.reach == .holder and !try madeValue(c, site.file, value, state, 0)) continue;
+                if (site.reach == .holder and !blind and !try madeValue(c, site.file, value, state, 0)) continue;
                 break :written value;
             } else null,
             .update => site.node,
             // std's copies of whole holders (`append`, `std.mem.sort`) carry states made where
             // their values were, and code given a pointer to const writes none; other code over
             // the holder (`extern`) writes bytes.
-            .covered => if (site.reach == .holder and try coveredRead(c, site.file, site.node, site.target)) continue else null,
+            .covered => if (site.reach == .holder and !blind and try coveredRead(c, site.file, site.node, site.target)) continue else null,
             // A program the unit is read for may write any state, by code not seen here.
             .open => null,
         };
-        var unseen = site.kind == .open;
+        var unseen = site.kind == .open or blind;
         // A view that reads the holder as other bytes, handed to a function the program holds,
         // is written there through a parameter of another type: here, not where it is made.
         const as_bytes = if (site.target) |given| try Facts.accesses.reinterprets(c.facts, site.file, given) else false;
@@ -4037,7 +4196,9 @@ fn literalProngs(c: *Context, file: Project.FileId, choice: Ast.full.Switch) Con
         for (case.ast.values) |value| {
             // A range's first bound (`1...3`).
             const item = if (tree.nodeTag(value) == .switch_range) tree.nodeData(value).node_and_node[0] else value;
-            const literal = if (try c.facts.literalOf(file, item)) |known| known == .number or known == .char else false;
+            // A literal, or a constant (`idle =>`) by the value the program fixes for it; an
+            // item whose value is not read is still one the language fixes as it compiles.
+            const literal = if (try c.facts.literalOf(file, item)) |known| known == .number or known == .char else if (try c.facts.comptimeValue(null, file, item)) |fixed| fixed == .integer else true;
             if (!literal) return false;
             any = true;
         }
@@ -4310,8 +4471,9 @@ fn moved(c: *Context, uses: []const Facts.Key, writes: []const StateWrite, holde
     return if (maybe) .maybe else .no;
 }
 
-/// Whether a call of the program that does not resolve, given a value of the holder's type,
-/// is made under a condition on the state: it may call a writer (`moved`).
+/// Whether a call of the program that does not resolve, given a value of the holder's type (or
+/// one whose type does not resolve, or arguments that do not), is made under a condition on the
+/// state: it may call a writer (`moved`).
 fn unresolvedUnder(c: *Context, uses: []const Facts.Key, holder: Facts.Container) Context.Error!bool {
     const program = try Program.get(c);
     for (c.project.sources) |*each| {
@@ -4320,14 +4482,12 @@ fn unresolvedUnder(c: *Context, uses: []const Facts.Key, holder: Facts.Container
         const model = &c.project.at(each.id).model;
         for (try Facts.calls.in(c.facts, each.id)) |*call| {
             if (call.callee != .any) continue;
-            const args = switch (call.args) {
-                .known => |args| args,
-                .unknown => continue,
+            const given = switch (call.args) {
+                .known => |args| for (args) |arg| {
+                    if (pointsAt(try c.facts.resolve(each.id, arg), holder) orelse true) break true;
+                } else false,
+                .unknown => true,
             };
-            const given = for (args) |arg| {
-                const owner = byPointer(try c.facts.resolve(each.id, arg)) orelse continue;
-                if (owner.file == holder.file and owner.scope == holder.scope) break true;
-            } else false;
             if (!given) continue;
             const function = enclosingFunction(model, tree, call.node) orelse continue;
             if (conditioned(tree, model, uses, each.id, call.node, function)) return true;
@@ -4392,15 +4552,40 @@ fn mayLeave(tree: *const Ast, node: Ast.Node.Index) bool {
 /// an integer, or std's `atomic.Value` of one.
 const StateHold = enum { enumerated, tagged, integral, atomic };
 
-fn stateHold(c: *Context, value: Facts.Value) Context.Error!?StateHold {
-    if (integer(value) != null) return .integral;
-    const container = byValue(value) orelse return null;
+/// What a field's type holds (`stateHold`): a state of one kind; none; or not known, where the
+/// type does not resolve, is read by reflection or built from field types, or is a choice per
+/// build of types that hold different kinds.
+const StateType = union(enum) { state: StateHold, none, unknown };
+
+/// What a type holds by value, through optionals, error unions and arrays, never a pointer,
+/// which borrows; chosen per build, what every part holds.
+fn stateHold(c: *Context, value: Facts.Value) Context.Error!StateType {
+    if (integer(value) != null) return .{ .state = .integral };
+    const container = switch (value) {
+        .container, .instance => |k| k,
+        .optional, .error_union, .array => |inner| return stateHold(c, inner.*),
+        .alternatives => |parts| {
+            var found: ?StateType = null;
+            for (parts) |part| {
+                const one = try stateHold(c, part);
+                if (one == .unknown) return .unknown;
+                if (found) |known| if (!std.meta.eql(known, one)) return .unknown;
+                found = one;
+            }
+            return found orelse .unknown;
+        },
+        // A value of a primitive whose type is not named may be an integer's.
+        .unknown, .reflected, .reified, .scalar => return .unknown,
+        // An integer type of a width computed as the program compiles is an integer; an enum
+        // type built from a list of names (`Facts`' `@Enum`, a union's tag) may name tags or none.
+        .primitive => |name| return if (std.mem.eql(u8, name, "@Int")) .{ .state = .integral } else if (std.mem.eql(u8, name, "@Enum")) .unknown else .none,
+        .function, .pointer, .error_set, .literal, .fn_type => return .none,
+    };
     // An enum that names no tag (`enum(u32) { _ }`) is an id: switched on, it picks what it
     // names, not a state.
-    if (isEnum(c, container)) return if (namesTags(c, container)) .enumerated else null;
-    if (taggedUnion(c, container)) return .tagged;
-    if (try atomicValue(c, container)) return .atomic;
-    return null;
+    if (isEnum(c, container)) return if (namesTags(c, container)) .{ .state = .enumerated } else .none;
+    if (taggedUnion(c, container)) return .{ .state = .tagged };
+    return if (try atomicValue(c, container)) |atomic| if (atomic) .{ .state = .atomic } else .none else .unknown;
 }
 
 /// Whether a container declares a field other than `_`: an enum's named tag.
@@ -4426,17 +4611,18 @@ fn taggedUnion(c: *Context, value: Facts.Container) bool {
     return container.ast.enum_token != null or container.ast.arg != .none;
 }
 
-/// Whether a container is one std's `atomic.Value` makes.
-fn atomicValue(c: *Context, held: Facts.Container) Context.Error!bool {
+/// Whether a container is one std's `atomic.Value` makes; null where std's does not resolve.
+fn atomicValue(c: *Context, held: Facts.Container) Context.Error!?bool {
     const decls = switch (try Governed.declarations(c, "std", "atomic.Value")) {
         .decls => |decls| decls,
-        .none, .unknown => return false,
+        .none => return false,
+        .unknown => return null,
     };
     const tree = &c.project.at(held.file).file.tree;
     const model = &c.project.at(held.file).model;
     const first = model.scopes[@backingInt(held.scope)].first;
     for (decls) |each| {
-        const decl = (try originKnown(c, each)) orelse continue;
+        const decl = (try originKnown(c, each)) orelse return null;
         if (decl.file != held.file) continue;
         const function = model.parentOf(model.declarations[@backingInt(decl.index)].node) orelse continue;
         if (first >= tree.firstToken(function) and first <= tree.lastToken(function)) return true;
@@ -4652,6 +4838,21 @@ fn byValue(value: Facts.Value) ?Facts.Container {
         found = one;
     }
     return found;
+}
+
+/// Whether a value is or points at `holder`: chosen per build, where some part
+/// (`Facts.valueParts`) is; null where a part does not resolve and none is.
+fn pointsAt(value: Facts.Value, holder: Facts.Container) ?bool {
+    var each: Facts.Join = .{};
+    for (Facts.valueParts(&value)) |part| each.add(part, switch (part) {
+        .container, .instance => |k| k.file == holder.file and k.scope == holder.scope,
+        .pointer => |inner| pointsAt(inner.child.*, holder),
+        .optional => |inner| pointsAt(inner.*, holder),
+        .unknown => null,
+        .alternatives => null, // a choice, never a part (valueParts): not known
+        else => false,
+    });
+    return each.any();
 }
 
 /// The container a value is or points at. Chosen per build, the one every part
