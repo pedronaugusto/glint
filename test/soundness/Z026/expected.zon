@@ -6,6 +6,8 @@
         .destructure,
         // A pointer to an error keeps it; no handler drops one by taking its address.
         .address,
+        // A call is not empty; no callee body is read (callee_only_returns, callee_drops: deleted).
+        .call,
         // An operator only reads an error (`err == error.X`); the handler around it is the
         // branch row.
         .operator,
