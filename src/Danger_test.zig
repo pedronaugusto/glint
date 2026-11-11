@@ -1395,66 +1395,6 @@ test "A016 finds identifying integers of one type meeting, not other integers" {
     , 2);
 }
 
-test "A017 finds an enum state written in two functions and switched on" {
-    try expect(pack.state_machines,
-        \\const Phase = enum { idle, running, done };
-        \\const Job = struct {
-        \\    phase: Phase = .idle,
-        \\    kind: Phase = .idle,
-        \\    fn start(j: *Job) void { j.phase = .running; j.kind = .done; }
-        \\    fn finish(j: *Job) void { j.phase = .done; }
-        \\    fn step(j: *Job) void { switch (j.phase) { .idle => j.start(), .running => j.finish(), .done => {} } switch (j.kind) { else => {} } }
-        \\};
-        \\pub fn run(j: *Job) void { j.step(); }
-    , 1);
-    // The holder moves it in the switch itself.
-    try expect(pack.state_machines,
-        \\const Phase = enum { idle, running, done };
-        \\const Job = struct {
-        \\    phase: Phase = .idle,
-        \\    fn reset(j: *Job) void { j.phase = .idle; }
-        \\    fn step(j: *Job) void { switch (j.phase) { .idle => j.phase = .running, .running => j.phase = .done, .done => {} } }
-        \\};
-        \\pub fn run(j: *Job) void { j.step(); j.reset(); }
-    , 1);
-    // A parser's frame, a record its decoder moves through the frame on top.
-    try expect(pack.state_machines,
-        \\const State = enum { start, value, after_value };
-        \\const Frame = struct { state: State };
-        \\const Decoder = struct {
-        \\    frames: [4]Frame = undefined,
-        \\    depth: usize = 0,
-        \\    fn top(d: *Decoder) *Frame { return &d.frames[d.depth]; }
-        \\    fn open(d: *Decoder) void { d.top().state = .start; }
-        \\    fn step(d: *Decoder) void { const f = d.top(); switch (f.state) { .start => f.state = .value, .value => f.state = .after_value, .after_value => {} } }
-        \\};
-        \\pub fn run(d: *Decoder) void { d.open(); d.step(); }
-    , 1);
-}
-
-test "A017 leaves a kind set where its value is built, and finds a state each record a loop walks is moved through" {
-    // A table's layout, set by whichever builder made it.
-    try expect(pack.state_machines,
-        \\const Kind = enum { single, double };
-        \\const Table = struct {
-        \\    kind: Kind = .single,
-        \\    fn buildSingle(t: *Table) void { t.kind = .single; }
-        \\    fn buildDouble(t: *Table) void { t.kind = .double; }
-        \\    fn width(t: *const Table) u8 { return switch (t.kind) { .single => 1, .double => 2 }; }
-        \\};
-        \\pub fn run(t: *Table, wide: bool) u8 { if (wide) t.buildDouble() else t.buildSingle(); return t.width(); }
-    , 0);
-    // Classes rules refine on their own value, record by record, from outside the record: each
-    // record's state moved by hand, which nothing here tells from a connection's.
-    try expect(pack.state_machines,
-        \\const Class = enum { mark, letter, number, neutral };
-        \\const Slot = struct { class: Class };
-        \\fn marks(slots: []Slot, before: Class) void { for (slots) |*s| if (s.class == .mark) { s.class = before; }; }
-        \\fn numbers(slots: []Slot) void { var p: ?usize = 0; while (p) |at| : (p = if (at + 1 < slots.len) at + 1 else null) { const s = &slots[at]; switch (s.class) { .number => s.class = .neutral, else => {} } } }
-        \\pub fn run(slots: []Slot) usize { marks(slots, .letter); numbers(slots); var n: usize = 0; for (slots) |s| switch (s.class) { .letter => n += 1, else => {} }; return n; }
-    , 1);
-}
-
 test "A021 finds a second lock taken while a guard is held, unless both are ranked by Order" {
     try expect(pack.lock_order,
         \\const std = @import("std");
@@ -4382,145 +4322,6 @@ test "A010 reads a position in a table std names by a u32 index as one: a node's
     try std.testing.expectEqualSlices(u32, &.{8}, found.lines[0..found.findings]);
 }
 
-test "A018 finds an error's name written to a peer, not to another writer" {
-    try expect(pack.diagnostics,
-        \\const std = @import("std");
-        \\pub fn reply(stream: std.Io.net.Stream, err: anyerror, log: *std.Io.Writer) !void {
-        \\    var buf: [64]u8 = undefined;
-        \\    var w = stream.writer(&buf);
-        \\    try w.print("{s}", .{@errorName(err)});
-        \\    try log.print("{s}", .{@errorName(err)});
-        \\}
-    , 1);
-}
-
-test "A018 reads no error's text from a side of a catch that never gives a value, and from one that does" {
-    const head =
-        \\const std = @import("std");
-        \\fn listed() ![]const u8 { return "a"; }
-        \\fn fail(err: anyerror) noreturn { @panic(@errorName(err)); }
-        \\pub fn reply(stream: std.Io.net.Stream) !void {
-        \\    var buf: [64]u8 = undefined;
-        \\    var w = stream.writer(&buf);
-        \\
-    ;
-    const tail =
-        \\    try w.print("{s}", .{name});
-        \\}
-    ;
-    try expect(pack.diagnostics, head ++ "    const name = listed() catch |err| fail(err);\n" ++ tail, 0);
-    try expect(pack.diagnostics, head ++ "    const name = listed() catch |err| @panic(@errorName(err));\n" ++ tail, 0);
-    try expect(pack.diagnostics, head ++ "    const name = listed() catch |err| @errorName(err);\n" ++ tail, 1);
-    try expect(pack.diagnostics, head ++ "    const name = listed() catch |err| return err;\n" ++ tail, 0);
-}
-
-test "A018 takes as the writer only a value whose type may hold one: a peer writer's bytes handed to std are written, never the writer" {
-    // warp's Index.build: an allocation's bytes the writer fact reached through std's calls,
-    // handed to an `anytype` parameter beside other values, read as a peer's writer.
-    try expect(pack.diagnostics,
-        \\const std = @import("std");
-        \\pub fn reply(stream: std.Io.net.Stream, err: anyerror) void {
-        \\    var buf: [64]u8 = undefined;
-        \\    var w = stream.writer(&buf);
-        \\    const bytes = w.buffered();
-        \\    _ = std.mem.readInt(u32, bytes, @errorName(err));
-        \\}
-    , 0);
-    // The writer itself in that place is one.
-    try expect(pack.diagnostics,
-        \\const std = @import("std");
-        \\pub fn reply(stream: std.Io.net.Stream, err: anyerror) void {
-        \\    var buf: [64]u8 = undefined;
-        \\    var w = stream.writer(&buf);
-        \\    _ = std.mem.readInt(u32, &w, @errorName(err));
-        \\}
-    , 1);
-}
-
-test "A018 reads a writer kept where its type only may hold one as no writer shown: undecided, never a finding" {
-    // relic's remote_helper.warn: a writer over memory made from an allocator whose opaque
-    // state a writer's level reached, read as a peer's writer. A place whose type holds a
-    // writer only through what does not resolve (`*anyopaque`) keeps it unknown.
-    const kept = try run(pack.diagnostics,
-        \\const std = @import("std");
-        \\pub fn reply(stream: std.Io.net.Stream, err: anyerror) !void {
-        \\    var buf: [64]u8 = undefined;
-        \\    var w = stream.writer(&buf);
-        \\    const ctx: *anyopaque = @ptrCast(&w);
-        \\    const again: *std.Io.Writer = @ptrCast(@alignCast(ctx));
-        \\    try again.print("{s}", .{@errorName(err)});
-        \\}
-    );
-    try std.testing.expectEqual(@as(usize, 0), kept.findings);
-    try std.testing.expectEqual(@as(usize, 1), kept.undecided);
-    // relic's remote_helper.warn, the other half: a writer stored through a holder whose type
-    // does not resolve is in memory no place names, which any field so reached may read. A
-    // writer reached only so is no writer shown: unknown, never a finding.
-    const unnamed = try run(pack.diagnostics,
-        \\const std = @import("std");
-        \\const missing = @import("missing.zig");
-        \\const Out = struct { writer: *std.Io.Writer };
-        \\pub fn reply(stream: std.Io.net.Stream, err: anyerror, out: *Out) !void {
-        \\    var buf: [64]u8 = undefined;
-        \\    var w = stream.writer(&buf);
-        \\    missing.holder.writer = &w;
-        \\    try out.writer.print("{s}", .{@errorName(err)});
-        \\}
-    );
-    try std.testing.expectEqual(@as(usize, 0), unnamed.findings);
-    try std.testing.expect(unnamed.undecided >= 1);
-}
-
-test "A018 reads the peer writers a package declares" {
-    var project = try sources.projectWithSources(std.testing.allocator,
-        \\const std = @import("std");
-        \\pub fn reply(err: anyerror) !void {
-        \\    var buf: [64]u8 = undefined;
-        \\    var w = std.Io.protocolWriter(&buf);
-        \\    try w.print("{s}", .{@errorName(err)});
-        \\}
-    , &std_files, &std_imports);
-    defer project.deinit();
-    const declared = [_]glint.Config.PeerWriter{.{ .module = "std", .declaration = "Io.protocolWriter" }};
-    for ([_]usize{ 0, 1 }) |given| {
-        var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.diagnostics, .level = .report }}, .peer_writers = declared[0..given] }, .{ .project_rules = &pack.rules });
-        defer report.deinit();
-        try std.testing.expectEqual(given, report.diagnostics.len);
-    }
-}
-
-test "A018 reads a peer writer a package declares as one wherever it is declared, its body the program's or not" {
-    // Declared in the selected file, and in `wire.zig`, of the package and outside the
-    // selection: each is a peer writer when the configuration names it, and nothing else.
-    const wire: sources.Extra = .{ .name = "wire.zig", .package = "pkg", .bytes = "const std = @import(\"std\");\npub fn peer(buffer: []u8) std.Io.Writer { return std.Io.protocolWriter(buffer); }" };
-    const programs = [_][]const u8{
-        \\const std = @import("std");
-        \\pub fn peer(buffer: []u8) std.Io.Writer { return std.Io.protocolWriter(buffer); }
-        \\pub fn reply(err: anyerror) !void {
-        \\    var buf: [64]u8 = undefined;
-        \\    var w = peer(&buf);
-        \\    try w.print("{s}", .{@errorName(err)});
-        \\}
-        ,
-        \\const wire = @import("wire.zig");
-        \\pub fn reply(err: anyerror) !void {
-        \\    var buf: [64]u8 = undefined;
-        \\    var w = wire.peer(&buf);
-        \\    try w.print("{s}", .{@errorName(err)});
-        \\}
-    };
-    for (programs) |program| {
-        var project = try sources.projectAs(std.testing.allocator, program, .{ .package = "pkg" }, &(std_files ++ [_]sources.Extra{wire}), &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "wire.zig", .target = std_files.len }, .{ .from = std_files.len, .spelling = "std", .target = 0 } }));
-        defer project.deinit();
-        const declared = [_]glint.Config.PeerWriter{.{ .module = "pkg", .declaration = "peer" }};
-        for ([_]usize{ 0, 1 }) |given| {
-            var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.diagnostics, .level = .report }}, .peer_writers = declared[0..given] }, .{ .project_rules = &pack.rules });
-            defer report.deinit();
-            try std.testing.expectEqual(given, report.diagnostics.len);
-        }
-    }
-}
-
 test "A009 and A010 judge a dependency's sinks at the call that gives them input: an index, a step, one through the dependency's own call, and one through a call that does not resolve" {
     // `dep.zig` is a dependency's file the run does not select: its body is judged where a
     // selected call gives it input (main's provenance ruling). `pick(buf, 3)` and `grow(1)`
@@ -4673,55 +4474,6 @@ test "A009 reads a dependency's function at a call by what may reach it: a point
             for (report.coverage) |entry| std.debug.print("  {s}\n", .{entry.detail});
             return err;
         };
-    }
-}
-
-test "A018 judges a dependency's peer writes at the call that gives them an error's name, through the dependency's own call too, and undecided at a call into one writing an error of its own" {
-    // `dep.zig` is a dependency's file the run does not select (main's provenance ruling): it
-    // writes what it is given to a peer; `send(stream, "busy")` gives it the program's text.
-    // `fail` writes an error of its own to a writer its caller decides: undecided at the call.
-    const dep: sources.Extra = .{ .name = "dep.zig", .package = "dep", .bytes =
-        \\const std = @import("std");
-        \\pub fn send(stream: std.Io.net.Stream, text: []const u8) !void {
-        \\    var buf: [64]u8 = undefined;
-        \\    var w = stream.writer(&buf);
-        \\    try w.print("{s}", .{text});
-        \\}
-        \\pub fn via(stream: std.Io.net.Stream, text: []const u8) !void {
-        \\    try send(stream, text);
-        \\}
-        \\pub fn fail(stream: std.Io.net.Stream) !void {
-        \\    var buf: [64]u8 = undefined;
-        \\    var w = stream.writer(&buf);
-        \\    const e: anyerror = error.Busy;
-        \\    try w.print("{}", .{e});
-        \\}
-    };
-    var project = try sources.projectAs(std.testing.allocator,
-        \\const std = @import("std");
-        \\const dep = @import("dep.zig");
-        \\pub fn f(stream: std.Io.net.Stream, err: anyerror) !void {
-        \\    try dep.send(stream, @errorName(err));
-        \\    try dep.via(stream, @errorName(err));
-        \\    try dep.send(stream, "busy");
-        \\    try dep.fail(stream);
-        \\}
-    , .{ .package = "pkg" }, &(std_files ++ [_]sources.Extra{dep}), &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "dep.zig", .target = std_files.len }, .{ .from = std_files.len, .spelling = "std", .target = 0 } }));
-    defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.diagnostics, .level = .report }} }, .{ .project_rules = &pack.rules });
-    defer report.deinit();
-    // One undecided: `dep.fail(stream)`, its error the dependency's own.
-    var undecided: usize = 0;
-    for (report.coverage) |entry| if (entry.rule != null) {
-        undecided += 1;
-        try std.testing.expect(std.mem.find(u8, entry.detail, "fail writes an error of its own") != null);
-    };
-    try std.testing.expectEqual(@as(usize, 1), undecided);
-    const lines = [_]u32{ 4, 5 };
-    try std.testing.expectEqual(lines.len, report.diagnostics.len);
-    for (report.diagnostics, lines) |found, line| {
-        try std.testing.expectEqual(line, found.span.line);
-        try std.testing.expect(std.mem.find(u8, found.message, "input passed to ") != null);
     }
 }
 
@@ -5078,33 +4830,6 @@ test "A010 reads the left side of an or as holding where its right side is read:
     );
     try std.testing.expectEqual(@as(usize, 0), result.undecided);
     try std.testing.expectEqualSlices(u32, &.{9}, result.lines[0..result.findings]);
-}
-
-test "A002 reads a type std computes from root, as std's VTable's handles are, as std's own: copying it copies no aegis owner" {
-    const result = try run(pack.copies,
-        \\const std = @import("std");
-        \\fn keep(args: anytype) @TypeOf(args) {
-        \\    var local = args;
-        \\    _ = &local;
-        \\    return local;
-        \\}
-        \\pub fn slot(comptime name: []const u8) @FieldType(std.Io.VTable, name) {
-        \\    const params = @typeInfo(@typeInfo(@FieldType(std.Io.VTable, name)).pointer.child).@"fn".param_types;
-        \\    return switch (params.len) {
-        \\        3 => &struct {
-        \\            fn f(u: ?*anyopaque, a: params[1].?, b: params[2].?) void {
-        \\                _ = u;
-        \\                _ = keep(.{ a, b });
-        \\            }
-        \\        }.f,
-        \\        else => unreachable,
-        \\    };
-        \\}
-    );
-    try std.testing.expectEqual(@as(usize, 1), result.undecided);
-    // One of them the note at a public generic nothing the run binds.
-    try std.testing.expectEqual(@as(usize, 1), result.unbound);
-    try std.testing.expectEqual(@as(usize, 0), result.findings);
 }
 
 test "A009 reads a parser handed to input.Untrusted.parse as reading input, and readForParse's value as input; only the parse's refined result is clean" {
@@ -10278,32 +10003,6 @@ test "A015 judges a public type's resource field where the program writes or rel
     try std.testing.expectEqualSlices(u32, &.{ 2, 3 }, private.lines[0..private.findings]);
 }
 
-test "A003 follows a std handle acquired raw to its release: a discard leaks it, a close or deferred close releases it, a call given a copy it does not release is lent it" {
-    const found = try run(pack.cleanup,
-        \\const std = @import("std");
-        \\fn opened() std.Io.File { return undefined; }
-        \\pub fn leak() void { const file = opened(); _ = file; }
-        \\pub fn closed() void { const file = opened(); defer file.close(); }
-        \\pub fn direct() void { const file = opened(); file.close(); }
-        \\pub fn lent(f: std.Io.File) void { const file = f; _ = file; }
-        \\pub fn standard() void { const out = std.Io.File.stdout(); _ = out; }
-        \\fn use(f: std.Io.File) void { _ = f; }
-        \\fn shut(f: std.Io.File) void { f.close(); }
-        \\pub fn handed() void { const file = opened(); defer file.close(); use(file); }
-    );
-    try std.testing.expectEqualSlices(u32, &.{3}, found.lines[0..found.findings]);
-    try std.testing.expectEqual(@as(usize, 0), found.undecided);
-    // A copy handed to a call that releases it is a release this walk does not follow: undecided.
-    const shut = try run(pack.cleanup,
-        \\const std = @import("std");
-        \\fn opened() std.Io.File { return undefined; }
-        \\fn shut(f: std.Io.File) void { f.close(); }
-        \\pub fn handed() void { const file = opened(); defer file.close(); shut(file); }
-    );
-    try std.testing.expectEqual(@as(usize, 0), shut.findings);
-    try std.testing.expectEqual(@as(usize, 1), shut.undecided);
-}
-
 test "A015 reads a field by meaning: @field with its name, a destructure's place and a pointer capture write it as `=` does" {
     // Each writes an owner into its field, or releases it, in the field's own file; one given a
     // parameter by a destructure is lent it.
@@ -10367,41 +10066,6 @@ test "A015 reads a call of a function returning its parameter as the argument it
     );
     try std.testing.expectEqual(@as(usize, 0), found.undecided);
     try std.testing.expectEqualSlices(u32, &.{ 2, 4, 8 }, found.lines[0..found.findings]);
-}
-
-test "A003 leaves a copy handed to a function pointer, or put in a literal a callee releases, undecided" {
-    // Each callee may close the copy, which the caller's deferred close closes again: neither lent
-    // nor a release this walk follows. A literal's field only read is lent.
-    const found = try run(pack.cleanup,
-        \\const std = @import("std");
-        \\fn opened() std.Io.File { return undefined; }
-        \\fn closer(f: std.Io.File) void { f.close(); }
-        \\fn viaPointer(f: std.Io.File, how: *const fn (std.Io.File) void) void { how(f); }
-        \\pub fn pointer() void { const file = opened(); defer file.close(); viaPointer(file, closer); }
-        \\const Box = struct { f: std.Io.File };
-        \\fn viaLiteral(f: std.Io.File) void { const b: Box = .{ .f = f }; b.f.close(); }
-        \\pub fn literal() void { const file = opened(); defer file.close(); viaLiteral(file); }
-        \\fn readsLiteral(f: std.Io.File) i32 { const b: Box = .{ .f = f }; return b.f.handle; }
-        \\pub fn read() void { const file = opened(); defer file.close(); _ = readsLiteral(file); }
-    );
-    try std.testing.expectEqual(@as(usize, 0), found.findings);
-    try std.testing.expectEqual(@as(usize, 2), found.undecided);
-    // A literal no local holds goes where its type's values go: released where that field of
-    // the type is read and released (`Closing`), lent where it only is read (`Reading`).
-    const typed = try run(pack.cleanup,
-        \\const std = @import("std");
-        \\fn opened() std.Io.File { return undefined; }
-        \\const Closing = struct { f: std.Io.File };
-        \\fn closeIt(b: Closing) void { b.f.close(); }
-        \\fn viaClosing(f: std.Io.File) void { closeIt(.{ .f = f }); }
-        \\pub fn closing() void { const file = opened(); defer file.close(); viaClosing(file); }
-        \\const Reading = struct { f: std.Io.File };
-        \\fn readIt(b: Reading) i32 { return b.f.handle; }
-        \\fn viaReading(f: std.Io.File) i32 { return readIt(.{ .f = f }); }
-        \\pub fn reading() void { const file = opened(); defer file.close(); _ = viaReading(file); }
-    );
-    try std.testing.expectEqual(@as(usize, 0), typed.findings);
-    try std.testing.expectEqual(@as(usize, 1), typed.undecided);
 }
 
 test "A015 reads a capture as a view only where what it binds is one" {

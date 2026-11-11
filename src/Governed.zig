@@ -154,18 +154,6 @@ fn moduleRoots(self: *Context, source: []const u8) Context.Error![]const Project
     return roots.items;
 }
 
-/// The declarations at `path` from the files of `package`, every one the run loaded, selected
-/// or not: a package's own declaration, where none of its files imports the package by name.
-pub fn declarationsOfPackage(self: *Context, package: []const u8, path: []const u8) Context.Error!Declared {
-    var roots: std.ArrayList(Project.FileId) = .empty;
-    for (self.project.sources) |*source| {
-        if (std.mem.eql(u8, source.input.package, package)) try roots.append(self.allocator, source.id);
-    }
-    if (roots.items.len == 0) return .none;
-    const found = try walk(self, roots.items, path, true);
-    return if (found != .decls and self.facts.budgetSpent()) .{ .unknown = .budget } else found;
-}
-
 /// Every reference in the checked file that reaches a governed declaration, into `out`; a
 /// reference spelling a governed name that does not resolve is undecided for `rule`.
 pub fn sites(self: *Context, rule: Rule, governed: []const Governed, out: *std.ArrayList(Site)) Context.Error!void {

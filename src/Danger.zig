@@ -14,7 +14,6 @@ const Governed = @import("Governed.zig");
 const Escapes = @import("Escapes.zig");
 const Facts = @import("Facts.zig");
 const Model = @import("Model.zig");
-const Present = @import("Present.zig");
 const Project = @import("Project.zig");
 const Contract = @import("AegisContract.zig");
 const Report = @import("Report.zig");
@@ -1102,30 +1101,6 @@ fn asserts(c: *Context, rule: Rule) Context.Error!void {
         const token = tree.firstToken(parent);
         if (try invariant(c, parent, &edits)) try c.fixedAt(rule, token, message, edits.items) else try c.at(rule, token, message);
     }
-}
-
-/// The undecided site of `unseen`, by why its callee does not resolve.
-fn undecidedCall(c: *Context, rule: Rule, token: Ast.TokenIndex, why: Facts.Unknown) Context.Error!void {
-    const start = c.project.at(c.file).file.tree.tokenStart(token);
-    const lead = "a call whose callee does not resolve (";
-    const tail = ") may be std.debug.assert, whose value the program takes where its calls are not all read, on a condition that may hold input";
-    switch (why) {
-        inline else => |known| try c.undecided(rule, start, .unresolved, lead ++ @tagName(known) ++ tail),
-    }
-}
-
-/// Whether a callee is std's assert, or a constant whose value it is (`origin`).
-fn reachesAssert(c: *Context, assert_decls: []const Facts.Decl, callee: Facts.Decl) Context.Error!bool {
-    if (isAssert(assert_decls, callee)) return true;
-    return switch (try c.facts.origin(callee)) {
-        .decl => |found| isAssert(assert_decls, found),
-        .none, .unknown => false,
-    };
-}
-
-fn isAssert(assert_decls: []const Facts.Decl, decl: Facts.Decl) bool {
-    for (assert_decls) |each| if (std.meta.eql(each, decl)) return true;
-    return false;
 }
 
 /// The edits that make the call at `node` (`f(c)`) `aegis.assert.invariant(c, "c")`, the

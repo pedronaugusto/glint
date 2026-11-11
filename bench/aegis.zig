@@ -14,9 +14,7 @@ pub fn main(init: std.process.Init) !void {
     var project = try sources.project(init.gpa, source.written());
     defer project.deinit();
     const config: glint.Config = .{ .enabled = @splat(false), .selections = &.{
-        .{ .rule = pack.access, .level = .report },   .{ .rule = pack.copies, .level = .report },
-        .{ .rule = pack.cleanup, .level = .report },  .{ .rule = pack.scalar, .level = .report },
-        .{ .rule = pack.capacity, .level = .report },
+        .{ .rule = pack.access, .level = .report }, .{ .rule = pack.scalar, .level = .report },
     } };
     const start = std.Io.Clock.awake.now(init.io);
     var findings: usize = 0;

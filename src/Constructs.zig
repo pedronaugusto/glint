@@ -553,17 +553,11 @@ fn table(comptime Tag: type, comptime entries: []const Entry) std.EnumArray(Tag,
 }
 
 const zir_rows = table(Zir.Inst.Tag, &zir);
-const extended_rows = table(Zir.Inst.Extended, &extended);
 const ast_rows = table(Ast.Node.Tag, &ast);
 
 /// A ZIR instruction's row; null for a tag this table does not place yet.
 pub fn ofInstruction(tag: Zir.Inst.Tag) ?Row {
     return zir_rows.get(tag);
-}
-
-/// An extended ZIR instruction's row; null for one this table does not place yet.
-pub fn ofExtended(opcode: Zir.Inst.Extended) ?Row {
-    return extended_rows.get(opcode);
 }
 
 /// An Ast node's row; null for a form this table does not place yet.

@@ -12,7 +12,6 @@ const aegis = @import("aegis");
 const ensign = @import("ensign");
 const release = @import("release");
 
-
 const Module = struct { name: []const u8, path: []const u8 };
 const Options = struct {
     config: Rule.Config = .{},

@@ -636,43 +636,6 @@ fn namesTag(tree: *const Ast, item: Ast.Node.Index, tag: []const u8) bool {
     return tree.nodeTag(item) == .enum_literal and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(item)), tag);
 }
 
-/// Whether the function around `node` branches on a comptime `bool` parameter, or switches on a
-/// comptime enum one, anywhere in its body: its paths then differ between the instantiations
-/// that bind it.
-pub fn branchesOnCondition(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
-    if (!try self.hasConditions(file)) return false;
-    const tree = &self.project.at(file).file.tree;
-    const model = &self.project.at(file).model;
-    var up = model.parentOf(node);
-    const function = while (up) |parent| : (up = model.parentOf(parent)) {
-        if (tree.nodeTag(parent) == .fn_decl) break parent;
-    } else return false;
-    const first = tree.firstToken(function);
-    const last = tree.lastToken(function);
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        const branch: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const at = tree.nodeMainToken(branch);
-        if (at < first or at > last) continue;
-        switch (tag) {
-            .@"if", .if_simple => if (self.namesCondition(file, tree.fullIf(branch).?.ast.cond_expr, 0)) return true,
-            .@"switch", .switch_comma => if (self.switchParameter(file, tree.fullSwitch(branch).?.ast.condition) != null) return true,
-            else => {},
-        }
-    }
-    return false;
-}
-
-fn namesCondition(self: *const Facts, file: Project.FileId, node: Ast.Node.Index, depth: usize) bool {
-    if (depth == 16) return false;
-    const tree = &self.project.at(file).file.tree;
-    return switch (conditionOf(tree, node)) {
-        .not => |inner| self.namesCondition(file, inner, depth + 1),
-        .both, .either => |sides| self.namesCondition(file, sides[0], depth + 1) or self.namesCondition(file, sides[1], depth + 1),
-        .compare => false,
-        .other => |value| tree.nodeTag(value) == .identifier and self.conditionParameter(file, value) != null,
-    };
-}
-
 /// A local a generic function initialises by copying a value its type parameter at `position`
 /// types (`var result = value;` of `value: T`), or its `anytype` parameter at `position`
 /// (`var local = args;`), there or in a function it passes the parameter on to (as is, or a
@@ -1444,15 +1407,6 @@ pub fn breaksOut(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resol
     return found.items;
 }
 
-/// Whether the declaration `site` is a copy a generic function makes of its parameters'
-/// values that its bindings decide (`parameterCopies`), reading `place`: where every binding is
-/// a call a run judges (`judgedAtBindings`).
-pub fn boundAtBinding(self: *Facts, file: Project.FileId, site: Ast.Node.Index, place: Ast.Node.Index) ResolveError!bool {
-    if (self.copies == null) try self.findCopies();
-    const function = self.bound_places.get(.{ .site = .{ .file = file, .node = site }, .place = place }) orelse return false;
-    return self.judgedAtBindings(function);
-}
-
 /// The position of the generic parameter that decides what the call `value` makes (through
 /// `try` or `catch`), a parameter of the function the call is in: a function of a type parameter
 /// (`T.init(...)`, `comptime T: type`), or a method of a value of one (`probe.of(...)`,
@@ -1677,26 +1631,6 @@ fn choiceOfTypes(value: Value) bool {
     return true;
 }
 
-/// The readings of the function a copy is in, as `call` binds `function` and the copy's path
-/// passes the parameter on (`boundCopy`'s walk): one per instantiation that reaches the copy's
-/// site, none where none does. Unknown where the binding or a call on the path does not resolve,
-/// and for a crowded copy, which `boundCopy` reads by its routes, not one path. The list is the
-/// caller's, in `gpa`; the readings themselves are kept as every reading is.
-pub fn copyReadings(self: *Facts, gpa: std.mem.Allocator, call: calls.Call, function: Decl, copy: ParameterCopy) ResolveError!union(enum) { readings: []const *const Env, unknown: Unknown } {
-    if (copy.crowded) return .{ .unknown = .budget };
-    const bound = switch (try self.bindCall(&call, function, null)) {
-        .reading => |reading| reading,
-        .unknown => |why| return .{ .unknown = why },
-    };
-    var found: std.ArrayList(*const Env) = .empty;
-    for (try self.instantiations(bound)) |reading| switch (try self.pathIn(reading, copy)) {
-        .reading => |env| if (try self.reachedUnder(env, copy.site.file, copy.site.node)) try found.append(gpa, env),
-        .unreached => {},
-        .unknown => |why| return .{ .unknown = why },
-    };
-    return .{ .readings = found.items };
-}
-
 /// The reading of the function a copy is in, from `start`, the reading of the function the
 /// binding binds, through each call on the copy's path.
 fn pathIn(self: *Facts, start: *const Env, copy: ParameterCopy) ResolveError!union(enum) { reading: *const Env, unreached, unknown: Unknown } {
@@ -1894,25 +1828,6 @@ pub fn comptimeParameter(self: *Facts, file: Project.FileId, node: Ast.Node.Inde
     const index = (model.reference(node) orelse return false).declaration orelse return false;
     const record = model.declarations[@backingInt(index)];
     return record.kind == .parameter and record.token > 0 and t.tokenTag(record.token - 1) == .keyword_comptime;
-}
-
-/// Whether `node`, an identifier, names a value of a type parameter of its function (`value`
-/// of `value: T`): a copy of it is each binding's.
-pub fn parameterValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) bool {
-    const model = &self.project.at(file).model;
-    if (self.syntaxOf(file).nodeTag(node) != .identifier) return false;
-    const index = (model.reference(node) orelse return false).declaration orelse return false;
-    const function = self.functionOf(.{ .file = file, .index = index }) orelse return false;
-    return self.valueOfParameter(function, index) != null;
-}
-
-/// Whether `node` names a value of a generic parameter of a function whose bindings are all
-/// calls a run judges, each deciding a copy of it (`parameterValue`, `judgedAtBindings`).
-pub fn parameterAtBinding(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
-    if (!self.parameterValue(file, node)) return false;
-    const model = &self.project.at(file).model;
-    const index = model.reference(node).?.declaration.?; // unreachable: `parameterValue` holds only for a parameter's name
-    return self.judgedAtBindings(self.functionOf(.{ .file = file, .index = index }).?); // unreachable: as above
 }
 
 /// Whether `node`, written in a generic function, is or is a part of one of its generic
@@ -3599,13 +3514,6 @@ fn mergedNames(self: *Facts, a: ErrorNames, b: ErrorNames) ResolveError!ErrorNam
 /// parameter's, as `Io.Future(T).await`'s `Result`: a task's own result is never the call's).
 pub fn callErrors(self: *Facts, callee: Decl) ResolveError!ErrorNames {
     return self.errorsOf(callee, .body);
-}
-
-/// The errors `callee`'s declaration names in its result (`callErrors` without reading a body):
-/// an inferred `!T` is unknown. For a reading that takes a declared set as the callee's
-/// contract, as A020 takes std's `Io` operations.
-pub fn declaredErrors(self: *Facts, callee: Decl) ResolveError!ErrorNames {
-    return self.errorsOf(callee, .declared);
 }
 
 fn errorsOf(self: *Facts, callee: Decl, reading: enum { declared, body }) ResolveError!ErrorNames {
@@ -5953,15 +5861,6 @@ fn partsOf(self: *Facts, file: Project.FileId) ResolveError!*const FileParts {
     parts.of = of;
     try self.file_parts.put(self.gpa, file, parts);
     return parts;
-}
-
-/// The reading the call at `node` in `file` makes of `decl`, made in `env`: none where `env`
-/// is none, an `@call`'s arguments are not known, or the chain is past 32 calls deep (each
-/// binding's then).
-pub fn readingAt(self: *Facts, file: Project.FileId, node: Ast.Node.Index, decl: Decl, env: ?*const Env) ResolveError!?*const Env {
-    const outer = env orelse return null;
-    if (outer.depth >= 32) return null;
-    return self.readingFrom(file, node, decl, outer);
 }
 
 /// The reading the call at `node` makes of `decl`, made in `outer` or in none (a function read
@@ -8771,16 +8670,6 @@ pub fn languageField(self: *Facts, file: Project.FileId, node: Ast.Node.Index) R
     return if (declared) .none else .{ .unknown = .unsupported };
 }
 
-/// Whether the memory a value of `value`'s type holds (a function's result through its error
-/// union or optional) has a length below half the address space: `memoryField`'s `memory`.
-pub fn sizedMemory(self: *Facts, value: Value) ResolveError!bool {
-    return switch (value) {
-        .error_union, .optional => |inner| self.sizedMemory(inner.*),
-        .alternatives => try self.lengthOfValue(value, "len") == .memory,
-        else => try self.lengthOfValue(value, "len") == .memory,
-    };
-}
-
 /// What a field `name` read on a value of `value` reads (`memoryField`).
 pub fn lengthOfValue(self: *Facts, value: Value, name: []const u8) ResolveError!Length {
     switch (value) {
@@ -10887,23 +10776,6 @@ fn readingsBound(self: *Facts, function: Decl, comptime members: bool) ResolveEr
         if (read.lowest >= position) read.lowest = std.math.maxInt(usize);
     } else _ = read.map.remove(function);
     return found.items;
-}
-
-/// Whether every compiled call that binds `function` to `reading` (one of `instantiatedReadings`)
-/// is written in `file`, and some is: what the reading does it does for that file's code alone.
-pub fn boundOnlyFrom(self: *Facts, function: Decl, reading: *const Env, file: Project.FileId) ResolveError!bool {
-    const sites = (try self.scanCallSites(function, .program, .aliases)) orelse return false;
-    var some = false;
-    for (sites) |site| {
-        const outer_readings: []const ?*const Env = if (try self.functionAround(site.file, site.holder)) |outer| (try self.instantiatedReadings(outer)) orelse &.{null} else &.{null};
-        for (outer_readings) |outer| {
-            if (!try self.reachedUnder(outer, site.file, site.holder)) continue;
-            if (try self.readingFrom(site.file, site.call, function, outer) != reading) continue;
-            if (site.file != file) return false;
-            some = true;
-        }
-    }
-    return some;
 }
 
 /// What a rule writes at a generic's body that `boundInRun` says nothing compiled binds.

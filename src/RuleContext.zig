@@ -263,11 +263,6 @@ pub fn unknown(self: *RuleContext, rule: rules.Rule, node: std.zig.Ast.Node.Inde
     if (@backingInt(node) >= tree.nodes.len) return error.InvalidHandle; // safe: reject compiler node indexes outside the frozen source.
     try self.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), if (reason == .budget) .budget_exhausted else .unresolved, @tagName(reason));
 }
-/// The configuration `file` is checked with: a fact computed for the whole program reads
-/// only the files whose rules ask for it.
-pub fn configOf(self: *const RuleContext, file: Project.FileId) rules.Config {
-    return self.sink.config(self.sink, file);
-}
 /// Whether a token is test code: a test input, or inside a `test` block.
 pub fn inTest(self: *const RuleContext, token: std.zig.Ast.TokenIndex) bool {
     return inTestScope(self.project.at(self.file), token);

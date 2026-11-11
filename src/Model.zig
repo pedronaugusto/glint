@@ -569,13 +569,6 @@ pub fn reference(self: *const Model, node: Ast.Node.Index) ?Reference {
     return if (self.node_references[index]) |id| self.references[@backingInt(id)] else null;
 }
 
-/// The operation the lowering made of `node`; null for none, and for a node past the file's tree.
-pub fn operationOf(self: *const Model, node: Ast.Node.Index) ?Operation {
-    const index = @backingInt(node);
-    if (index >= self.node_operations.len) return null;
-    return if (self.node_operations[index]) |id| self.operations[@backingInt(id)] else null;
-}
-
 fn scopeLess(_: void, lhs: Scope, rhs: Scope) bool {
     if (lhs.first != rhs.first) return lhs.first < rhs.first;
     if (lhs.last != rhs.last) return lhs.last > rhs.last;
