@@ -50,9 +50,6 @@ assumed: ?Assumptions.Id = null,
 copies: ?std.AutoHashMapUnmanaged(Decl, []const ParameterCopy) = null,
 /// Whether the run holds every file its programs may be built of (`runHeld`), found once.
 run_held: ?bool = null,
-/// The places the copies `directCopies` finds in a value chosen or wrapped read, each with
-/// its copy's declaration: a copy its bindings decide (`boundAtBinding`).
-bound_places: std.AutoHashMapUnmanaged(struct { site: Key, place: Ast.Node.Index }, Decl) = .empty,
 /// The builtins and `raw` calls `scalarCasts` finds, each with its function: casts each
 /// binding decides (`castAtBinding`).
 cast_sites: std.AutoHashMapUnmanaged(Key, Decl) = .empty,
@@ -66,10 +63,6 @@ templates: std.AutoHashMapUnmanaged(Decl, ?Value) = .empty,
 at_bindings: std.AutoHashMapUnmanaged(Decl, ?[]const Value) = .empty,
 /// The values a function's own `return`s give, by function, found once (`ownReturns`).
 type_returns: std.AutoHashMapUnmanaged(Decl, []const Ast.Node.Index) = .empty,
-/// What each generic parameter binds when the project's own calls are the only ones: the
-/// union of their arguments, or null when the function is reachable from outside or taken
-/// other than by a call.
-callers: std.AutoHashMapUnmanaged(Decl, ?Value) = .empty,
 /// The names some container in the run declares as `comptime` fields, found once: the
 /// candidates a member of a holder of no known type may be (`comptimeField`).
 comptime_fields: std.StringHashMapUnmanaged(void) = .empty,
@@ -347,14 +340,12 @@ pub fn deinit(self: *Facts) void {
     self.truths_open.deinit(self.gpa);
     self.settled.deinit(self.gpa);
     if (self.copies) |*found| found.deinit(self.gpa);
-    self.bound_places.deinit(self.gpa);
     self.cast_sites.deinit(self.gpa);
     self.conditional_files.deinit(self.gpa);
     self.package_roots.deinit(self.gpa);
     self.templates.deinit(self.gpa);
     self.type_returns.deinit(self.gpa);
     self.at_bindings.deinit(self.gpa);
-    self.callers.deinit(self.gpa);
     self.comptime_fields.deinit(self.gpa);
     self.dereferences.deinit(self.gpa);
     self.dereferences_found.deinit(self.gpa);
@@ -978,7 +969,6 @@ fn directCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
             if (itself and !self.inLoop(function, d.node) and self.holdingReads(function, model.reference(place).?.declaration.?) == 1) continue;
             const site: Key = .{ .file = function.file, .node = d.node };
             try out.append(self.gpa, .{ .position = position, .site = site, .source = if (itself) null else .{ .file = function.file, .node = place } });
-            try self.bound_places.put(self.gpa, .{ .site = site, .place = place }, function);
         }
     }
     try self.storedCopies(function, out);
@@ -1084,7 +1074,6 @@ fn storedCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
                 const moving = itself and !looped and self.holdingReads(function, named.?) == 1 and copied == 1;
                 const site: Key = .{ .file = function.file, .node = node };
                 try out.append(self.gpa, .{ .position = position, .site = site, .kind = if (moving) .moved else .copy, .source = if (itself) null else .{ .file = function.file, .node = place } });
-                try self.bound_places.put(self.gpa, .{ .site = site, .place = place }, function);
             }
         }
     }
@@ -2059,59 +2048,8 @@ fn truth(self: *const Facts, env: ?*const Env, file: Project.FileId, node: Ast.N
     return null;
 }
 
-/// A `bool` known as the program compiles, on no call's reading (`comptimeTruth`): `true`,
-/// `false`, `!`, `and` and `or` of known ones, two types known the same or different, a
-/// `@hasDecl` that resolves; null where it may be either.
-pub fn knownBool(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?bool {
-    return self.comptimeTruth(null, file, node);
-}
-
 /// A condition's form through parentheses and `comptime`: Model's one reading (`Model.conditionOf`).
-pub const Condition = Model.Condition;
-pub const Comparison = Model.Comparison;
-pub const Order = Model.Order;
 pub const conditionOf = Model.conditionOf;
-
-/// A part of a condition known to hold a truth value: a comparison or another bool value.
-pub const Truth = struct { part: Ast.Node.Index, value: bool };
-
-/// The parts a condition's being `value` shows, each with its truth value, in the order they are
-/// written, each read inside its parentheses: `a and b` true shows both true, `a or b` false
-/// both false, `!a` shows `a` the other way; `a and b` false or `a or b` true is kept whole,
-/// none of its parts shown alone. Null where the condition is known never `value`.
-pub fn truthsWhen(self: *Facts, file: Project.FileId, condition: Ast.Node.Index, value: bool) ResolveError!?[]const Truth {
-    var out: std.ArrayList(Truth) = .empty;
-    if (!try self.gatherTruths(file, condition, value, &out, 0)) return null;
-    return out.items;
-}
-
-fn gatherTruths(self: *Facts, file: Project.FileId, node: Ast.Node.Index, value: bool, out: *std.ArrayList(Truth), depth: u8) ResolveError!bool {
-    // Past the depth, the part is kept whole: true of it, and nothing of its parts.
-    if (depth >= 32) {
-        try out.append(self.gpa, .{ .part = node, .value = value });
-        return true;
-    }
-    if (try self.knownBool(file, node)) |known| return known == value;
-    const condition = conditionOf(&self.project.at(file).file.tree, node);
-    switch (condition) {
-        .not => |inner| return self.gatherTruths(file, inner, !value, out, depth + 1),
-        .both => |sides| if (value) {
-            return try self.gatherTruths(file, sides[0], true, out, depth + 1) and try self.gatherTruths(file, sides[1], true, out, depth + 1);
-        },
-        .either => |sides| if (!value) {
-            return try self.gatherTruths(file, sides[0], false, out, depth + 1) and try self.gatherTruths(file, sides[1], false, out, depth + 1);
-        },
-        .compare, .other => {},
-    }
-    // A part is the expression inside its parentheses and `comptime` (`(ok)` is `ok`).
-    const part = switch (condition) {
-        .compare => |compared| compared.node,
-        .other => |inner| inner,
-        .not, .both, .either => node,
-    };
-    try out.append(self.gpa, .{ .part = part, .value = value });
-    return true;
-}
 
 /// A value written in place, by what it is: an enum literal and an error by name, a number, a
 /// string, a character, `null`, `undefined`, `true` or `false`, `unreachable`; through
@@ -3340,66 +3278,6 @@ fn constantValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resol
     const variable = source.file.tree.fullVarDecl(record.node) orelse return null;
     if (source.file.tree.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
     return .{ decl.file, variable.ast.init_node.unwrap() orelse return null };
-}
-
-/// The error an expression names: `error.Name`, a member of an error set (`Set.Name`), or a
-/// const given one; null where it names none, or one not shown here.
-pub fn errorName(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?[]const u8 {
-    var at_file = file;
-    var at = node;
-    for (0..16) |_| {
-        const tree = &self.project.at(at_file).file.tree;
-        at = ungrouped(tree, at);
-        switch (tree.nodeTag(at)) {
-            .error_value => return try Model.identifier(self.gpa, tree.tokenSlice(tree.nodeMainToken(at) + 2)),
-            .field_access => {
-                const holder, const name = tree.nodeData(at).node_and_token;
-                if (try self.resolve(at_file, holder) == .error_set) return try Model.identifier(self.gpa, tree.tokenSlice(name));
-            },
-            else => {},
-        }
-        at_file, at = (try self.constantValue(at_file, at)) orelse return null;
-    }
-    return null;
-}
-
-/// Whether the error set a type names holds the error `name`: an `error{...}` set, `A || B`,
-/// an error union's set, `anyerror` (every error), or a const given one. Unknown where the set
-/// is not written here (an inferred `!T`, one a function or `@TypeOf` makes, a name that does
-/// not resolve), never read as either.
-pub fn errorSetHolds(self: *Facts, file: Project.FileId, node: Ast.Node.Index, name: []const u8) ResolveError!Is {
-    return self.setHolds(file, node, name, 0);
-}
-
-fn setHolds(self: *Facts, file: Project.FileId, node: Ast.Node.Index, name: []const u8, depth: u8) ResolveError!Is {
-    if (depth >= 16) return .{ .unknown = .budget };
-    const tree = &self.project.at(file).file.tree;
-    const at = ungrouped(tree, node);
-    switch (tree.nodeTag(at)) {
-        .error_set_decl => {
-            const open, const close = tree.nodeData(at).token_and_token;
-            var token = open + 1;
-            while (token < close) : (token += 1) {
-                if (tree.tokenTag(token) != .identifier) continue;
-                if (std.mem.eql(u8, try Model.identifier(self.gpa, tree.tokenSlice(token)), name)) return .yes;
-            }
-            return .no;
-        },
-        .merge_error_sets => {
-            const lhs, const rhs = tree.nodeData(at).node_and_node;
-            const left = try self.setHolds(file, lhs, name, depth + 1);
-            if (left == .yes) return .yes;
-            const right = try self.setHolds(file, rhs, name, depth + 1);
-            if (right == .yes) return .yes;
-            if (left == .no and right == .no) return .no;
-            return if (left == .unknown) left else right;
-        },
-        .error_union => return self.setHolds(file, tree.nodeData(at).node_and_node[0], name, depth + 1),
-        .identifier => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), "anyerror") and try self.definition(file, at) == .none) return .yes,
-        else => {},
-    }
-    const given_file, const given = (try self.constantValue(file, at)) orelse return .{ .unknown = .unsupported };
-    return self.setHolds(given_file, given, name, depth + 1);
 }
 
 /// The errors a function's prototype says it returns: none (no error union), a set written
@@ -5319,24 +5197,6 @@ fn enumOf(value: Value) ?Container {
 /// information named in place, through constants, or by a capture of a `switch` on or an `if`
 /// over `@typeInfo(subject)`.
 pub const NamesOf = struct { subject: Ast.Node.Index, info: Ast.Node.Index };
-
-/// The type whose field names `node` is one of (`NamesOf`), as a `@field` name reads it: a rule
-/// asks it rather than spelling `std.builtin.Type`'s `name`, `fields` or `field_names`.
-pub fn fieldNameOf(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?NamesOf {
-    return self.namesOf(file, node, 0);
-}
-
-/// A list of a type's fields: of their descriptions (`info.fields`) or of their names
-/// (`info.field_names`), and the type (`subject`, of the information `info` names).
-pub const FieldList = struct { of: NamesOf, names: bool };
-
-/// The list of a type's fields `node` is, in place or through constants (`FieldList`); null for
-/// any other node.
-pub fn fieldList(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?FieldList {
-    if (try self.listOf(file, node, "field_names", 0)) |of| return .{ .of = of, .names = true };
-    if (try self.listOf(file, node, "fields", 0)) |of| return .{ .of = of, .names = false };
-    return null;
-}
 
 fn namesOf(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: usize) ResolveError!?NamesOf {
     if (depth > 8) return null;
@@ -8527,105 +8387,6 @@ pub fn member(self: *const Facts, container: Container, name: []const u8) ?Decl 
     return null;
 }
 
-/// The fields a container declares, in order: each file's read once for the run, by one pass
-/// over its declarations (`member` and a walk over a type's fields find them here, not by
-/// scanning every declaration of its file).
-pub fn fieldsOf(self: *Facts, holder: Container) ResolveError![]const Model.Declaration.Id {
-    const index = try self.memo(FieldIndex);
-    const entry = try index.files.getOrPut(self.gpa, holder.file);
-    if (!entry.found_existing) {
-        entry.value_ptr.* = .empty;
-        for (self.project.at(holder.file).model.declarations, 0..) |decl, i| {
-            if (decl.kind != .field) continue;
-            const fields = try entry.value_ptr.getOrPut(self.gpa, decl.scope);
-            if (!fields.found_existing) fields.value_ptr.* = .empty;
-            try fields.value_ptr.append(self.gpa, @fromBackingInt(@intCast(i)));
-        }
-    }
-    return if (entry.value_ptr.get(holder.scope)) |fields| fields.items else &.{};
-}
-
-const FieldIndex = struct {
-    files: std.AutoHashMapUnmanaged(Project.FileId, std.AutoHashMapUnmanaged(Model.Scope.Id, std.ArrayList(Model.Declaration.Id))) = .empty,
-};
-
-/// What a probe of `fieldsHold` reads of one field: the kind it looks for, none of it, a form
-/// it does not read (`maybe`), or a container whose own fields say (`holder`).
-pub const Probed = union(enum) { is, none, maybe, holder: Container };
-
-/// Where a type's fields hold what a probe looks for: at a path of field names (`.at`, `"ctx.io"`,
-/// the first in declaration order), nowhere, or maybe.
-pub const Holding = union(enum) { none, at: []const u8, maybe };
-
-/// Whether a value of the container `holder` holds, in its fields and theirs, what `probe` looks
-/// for: a type's property (does it hold an `Io`, memory with a length), read once per probe and
-/// type for the run. A probe's type declares `Key`, what tells its probes apart for the run
-/// (the probe's `key`), and `Error`, what its reading may fail with; `of(probe, facts, field,
-/// value)` says what a field (its declaration, and the value Facts gives it, never unknown)
-/// holds. A field whose value does not resolve may hold it (`maybe`): an
-/// unknown never clears. A container reached again through its own fields (`next: ?*Node`) adds nothing of
-/// its own there; an answer of none read meanwhile is not kept, being read again where asked,
-/// and none read once the file's fact budget is spent.
-pub fn fieldsHold(self: *Facts, probe: anytype, comptime of: ProbeOf(@TypeOf(probe)), holder: Container) (ResolveError || @TypeOf(probe).Error)!Holding {
-    const state = try self.memo(HoldsMemo(@TypeOf(probe).Key));
-    const at: HoldsMemo(@TypeOf(probe).Key).Type = .{ .key = probe.key, .file = holder.file, .scope = holder.scope, .made = holder.made_by };
-    if (state.found.get(at)) |known| return known;
-    if (state.open.contains(at)) {
-        state.met_open += 1;
-        return .none;
-    }
-    try state.open.put(self.gpa, at, {});
-    const met_open = state.met_open;
-    const out = try self.fieldsHoldOnce(probe, of, holder);
-    _ = state.open.remove(at);
-    if ((out != .none or state.met_open == met_open) and self.remaining != 0) try state.found.put(self.gpa, at, out);
-    return out;
-}
-
-/// What a probe of `fieldsHold` is asked of one field: the probe, Facts, the field's
-/// declaration and the value Facts gives it, never unknown.
-pub fn ProbeOf(comptime Probe: type) type {
-    return fn (Probe, *Facts, Decl, Value) (ResolveError || Probe.Error)!Probed;
-}
-
-fn HoldsMemo(comptime ProbeKey: type) type {
-    return struct {
-        /// A type a type function made is read with that call's bindings (`made`): each making
-        /// apart.
-        const Type = struct { key: ProbeKey, file: Project.FileId, scope: Model.Scope.Id, made: ?*const Made };
-        found: std.AutoHashMapUnmanaged(Type, Holding) = .empty,
-        open: std.AutoHashMapUnmanaged(Type, void) = .empty,
-        /// How many times one still being read was met again.
-        met_open: usize = 0,
-    };
-}
-
-fn fieldsHoldOnce(self: *Facts, probe: anytype, comptime of: ProbeOf(@TypeOf(probe)), holder: Container) (ResolveError || @TypeOf(probe).Error)!Holding {
-    var maybe = false;
-    for (try self.fieldsOf(holder)) |index| {
-        const field: Decl = .{ .file = holder.file, .index = index };
-        const name = self.project.at(holder.file).model.declarations[@backingInt(index)].name;
-        // A field whose value does not resolve may hold anything; a probe reads resolved values.
-        // One of a type a type function made is read with that call's bindings (memberOf).
-        const value = try self.memberOf(holder, field);
-        if (value == .unknown) {
-            maybe = true;
-            continue;
-        }
-        switch (try of(probe, self, field, value)) {
-            .is => return .{ .at = name },
-            .none => {},
-            .maybe => maybe = true,
-            .holder => |inner| switch (try self.fieldsHold(probe, of, inner)) {
-                .at => |through| return .{ .at = try self.gpa.print("{s}.{s}", .{ name, through }) },
-                .maybe => maybe = true,
-                .none => {},
-            },
-        }
-    }
-    return if (maybe) .maybe else .none;
-}
-
 /// What a field `len` or `ptr` reads. `memory`: the length (or the address) of an array or a
 /// slice (or one a single pointer reaches) whose elements take room, so one object's count of
 /// them is below half the address space. `unsized`: a length of memory whose elements may
@@ -8743,142 +8504,6 @@ fn sized(self: *Facts, value: Value, depth: usize) ResolveError!bool {
         },
         else => return false,
     }
-}
-
-/// Whether a value of the type written at `type_node` has a length or holds memory that has
-/// one: a slice, an array or a pointer to one, and a pointer, struct or union with a field
-/// that does (a field read through it carries its length), or memory a cast may give any
-/// type (`*anyopaque`). A number, `bool`, an enum, an error set, and a single-item pointer,
-/// an optional or a struct of those hold none; a struct reached again through its own fields
-/// (`next: ?*Node`) adds none of its own. A type that does not resolve, or one nested this
-/// deep, may.
-pub fn holdsLength(self: *Facts, file: Project.FileId, type_node: Ast.Node.Index) ResolveError!bool {
-    var open: OpenTypes = .{};
-    return self.writtenHoldsLength(file, type_node, &open, 0);
-}
-
-/// The structs whose fields a `holdsLength` reading is within.
-const OpenTypes = struct { items: [8]Container = undefined, len: usize = 0 };
-
-fn writtenHoldsLength(self: *Facts, file: Project.FileId, type_node: Ast.Node.Index, open: *OpenTypes, depth: usize) ResolveError!bool {
-    if (depth > 16) return true;
-    const tree = &self.project.at(file).file.tree;
-    if (tree.fullPtrType(type_node)) |pointer| {
-        if (pointer.size != .one) return true;
-        return self.writtenHoldsLength(file, pointer.ast.child_type, open, depth + 1);
-    }
-    switch (tree.nodeTag(type_node)) {
-        .optional_type => return self.writtenHoldsLength(file, tree.nodeData(type_node).node, open, depth + 1),
-        .grouped_expression => return self.writtenHoldsLength(file, tree.nodeData(type_node).node_and_token[0], open, depth + 1),
-        else => {},
-    }
-    return self.valueHoldsLength(try self.resolve(file, type_node), open, depth + 1);
-}
-
-/// `holdsLength` by what a type resolves to, where its spelling does not show it: a pointer
-/// read this way may be a slice.
-fn valueHoldsLength(self: *Facts, value: Value, open: *OpenTypes, depth: usize) ResolveError!bool {
-    if (depth > 16) return true;
-    switch (value) {
-        .primitive => |p| return std.mem.eql(u8, p, "anyopaque"),
-        .error_set, .scalar, .function, .fn_type => return false,
-        .optional, .error_union => |inner| return self.valueHoldsLength(inner.*, open, depth + 1),
-        .container, .instance => |k| {
-            const scope = self.project.at(k.file).model.scopes[@backingInt(k.scope)];
-            if (scope.kind != .container and scope.kind != .file) return true;
-            const kind = self.kindOf(k) orelse return true;
-            if (kind == .keyword_enum) return false;
-            if (kind == .keyword_opaque) return true;
-            for (open.items[0..open.len]) |outer| if (outer.file == k.file and outer.scope == k.scope) return false;
-            if (open.len == open.items.len) return true;
-            open.items[open.len] = k;
-            open.len += 1;
-            defer open.len -= 1;
-            const tree = &self.project.at(k.file).file.tree;
-            var buffer: [2]Ast.Node.Index = undefined;
-            const members = if (scope.node == .root) tree.rootDecls() else (tree.fullContainerDecl(&buffer, scope.node) orelse return true).ast.members;
-            for (members) |item| {
-                const field = tree.fullContainerField(item) orelse continue;
-                const t = field.ast.type_expr.unwrap() orelse return true;
-                if (try self.writtenHoldsLength(k.file, t, open, depth + 1)) return true;
-            }
-            return false;
-        },
-        .alternatives => |each| {
-            for (each) |one| if (try self.valueHoldsLength(one, open, depth + 1)) return true;
-            return false;
-        },
-        else => return true,
-    }
-}
-
-/// The container an untyped literal or a declaration literal at `node` takes (`.{…}`,
-/// `.init(...)`): the one the type its place gives (`literalType`) is, through the error union
-/// or optional around it. Null where that type is no one container.
-pub fn resultContainer(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Container {
-    return heldContainer(try self.literalType(file, node));
-}
-
-/// The container a type or a value is, through the error union or optional around it.
-fn heldContainer(value: Value) ?Container {
-    return switch (value) {
-        .container, .instance => |container| container,
-        .error_union, .optional => |inner| heldContainer(inner.*),
-        .alternatives => null,
-        else => null,
-    };
-}
-
-/// An array type, its parts nodes of `file`: its length (null for `_`, which its literal's
-/// elements give), its element's type, and its sentinel.
-pub const ArrayType = struct { file: Project.FileId, length: ?Ast.Node.Index, element: Ast.Node.Index, sentinel: ?Ast.Node.Index };
-
-/// The array type `node` writes, through parentheses, `comptime` and the constants that name one
-/// (`const Buf = [32]u8`); null for any other expression, or a name that does not resolve. Its
-/// length is a node: what it counts is its constant value.
-pub fn arrayType(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?ArrayType {
-    var at_file = file;
-    var at = node;
-    for (0..16) |_| {
-        const tree = &self.project.at(at_file).file.tree;
-        if (tree.fullArrayType(at)) |array| {
-            const count = array.ast.elem_count;
-            const inferred = tree.nodeTag(count) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(count)), "_");
-            return .{ .file = at_file, .length = if (inferred) null else count, .element = array.ast.elem_type, .sentinel = array.ast.sentinel.unwrap() };
-        }
-        switch (tree.nodeTag(at)) {
-            .grouped_expression => at = tree.nodeData(at).node_and_token[0],
-            .@"comptime" => at = tree.nodeData(at).node,
-            .identifier, .field_access => {
-                // A name that does not resolve shows no array type: null, as for none.
-                const decl = switch (try self.definition(at_file, at)) {
-                    .decl => |found| found,
-                    .none, .unknown => return null,
-                };
-                const record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
-                if (record.kind != .variable) return null;
-                const held = &self.project.at(decl.file).file.tree;
-                const constant = held.fullVarDecl(record.node) orelse return null;
-                if (held.tokenTag(constant.ast.mut_token) != .keyword_const) return null;
-                at_file = decl.file;
-                at = constant.ast.init_node.unwrap() orelse return null;
-            },
-            else => return null,
-        }
-    }
-    return null;
-}
-
-/// The memory whose length `node` reads, through parentheses: `x` of `x.len` where `x` is an
-/// array, a slice or a pointer to an array (`memoryField`). Null for anything else, a field a
-/// container declares by that name among them, and where what `x` is does not resolve.
-pub fn lengthOf(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Ast.Node.Index {
-    const tree = &self.project.at(file).file.tree;
-    const at = ungrouped(tree, node);
-    if (tree.nodeTag(at) != .field_access) return null;
-    const holder, const member_token = tree.nodeData(at).node_and_token;
-    if (!std.mem.eql(u8, tree.tokenSlice(member_token), "len")) return null;
-    return if (try self.memoryField(file, at) != .field) holder else null;
 }
 
 pub fn definition(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Named {
@@ -9827,7 +9452,7 @@ fn elementsByAddress(self: *Facts, env: ?*const Env, file: Project.FileId, addre
 /// The reading of `function` at one `call` in `file`: its parameters bound to the call's
 /// arguments, a method called on a value given that value first, each read under `outer`,
 /// the reading the call is itself in. A rule walking down a chain of calls binds each in turn
-/// and reads what the callee does under it (`resolveBound`): `value.format(w)` in a generic
+/// and reads what the callee does under it (`resolveIn`): `value.format(w)` in a generic
 /// std calls with what the program handed it.
 pub fn bind(self: *Facts, file: Project.FileId, call: Ast.full.Call, function: Decl, outer: ?*const Env) ResolveError!*const Env {
     return self.bindTo(file, call.ast.fn_expr, call.ast.params, function, outer);
@@ -9940,12 +9565,6 @@ fn literalNamesFunction(self: *Facts, value: Value) ResolveError!bool {
     if (value != .literal) return false;
     for (try self.literalParts(value.literal)) |part| if (namesFunction(part) or try self.literalNamesFunction(part)) return true;
     return false;
-}
-
-/// `node` in `file` read under `env`, a reading `bind` made: a parameter is its argument, a
-/// constant what initializes it, and what is built of them built again.
-pub fn resolveBound(self: *Facts, env: *const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
-    return self.resolveIn(env, file, node);
 }
 
 /// What a type function returns where more than its final statement returns: the choice of
@@ -10608,23 +10227,6 @@ pub fn atCall(self: *Facts, decl: Decl, call: calls.Call) ResolveError!?Value {
     return try self.readWith(decl, how, args.items);
 }
 
-/// Whether code outside the program's own calls may call `function`, with values no call of
-/// the program's shows: a consumer by name, as any public function may be (a run need not hold
-/// a file importing the package), std's or a known library's code
-/// through a member of a value the program hands it (a context's `hash`), or anyone given the
-/// function itself as a value (`std.mem.sort(T, items, {}, less)`, `Thread.spawn(.{}, worker,
-/// …)`). Each of the function's parameters may then hold anything.
-pub fn escapes(self: *Facts, function: Decl) ResolveError!bool {
-    return (try self.callSites(function)) == null;
-}
-
-/// Whether std's or a known library's code, or anyone given the function as a value, may call
-/// `function`: what `escapes` reads but a consumer calling it by its exported name, which hands
-/// it the consumer's own values, as the program's own callers do.
-pub fn handedOut(self: *Facts, function: Decl) ResolveError!bool {
-    return try self.namedCalls(function) == null;
-}
-
 /// One call of a function the program makes (`call`): its arguments, after the receiver a
 /// method call on a value passes first (`holder`).
 pub const CallSite = struct { file: Project.FileId, params: []const Ast.Node.Index, receiver: usize, holder: Ast.Node.Index, call: Ast.Node.Index };
@@ -10872,7 +10474,7 @@ const Callers = enum { consumers, program };
 /// value holding the field may reach a consumer (a pub fn's return, a public declaration, a
 /// store through a pointer parameter), whose call through it its own run resolves by the
 /// field's stores (`fieldOf`) and judges, or leaves unresolved; it is no call this scan sees,
-/// so for `escapes` and `handedOut` the field escapes.
+/// so for `callSites` and `namedCalls` the field escapes.
 const Follow = enum { aliases, fields };
 
 fn scanCallSites(self: *Facts, function: Decl, callers: Callers, follow: Follow) ResolveError!?[]const CallSite {
@@ -11013,7 +10615,7 @@ fn constDecl(tree: *const Ast, model: *const Model, node: Ast.Node.Index, follow
     const declared = tree.fullVarDecl(node) orelse return null;
     if (tree.tokenTag(declared.ast.mut_token) != .keyword_const) return null;
     // A public one is the function handed out: a consumer's call through it is none this scan
-    // sees, so for `escapes` and `handedOut` it escapes; `fields` follows it, as a field, by
+    // sees, so for `callSites` and `namedCalls` it escapes; `fields` follows it, as a field, by
     // the program's uses, a consumer's being its own run's (`Facts.calls` resolves it there).
     if (declared.visib_token != null and follow != .fields) return null;
     for (model.declarations, 0..) |d, i| if (d.kind == .variable and d.node == node) return @fromBackingInt(@intCast(i));
@@ -15537,8 +15139,8 @@ test "facts read a ZON file's literals as the same literals placed in place, or 
     const zon_tree = &project.sources[1].file.tree;
     var buffer: [2]Ast.Node.Index = undefined;
     const fields = zon_tree.fullStructInit(&buffer, from_zon.literal.node).?.ast.fields;
-    try std.testing.expect((try facts.knownBool(project.sources[1].id, fields[0])) orelse true);
-    try std.testing.expect(!((try facts.knownBool(project.sources[1].id, fields[1])) orelse false));
+    try std.testing.expect((try facts.comptimeTruth(null, project.sources[1].id, fields[0])) orelse true);
+    try std.testing.expect(!((try facts.comptimeTruth(null, project.sources[1].id, fields[1])) orelse false));
     try std.testing.expect(isNull(zon_tree, fields[2]));
 }
 
@@ -16470,7 +16072,7 @@ test "a reading bound call by call reads a generic's value as the chain of calls
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "v") and tree.nodeMainToken(node) != v.token) use = node;
     };
-    const value = try facts.resolveBound(inner, file, use.?);
+    const value = try facts.resolveIn(inner, file, use.?);
     try std.testing.expect(value == .instance);
     try std.testing.expect(facts.member(value.instance, "format") != null);
     // Unbound, the same `v` of a public generic is each binding's.
@@ -16499,11 +16101,11 @@ test "a function handed to code outside the program as a value escapes: its call
         if (std.mem.eql(u8, decl.name, "twice")) twice = id;
         if (std.mem.eql(u8, decl.name, "f")) entry = id;
     }
-    try std.testing.expect(try facts.escapes(less.?));
-    try std.testing.expect(!try facts.escapes(twice.?));
+    try std.testing.expect(try facts.callSites(less.?) == null);
+    try std.testing.expect(try facts.callSites(twice.?) != null);
     // Only `less` is handed out to be called with anything: `f` is called by its name alone.
-    try std.testing.expect(try facts.handedOut(less.?));
-    try std.testing.expect(!try facts.handedOut(entry.?) and !try facts.handedOut(twice.?));
+    try std.testing.expect(try facts.namedCalls(less.?) == null);
+    try std.testing.expect(try facts.namedCalls(entry.?) != null and try facts.namedCalls(twice.?) != null);
 }
 
 test "a slice of what does not resolve is a slice: its `.len` is its count, never a field" {
@@ -16578,11 +16180,11 @@ test "a function's value in a private alias or table is followed for every reade
         };
     }
     const a, const b, const c, const d = .{ found[0].?, found[1].?, found[2].?, found[3].? };
-    try std.testing.expect(!try facts.escapes(a) and !try facts.escapes(b));
-    try std.testing.expect(!try facts.handedOut(a) and !try facts.handedOut(b));
+    try std.testing.expect(try facts.callSites(a) != null and try facts.callSites(b) != null);
+    try std.testing.expect(try facts.namedCalls(a) != null and try facts.namedCalls(b) != null);
     try std.testing.expectEqual(@as(usize, 3), (try facts.callSites(a)).?.len);
-    try std.testing.expect(try facts.escapes(c) and try facts.handedOut(c));
-    try std.testing.expect(try facts.escapes(d) and try facts.handedOut(d));
+    try std.testing.expect(try facts.callSites(c) == null and try facts.namedCalls(c) == null);
+    try std.testing.expect(try facts.callSites(d) == null and try facts.namedCalls(d) == null);
 }
 
 /// Whether `run`, a private function of `text`, escapes in a run of `text` and, where given, a
@@ -16596,7 +16198,7 @@ fn runEscapes(text: []const u8, broken: ?[]const u8) !bool {
     var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
     defer facts.deinit();
     const run = facts.member(facts.rootOf(project.sources[0].id), "run") orelse return error.TestUnexpectedResult;
-    return facts.escapes(run);
+    return try facts.callSites(run) == null;
 }
 
 test "a member of a holder of no known type is read over every field the run declares so named, and a file the run cannot parse may declare one" {
@@ -16624,57 +16226,6 @@ test "a member of a holder of no known type is read over every field the run dec
     try std.testing.expect(!try runEscapes(uses, null));
     // A file the run was given that does not parse may declare one: not known as a value's.
     try std.testing.expect(try runEscapes(uses, "const Kept = struct { comptime missing: u8 = 0 };\nfn ("));
-}
-
-test "a parameter's type has a length where it is or holds memory that has one" {
-    // A slice, an array, a pointer to one, a struct holding a slice (through a pointer or an
-    // optional, or itself), memory a cast may give any type, and a type that does not resolve
-    // have one; a number, `bool`, an enum, an error set, a pointer to a number, and a struct of
-    // those (one reaching itself among them) have none.
-    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes =
-        \\const Color = enum { red, blue };
-        \\const Pair = struct { a: u32, b: ?bool };
-        \\const Node = struct { next: ?*Node, value: u64 };
-        \\const Held = struct { items: []u8, count: usize };
-        \\const Bytes = []const u8;
-        \\const Missing = @import("missing").Missing;
-        \\fn f(
-        \\    a: u32,
-        \\    b: bool,
-        \\    c: Color,
-        \\    d: error{Fail},
-        \\    e: *const u32,
-        \\    g: ?u64,
-        \\    h: Pair,
-        \\    i: *Node,
-        \\    j: []const u8,
-        \\    k: [4]u8,
-        \\    l: *const [4]u8,
-        \\    m: Held,
-        \\    n: ?*const Held,
-        \\    o: Bytes,
-        \\    p: *anyopaque,
-        \\    q: Missing,
-        \\) void {
-        \\    _ = .{ a, b, c, d, e, g, h, i, j, k, l, m, n, o, p, q };
-        \\}
-    }}, &.{}, .{});
-    defer project.deinit();
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
-    defer facts.deinit();
-    const tree = &project.sources[0].file.tree;
-    const model = &project.sources[0].model;
-    var proto: ?Ast.full.FnProto = null;
-    var buffer: [1]Ast.Node.Index = undefined;
-    for (model.declarations) |decl| if (decl.kind == .function and std.mem.eql(u8, decl.name, "f")) {
-        proto = tree.fullFnProto(&buffer, decl.node);
-    };
-    var seen: std.ArrayList(u8) = .empty;
-    var it = proto.?.iterate(tree);
-    while (it.next()) |param| if (try facts.holdsLength(project.sources[0].id, param.type_expr.?)) try seen.appendSlice(arena.allocator(), tree.tokenSlice(param.name_token.?));
-    try std.testing.expectEqualStrings("jklmnopq", seen.items);
 }
 
 test "a library's call through a field whose type names none of its generic's parameters calls none of the program's functions" {
@@ -16718,8 +16269,8 @@ test "a library's call through a field whose type names none of its generic's pa
         if (std.mem.eql(u8, decl.name, "load")) load = id;
         if (std.mem.eql(u8, decl.name, "hash")) hash = id;
     }
-    try std.testing.expect(!try facts.handedOut(load.?));
-    try std.testing.expect(try facts.handedOut(hash.?));
+    try std.testing.expect(try facts.namedCalls(load.?) != null);
+    try std.testing.expect(try facts.namedCalls(hash.?) == null);
 }
 
 test "reachedUnder: a site past a condition a binding decides is no site of that binding" {
@@ -16850,7 +16401,7 @@ test "a type function is evaluated in a reading however many calls deep its chai
         env = try facts.bind(file, tree.fullCall(&buffer, node.of(tree, text)).?, facts.member(root, name).?, env);
     }
     try std.testing.expectEqual(@as(usize, 9), env.?.depth);
-    const value = try facts.resolveBound(env.?, file, node.of(tree, "w.?"));
+    const value = try facts.resolveIn(env.?, file, node.of(tree, "w.?"));
     const foo = try facts.resolve(file, node.of(tree, "Foo"));
     try std.testing.expect(value == .instance and foo == .container and value.instance.scope == foo.container.scope);
 }
@@ -17021,7 +16572,7 @@ test "a call whose result type a type function builds from its argument's type r
         env = try facts.bind(file, tree.fullCall(&buffer, node.of(tree, text)).?, facts.member(root, name).?, env);
     }
     try std.testing.expectEqual(@as(usize, 9), env.?.depth);
-    const value = try facts.resolveBound(env.?, file, node.of(tree, "old_memory[0]"));
+    const value = try facts.resolveIn(env.?, file, node.of(tree, "old_memory[0]"));
     const foo = try facts.resolve(file, node.of(tree, "Foo"));
     try std.testing.expect(value == .instance and foo == .container and value.instance.scope == foo.container.scope);
 }
@@ -17149,9 +16700,9 @@ test "@This() in a made container's method is the container its reading made: it
         .none, .unknown => unreachable, // unreachable: the call names the method
     };
     const env = try facts.bind(file, call, first, null);
-    const this = try facts.resolveBound(env, file, node.of(tree, "@This()"));
+    const this = try facts.resolveIn(env, file, node.of(tree, "@This()"));
     try std.testing.expect(this == .container and this.container.made_by != null);
-    const value = try facts.resolveBound(env, file, node.of(tree, "list.items[0]"));
+    const value = try facts.resolveIn(env, file, node.of(tree, "list.items[0]"));
     const foo = try facts.resolve(file, node.of(tree, "Foo"));
     try std.testing.expect(value == .instance and foo == .container and value.instance.scope == foo.container.scope);
 }
@@ -17213,17 +16764,17 @@ test "a parameter of a method in a type function's container reads its written t
     const close = facts.member(file_type.container, "close").?;
     // In `Box(File)`'s reading, `b` points at the container that reading made: its `v` is a
     // `File`, and what `b.v.close()` calls is `File.close`.
-    const bound = try facts.resolveBound(env, file, node.of(tree, "b.v.close"));
+    const bound = try facts.resolveIn(env, file, node.of(tree, "b.v.close"));
     try std.testing.expect(bound == .function and std.meta.eql(bound.function, close));
     // In `Box(Pipe)`'s, the same call is `Pipe.close`: each reading its own.
     const pipe_env = try facts.bind(file, tree.fullCall(&buffer, node.of(tree, "Box(Pipe)")).?, facts.member(root, "Box").?, null);
     const pipe_type = try facts.resolve(file, node.of(tree, "Pipe"));
     try std.testing.expect(pipe_type == .container);
-    const pipe_bound = try facts.resolveBound(pipe_env, file, node.of(tree, "b.v.close"));
+    const pipe_bound = try facts.resolveIn(pipe_env, file, node.of(tree, "b.v.close"));
     try std.testing.expect(pipe_bound == .function and std.meta.eql(pipe_bound.function, facts.member(pipe_type.container, "close").?));
     // `held: U` names `put`'s own parameter, which no reading of `Box` binds: it stays as with
     // none, never a `File`.
-    const held = try facts.resolveBound(env, file, node.of(tree, "held"));
+    const held = try facts.resolveIn(env, file, node.of(tree, "held"));
     try std.testing.expect(held != .instance or held.instance.scope != file_type.container.scope);
     try std.testing.expectEqual(std.meta.activeTag(try facts.resolve(file, node.of(tree, "held"))), std.meta.activeTag(held));
 }
@@ -17290,7 +16841,7 @@ test "@field over a type's own field_names in a reading is the choice of each me
     const file_type = try facts.resolve(file, node.of(tree, "File"));
     try std.testing.expect(file_type == .container);
     // Each of `Holds`' fields read on a `Holds`: a `File` among the choices, each its own.
-    const whole = try facts.resolveBound(env, file, node.of(tree, "@field(k.held, name)"));
+    const whole = try facts.resolveIn(env, file, node.of(tree, "@field(k.held, name)"));
     try std.testing.expect(whole == .alternatives);
     var found_file = false;
     for (whole.alternatives) |part| {
@@ -17298,9 +16849,9 @@ test "@field over a type's own field_names in a reading is the choice of each me
     }
     try std.testing.expect(found_file);
     // `Other` lacks `n`: the whole read is unknown, not the `out` it has.
-    try std.testing.expect(try facts.resolveBound(env, file, node.of(tree, "@field(k.missing, name)")) == .unknown);
+    try std.testing.expect(try facts.resolveIn(env, file, node.of(tree, "@field(k.missing, name)")) == .unknown);
     // A list sliced from the names is not the type's whole list: undecided.
-    try std.testing.expect(try facts.resolveBound(env, file, node.of(tree, "@field(k.*.held, name)")) == .unknown);
+    try std.testing.expect(try facts.resolveIn(env, file, node.of(tree, "@field(k.*.held, name)")) == .unknown);
 }
 
 test "@field over a type's own field_names on a type built from that very list reads its fields' types; one built from another list stays unknown" {
@@ -17382,11 +16933,11 @@ test "@field over a type's own field_names on a type built from that very list r
     const file_type = try facts.resolve(file, node.of(tree, "File"));
     try std.testing.expect(file_type == .container);
     // `Partial(Holds)` is built from `Holds`' own names: each of them is one of its fields.
-    const partial = try facts.resolveBound(env, file, node.of(tree, "@field(k.partial, name)"));
+    const partial = try facts.resolveIn(env, file, node.of(tree, "@field(k.partial, name)"));
     try std.testing.expect(partial != .unknown and node.carries(partial, file_type.container.scope));
     // Built from a list spelled out, or from `Other`'s names: nothing says `Holds`' names are its.
-    try std.testing.expect(try facts.resolveBound(env, file, node.of(tree, "@field(k.spelled, name)")) == .unknown);
-    try std.testing.expect(try facts.resolveBound(env, file, node.of(tree, "@field(k.other, name)")) == .unknown);
+    try std.testing.expect(try facts.resolveIn(env, file, node.of(tree, "@field(k.spelled, name)")) == .unknown);
+    try std.testing.expect(try facts.resolveIn(env, file, node.of(tree, "@field(k.other, name)")) == .unknown);
 }
 
 test "a container a generic declares in its body is its reading's: its fields read that reading's bindings" {
@@ -17429,7 +16980,7 @@ test "a container a generic declares in its body is its reading's: its fields re
         const call_text, const type_name = row;
         var buffer: [1]Ast.Node.Index = undefined;
         const env = try facts.bind(file, tree.fullCall(&buffer, node.of(tree, call_text)).?, spawn, null);
-        const value = try facts.resolveBound(env, file, field);
+        const value = try facts.resolveIn(env, file, field);
         try std.testing.expect(value == .instance);
         const expected = try facts.resolve(file, node.of(tree, type_name));
         try std.testing.expect(expected == .container and value.instance.scope == expected.container.scope);
@@ -17892,8 +17443,8 @@ test "a method of a value a type parameter types is made per binding: each bindi
     // In that reading the literal is the probe its parameter's type names, so its method is
     // that type's.
     const access = node.of(tree, "probe.of");
-    try std.testing.expect(try facts.resolveBound(env2, file, tree.nodeData(access).node_and_token[0]) == .instance);
-    try std.testing.expect(try facts.resolveBound(env2, file, access) == .function);
+    try std.testing.expect(try facts.resolveIn(env2, file, tree.nodeData(access).node_and_token[0]) == .instance);
+    try std.testing.expect(try facts.resolveIn(env2, file, access) == .function);
     const binding = (try calls.at(&facts, file, node.of(tree, "facts.fieldsHold(IoProbe, .{ .key = 1 }, 3)"))).?;
     const value = (try facts.boundCopy(binding, hold, found.?)).?;
     try std.testing.expect(value == .error_union and value.error_union.* == .instance);
@@ -18872,7 +18423,7 @@ test "a copy crowded past its routes is read along the routes its binding compil
     try std.testing.expect(value == .instance);
 }
 
-/// What `knownBool` gives for the initializer of the constant `name` in the project's `source`th
+/// What `comptimeTruth` gives on no reading for the initializer of the constant `name` in the project's `source`th
 /// file, for the tests of values the program fixes (`comptimeValue`).
 fn testKnownBool(facts: *Facts, source: usize, name: []const u8) !?bool {
     const project = facts.project;
@@ -18880,7 +18431,7 @@ fn testKnownBool(facts: *Facts, source: usize, name: []const u8) !?bool {
     const tree = &project.sources[source].file.tree;
     for (model.declarations) |d| if (std.mem.eql(u8, d.name, name) and d.kind == .variable) {
         const init = tree.fullVarDecl(d.node).?.ast.init_node.unwrap().?; // unreachable: each asked is a constant with a value
-        return facts.knownBool(project.sources[source].id, init);
+        return facts.comptimeTruth(null, project.sources[source].id, init);
     };
     unreachable; // unreachable: the source declares each name asked
 }
@@ -19010,7 +18561,7 @@ test "a value the program fixes decides a condition: strand's scalars.kind(T) re
         const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
         if (std.mem.eql(u8, tree.getNodeSource(at), "kind(T) == .ranged")) break at;
     } else unreachable; // unreachable: the source holds it
-    try std.testing.expectEqual(@as(?bool, null), try facts.knownBool(project.sources[0].id, unbound_return));
+    try std.testing.expectEqual(@as(?bool, null), try facts.comptimeTruth(null, project.sources[0].id, unbound_return));
 }
 
 test "@hasDecl sees a declaration not pub only from its container's file, as Zig has it" {
@@ -19119,7 +18670,7 @@ test "a guard on a value the program fixes prunes per binding: `comptime kind(T)
     // A runtime optional is no value the program fixes: unknown, never `null`, and the branch it
     // guards is reached.
     try std.testing.expectEqual(@as(?Comptime, null), try facts.comptimeValue(null, file, node.of(tree, "x orelse null")));
-    try std.testing.expectEqual(@as(?bool, null), try facts.knownBool(file, node.of(tree, "maybe(k) != null")));
+    try std.testing.expectEqual(@as(?bool, null), try facts.comptimeTruth(null, file, node.of(tree, "maybe(k) != null")));
     try std.testing.expect(try facts.reachedUnder(null, file, node.of(tree, "emitScalar(k)")));
 }
 
