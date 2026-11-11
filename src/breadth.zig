@@ -1,5 +1,5 @@
-//! The breadth hygiene rules (glint 0.8): seven rules, each in its own file, that read the syntax
-//! and the type a declaration writes, and report only what is certain. Until they are registered
+//! The breadth rules (glint 0.8): fifteen hygiene rules and opt-in bans, each in its own file, that
+//! read the syntax and the type a declaration writes, and report only what is certain. Until they are registered
 //! as built-in rules, each runs and is tested as a project rule of the id below.
 const std = @import("std");
 const Context = @import("RuleContext.zig");
@@ -16,6 +16,14 @@ pub const LargeStackArray = @import("LargeStackArray.zig");
 pub const FixedComparison = @import("FixedComparison.zig");
 pub const ExpectComparison = @import("ExpectComparison.zig");
 pub const DiscardedCount = @import("DiscardedCount.zig");
+pub const ExpectEqualOrder = @import("ExpectEqualOrder.zig");
+pub const NeverLoops = @import("NeverLoops.zig");
+pub const SelfRecursion = @import("SelfRecursion.zig");
+pub const DocComment = @import("DocComment.zig");
+pub const FieldNaming = @import("FieldNaming.zig");
+pub const UnwrapTrap = @import("UnwrapTrap.zig");
+pub const UndefinedReason = @import("UndefinedReason.zig");
+pub const LeftoverDebugging = @import("LeftoverDebugging.zig");
 
 /// A rule's check, as each breadth rule exports it.
 pub const Check = fn (*Context, Rule) Context.Error!void;
@@ -132,4 +140,12 @@ test {
     _ = FixedComparison;
     _ = ExpectComparison;
     _ = DiscardedCount;
+    _ = ExpectEqualOrder;
+    _ = NeverLoops;
+    _ = SelfRecursion;
+    _ = DocComment;
+    _ = FieldNaming;
+    _ = UnwrapTrap;
+    _ = UndefinedReason;
+    _ = LeftoverDebugging;
 }
