@@ -7,7 +7,8 @@
 //! (src/compiled_read.zig), so what it refuses the dump refuses.
 const std = @import("std");
 const reader = @import("reader");
-const format = reader.format;
+// The format's own file, copied beside the tool by round.sh: glint's reader keeps its copy private.
+const format = @import("format");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.arena.allocator();
@@ -23,21 +24,18 @@ pub fn main(init: std.process.Init) !void {
     var buffer: [1 << 16]u8 = undefined;
     var out = std.Io.File.stdout().writer(io, &buffer);
     const w = &out.interface;
-    const records = reader.read(gpa, .init(bytes), .{}) catch |err| {
-        try w.print("refused {t}\n", .{err});
-        try w.flush();
-        return;
+    const records = switch (try reader.read(gpa, .init(bytes), .{})) {
+        .kept => |kept| kept,
+        .refused => |why| {
+            try w.print("refused {t}\n", .{why});
+            try w.flush();
+            return;
+        },
     };
-    const view: View = .{ .records = &records, .config = records.config, .files = records.files, .values = records.values, .bodies = records.bodies };
+    // The records glint read, in the format's layout again; every id among them is checked.
+    const builder = try toBuilder(gpa, &records);
+    const view: View = .{ .b = &builder, .config = builder.config.items, .files = builder.files.items, .values = builder.values.items, .bodies = builder.bodies.items };
     // It is canonical: writing it again changes nothing.
-    var builder: format.Builder = .{ .gpa = gpa };
-    try builder.strings.appendSlice(gpa, records.strings);
-    try builder.extra.appendSlice(gpa, records.extra);
-    try builder.config.appendSlice(gpa, records.config);
-    try builder.files.appendSlice(gpa, records.files);
-    try builder.values.appendSlice(gpa, records.values);
-    try builder.bodies.appendSlice(gpa, records.bodies);
-    try builder.results.appendSlice(gpa, records.results);
     const ordered = try format.canonical(gpa, &builder);
     const again = try ordered.finish();
     try w.print("canonical {s}\n", .{if (std.mem.eql(u8, again, bytes)) "yes" else "NO"});
@@ -120,22 +118,60 @@ fn plain(name: []const u8) []const u8 {
 
 /// The records as the dump reads them: every id among them was checked by the reader.
 const View = struct {
-    records: *const reader.Records,
+    b: *const format.Builder,
     config: []const format.Config = &.{},
     files: []const format.File = &.{},
     values: []const format.Value = &.{},
     bodies: []const format.Body = &.{},
 
     fn string(view: *const View, text: format.Text) []const u8 {
-        return view.records.string(text) orelse "";
+        return view.b.strings.items[text.start..][0..text.len];
     }
     fn run(view: *const View, list: format.Run) []const u32 {
-        return view.records.run(list) orelse &.{};
+        return view.b.extra.items[list.start..][0..list.len];
     }
     fn resultsOf(view: *const View, body: format.Body) []const format.Result {
-        return view.records.resultsOf(body) orelse &.{};
+        return view.b.results.items[body.results_start..][0..body.results_len];
     }
 };
+
+fn rawId(id: anytype) u32 {
+    return if (id) |known| @backingInt(known) else format.none;
+}
+
+fn toBuilder(gpa: std.mem.Allocator, records: *const reader.Records) !format.Builder {
+    var b: format.Builder = .{ .gpa = gpa };
+    try b.strings.appendSlice(gpa, records.strings);
+    try b.extra.appendSlice(gpa, records.extra);
+    for (records.config) |each| try b.config.append(gpa, .{ .key = .{ .start = each.key.start, .len = each.key.len }, .value = .{ .start = each.value.start, .len = each.value.len } });
+    for (records.files) |each| try b.files.append(gpa, .{ .path = .{ .start = each.path.start, .len = each.path.len }, .hash = each.hash });
+    for (records.values) |each| try b.values.append(gpa, .{ .kind = @backingInt(each.kind), .a = each.a, .b = each.b, .c = each.c, .list = .{ .start = each.list.start, .len = each.list.len }, .text = .{ .start = each.text.start, .len = each.text.len } });
+    for (records.bodies) |each| try b.bodies.append(gpa, .{
+        .kind = @backingInt(each.kind),
+        .file = @backingInt(each.file),
+        .declaration = each.declaration,
+        .function = rawId(each.function),
+        .arguments = .{ .start = each.arguments.start, .len = each.arguments.len },
+        .caller = rawId(each.caller),
+        .call = each.call,
+        .call_visit = each.call_visit,
+        .result = rawId(each.result),
+        .results_start = each.results_start,
+        .results_len = each.results_len,
+    });
+    for (records.results) |each| try b.results.append(gpa, .{
+        .instruction = each.instruction,
+        .visit = each.visit,
+        .value = rawId(each.value),
+        .type = rawId(each.type),
+        .callee = switch (each.callee) {
+            .none => format.none,
+            .runtime => format.Result.runtime_callee,
+            .function => |callee| @backingInt(callee),
+        },
+    });
+    return b;
+}
 
 /// Where a call analysed in place was made, without ZIR numbers: what the caller's result at
 /// its call (instruction and visit) is. The call's own result is the inlined body's (`runtime`

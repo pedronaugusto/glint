@@ -49,7 +49,8 @@ if [ ! -x "$NEW" ] || [ "$PATCH" -nt "$NEW" ]; then
 fi
 
 # 2. The dump tool.
-( cd "$E/tool" && "$BOOT" build-exe -OReleaseSafe --dep reader -Mroot=facts_dump.zig --dep aegis -Mreader="$READER" -Maegis="$AEGIS" \
+cp "$FORMAT" "$E/tool/facts_format.zig" || fail "dump tool" "$FORMAT"
+( cd "$E/tool" && "$BOOT" build-exe -OReleaseSafe --dep reader --dep format -Mroot=facts_dump.zig --dep aegis -Mreader="$READER" -Maegis="$AEGIS" -Mformat=facts_format.zig \
     --cache-dir "$S/join/cache" --global-cache-dir "$S/join/gcache" -femit-bin=facts_dump ) > "$OUT/tool.log" 2>&1 \
     || fail "dump tool" "$OUT/tool.log"
 DUMP=$E/tool/facts_dump

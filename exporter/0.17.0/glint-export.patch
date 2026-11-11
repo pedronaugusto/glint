@@ -656,8 +656,8 @@ diff -ruN a/src/glint_export.zig b/src/glint_export.zig
 +}
 diff -ruN a/src/glint_facts_format.zig b/src/glint_facts_format.zig
 --- a/src/glint_facts_format.zig	1970-01-01 01:00:00
-+++ b/src/glint_facts_format.zig	2026-11-10 22:40:09
-@@ -0,0 +1,631 @@
++++ b/src/glint_facts_format.zig	2026-11-11 00:07:37
+@@ -0,0 +1,663 @@
 +//! The compiled-facts file: what zig's own semantic analysis of one configuration holds for
 +//! glint, exported by exporter/<zig-version>/ (designs/glint-compiled-facts.md). This file holds
 +//! what the exporter and glint must agree on, and nothing else: the record layouts, the section
@@ -675,7 +675,7 @@ diff -ruN a/src/glint_facts_format.zig b/src/glint_facts_format.zig
 +//! never read as fewer facts.
 +const std = @import("std");
 +
-+pub const magic = "GLFACTS\x00".*;
++pub const magic: [8]u8 = "GLFACTS\x00".*;
 +pub const version: u32 = 1;
 +
 +/// No value, body or file: the id a field holds where it names none.
@@ -908,7 +908,7 @@ diff -ruN a/src/glint_facts_format.zig b/src/glint_facts_format.zig
 +    /// The file's bytes, owned by the caller. Fields are written as the host has them: the
 +    /// format is little-endian and so is every host the exporter runs on (checked here).
 +    pub fn finish(self: *const Builder) std.mem.Allocator.Error![]u8 {
-+        comptime std.debug.assert(@import("builtin").cpu.arch.endian() == .little);
++        if (comptime std.mem.nativeToLittle(u32, 1) != 1) @compileError("the facts format is little-endian and is written as the host holds it");
 +        const end: End = .{ .files = @intCast(self.files.items.len), .values = @intCast(self.values.items.len), .bodies = @intCast(self.bodies.items.len), .results = @intCast(self.results.items.len) };
 +        const parts = [_]struct { tag: Tag, count: usize, bytes: []const u8 }{
 +            .{ .tag = .strings, .count = self.strings.items.len, .bytes = self.strings.items },
@@ -958,7 +958,7 @@ diff -ruN a/src/glint_facts_format.zig b/src/glint_facts_format.zig
 +        each.* = @intCast(i);
 +        path.* = try canon.textOf(file.path);
 +    }
-+    std.mem.sort(u32, file_order, @as([]const []const u8, file_paths), lessByText);
++    try sortByText(arena, file_order, file_paths);
 +    canon.file_new = try arena.alloc(u32, files.len);
 +    for (file_order, 0..) |old, new| {
 +        canon.file_new[old] = @intCast(new);
@@ -974,7 +974,7 @@ diff -ruN a/src/glint_facts_format.zig b/src/glint_facts_format.zig
 +        each.* = @intCast(i);
 +        key.* = try canon.bodyKey(@intCast(i), 0);
 +    }
-+    std.mem.sort(u32, body_order, @as([]const []const u8, keys), lessByText);
++    try sortByText(arena, body_order, keys);
 +    canon.body_new = try arena.alloc(u32, bodies.len);
 +    for (body_order, 0..) |old, new| canon.body_new[old] = @intCast(new);
 +
@@ -986,7 +986,7 @@ diff -ruN a/src/glint_facts_format.zig b/src/glint_facts_format.zig
 +        each.* = @intCast(i);
 +        key.* = try canon.textOf(entry.key);
 +    }
-+    std.mem.sort(u32, config_order, @as([]const []const u8, config_keys), lessByText);
++    try sortByText(arena, config_order, config_keys);
 +    for (config_order) |old| try canon.out.config.append(gpa, .{ .key = try canon.out.text(config_keys[old]), .value = try canon.out.text(try canon.textOf(config[old].value)) });
 +
 +    // Values in the order the bodies, so ordered, first name them.
@@ -1021,6 +1021,38 @@ diff -ruN a/src/glint_facts_format.zig b/src/glint_facts_format.zig
 +        });
 +    }
 +    return canon.out;
++}
++
++/// `order` (positions into `texts`) sorted by their texts, equal texts in the order given: a
++/// merge sort of its own, bottom up, so every comparison is a call this file makes.
++fn sortByText(arena: std.mem.Allocator, order: []u32, texts: []const []const u8) std.mem.Allocator.Error!void {
++    const spare = try arena.alloc(u32, order.len);
++    var from: []u32 = order;
++    var to: []u32 = spare;
++    var width: usize = 1;
++    while (width < order.len) : (width *= 2) {
++        var start: usize = 0;
++        while (start < order.len) : (start += 2 * width) {
++            const middle = @min(start + width, order.len);
++            const end = @min(start + 2 * width, order.len);
++            var left = start;
++            var right = middle;
++            var at = start;
++            while (at < end) : (at += 1) {
++                if (left < middle and (right >= end or !lessByText(texts, from[right], from[left]))) {
++                    to[at] = from[left];
++                    left += 1;
++                } else {
++                    to[at] = from[right];
++                    right += 1;
++                }
++            }
++        }
++        const swapped = from;
++        from = to;
++        to = swapped;
++    }
++    if (from.ptr != order.ptr) @memcpy(order, from);
 +}
 +
 +fn lessByText(texts: []const []const u8, x: u32, y: u32) bool {
@@ -1207,7 +1239,7 @@ diff -ruN a/src/glint_facts_format.zig b/src/glint_facts_format.zig
 +    try b.config.append(gpa, .{ .key = try b.text(if (way == 0) "zig_version" else "target"), .value = try b.text(if (way == 0) "0.17.0" else "aarch64-macos") });
 +    // Values: u8, a declared Node with a field `next: ?*Node`, the pointer, the optional, and
 +    // the functions f and g.
-+    var ids: [6]u32 = undefined;
++    var ids: [6]u32 = @splat(0);
 +    const order = if (way == 0) [_]usize{ 0, 1, 2, 3, 4, 5 } else [_]usize{ 5, 4, 3, 2, 1, 0 };
 +    for (order, 0..) |which, at| ids[which] = @intCast(at);
 +    for (order) |which| switch (which) {
@@ -1224,7 +1256,7 @@ diff -ruN a/src/glint_facts_format.zig b/src/glint_facts_format.zig
 +    };
 +    // Bodies: f(u8) and f(Node) in a.zig, and an inline call of g inside f(Node).
 +    const bodies = if (way == 0) [_]usize{ 0, 1, 2 } else [_]usize{ 2, 1, 0 };
-+    var body_id: [3]u32 = undefined;
++    var body_id: [3]u32 = @splat(0);
 +    for (bodies, 0..) |which, at| body_id[which] = @intCast(at);
 +    for (bodies) |which| {
 +        const start: u32 = @intCast(b.results.items.len);
@@ -1247,21 +1279,21 @@ diff -ruN a/src/glint_facts_format.zig b/src/glint_facts_format.zig
 +
 +test "canonical: the same facts appended in another order give the same bytes, and canonical of canonical is itself" {
 +    const gpa = std.testing.allocator;
-+    var bytes: [2][]u8 = undefined;
-+    var made: [2]Builder = undefined;
-+    for (&bytes, &made, 0..) |*out, *kept, way| {
-+        var b = try sample(gpa, way);
-+        defer b.deinit();
-+        kept.* = try canonical(gpa, &b);
-+        out.* = try kept.finish();
-+    }
-+    defer for (&bytes, &made) |each, *kept| {
-+        gpa.free(each);
-+        kept.deinit();
-+    };
-+    try std.testing.expectEqualSlices(u8, bytes[0], bytes[1]);
++    var forward = try sample(gpa, 0);
++    defer forward.deinit();
++    var backward = try sample(gpa, 1);
++    defer backward.deinit();
++    var made = try canonical(gpa, &forward);
++    defer made.deinit();
++    var made_backward = try canonical(gpa, &backward);
++    defer made_backward.deinit();
++    const bytes = try made.finish();
++    defer gpa.free(bytes);
++    const bytes_backward = try made_backward.finish();
++    defer gpa.free(bytes_backward);
++    try std.testing.expectEqualSlices(u8, bytes, bytes_backward);
 +    // Files by path, the generic's two instances together, the inline call after its function.
-+    const c = &made[0];
++    const c = &made;
 +    try std.testing.expectEqualStrings("src/a.zig", c.strings.items[c.files.items[0].path.start..][0..c.files.items[0].path.len]);
 +    try std.testing.expectEqual(@as(usize, 3), c.bodies.items.len);
 +    try std.testing.expectEqual(@as(u32, 0), c.bodies.items[0].file);
@@ -1274,7 +1306,7 @@ diff -ruN a/src/glint_facts_format.zig b/src/glint_facts_format.zig
 +    defer again.deinit();
 +    const twice = try again.finish();
 +    defer gpa.free(twice);
-+    try std.testing.expectEqualSlices(u8, bytes[0], twice);
++    try std.testing.expectEqualSlices(u8, bytes, twice);
 +}
 +
 +test "canonical: records naming what they do not hold are the writer's mistake, never written" {
