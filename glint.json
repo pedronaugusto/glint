@@ -1,0 +1,18 @@
+{
+  "seams": [
+    {
+      "file": "src/cli.zig",
+      "rules": [
+        "A009"
+      ],
+      "reason": "the command line's input: the sources, configurations, manifests, file lists and escape records it is given are read here, each parsed as input before use"
+    },
+    {
+      "file": "src/BuildGate.zig",
+      "rules": [
+        "A009"
+      ],
+      "reason": "the build gate runs a linter and reads its receipt: a child's output and a file it wrote, judged here"
+    }
+  ]
+}

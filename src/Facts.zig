@@ -111,7 +111,7 @@ pub const Assumptions = struct {
     held: []const Assumption,
 
     /// A set of `settled`, made only as it is appended or by counting them.
-    const Id = enum(u32) { _ };
+    pub const Id = enum(u32) { _ };
 };
 /// A `comptime` parameter's value on a path: a `bool`'s inside `if (wrapped)`'s branches or
 /// after `if (wrapped) return ...;`, an enum's inside a `switch` prong naming one tag. Zig
