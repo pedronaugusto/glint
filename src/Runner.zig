@@ -245,11 +245,17 @@ pub fn packageRules(a: std.mem.Allocator, project: *const Project) RunError![]co
     return declaredRules(&facts);
 }
 /// Two packages declaring one rule id, or more rules than ids, is no selection a run can make.
+/// A rule that reads `.replaces` joins the run; one that reads `.governed` or `.exits` waits for
+/// the engines that read them, which retire the compiled A001 and A004 of the same names (vocabulary
+/// push 4). Each keeps the id the table gave it.
 fn declaredRules(facts: *Facts) RunError![]const rules.Definition {
-    return PackageRules.table(facts) catch |err| switch (err) {
-        error.DuplicateRule, error.TooManyRules => error.InvalidSelection,
-        else => |other| other,
+    const all = PackageRules.table(facts) catch |err| switch (err) {
+        error.DuplicateRule, error.TooManyRules => return error.InvalidSelection,
+        else => |other| return other,
     };
+    var read: std.ArrayList(rules.Definition) = .empty;
+    for (all) |definition| if (definition.declared.?.reads == .replaces) try read.append(facts.gpa, definition);
+    return read.items;
 }
 
 /// Only a rule that ran shows that a suppression of it suppresses nothing; an escape is

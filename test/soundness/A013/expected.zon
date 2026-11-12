@@ -1,6 +1,0 @@
-.{
-    .open = .{
-    },
-    .no_hole = .{ .destructure, .jump, .conversion, .unwrap, .memory },
-    .no_twin = .{ .destructure, .jump, .conversion, .unwrap, .memory },
-}

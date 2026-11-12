@@ -7855,7 +7855,6 @@ pub fn memo(self: *Facts, comptime T: type) ResolveError!*T {
     return @ptrCast(@alignCast(entry.value_ptr.*)); // aegis: internal(A019): the key is this type's own name.
 }
 
-
 /// A file's own container: the struct the file is.
 pub fn rootOf(self: *const Facts, file: Project.FileId) Container {
     return .{ .file = file, .scope = self.project.at(file).model.root() };

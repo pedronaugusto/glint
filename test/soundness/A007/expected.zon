@@ -1,5 +1,0 @@
-// A lock or an atomic cell is no operand of an operator, and an operator makes no type:
-// A007's value (a sync type held, a raw atomic) cannot pass through one.
-.{
-    .na = .{.operator},
-}
