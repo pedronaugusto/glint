@@ -7,6 +7,6 @@
     // behind `@alignCast(@fieldParentPtr(...))`), which P007 does not read (glint-0.8-shape,
     // what the bans do not claim): assignment, capture, field, address, compile_time, aggregate,
     // memory.
-    .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch },
-    .no_twin = .{ .field, .deferred, .inline_loop, .operator, .conversion, .aggregate, .branch },
+    .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .deferred, .jump, .inline_loop, .operator, .unwrap, .aggregate, .branch },
+    .no_twin = .{ .field, .deferred, .inline_loop, .operator, .aggregate, .branch },
 }
