@@ -4,6 +4,8 @@
 //! condition is `i < n`, `i <= n`, `n > i` or `n >= i` with both names' types written, and whose
 //! continue expression is `i += …` on the same name. A bound of `usize` or `isize` is at least 16
 //! bits on every target Zig builds for, so a counter of fewer than 16 bits is narrower than it.
+//! A bound and step the program states as it compiles (`const n: usize = 10;`) that the counter
+//! holds through its last step is no overflow, and not reported.
 const std = @import("std");
 const Ast = std.zig.Ast;
 const Context = @import("RuleContext.zig");
@@ -39,6 +41,21 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
             .float, .boolean => false,
         };
         if (!narrower) continue;
+        // A bound the program states, which the counter holds through its last step: the
+        // loop ends before the counter can overflow (review 8, m11).
+        if (Written.constantInteger(tree, model, bound)) |limit| if (Written.constantInteger(tree, model, tree.nodeData(step).node_and_node[1])) |by| {
+            const signed = switch (Written.primitive(tree, Written.typeOf(tree, model, counter).?).?) {
+                .sized => |sized| sized.signed,
+                else => unreachable, // unreachable: counter_bits came from a sized primitive above
+            };
+            const max: u128 = (@as(u128, 1) << @intCast(counter_bits - @intFromBool(signed))) - 1;
+            // The last value the condition lets through, and the step after it.
+            const last = switch (tree.nodeTag(condition)) {
+                .less_than, .greater_than => if (limit == 0) 0 else limit - 1,
+                else => limit,
+            };
+            if ((std.math.add(u128, last, by) catch (max + 1)) <= max) continue;
+        };
         try c.at(rule, loop.ast.while_token, try c.allocator.print("the counter is {d} bits and its bound wider: where the bound passes what the counter holds, it overflows before the loop ends", .{counter_bits}));
     }
 }
@@ -51,4 +68,8 @@ test "breadth: narrow counter: a u8 counter to a u16 or usize bound reported; as
     try breadth.expectFindings(check, "pub fn f(n: u16) void { var i: u16 = 0; while (i < n) : (i += 1) {} }", 0);
     try breadth.expectFindings(check, "pub fn f(n: usize) void { var i: u32 = 0; while (i < n) : (i += 1) {} }", 0);
     try breadth.expectFindings(check, "pub fn f(n: u16) void { var i: u8 = 0; var j: u8 = 0; while (i < n) : (j += 1) { i += 1; } }", 0);
+    // A constant bound the counter holds through its last step, and one it does not.
+    try breadth.expectFindings(check, "const n: usize = 10; pub fn f() void { var i: u8 = 0; while (i < n) : (i += 1) {} }", 0);
+    try breadth.expectFindings(check, "const n: usize = 255; pub fn f() void { var i: u8 = 0; while (i <= n) : (i += 1) {} }", 1);
+    try breadth.expectFindings(check, "const n: usize = 255; pub fn f() void { var i: u8 = 0; while (i < n) : (i += 1) {} }", 0);
 }

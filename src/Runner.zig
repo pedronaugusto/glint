@@ -29,6 +29,10 @@ emitted: std.StringHashMapUnmanaged(?usize) = .empty,
 errors: std.ArrayList(Report.RunError) = .empty,
 suppressions: []Suppression = &.{},
 suppressed: usize = 0,
+/// The finding each of the current file's suppressions hid of each rule, by its index: put back
+/// where the suppression meets a second site of that rule on its line, which leaves it hiding
+/// neither.
+hidden: std.AutoHashMapUnmanaged(struct { usize, rules.Rule }, Report.Diagnostic) = .empty,
 stale: std.ArrayList(Report.Stale) = .empty,
 /// Where the rules' findings come in; each callback gets the runner back from it.
 sink: Context.Sink = .{ .diagnostic = sinkDiagnostic, .refuse = sinkRefuse, .config = sinkConfig, .suppresses = sinkSuppresses },
@@ -109,6 +113,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
         const file = source.file;
         var malformed: std.ArrayList(Suppression.Malformed) = .empty;
         runner.suppressions = try Suppression.parseConfigured(a, file, known, &malformed);
+        runner.hidden.clearRetainingCapacity();
         for (malformed.items) |entry| {
             runner.complete = false;
             const start = entry.comment.start;
@@ -236,8 +241,9 @@ fn declarationProblems(runner: *Runner, file: *const File) RunError!void {
         const start = tree.tokenStart(tree.firstToken(problem.node));
         runner.complete = false;
         try runner.malformed.append(runner.a, .{
-            .why = try runner.a.print("lint_rules: {t}: glint does not read this part, so the programs that import this package do not know what it declares", .{problem.why}),
+            .why = try runner.a.print("{t}: glint does not read this part, so the programs that import this package do not know what it declares", .{problem.why}),
             .span = .{ .file = runner.file, .start = start, .end = start, .line = file.line(start) + 1, .column = file.column(start) },
+            .of = .lint_rules,
         });
     };
 }
@@ -309,28 +315,34 @@ fn emitRelated(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: [
         return;
     }
     seen.value_ptr.* = null;
-    for (self.suppressions) |*suppression| {
+    const diagnostic: Report.Diagnostic = .{ .rule = rule, .name = metadata.name, .rule_version = metadata.version, .class = switch (metadata.group) {
+        .correctness => .correctness,
+        .zig_style => .zig_style,
+        .family_policy => .family_policy,
+    }, .level = self.config.level(rule), .severity = if (rule == .Z003) .@"error" else .warning, .span = span, .message = try self.a.dupe(u8, message), .related = try self.a.dupe(Report.Span, related), .bug_class = metadata.purpose, .fix = if (fix.len != 0) try Fix.copy(self.a, fix) else &.{} };
+    for (self.suppressions, 0..) |*suppression, index| {
         const matched = suppression.matches(rule, line, start) catch {
-            // A second site of a rule the suppression names, on its line: the finding stands, and
-            // the suppression is malformed where it is written, once.
+            // A second site of a rule the suppression names, on its line: it hides neither, so
+            // both findings stand, and the suppression is malformed where it is written, once.
             if (!suppression.ambiguous) {
                 suppression.ambiguous = true;
                 self.complete = false;
                 const comment = suppression.comment;
                 try self.malformed.append(self.a, .{ .why = try self.a.print("names {s} for one site, and its line holds another: give each site its own line", .{metadata.name}), .span = .{ .file = self.file, .start = comment.start, .end = comment.end, .line = comment.line + 1, .column = file.column(comment.start) } });
+                if (self.hidden.fetchRemove(.{ index, rule })) |first| {
+                    self.suppressed -= 1;
+                    try self.diagnostics.append(self.a, first.value);
+                }
             }
             break;
         };
         if (!matched) continue;
         self.suppressed += 1;
+        try self.hidden.put(self.a, .{ index, rule }, diagnostic);
         return;
     }
     seen.value_ptr.* = self.diagnostics.items.len;
-    try self.diagnostics.append(self.a, .{ .rule = rule, .name = metadata.name, .rule_version = metadata.version, .class = switch (metadata.group) {
-        .correctness => .correctness,
-        .zig_style => .zig_style,
-        .family_policy => .family_policy,
-    }, .level = self.config.level(rule), .severity = if (rule == .Z003) .@"error" else .warning, .span = span, .message = try self.a.dupe(u8, message), .related = try self.a.dupe(Report.Span, related), .bug_class = metadata.purpose, .fix = if (fix.len != 0) try Fix.copy(self.a, fix) else &.{} });
+    try self.diagnostics.append(self.a, diagnostic);
 }
 
 fn sinkDiagnostic(sink: *Context.Sink, rule: rules.Rule, start: u32, end: u32, message: []const u8, related: []const Report.Span, fix: []const Report.Edit) Context.Error!void {

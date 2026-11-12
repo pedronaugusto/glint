@@ -286,16 +286,26 @@ pub const Arguments = struct {
 
 /// What the arguments ask: the profile chosen, the rules named (resolved by `resolve` once the
 /// packages' rules are read), the code options and the inputs.
-fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments) !Options {
+fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, problems: *std.Io.Writer) !Options {
     var result: Options = .{ .format = arguments.format, .zig_lib_path = arguments.zig_lib_path };
     if (arguments.config) |path| {
         const bytes = try aegis.own.readFile(io, std.Io.Dir.cwd(), path, a, .fromRaw(4 * 1024 * 1024));
         // A configuration file is the checked repository's content: input until parsed.
         const configured = try aegis.input.Untrusted([]const u8).init(bytes).parse(a, configure);
+        if (configured.refused_profile) |name| {
+            try problems.writeAll("glint: ");
+            try refuseProfile(problems, name);
+            try problems.writeByte('\n');
+            try problems.flush();
+            return error.UnknownProfile;
+        }
         result.config = configured.config;
         // Its seams and test inputs name paths from its own directory.
         const real = try std.Io.Dir.cwd().realPathFileAlloc(io, path, a);
         result.config.paths_from = std.Io.Dir.path.dirname(real) orelse ".";
+        // And from the working directory, where relative input names start.
+        const here = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", a);
+        result.config.paths_from_relative = try std.Io.Dir.path.relativeAlloc(a, here, null, here, result.config.paths_from.?);
         result.settings = configured.settings;
         result.package_defaults = configured.package_defaults;
     } else if (arguments.reviewed) {
@@ -344,6 +354,14 @@ fn unknownRule(result: *const Options, definitions: []const Rule.Definition, own
 fn unknown(name: []const u8, definitions: []const Rule.Definition, own_form: bool) bool {
     if (own_form and (name.len == 0 or std.mem.findScalar(u8, "ZPD", name[0]) == null)) return false;
     return Rule.parseConfigured(name, definitions) == null;
+}
+
+/// What a configuration naming a profile glint does not have is told: 0.7's `aegis` and `family`
+/// with where their rules are now.
+fn refuseProfile(w: *std.Io.Writer, name: []const u8) std.Io.Writer.Error!void {
+    if (std.mem.eql(u8, name, "aegis") or std.mem.eql(u8, name, "family"))
+        return w.print("profile `{s}` was removed in glint 0.8: aegis's rules are its own `lint_rules`, on wherever the program reaches aegis, and glint's are in `core` and `reviewed`; name one of those", .{name});
+    try w.print("profile `{s}` is not one glint has: `core`, `none` or `reviewed`", .{name});
 }
 
 /// Refuses a run that names a rule it does not have (`unknownRule`), saying which and, where
@@ -469,7 +487,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
         // outcome no parse of them gives is a refusal, not a state the program cannot reach.
         .complete => return error.InvalidArguments,
     };
-    var configured = try options(a, io, arguments);
+    var configured = try options(a, io, arguments, problems);
     try refuseUnknown(&configured, definitions, true, problems);
     if (configured.files.items.len == 0) return error.MissingSource;
     record.outcome = .input_failure;
@@ -516,7 +534,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
         const changed = try Fix.apply(a, &project, &report, .{ .escapes_before = configured.escapes_before });
         for (changed) |file| {
             try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = project.at(file.file).input.name, .data = file.bytes });
-            made += file.edits;
+            made += file.sites;
         }
         try problems.print("glint: fixed {d} sites in {d} files\n", .{ made, changed.len });
         try problems.flush();
@@ -549,6 +567,27 @@ fn refused(err: ensign.Error, diagnostic: ensign.Diagnostic, problems: *std.Io.W
     return error.InvalidArguments;
 }
 
+/// `options` in a test, its problems written nowhere.
+fn testOptions(a: std.mem.Allocator, arguments: Arguments) !Options {
+    var buffer: [256]u8 = undefined;
+    var problems: std.Io.Writer = .fixed(&buffer);
+    return options(a, std.testing.io, arguments, &problems);
+}
+
+test "a configuration naming 0.7's aegis or family profile is refused with where its rules are now" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings("aegis", (try configure(arena.allocator(), "{\"profile\": \"aegis\"}")).refused_profile.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), (try configure(arena.allocator(), "{\"profile\": \"reviewed\"}")).refused_profile);
+    var buffer: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buffer);
+    try refuseProfile(&w, "family");
+    try std.testing.expect(std.mem.startsWith(u8, w.buffered(), "profile `family` was removed in glint 0.8"));
+    w.end = 0;
+    try refuseProfile(&w, "strict");
+    try std.testing.expectEqualStrings("profile `strict` is not one glint has: `core`, `none` or `reviewed`", w.buffered());
+}
+
 test "fuzz: the configuration JSON" {
     const Target = struct {
         fn one(_: void, smith: *std.testing.Smith) anyerror!void {
@@ -578,9 +617,9 @@ test "CLI invalid selections and unknown formats fail" {
     defer arena.deinit();
     // A name of glint's own form is known or not before the project is read; any other waits
     // for the packages' rules.
-    const own = try options(arena.allocator(), std.testing.io, .{ .only = &.{"Z008"} });
+    const own = try testOptions(arena.allocator(), .{ .only = &.{"Z008"} });
     try std.testing.expectEqualStrings("Z008", unknownRule(&own, &.{}, true).?);
-    var asked = try options(arena.allocator(), std.testing.io, .{ .only = &.{"X008"} });
+    var asked = try testOptions(arena.allocator(), .{ .only = &.{"X008"} });
     try std.testing.expectEqual(@as(?[]const u8, null), unknownRule(&asked, &.{}, true));
     try std.testing.expectEqualStrings("X008", unknownRule(&asked, &.{}, false).?);
     try std.testing.expectError(error.UnknownRule, resolve(arena.allocator(), &asked, &.{}));
@@ -604,7 +643,9 @@ test "a configuration's limits reach the rules that read them: P013's parameters
 
 /// Strict JSON policy, containing code options only. Callers own file selection.
 pub const Configuration = struct {
-    profile: enum { core, none, reviewed } = .core,
+    /// `core`, `none` or `reviewed`; 0.7's `aegis` and `family` are refused with what to
+    /// write instead.
+    profile: []const u8 = "core",
     rules: []const Setting = &.{},
     max_line_length: u32 = 100,
     max_function_lines: u32 = 120,
@@ -632,11 +673,13 @@ fn select(a: std.mem.Allocator, config: *Rule.Config, id: Rule.Rule, level: Rule
     config.selections = selections;
 }
 const ConfigureError = std.json.ParseError(std.json.Scanner) || error{InvalidSelection};
-const Configured = struct { config: Rule.Config, package_defaults: bool, settings: []const Configuration.Setting };
+const Configured = struct { config: Rule.Config, package_defaults: bool, settings: []const Configuration.Setting, refused_profile: ?[]const u8 = null };
 /// A configuration's profile and code options; its rule settings are named, for `resolve`.
 fn configure(a: std.mem.Allocator, bytes: []const u8) ConfigureError!Configured {
     const document = try std.json.parseFromSliceLeaky(Configuration, a, bytes, .{});
-    var config: Rule.Config = switch (document.profile) {
+    const profile = std.meta.stringToEnum(enum { core, none, reviewed }, document.profile) orelse
+        return .{ .config = .{}, .package_defaults = false, .settings = &.{}, .refused_profile = document.profile };
+    var config: Rule.Config = switch (profile) {
         .core => .{},
         .none => Rule.Config.none(),
         .reviewed => Rule.Config.reviewed(),
@@ -654,7 +697,7 @@ fn configure(a: std.mem.Allocator, bytes: []const u8) ConfigureError!Configured 
     config.seams = document.seams;
     config.test_inputs = document.test_inputs;
     try config.validate();
-    return .{ .config = config, .package_defaults = document.profile != .none, .settings = document.rules };
+    return .{ .config = config, .package_defaults = profile != .none, .settings = document.rules };
 }
 
 test "the packages' rules on by default run unless a profile of none or --only says otherwise, and a package rule's name resolves once the packages' rules are read" {
@@ -665,11 +708,11 @@ test "the packages' rules on by default run unless a profile of none or --only s
         .{ .id = @fromBackingInt(2000), .name = "X001", .group = .family_policy, .purpose = "p", .declared = .{ .package = "pkg", .kind = .ban, .reads = .replaces, .default = true } },
         .{ .id = @fromBackingInt(2001), .name = "X002", .group = .family_policy, .purpose = "q", .declared = .{ .package = "pkg", .kind = .ban, .reads = .replaces, .default = false } },
     };
-    var plain = try options(a, std.testing.io, .{});
+    var plain = try testOptions(a, .{});
     try resolve(a, &plain, &declared);
     // The run selects the defaults (Runner); the configuration says it takes them.
     try std.testing.expect(plain.config.package_defaults);
-    var only = try options(a, std.testing.io, .{ .only = &.{"X002"} });
+    var only = try testOptions(a, .{ .only = &.{"X002"} });
     try resolve(a, &only, &declared);
     try std.testing.expect(!only.config.package_defaults);
     try std.testing.expectEqual(Rule.Config.Level.report, only.config.level(declared[1].id));

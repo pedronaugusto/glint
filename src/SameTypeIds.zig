@@ -88,12 +88,15 @@ const Kind = struct {
     unknown: bool = false,
 };
 
-/// The integers a type written at `node` may be; null for a type that is none in any build.
+/// The integers a type written at `node` may be, or the optional of it may hold; null for a type
+/// that is none in any build.
 fn kindOf(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!?Kind {
     const first = tree.firstToken(node);
     const last = tree.lastToken(node);
     const spelled = tree.source[tree.tokenStart(first) .. tree.tokenStart(last) + tree.tokenSlice(last).len];
-    const value = try c.facts.resolve(c.file, node);
+    // An optional id is the id's integer where it is one (`parent_id: ?u32, child_id: ?u32`).
+    var value = try c.facts.resolve(c.file, node);
+    while (value == .optional) value = value.optional.*;
     switch (value) {
         .unknown, .reflected => return .{ .spelled = spelled, .unknown = true },
         // `@Int` of a width computed as the program compiles: an integer, which one unread.
@@ -201,6 +204,14 @@ fn reachedFrom(c: *Context, tree: *const Ast, model: *const Model, out: []const 
                 break :name proto.name_token orelse continue;
             },
             .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl => tree.fullVarDecl(parent).?.ast.mut_token + 1,
+            // A container's `comptime` block has no name code outside the file can reach it by
+            // (`comptime { _ = &f; }` keeps `f` analysed, and reaches it from nowhere).
+            .@"comptime" => {
+                const holder = model.parentOf(parent) orelse return false;
+                var buffer: [2]Ast.Node.Index = undefined;
+                if (holder == .root or tree.fullContainerDecl(&buffer, holder) != null) return false;
+                continue;
+            },
             else => continue,
         };
         const decl = model.lookup(model.scopeOf(name), tree.tokenSlice(name), name) orelse continue;

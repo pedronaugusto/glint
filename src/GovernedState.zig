@@ -12,7 +12,8 @@
 //! operand does not resolve spells no governed name and is silent.
 //!
 //! A rule that reads `.exits` is hygiene: an exit's result (`raw()`) given straight to arithmetic, a
-//! comparison or a narrowing cast loses the type's checks. Only a call that resolves to an exit
+//! comparison or a narrowing cast (into a type that cannot hold every value of the exit's, both
+//! widths known) loses the type's checks. Only a call that resolves to an exit
 //! is read, and only that certain shape: a value kept in a name first is not followed.
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -209,11 +210,38 @@ pub fn exits(c: *Context, definition: Rule.Definition) Context.Error!void {
             else => blk: {
                 const builtin = Facts.builtinName(tree, parent) orelse continue;
                 if (!std.mem.eql(u8, builtin, "@intCast") and !std.mem.eql(u8, builtin, "@truncate")) continue;
+                // Only a cast into a type that cannot hold every value of the exit's: a widening
+                // loses nothing, and a width either side's build decides is not read (hygiene).
+                const from = intType(try c.facts.resolve(c.file, node)) orelse continue;
+                const into = intType(try c.facts.castTypeIn(null, c.file, parent)) orelse continue;
+                if (holdsAll(into, from)) continue;
                 break :blk "a narrowing cast";
             },
         };
         try c.at(definition.id, token, try c.allocator.print("{s}'s bare value given to {s} loses its checks: use the type's own operation", .{ typeName(c, entry), shape }));
     }
+}
+
+/// An integer type of a width every build gives it (`u32`, `i7`), as a value's type names it.
+const Int = struct { signed: bool, bits: u16 };
+
+fn intType(value: Facts.Value) ?Int {
+    const name = switch (value) {
+        .primitive => |name| name,
+        // A width a build chooses is not read: hygiene is silent where it does not know.
+        .alternatives => return null,
+        else => return null,
+    };
+    if (name.len < 2 or (name[0] != 'u' and name[0] != 'i')) return null;
+    const bits = std.fmt.parseInt(u16, name[1..], 10) catch return null;
+    return .{ .signed = name[0] == 'i', .bits = bits };
+}
+
+/// Whether every value of `from` is one of `into`.
+fn holdsAll(into: Int, from: Int) bool {
+    if (from.signed and !into.signed) return false;
+    if (!from.signed and into.signed) return into.bits > from.bits;
+    return into.bits >= from.bits;
 }
 
 /// The entry that governs `container`.

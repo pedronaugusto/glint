@@ -129,3 +129,37 @@ pub fn literalInteger(tree: *const Ast, node: Ast.Node.Index) ?u128 {
         else => return null,
     }
 }
+
+/// The value of an integer the program states as it compiles: a literal, a `const` whose value
+/// is one (`const n: usize = 10;`), and `*`, `+`, `<<` over them; null for any other, a name
+/// of a `var` or a parameter among them.
+pub fn constantInteger(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?u128 {
+    return constantAt(tree, model, node, 0);
+}
+
+fn constantAt(tree: *const Ast, model: *const Model, node: Ast.Node.Index, depth: u8) ?u128 {
+    if (depth == 8) return null;
+    const at = ungrouped(tree, node);
+    switch (tree.nodeTag(at)) {
+        .identifier => {
+            const d = (model.reference(at) orelse return null).declaration orelse return null;
+            const record = model.declarations[@backingInt(d)];
+            if (record.kind != .variable) return null;
+            const declared = tree.fullVarDecl(record.node) orelse return null;
+            if (tree.tokenTag(declared.ast.mut_token) != .keyword_const) return null;
+            return constantAt(tree, model, declared.ast.init_node.unwrap() orelse return null, depth + 1);
+        },
+        .mul, .add, .shl => {
+            const lhs, const rhs = tree.nodeData(at).node_and_node;
+            const a = constantAt(tree, model, lhs, depth + 1) orelse return null;
+            const b = constantAt(tree, model, rhs, depth + 1) orelse return null;
+            return switch (tree.nodeTag(at)) {
+                .mul => std.math.mul(u128, a, b) catch null,
+                .add => std.math.add(u128, a, b) catch null,
+                .shl => if (b < 128) std.math.shlExact(u128, a, @intCast(b)) catch null else null,
+                else => unreachable,
+            };
+        },
+        else => return literalInteger(tree, at),
+    }
+}

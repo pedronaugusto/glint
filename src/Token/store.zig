@@ -16,6 +16,7 @@ pub const Token = struct {
         };
     }
     pub inline fn text(t: Token) []const u8 {
+        // glint-ignore: P007 -- a token holds its text as a pointer and a 32-bit length, half a slice's width; both come from one byte slice where it is made (`init`)
         return t.ptr[0..t.length];
     }
     pub inline fn partner(t: Token) u32 {

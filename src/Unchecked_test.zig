@@ -537,7 +537,7 @@ test "one suppression names each rule it covers on its line, one site each; the 
     try std.testing.expect(!report.complete);
 }
 
-test "the fix rewrites the aegis escape into glint-ignore under today's names, names an older one from a run's record or else by what finds on its line now, and removes one naming only a rule that went" {
+test "the fix rewrites the aegis escape into glint-ignore under today's names, names an older one from a run's record and leaves one no record names, and removes one naming only a rule that went" {
     const program =
         \\pub fn a(p: usize) *u8 {
         \\    return @ptrFromInt(p); // aegis: internal(A019, A014): the page the kernel hands back
@@ -550,6 +550,12 @@ test "the fix rewrites the aegis escape into glint-ignore under today's names, n
         \\}
         \\pub fn d(p: usize) *u8 {
         \\    return @ptrFromInt(p); // aegis: design: no record names it
+        \\}
+        \\pub fn e(p: usize) *u8 {
+        \\    return @ptrFromInt(p); // aegis: no-danger(A003): a rule 0.8 removed
+        \\}
+        \\pub fn g(p: usize) *u8 {
+        \\    return @ptrFromInt(p); // aegis: design(A003, A019): one removed, one renamed
         \\}
         \\
     ;
@@ -566,7 +572,13 @@ test "the fix rewrites the aegis escape into glint-ignore under today's names, n
         \\    return @ptrFromInt(p);
         \\}
         \\pub fn d(p: usize) *u8 {
-        \\    return @ptrFromInt(p); // glint-ignore: P007 -- design: no record names it
+        \\    return @ptrFromInt(p); // aegis: design: no record names it
+        \\}
+        \\pub fn e(p: usize) *u8 {
+        \\    return @ptrFromInt(p);
+        \\}
+        \\pub fn g(p: usize) *u8 {
+        \\    return @ptrFromInt(p); // glint-ignore: P007 -- design: one removed, one renamed
         \\}
         \\
     , out.bytes);
@@ -601,13 +613,20 @@ test "P007 leaves a vtable's owner recovery from *anyopaque alone, and reports a
     , 2);
 }
 
-test "the fix writes 0.7's reason on a catch unreachable as Z026's suppression; a bare one stays a finding" {
+test "the fix writes 0.7's reason on a catch unreachable as Z026's suppression; a bare one stays a finding, and one reason over two sites stays for its owner" {
     const program =
         \\fn g() !void {}
         \\pub fn a() void {
         \\    g() catch unreachable; // unreachable: g fails on nothing here
         \\}
         \\pub fn b() void {
+        \\    g() catch unreachable;
+        \\}
+        \\pub fn c() void {
+        \\    g() catch unreachable; g() catch unreachable; // unreachable: both checked by the caller
+        \\}
+        \\pub fn d() void {
+        \\    // unreachable: the reason on the line before, 0.7's other form
         \\    g() catch unreachable;
         \\}
         \\
@@ -620,6 +639,13 @@ test "the fix writes 0.7's reason on a catch unreachable as Z026's suppression; 
         \\    g() catch unreachable; // glint-ignore: Z026 -- g fails on nothing here
         \\}
         \\pub fn b() void {
+        \\    g() catch unreachable;
+        \\}
+        \\pub fn c() void {
+        \\    g() catch unreachable; g() catch unreachable; // unreachable: both checked by the caller
+        \\}
+        \\pub fn d() void {
+        \\    // glint-ignore: Z026 -- the reason on the line before, 0.7's other form
         \\    g() catch unreachable;
         \\}
         \\

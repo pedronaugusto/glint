@@ -81,6 +81,9 @@ pub fn check(c: *Context, definition: Rule.Definition) Context.Error!void {
     try Governed.sitesLeaving(c, governed.items, &sites, &unread);
     for (sites.items) |site| {
         const entry = all[site.index];
+        // A use through an alias the run reports is no second site: the alias is, where it
+        // spells the target (review 8, m8).
+        if (site.through_alias) continue;
         if (!try applies(c, entry, site.node)) continue;
         const fix = if (entry.replacement.drop_in) |drop_in| try dropInFix(c, entry, drop_in, site, sites.items) else &.{};
         try c.atDefinitionFixed(definition.id, site.token, try message(c, entry), site.decl, fix);
@@ -195,9 +198,9 @@ fn message(c: *Context, entry: Entry) Context.Error![]const u8 {
 
 /// The fix of a site of an entry with a `.drop_in`: the call written with the answer, and the
 /// message argument where the answer takes one, the call's arguments as written. A private
-/// container alias of the target (`const assert = std.debug.assert;`) is fixed with every call
-/// through it, the alias spelling the answer, and each finding of it carries that whole fix:
-/// a use that is no call leaves the alias, and its sites, unfixed. Where the file reaches the
+/// container alias of the target (`const assert = std.debug.assert;`), the one site of its
+/// uses, is fixed with every call through it, the alias spelling the answer: a use that is no
+/// call leaves it unfixed. Where the file reaches the
 /// declaring package through no import, the fix adds the one the package's other files make.
 /// No fix where the answer cannot be spelled from the file: the declaring package's own code,
 /// a file a build script compiles, or a package its module reaches under no one name.
@@ -220,8 +223,6 @@ fn dropInFix(c: *Context, entry: Entry, drop_in: PackageRules.Replacement.DropIn
         return edits.items;
     }
     const call = callOf(tree, model, site.node) orelse return &.{};
-    // A use of an alias this fix does not write (one in a function, or a public one).
-    if (site.through_alias and tree.nodeTag(site.node) == .identifier) return &.{};
     try edits.append(c.allocator, replacing(tree, site.node, spelled.path));
     if (drop_in.message) try edits.append(c.allocator, (try messageArgument(c, tree, call)) orelse return &.{});
     return edits.items;
@@ -310,6 +311,8 @@ fn pathTo(c: *Context, container: Facts.Container, answer: Facts.Decl, depth: u8
         const value = try c.facts.declaration(.{ .file = container.file, .index = @fromBackingInt(@intCast(i)) });
         const inner = switch (value) {
             .container => |held| held,
+            // A namespace a build chooses is no one path every build spells.
+            .alternatives => continue,
             else => continue,
         };
         if (inner.file == container.file and inner.scope == container.scope) continue;
@@ -319,17 +322,14 @@ fn pathTo(c: *Context, container: Facts.Container, answer: Facts.Decl, depth: u8
     return null;
 }
 
-/// A container alias of the target a site is part of: the site is its value, or a use of it.
-/// Only a private one whose value is itself a site, so every use of it is in this file.
+/// The container alias of the target whose value a site is. Only a private one, so every use
+/// of it is in this file.
 const Alias = struct { decl: Model.Declaration.Id, init: Ast.Node.Index };
 
 fn aliasOf(c: *Context, site: Governed.Site, sites: []const Governed.Site) ?Alias {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
-    const decl: Model.Declaration.Id = if (site.through_alias) found: {
-        const reference = model.node_references[@backingInt(site.node)] orelse return null;
-        break :found model.references[@backingInt(reference)].declaration orelse return null;
-    } else found: {
+    const decl: Model.Declaration.Id = found: {
         const parent = model.parentOf(site.node) orelse return null;
         for (model.declarations, 0..) |record, i| if (record.node == parent and record.kind == .variable) break :found @fromBackingInt(@intCast(i));
         return null;

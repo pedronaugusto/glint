@@ -7,7 +7,8 @@
 //! Read: `*` and `<<` (the operations whose result outgrows their operands the most); the
 //! destination's type and each operand's type as written, `uN` / `iN` only (a `usize` is as wide
 //! as the target makes it); an integer literal operand, which takes the other's type. An operand
-//! whose type is not written leaves the site unread.
+//! whose type is not written leaves the site unread, as do two operands the program states as it
+//! compiles (`const a: u32 = 1000;`), whose product the compiler computes and checks.
 const std = @import("std");
 const Ast = std.zig.Ast;
 const Context = @import("RuleContext.zig");
@@ -45,6 +46,9 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
             else => continue,
         }
         const lhs, const rhs = tree.nodeData(operation).node_and_node;
+        // Operands the program states as it compiles: the compiler computes the result, and
+        // refuses an overflow, as it compiles (review 8, M13).
+        if (Written.constantInteger(tree, model, lhs) != null and Written.constantInteger(tree, model, rhs) != null) continue;
         const narrow = if (tree.nodeTag(operation) == .shl)
             narrowWidth(tree, model, lhs, false)
         else
@@ -103,4 +107,8 @@ test "breadth: narrow widened: a product and a shift widened after, reported; wi
     try breadth.expectFindings(check, "pub fn f(a: usize, b: usize) u64 { return @as(u64, a * b); }", 0);
     try breadth.expectFindings(check, "pub fn f(a: anytype, b: u32) u64 { return @as(u64, a * b); }", 0);
     try breadth.expectFindings(check, "pub fn f(a: u32, b: u32) u64 { return @as(u64, a + b); }", 0);
+    // Constants: computed, and checked, as the program compiles.
+    try breadth.expectFindings(check, "const a: u32 = 1000; const b: u32 = 1000; pub const product: u64 = a * b;", 0);
+    try breadth.expectFindings(check, "pub fn f() u64 { const a: u32 = 7; return @as(u64, a * 1000); }", 0);
+    try breadth.expectFindings(check, "pub fn f(b: u32) u64 { const a: u32 = 7; return @as(u64, a * b); }", 1);
 }

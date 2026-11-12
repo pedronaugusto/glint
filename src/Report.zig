@@ -108,7 +108,9 @@ pub const Edit = struct {
 pub const RunError = struct { file: ?Project.FileId = null, why: []const u8 };
 /// A suppression that suppressed nothing: a rule it names that ran, and its comment's site.
 pub const Stale = struct { name: []const u8, span: Span };
-pub const Malformed = struct { why: []const u8, span: Span };
+/// A comment or declaration glint cannot read: a suppression, or a part of a package's
+/// `lint_rules`, each told apart in the report.
+pub const Malformed = struct { why: []const u8, span: Span, of: enum { suppression, lint_rules } = .suppression };
 pub const Format = enum { text, json, sarif };
 pub const WriteError = std.Io.Writer.Error || error{InvalidProject};
 
@@ -130,7 +132,7 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
                 try writer.print("error: {s}: {s}\n", .{ project.at(file).input.name, run_error.why });
             } else try writer.print("error: {s}\n", .{run_error.why});
             for (self.stale) |stale| try writer.print("suppression: {s}:{d}:{d}: {s} suppresses nothing\n", .{ project.at(stale.span.file).input.name, stale.span.line, stale.span.column, stale.name });
-            for (self.malformed) |entry| try writer.print("suppression: {s}:{d}:{d}: malformed: {s}\n", .{ project.at(entry.span.file).input.name, entry.span.line, entry.span.column, entry.why });
+            for (self.malformed) |entry| try writer.print("{t}: {s}:{d}:{d}: malformed: {s}\n", .{ entry.of, project.at(entry.span.file).input.name, entry.span.line, entry.span.column, entry.why });
             for (self.seams) |seam| {
                 try writer.print("seam: {s}: {s}: ", .{ seam.where, seam.reason });
                 for (seam.rules, 0..) |rule, i| try writer.print("{s}{s} {d}", .{ if (i == 0) "" else ", ", rule.name, rule.sites });

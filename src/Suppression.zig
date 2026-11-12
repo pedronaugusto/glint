@@ -41,7 +41,7 @@ pub fn parse(a: std.mem.Allocator, file: *const File) ParseError![]Suppression {
 /// The file's suppressions, each malformed one appended to `malformed` instead.
 pub fn parseConfigured(a: std.mem.Allocator, file: *const File, definitions: []const rules.Definition, malformed: *std.ArrayList(Malformed)) std.mem.Allocator.Error![]Suppression {
     var result: std.ArrayList(Suppression) = .empty;
-    for (file.comments) |comment| switch (one(file, comment, definitions)) {
+    for (file.comments) |comment| switch (try one(a, file, comment, definitions)) {
         .none => {},
         .found => |found| try result.append(a, found),
         .malformed => |why| try malformed.append(a, .{ .comment = comment, .why = why }),
@@ -51,7 +51,7 @@ pub fn parseConfigured(a: std.mem.Allocator, file: *const File, definitions: []c
 
 const Outcome = union(enum) { none, found: Suppression, malformed: []const u8 };
 
-fn one(file: *const File, comment: File.Comment, definitions: []const rules.Definition) Outcome {
+fn one(a: std.mem.Allocator, file: *const File, comment: File.Comment, definitions: []const rules.Definition) std.mem.Allocator.Error!Outcome {
     const raw = std.mem.trim(u8, file.source[comment.start + 2 .. comment.end], " \t\r");
     if (std.mem.startsWith(u8, raw, "aegis:")) return .{ .malformed = old_escape };
     if (!std.mem.startsWith(u8, raw, "glint-ignore:")) return .none;
@@ -60,7 +60,14 @@ fn one(file: *const File, comment: File.Comment, definitions: []const rules.Defi
     var found: Suppression = .{ .line = comment.line, .comment = comment, .reason = std.mem.trim(u8, why, " \t") };
     var listed_names = std.mem.tokenizeAny(u8, listed, ", \t");
     while (listed_names.next()) |id| {
-        const rule = rules.parseConfigured(id, definitions) orelse return .{ .malformed = "a suppression names a rule glint does not have" };
+        const rule = rules.parseConfigured(id, definitions) orelse {
+            // One 0.8 removed: what to write instead, as a configuration naming it is told.
+            const gone = rules.removed(id) orelse return .{ .malformed = "a suppression names a rule glint does not have" };
+            var text: std.Io.Writer.Allocating = .init(a);
+            text.writer.writeAll("a suppression names a rule glint does not have: ") catch return error.OutOfMemory;
+            gone.write(&text.writer) catch return error.OutOfMemory;
+            return .{ .malformed = text.written() };
+        };
         for (0..found.named_len) |i| if (found.named[i] == rule) return .{ .malformed = "a suppression names each rule once" };
         if (found.named_len == max_named) return .{ .malformed = "a suppression names at most eight rules" };
         found.named[found.named_len] = rule;
@@ -98,6 +105,16 @@ pub fn matches(self: *Suppression, rule: rules.Rule, line: u32, start: u32) erro
 /// Whether this covers a finding of `rule` on `line` (`matches`), asked without using it.
 pub fn applies(self: *const Suppression, rule: rules.Rule, line: u32) bool {
     return self.line == line and std.mem.findScalar(rules.Rule, self.names(), rule) != null;
+}
+
+test "a suppression naming a rule 0.8 removed is told what to write instead" {
+    var file = try File.init(std.testing.allocator, "const x = 1; // glint-ignore: A010 -- gone\nconst y = 1; // glint-ignore: Z999 -- never\n", .{});
+    defer file.deinit();
+    var malformed: std.ArrayList(Malformed) = .empty;
+    _ = try parseConfigured(file.arena.allocator(), &file, &.{}, &malformed);
+    try std.testing.expectEqual(@as(usize, 2), malformed.items.len);
+    try std.testing.expectEqualStrings("a suppression names a rule glint does not have: `A010` was removed in glint 0.8: remove it", malformed.items[0].why);
+    try std.testing.expectEqualStrings("a suppression names a rule glint does not have", malformed.items[1].why);
 }
 
 test "suppression requires exact ID and reason from a real comment" {

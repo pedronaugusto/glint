@@ -1,6 +1,7 @@
 //! Hygiene: `const x: T = undefined;`: a constant is never written, so every read of it reads
 //! undefined memory. A name read only inside `@TypeOf` (a type spelled through a value:
-//! `@TypeOf(x.f)`) reads no value, and is not reported; nor is one never named at all (D001's).
+//! `@TypeOf(x.f)`) reads no value, and is not reported; nor is an array's read only as its `.len`,
+//! which its type states (review 8, m12), nor one never named at all (D001's).
 const std = @import("std");
 const Ast = std.zig.Ast;
 const Context = @import("RuleContext.zig");
@@ -16,15 +17,18 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         if (tree.tokenTag(declared.ast.mut_token) != .keyword_const) continue;
         const value = declared.ast.init_node.unwrap() orelse continue;
         if (tree.nodeTag(value) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "undefined")) continue;
-        if (!readAsValue(tree, model, @fromBackingInt(@intCast(d)))) continue;
+        const array = if (declared.ast.type_node.unwrap()) |written| tree.fullArrayType(written) != null else false;
+        if (!readAsValue(tree, model, @fromBackingInt(@intCast(d)), array)) continue;
         try c.at(rule, decl.token, try c.allocator.print("constant '{s}' is `undefined` and never written: each read of it is undefined behaviour", .{decl.name}));
     }
 }
 
-/// Whether a reference to the declaration sits outside every `@TypeOf`.
-fn readAsValue(tree: *const Ast, model: *const Model, decl: Model.Declaration.Id) bool {
+/// Whether a reference to the declaration sits outside every `@TypeOf`, and, for an array,
+/// is more than its `.len`, which its type states.
+fn readAsValue(tree: *const Ast, model: *const Model, decl: Model.Declaration.Id, array: bool) bool {
     for (model.references) |reference| {
         if (reference.declaration != decl) continue;
+        if (array) if (model.parentOf(reference.node)) |parent| if (tree.nodeTag(parent) == .field_access and std.mem.eql(u8, tree.tokenSlice(tree.nodeData(parent).node_and_token[1]), "len")) continue;
         var at = reference.node;
         const typed = while (model.parentOf(at)) |parent| : (at = parent) {
             switch (tree.nodeTag(parent)) {
@@ -45,4 +49,6 @@ test "breadth: undefined const: a constant read as a value reported; one read on
     try breadth.expectFindings(check, "pub fn f() u32 { const x: u32 = undefined; return x; }", 1);
     try breadth.expectFindings(check, "const S = struct { f: u8 }; pub fn f() type { const x: S = undefined; return @TypeOf(x.f); }", 0);
     try breadth.expectFindings(check, "pub fn f() u32 { var x: u32 = undefined; x = 1; return x; }", 0);
+    try breadth.expectFindings(check, "const scratch: [16]u8 = undefined; pub fn f() usize { return scratch.len; }", 0);
+    try breadth.expectFindings(check, "const scratch: [16]u8 = undefined; pub fn f() u8 { return scratch[0]; }", 1);
 }

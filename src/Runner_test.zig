@@ -151,15 +151,15 @@ test "each file's analysis has its own fact budget" {
     for (report.errors) |item| try std.testing.expectEqual(three.sources[0].id, item.file.?);
 }
 
-test "a suppression that meets a second site of its rule on its line is malformed there, and that site stands" {
+test "a suppression that meets a second site of its rule on its line is malformed there, and hides neither site" {
     var project = try glint.Project.init(std.testing.allocator, &.{ .{ .name = "root", .bytes = "const a = @import(\"a\"); const b = @import(\"b\"); // glint-ignore: Z013 -- one site only\n" }, .{ .name = "a", .bytes = "", .selected = false }, .{ .name = "b", .bytes = "", .selected = false } }, &.{ .{ .from = 0, .spelling = "a", .target = 1 }, .{ .from = 0, .spelling = "b", .target = 2 } }, .{});
     defer project.deinit();
     var report = try glint.run(std.testing.allocator, &project, .{});
     defer report.deinit();
     try std.testing.expect(!report.complete);
     try std.testing.expectEqual(@as(usize, 1), report.malformed.len); // safe: the one suppression.
-    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: the second import stands.
-    try std.testing.expectEqual(@as(usize, 1), report.suppressed); // safe: the first.
+    try std.testing.expectEqual(@as(usize, 2), report.diagnostics.len); // safe: both imports stand (review 8, m9).
+    try std.testing.expectEqual(@as(usize, 0), report.suppressed);
 }
 
 test "compatibility deprecation resolves escaped member identity" {
@@ -273,12 +273,14 @@ test "Z026 reads the handler's syntax: each empty form is a site, a call, a stor
     try check(.Z026, head ++ "pub fn f(c: bool) void { fallible() catch if (c) {}; fallible() catch |e| switch (e) { else => {} }; }", 2);
     try check(.Z026, head ++ "pub fn f() void { fallible() catch return; while (true) { fallible() catch continue; fallible() catch break; } }", 3);
     try check(.Z026, head ++ "pub fn f() void { if (give()) |_| {} else |_| {} while (give()) |_| {} else |_| {} }", 2);
-    // `unreachable` as the whole handler of a `catch` or an `orelse`.
+    // `unreachable` as the whole handler of a `catch`; an `orelse`'s is P010's.
     try check(.Z026, head ++ "pub fn f(o: ?u8) u8 { fallible() catch unreachable; return o orelse unreachable; }", 1);
+    // A handler that only traps however written: in blocks, or in every prong of a switch.
+    try check(.Z026, head ++ "pub fn f() void { fallible() catch { { unreachable; } }; fallible() catch |e| switch (e) { error.Failure => unreachable }; }", 2);
     // Not empty: a call (whatever the callee does), a store, a value, a `return` of one.
     try check(.Z026, head ++ "pub fn f() void { fallible() catch |e| record(e); fallible() catch { _ = record(error.X); }; }", 0);
     try check(.Z026, head ++ "pub fn f(c: bool) u8 { fallible() catch { n += 1; }; fallible() catch if (c) record(error.X); return give() catch 0; }", 0);
-    try check(.Z026, head ++ "pub fn f() !void { fallible() catch |e| return e; fallible() catch @panic(\"x\"); fallible() catch { { unreachable; } }; }", 0);
+    try check(.Z026, head ++ "pub fn f() !void { fallible() catch |e| return e; fallible() catch @panic(\"x\"); }", 0);
     // An `orelse` is read for `unreachable` alone.
     try check(.Z026, head ++ "pub fn f(o: ?u8) u8 { return o orelse return 0; }", 0);
 }
@@ -1007,8 +1009,8 @@ test "A013's drop-in fix writes each call with the answer and its condition as w
         \\    3, "x != 3"); return x; }
         \\
     ;
-    // The alias, its two calls and the direct call.
-    try std.testing.expectEqualStrings(fixed, try dropInFixed(arena.allocator(), program, 4));
+    // The alias, the one site of its two calls, and the direct call.
+    try std.testing.expectEqualStrings(fixed, try dropInFixed(arena.allocator(), program, 2));
 }
 
 test "A013's drop-in fix spells the answer through the file's own import of the package, under its name" {
@@ -1023,7 +1025,7 @@ test "A013's drop-in fix leaves an alias used other than by a call, and its site
     defer arena.deinit();
     // `check` hands the alias on: writing it to the answer would change what `check` is.
     const handed = "const std = @import(\"std\");\nconst assert = std.debug.assert;\nconst check: fn (bool) void = assert;\npub fn f(x: u8) void { assert(x > 1); check(x > 2); }\n";
-    try std.testing.expectEqualStrings(handed, try dropInFixed(arena.allocator(), handed, 3));
+    try std.testing.expectEqualStrings(handed, try dropInFixed(arena.allocator(), handed, 1));
     // A local `aegis` would shadow an added import of that name, which Zig refuses.
     const shadowed = "const std = @import(\"std\");\npub fn f(aegis: u8) void { std.debug.assert(aegis > 1); }\n";
     try std.testing.expectEqualStrings(shadowed, try dropInFixed(arena.allocator(), shadowed, 1));

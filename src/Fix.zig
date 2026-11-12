@@ -12,9 +12,11 @@ const aegis = @import("aegis");
 const Project = @import("Project.zig");
 const File = @import("File.zig");
 const Report = @import("Report.zig");
+const Rule = @import("Rule.zig");
 
-/// A file's bytes after its fixes, and how many edits made them.
-pub const Changed = struct { file: Project.FileId, bytes: []const u8, edits: usize };
+/// A file's bytes after its fixes, how many edits made them, and how many sites they fix (a
+/// fix may be several edits: Z034's two parentheses).
+pub const Changed = struct { file: Project.FileId, bytes: []const u8, edits: usize, sites: usize = 0 };
 
 /// A rule's fix, copied into the report's storage.
 pub fn copy(a: std.mem.Allocator, fix: []const Report.Edit) std.mem.Allocator.Error![]const Report.Edit {
@@ -105,18 +107,21 @@ fn ruleName(name: []const u8) bool {
 /// An edit outside its file's bytes is no edit glint makes: `InvalidEdit`.
 pub fn apply(a: std.mem.Allocator, project: *const Project, report: *const Report, options: Options) error{ OutOfMemory, InvalidEdit }![]const Changed {
     var by_file: std.array_hash_map.Auto(Project.FileId, std.ArrayList(Report.Edit)) = .empty;
+    var sites: std.AutoHashMapUnmanaged(Project.FileId, usize) = .empty;
     for (report.diagnostics) |d| {
         if (d.fix.len == 0) continue;
         const entry = try by_file.getOrPut(a, d.span.file);
         if (!entry.found_existing) entry.value_ptr.* = .empty;
         try entry.value_ptr.appendSlice(a, d.fix);
+        (try sites.getOrPutValue(a, d.span.file, 0)).value_ptr.* += 1;
     }
     for (report.malformed) |entry| {
         const file = project.at(entry.span.file).file;
-        const edit = (try oldSuppression(a, file, entry.span.start, entry.span.end)) orelse (try oldEscape(a, project, report, entry.span, options.escapes_before)) orelse continue;
+        const edit = (try oldSuppression(a, file, entry.span.start, entry.span.end)) orelse (try oldEscape(a, project, entry.span, options.escapes_before)) orelse continue;
         const slot = try by_file.getOrPut(a, entry.span.file);
         if (!slot.found_existing) slot.value_ptr.* = .empty;
         try slot.value_ptr.append(a, edit);
+        (try sites.getOrPutValue(a, entry.span.file, 0)).value_ptr.* += 1;
     }
     var out: std.ArrayList(Changed) = .empty;
     for (by_file.keys(), by_file.values()) |file, *edits| {
@@ -138,18 +143,23 @@ pub fn apply(a: std.mem.Allocator, project: *const Project, report: *const Repor
         }
         if (at > source.len) return error.InvalidEdit;
         try bytes.appendSlice(a, source[at..]);
-        try out.append(a, .{ .file = file, .bytes = bytes.items, .edits = made });
+        try out.append(a, .{ .file = file, .bytes = bytes.items, .edits = made, .sites = sites.get(file) orelse 0 });
     }
     return out.items;
 }
 
-/// The name glint gives now to a rule an old suppression or escape names: the pack's own under
-/// their built-in names, the rules that went with the flow engine none.
+/// The name glint gives now to a rule an old suppression or escape names, by the removed-rule
+/// table (`Rule.removed_rules`): a renamed one its successor (A019 is P007), a removed one none
+/// (A003, and those that went with the flow engine), one a package now declares its own id.
+/// A012 named the flow engine's input-sized work, which went; aegis's A012 is another check.
 fn renamed(name: []const u8) ?[]const u8 {
-    const moves = [_][2][]const u8{ .{ "A019", "P007" }, .{ "A016", "P008" }, .{ "A014", "P009" } };
-    for (moves) |move| if (std.mem.eql(u8, name, move[0])) return move[1];
-    for ([_][]const u8{ "A010", "A012", "A020" }) |gone| if (std.mem.eql(u8, name, gone)) return null;
-    return name;
+    if (std.mem.eql(u8, name, "A012")) return null;
+    const gone = Rule.removed(name) orelse return name;
+    return switch (gone.now) {
+        .renamed => |id| id,
+        .removed => null,
+        .declared => name,
+    };
 }
 
 /// The rules `names` lists under today's names, sorted and each once; whether any was renamed or
@@ -194,10 +204,9 @@ fn oldSuppression(a: std.mem.Allocator, file: *const File, start: u32, end: u32)
 /// An escape in the aegis pack's form, as the suppression glint reads: `// aegis: <reason>(<rules>):
 /// <why>` becomes `// glint-ignore: <rules> -- <reason>: <why>` under today's names. One in the
 /// older form, naming no rules, takes those a record of a run before shows it covered, at that
-/// place with those words; with no record, the rules that find something on its site's line now
-/// and that the older form covered (P007, P008, P009 and the rules packages declare), as it
-/// covered every pack finding on its line. One with neither is left for its owner to name.
-fn oldEscape(a: std.mem.Allocator, project: *const Project, report: *const Report, span: Report.Span, before: []const Escaped) std.mem.Allocator.Error!?Report.Edit {
+/// place with those words; with no record it is left for its owner to name, as no fix writes in
+/// rules a run only guesses it covered.
+fn oldEscape(a: std.mem.Allocator, project: *const Project, span: Report.Span, before: []const Escaped) std.mem.Allocator.Error!?Report.Edit {
     const file = project.at(span.file).file;
     const text = spanned(file, span.start, span.end) orelse return null;
     const rest = std.mem.trim(u8, std.mem.cutPrefix(u8, text, "// aegis:") orelse return null, " ");
@@ -214,19 +223,9 @@ fn oldEscape(a: std.mem.Allocator, project: *const Project, report: *const Repor
             if (!std.mem.eql(u8, escaped.path, project.at(span.file).input.name)) continue;
             if (std.mem.eql(u8, escaped.reason, reason) and std.mem.eql(u8, escaped.why, why)) break escaped;
         } else null;
-        if (recorded) |found| try names.appendSlice(a, found.rules) else {
-            // The line the escape covers: its own, or the next where it stands alone.
-            const line_start = file.lines[file.line(span.start)];
-            const alone = std.mem.trim(u8, file.source[line_start..span.start], " \t").len == 0;
-            const site = span.line + @intFromBool(alone);
-            for (report.diagnostics) |d| {
-                if (d.span.file != span.file or d.span.line != site) continue;
-                const id = @backingInt(d.rule);
-                const covered = d.rule == .P007 or d.rule == .P008 or d.rule == .P009 or id >= 1000;
-                if (covered) try names.append(a, d.name);
-            }
-            if (names.items.len == 0) return null;
-        }
+        // An escape no record names is its owner's to rewrite: no fix writes rules in that a
+        // run only guesses it covered.
+        try names.appendSlice(a, (recorded orelse return null).rules);
     }
     const now = try today(a, names.items);
     if (now.empty) return removal(file, span.start, span.end);
@@ -274,4 +273,30 @@ test "an old suppression takes today's names, and one naming only a rule that we
     const gone = (try oldSuppression(a, &file, file.comments[1].start, file.comments[1].end)).?;
     try std.testing.expectEqualStrings(" // glint-ignore: A010 -- design: gone", file.source[gone.start..gone.end]);
     try std.testing.expectEqual(null, try oldSuppression(a, &file, file.comments[2].start, file.comments[2].end));
+}
+
+test "fuzz: an escape record (--escapes-before, a file the caller hands in)" {
+    const Target = struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var buffer: [4096]u8 = undefined;
+            const bytes = buffer[0..smith.slice(&buffer)];
+            var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer arena.deinit();
+            // A record refused for its form is the answer: the CLI says so.
+            const escapes = escapeRecord(arena.allocator(), bytes) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                error.InvalidEscapeRecord => return,
+            };
+            for (escapes) |escaped| {
+                if (escaped.path.len == 0 or escaped.reason.len == 0) return error.TestUnexpectedResult;
+                for (escaped.rules) |rule| if (rule.len == 0) return error.TestUnexpectedResult;
+            }
+        }
+    };
+    try std.testing.fuzz({}, Target.one, .{ .corpus = &.{
+        "escape: src/a.zig:12:30: no-danger: why (A010 at 12:5, A013 at 12:9)\n",
+        "glint: escape: src/a.zig:12:30: no-danger: why (A010, A013)\n",
+        "other line\nescape: x:1:1: r: w (P007)\n",
+        "escape: :1:1: r: w (P007)\n",
+    } });
 }

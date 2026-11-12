@@ -300,9 +300,9 @@ fn amendedPolicies(self: *Context) RunError!void {
     };
 }
 
-/// Z026: each error handler written empty (`emptyHandler`), and `catch unreachable`, outside a
-/// `test` block: a discarded error needs a reason written at the site. The handlers are
-/// `catch`'s and an `if`'s or a `while`'s `else |err|`. Only the handler's syntax is read: a
+/// Z026: each error handler written empty (`emptyHandler`), and one that only traps (`catch
+/// unreachable`, `traps`), outside a `test` block: a discarded error needs a reason written at
+/// the site. The handlers are `catch`'s and an `if`'s or a `while`'s `else |err|`. Only the handler's syntax is read: a
 /// handler that calls anything or gives a value is not empty, whatever the callee does with the
 /// error. `orelse` handles a null, which is no error: `orelse unreachable` and `.?` are another
 /// rule's (an unwrap that can trap, opt-in).
@@ -322,7 +322,7 @@ fn emptyHandlers(self: *Context) RunError!void {
         const token = tree.nodeMainToken(node);
         if (self.inTest(token)) continue;
         if (tag == .@"orelse") continue;
-        if (tree.nodeTag(ungrouped(tree, handler)) == .unreachable_literal) {
+        if (traps(tree, handler, 0)) {
             const message = "catch unreachable: a panic, or undefined behaviour in a ReleaseFast build; return the error, or write the reason at this site";
             // 0.7's reason comment on its line (`// unreachable: <why>`) is that reason in the form
             // glint read then: --fix writes it as the suppression it reads now.
@@ -333,13 +333,37 @@ fn emptyHandlers(self: *Context) RunError!void {
     }
 }
 
-/// The edit that rewrites a `// unreachable: <why>` comment on `token`'s line, 0.7's reason for a
-/// `catch unreachable`, as `// glint-ignore: Z026 -- <why>`.
+/// Whether a handler only traps: `unreachable`, a block that is only that, or a `switch` every
+/// prong of which only traps (`catch |e| switch (e) { error.Empty => unreachable }`).
+fn traps(tree: *const Ast, written: Ast.Node.Index, depth: u8) bool {
+    if (depth == 8) return false;
+    const node = ungrouped(tree, written);
+    if (tree.nodeTag(node) == .unreachable_literal) return true;
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.blockStatements(&buffer, node)) |statements| return statements.len == 1 and traps(tree, statements[0], depth + 1);
+    const full = tree.fullSwitch(node) orelse return false;
+    if (full.ast.cases.len == 0) return false;
+    for (full.ast.cases) |case| if (!traps(tree, tree.fullSwitchCase(case).?.ast.target_expr, depth + 1)) return false;
+    return true;
+}
+
+/// The edit that rewrites a `// unreachable: <why>` comment, 0.7's reason for a `catch
+/// unreachable`, on `token`'s line or alone on the line before it (0.7's two forms), as `//
+/// glint-ignore: Z026 -- <why>`; none where the site's line holds another such site, which one
+/// suppression cannot name, so the reason is its owner's to place.
 fn oldReason(self: *Context, token: Ast.TokenIndex) RunError!?[]const Report.Edit {
     const file = self.project.at(self.file).file;
     const line = file.line(file.tree.tokenStart(token));
+    const tree = &file.tree;
+    for (tree.nodes.items(.tag), 0..) |tag, n| {
+        if (tag != .@"catch") continue;
+        const other = tree.nodeMainToken(@fromBackingInt(@intCast(n)));
+        if (other == token or file.line(tree.tokenStart(other)) != line) continue;
+        if (traps(tree, tree.nodeData(@fromBackingInt(@intCast(n))).node_and_node[1], 0)) return null;
+    }
     for (file.comments) |comment| {
-        if (comment.line != line) continue;
+        const above = comment.line + 1 == line and std.mem.trim(u8, file.source[file.lines[comment.line]..comment.start], " \t").len == 0;
+        if (comment.line != line and !above) continue;
         const text = file.source[comment.start..comment.end];
         const why = std.mem.trim(u8, std.mem.cutPrefix(u8, text, "// unreachable:") orelse continue, " \t");
         if (why.len == 0) return null;
