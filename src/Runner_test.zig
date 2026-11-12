@@ -151,10 +151,15 @@ test "each file's analysis has its own fact budget" {
     for (report.errors) |item| try std.testing.expectEqual(three.sources[0].id, item.file.?);
 }
 
-test "compatibility suppression rejects multiple distinct binding sites" {
-    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "const a = @import(\"a\"); const b = @import(\"b\"); // glint-ignore: Z013 -- one site only\n" }}, &.{}, .{});
+test "a suppression that meets a second site of its rule on its line is malformed there, and that site stands" {
+    var project = try glint.Project.init(std.testing.allocator, &.{ .{ .name = "root", .bytes = "const a = @import(\"a\"); const b = @import(\"b\"); // glint-ignore: Z013 -- one site only\n" }, .{ .name = "a", .bytes = "", .selected = false }, .{ .name = "b", .bytes = "", .selected = false } }, &.{ .{ .from = 0, .spelling = "a", .target = 1 }, .{ .from = 0, .spelling = "b", .target = 2 } }, .{});
     defer project.deinit();
-    try std.testing.expectError(error.AmbiguousSuppression, glint.run(std.testing.allocator, &project, .{}));
+    var report = try glint.run(std.testing.allocator, &project, .{});
+    defer report.deinit();
+    try std.testing.expect(!report.complete);
+    try std.testing.expectEqual(@as(usize, 1), report.malformed.len); // safe: the one suppression.
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: the second import stands.
+    try std.testing.expectEqual(@as(usize, 1), report.suppressed); // safe: the first.
 }
 
 test "compatibility deprecation resolves escaped member identity" {

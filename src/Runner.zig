@@ -310,7 +310,18 @@ fn emitRelated(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: [
     }
     seen.value_ptr.* = null;
     for (self.suppressions) |*suppression| {
-        if (!try suppression.matches(rule, line, start)) continue;
+        const matched = suppression.matches(rule, line, start) catch {
+            // A second site of a rule the suppression names, on its line: the finding stands, and
+            // the suppression is malformed where it is written, once.
+            if (!suppression.ambiguous) {
+                suppression.ambiguous = true;
+                self.complete = false;
+                const comment = suppression.comment;
+                try self.malformed.append(self.a, .{ .why = try self.a.print("names {s} for one site, and its line holds another: give each site its own line", .{metadata.name}), .span = .{ .file = self.file, .start = comment.start, .end = comment.end, .line = comment.line + 1, .column = file.column(comment.start) } });
+            }
+            break;
+        };
+        if (!matched) continue;
         self.suppressed += 1;
         return;
     }

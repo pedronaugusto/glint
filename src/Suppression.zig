@@ -15,6 +15,8 @@ line: u32,
 comment: File.Comment,
 reason: []const u8,
 used: bool = false,
+/// Met a second site of a rule it names on its line (`matches`): malformed, reported once.
+ambiguous: bool = false,
 
 /// How many rules one suppression may name.
 pub const max_named = 8;
