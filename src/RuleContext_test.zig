@@ -42,8 +42,10 @@ test "G2 compiled project rules share metadata rendering and written site suppre
     var gated = try glint.runConfigured(std.testing.allocator, &project, configuration(.gate), .{ .project_rules = &.{rule} });
     defer gated.deinit();
     try std.testing.expect(gated.complete);
-    try std.testing.expectEqual(@as(usize, 1), gated.gateFindings()); // safe: one gate finding, separate from one reasoned site.
-    try std.testing.expectEqual(@as(usize, 0), report.gateFindings()); // safe: reports do not gate.
+    // One gate finding, separate from one reasoned site; a report's findings do not gate.
+    for (gated.diagnostics) |diagnostic| try std.testing.expect(diagnostic.level == .gate);
+    try std.testing.expectEqual(@as(usize, 1), gated.diagnostics.len); // safe: one gate finding.
+    for (report.diagnostics) |diagnostic| try std.testing.expect(diagnostic.level != .gate);
 }
 /// Reaches each public declaration three times with one cause, its related place a different
 /// token each time but the last, and once with another cause.

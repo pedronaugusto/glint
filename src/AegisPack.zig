@@ -20,25 +20,23 @@ pub const access = Ids.access;
 pub const scalar = Ids.scalar;
 // The danger rules (designs/aegis.md §7): each finds where its danger exists and aegis's type is
 // the answer, from what the code resolves to.
-// Removed in 0.8 (A006, A018): their identities stay reserved, and named here only for preflight's
-// pinned glint policy, which lists them. No rule of the pack carries them.
+// Identities no rule of the pack carries, named here only for preflight's policy, which lists them:
+// A006 and A018 (removed in 0.8), and the rules aegis now declares itself or that went with the
+// flow engine (AegisRules).
 pub const recursion = Ids.recursion;
 pub const diagnostics = Ids.diagnostics;
-/// The danger rules: each finds where a danger exists and aegis's type is the answer.
-pub const danger = [_]Rule{ shared_state, secrets, untrusted_input, integers, units, bounded_work, contracts, lifetimes, ownership, identity, unsafe_set, cancellation, lock_order };
 pub const shared_state = Ids.shared_state;
-pub const secrets = Ids.secrets;
 pub const untrusted_input = Ids.untrusted_input;
 pub const integers = Ids.integers;
-pub const units = Ids.units;
 pub const bounded_work = Ids.bounded_work;
 pub const contracts = Ids.contracts;
-pub const lifetimes = Ids.lifetimes;
-pub const ownership = Ids.ownership;
-pub const identity = Ids.identity;
-pub const unsafe_set = Ids.unsafe_set;
 pub const cancellation = Ids.cancellation;
 pub const lock_order = Ids.lock_order;
+/// The danger rules: each finds where a danger exists and aegis's type is the answer.
+pub const danger = [_]Rule{ lifetimes, identity, unsafe_set };
+pub const lifetimes = Ids.lifetimes;
+pub const identity = Ids.identity;
+pub const unsafe_set = Ids.unsafe_set;
 /// Aegis's package, as its `build.zig.zon` names it: a caller states it for aegis's files.
 pub const package = Contract.package;
 /// The roles the pack reads from what aegis declares, and aegis as a library of them: a project's
@@ -63,55 +61,13 @@ pub fn importer(gpa: std.mem.Allocator, project: *const Project) Facts.ResolveEr
 pub const rules = [_]Context.Rule{
     .{ .definition = .{ .id = access, .name = "A001", .group = .family_policy, .purpose = "secret disclosure or shared-state access without a live capability", .version = 2, .exception = .aegis }, .check = checkAccess },
     .{ .definition = .{ .id = scalar, .name = "A004", .group = .family_policy, .purpose = "domain/unit or all-build integer checks bypassed by raw arithmetic/casts", .version = 2, .exception = .aegis }, .check = checkScalar },
-    .{ .definition = .{ .id = shared_state, .name = "A007", .group = .family_policy, .purpose = "shared state outside aegis's guards", .exception = .aegis }, .check = checkSharedState },
-    .{ .definition = .{ .id = secrets, .name = "A008", .group = .family_policy, .purpose = "secret material outside aegis's Secret and Choice", .exception = .aegis }, .check = checkSecrets },
-    .{ .definition = .{ .id = untrusted_input, .name = "A009", .group = .family_policy, .purpose = "input used before a parser refines it", .exception = .aegis }, .check = checkInput },
-    .{ .definition = .{ .id = integers, .name = "A010", .group = .family_policy, .purpose = "integer conversion or arithmetic on input that a peer can make fail", .exception = .aegis }, .check = checkIntegers },
-    .{ .definition = .{ .id = units, .name = "A011", .group = .family_policy, .purpose = "time crossing to std as a raw integer", .exception = .aegis }, .check = checkUnits },
-    .{ .definition = .{ .id = bounded_work, .name = "A012", .group = .family_policy, .purpose = "work sized by input without a stated limit", .exception = .aegis }, .check = checkBoundedWork },
-    .{ .definition = .{ .id = contracts, .name = "A013", .group = .family_policy, .purpose = "contract that is undefined behaviour when false in a release build", .exception = .aegis }, .check = checkContracts },
     .{ .definition = .{ .id = lifetimes, .name = "A014", .group = .family_policy, .purpose = "pointer that outlives what it points into", .exception = .aegis }, .check = checkLifetimes },
-    .{ .definition = .{ .id = ownership, .name = "A015", .group = .family_policy, .purpose = "std resource held or returned without its one owner", .exception = .aegis }, .check = checkOwnership },
     .{ .definition = .{ .id = identity, .name = "A016", .group = .family_policy, .purpose = "identifying integers of one type that one may pass for another", .exception = .aegis }, .check = checkIdentity },
     .{ .definition = .{ .id = unsafe_set, .name = "A019", .group = .family_policy, .purpose = "operation Zig leaves unchecked", .exception = .aegis }, .check = checkUnsafeSet },
-    .{ .definition = .{ .id = cancellation, .name = "A020", .group = .family_policy, .purpose = "loop on input or without bound that cannot be canceled", .exception = .aegis }, .check = checkCancellation },
-    .{ .definition = .{ .id = lock_order, .name = "A021", .group = .family_policy, .purpose = "two aegis guards held at once without both ranked by Order", .exception = .aegis }, .check = checkLockOrder },
 };
-// TODO(0.8 cut): A009, A010, A012 and A020 lost their flow engine; until they become the one
-// input-seam rule, each reports every reference to std's input sources (`Danger.inputSources`).
-fn checkInput(c: *Context) Context.Error!void {
-    if (try begin(c, untrusted_input)) try Danger.inputSources(c, untrusted_input);
-}
-fn checkBoundedWork(c: *Context) Context.Error!void {
-    if (try begin(c, bounded_work)) try Danger.inputSources(c, bounded_work);
-}
-fn checkCancellation(c: *Context) Context.Error!void {
-    if (try begin(c, cancellation)) try Danger.inputSources(c, cancellation);
-}
-fn checkSharedState(c: *Context) Context.Error!void {
-    if (try begin(c, shared_state)) try Danger.sharedState(c, shared_state);
-}
-fn checkSecrets(c: *Context) Context.Error!void {
-    if (try begin(c, secrets)) try Danger.secrets(c, secrets);
-}
-fn checkIntegers(c: *Context) Context.Error!void {
-    if (try begin(c, integers)) try Danger.inputSources(c, integers);
-}
-fn checkUnits(c: *Context) Context.Error!void {
-    if (try begin(c, units)) try Danger.units(c, units);
-}
-fn checkContracts(c: *Context) Context.Error!void {
-    if (try begin(c, contracts)) try Danger.contracts(c, contracts);
-}
 fn checkLifetimes(c: *Context) Context.Error!void {
     if (!try begin(c, lifetimes)) return;
     try Danger.lifetimes(c, lifetimes);
-}
-fn checkLockOrder(c: *Context) Context.Error!void {
-    if (try begin(c, lock_order)) try Shapes.lockOrder(c, lock_order);
-}
-fn checkOwnership(c: *Context) Context.Error!void {
-    if (try begin(c, ownership)) try Shapes.ownership(c, ownership);
 }
 fn checkIdentity(c: *Context) Context.Error!void {
     if (try begin(c, identity)) try Shapes.identity(c, identity);

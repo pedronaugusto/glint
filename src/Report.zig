@@ -351,11 +351,3 @@ fn sarifDiagnostic(writer: *std.Io.Writer, project: *const Project, d: Diagnosti
 fn wireSpan(span: Span) struct { file: u32, start: u32, end: u32, line: u32, column: u32 } {
     return .{ .file = @backingInt(span.file), .start = span.start, .end = span.end, .line = span.line, .column = span.column };
 }
-/// Findings selected to gate. Completion is checked independently, before acceptance.
-pub fn gateFindings(self: *const Report) usize {
-    var count: usize = 0;
-    for (self.diagnostics) |diagnostic| if (diagnostic.level == .gate) {
-        count += 1;
-    };
-    return count;
-}

@@ -57,9 +57,6 @@ conditional_files: std.AutoHashMapUnmanaged(Project.FileId, bool) = .empty,
 /// Each package's roots the program reaches (`packageRoots`), by its fingerprint.
 package_roots: std.AutoHashMapUnmanaged(u64, []const Project.FileId) = .empty,
 templates: std.AutoHashMapUnmanaged(Decl, ?Value) = .empty,
-/// What each declaration known only as the program compiles reads as with each call's
-/// bindings, found once (`atBindings`).
-at_bindings: std.AutoHashMapUnmanaged(Decl, ?[]const Value) = .empty,
 /// The values a function's own `return`s give, by function, found once (`ownReturns`).
 type_returns: std.AutoHashMapUnmanaged(Decl, []const Ast.Node.Index) = .empty,
 /// The names some container in the run declares as `comptime` fields, found once: the
@@ -79,9 +76,6 @@ lasting: std.AutoHashMapUnmanaged(usize, *anyopaque) = .empty,
 /// may have been built short of it. A walk's own step or depth limit does not set it: it answers
 /// the same whoever asks.
 short: bool = false,
-/// Every member access in the program's files, by the member's name, found once (`memberUses`).
-member_uses: std.StringHashMapUnmanaged(std.ArrayList(Key)) = .empty,
-member_uses_built: bool = false,
 /// For each field that holds a function pointer, the functions the program stores in it
 /// (`storedFunctions`), or null where a store may not be seen; and those being read.
 stored: std.AutoHashMapUnmanaged(Decl, ?Value) = .empty,
@@ -325,11 +319,6 @@ fn sizeNamed(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
     return if (value.reflected.of.* == .pointer) value.reflected.of.pointer.size else null;
 }
 
-/// What a value of a type built from its fields' types holds: a value of each of them.
-pub fn reifiedParts(self: *Facts, built: Reified) ResolveError!Value {
-    return self.instance(built.fields.*);
-}
-
 pub fn deinit(self: *Facts) void {
     self.cache.deinit(self.gpa);
     self.bound.deinit(self.gpa);
@@ -344,7 +333,6 @@ pub fn deinit(self: *Facts) void {
     self.package_roots.deinit(self.gpa);
     self.templates.deinit(self.gpa);
     self.type_returns.deinit(self.gpa);
-    self.at_bindings.deinit(self.gpa);
     self.comptime_fields.deinit(self.gpa);
     self.dereferences.deinit(self.gpa);
     self.dereferences_found.deinit(self.gpa);
@@ -3422,36 +3410,6 @@ fn containerHoldsNoAddress(self: *Facts, container: Container) ResolveError!bool
     return out;
 }
 
-/// Each part a value holds by value, for a rule to judge one by one: an instance or a type
-/// (`container`), each field it holds (`heldFields`) in turn, a pointer (not what it points to),
-/// and what does not resolve; through an error union, an optional, an array, a choice of types,
-/// a literal's parts and a type built from its fields' types (`@Struct`), what they wrap. A
-/// record of std's no type function made holds none of the program's types (std imports none
-/// of them): its fields are not read.
-/// The list is on `allocator`, the caller's: a rule's is its file's memory.
-pub fn heldParts(self: *Facts, allocator: std.mem.Allocator, value: Value) ResolveError![]const Value {
-    var out: std.ArrayList(Value) = .empty;
-    try self.collectHeld(allocator, &out, value, 0);
-    return out.items;
-}
-
-fn collectHeld(self: *Facts, allocator: std.mem.Allocator, out: *std.ArrayList(Value), value: Value, depth: u8) ResolveError!void {
-    if (depth == 16) return out.append(allocator, .{ .unknown = .cycle });
-    switch (value) {
-        .instance, .container => |found| {
-            try out.append(allocator, value);
-            if (found.made_by == null and try self.standard(found.file)) return;
-            for (try self.heldFields(found)) |field| try self.collectHeld(allocator, out, field.value, depth + 1);
-        },
-        .error_union, .optional, .array => |inner| try self.collectHeld(allocator, out, inner.*, depth + 1),
-        .alternatives => |each| for (each) |one| try self.collectHeld(allocator, out, one, depth + 1),
-        .literal => |key| for (try self.literalParts(key)) |one| try self.collectHeld(allocator, out, one, depth + 1),
-        .reified => |built| try self.collectHeld(allocator, out, try self.reifiedParts(built), depth + 1),
-        .pointer, .unknown => try out.append(allocator, value),
-        else => {},
-    }
-}
-
 /// Builtins whose result is a number or a truth value: sizes and offsets, conversions to
 /// integers, bit counts, arithmetic and the queries that answer yes or no.
 const numeric_builtins = [_][]const u8{
@@ -3491,59 +3449,6 @@ fn memberValue(self: *Facts, lhs: Value, name: []const u8) ResolveError!Value {
 
 /// A tag of an enum or a union, by its type and its name.
 pub const Tag = struct { container: Container, name: []const u8 };
-
-/// The tag a value names: an enum literal by the type its place gives it (`.unlimited` given a
-/// limit), a tag named on its type (`Io.Limit.unlimited`), a constant that names one. Null where
-/// it names none, or its type does not resolve.
-pub fn tagNamed(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Tag {
-    return self.tagWithin(file, node, 0);
-}
-
-fn tagWithin(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: u8) ResolveError!?Tag {
-    const tree = &self.project.at(file).file.tree;
-    switch (tree.nodeTag(node)) {
-        .enum_literal => {
-            const name = try self.memberName(tree.tokenSlice(tree.nodeMainToken(node)));
-            var holder = try self.literalType(file, node);
-            while (true) holder = switch (holder) {
-                .pointer => |inner| inner.child.*,
-                .optional, .error_union => |inner| inner.*,
-                .alternatives => break,
-                else => break,
-            };
-            const container = switch (holder) {
-                .container, .instance => |k| k,
-                .alternatives => return null,
-                else => return null,
-            };
-            return if (self.declaresTag(container, name)) .{ .container = container, .name = name } else null;
-        },
-        .field_access => {
-            const lhs, const token = tree.nodeData(node).node_and_token;
-            const container = switch (try self.resolve(file, lhs)) {
-                .container => |k| k,
-                .alternatives => return null,
-                else => return null,
-            };
-            const name = try self.memberName(tree.tokenSlice(token));
-            return if (self.declaresTag(container, name)) .{ .container = container, .name = name } else null;
-        },
-        .identifier => {
-            if (depth > 4) return null;
-            const decl = switch (try self.definition(file, node)) {
-                .decl => |d| d,
-                else => return null,
-            };
-            const record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
-            if (record.kind != .variable) return null;
-            const held = &self.project.at(decl.file).file.tree;
-            const constant = held.fullVarDecl(record.node) orelse return null;
-            if (held.tokenTag(constant.ast.mut_token) != .keyword_const) return null;
-            return self.tagWithin(decl.file, constant.ast.init_node.unwrap() orelse return null, depth + 1);
-        },
-        else => return null,
-    }
-}
 
 /// Whether `container` is an `enum` or a `union` with a field `name`, one of its tags.
 pub fn declaresTag(self: *const Facts, container: Container, name: []const u8) bool {
@@ -3594,12 +3499,6 @@ fn memberOfChoice(self: *Facts, choices: []const Value, name: []const u8) Resolv
     };
     if (kept.items.len == 0) return .{ .unknown = .unresolved };
     return self.choose(kept.items);
-}
-
-/// What the member `decl` of `container` holds: a field's value, read with the bindings of
-/// the call that made the container, if any.
-pub fn memberField(self: *Facts, container: Container, decl: Decl) ResolveError!Value {
-    return self.memberOf(container, decl);
 }
 
 /// A member of `container`: a field of a container a type function made is of its declared
@@ -7956,71 +7855,6 @@ pub fn memo(self: *Facts, comptime T: type) ResolveError!*T {
     return @ptrCast(@alignCast(entry.value_ptr.*)); // aegis: internal(A019): the key is this type's own name.
 }
 
-/// The member accesses (`x.name`) in the program's files (`program`) that spell `name`, each a
-/// `field_access` node: an index built once, for rules that follow one member across files. It
-/// is the candidates, never an answer: a member is reached only by its spelling (or `@field`,
-/// `fieldUses`), and every consumer reads each site by resolution (its receiver, its definition
-/// or its callee) before it counts it as the declaration it follows.
-pub fn memberUses(self: *Facts, name: []const u8) ResolveError![]const Key {
-    if (!self.member_uses_built) {
-        // The field's own table, filled whole before it is kept: one cut short is never asked.
-        var index: @TypeOf(self.member_uses) = .empty;
-        for (self.project.sources) |*source| {
-            if (!try self.program(source.id)) continue;
-            const file = source.id;
-            const tree = &source.file.tree;
-            for (tree.nodes.items(.tag), 0..) |tag, i| {
-                if (tag != .field_access) continue;
-                const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-                const spelled = try self.memberName(tree.tokenSlice(tree.nodeData(node).node_and_token[1]));
-                const entry = try index.getOrPut(self.gpa, spelled);
-                if (!entry.found_existing) entry.value_ptr.* = .empty;
-                try entry.value_ptr.append(self.gpa, .{ .file = file, .node = node });
-            }
-        }
-        self.member_uses = index;
-        self.member_uses_built = true;
-    }
-    return if (self.member_uses.get(name)) |list| list.items else &.{};
-}
-
-/// A `@field` in the program's files (`fieldUses`): the call, its holder (the first argument),
-/// and whether its name is one it computes, which may be any field.
-pub const FieldUse = struct { key: Key, holder: Ast.Node.Index, computed: bool };
-
-/// The program's `@field`s, each with what its name may be (`fieldName`), found once.
-const FieldBuiltins = struct {
-    built: bool = false,
-    each: std.ArrayList(struct { use: FieldUse, name: FieldName }) = .empty,
-};
-
-/// The `@field` reads and writes in the program's files (`program`) that may name a field
-/// `name`: each whose name `fieldName` spells as `name`, or ranges over a list or a struct that
-/// names it (`mayName`), and each whose name it computes, answered as `computed`, never left
-/// out. Of the program's files only (`Facts.program`): std's and dependencies' `@field`s are
-/// not among them. Beside `memberUses`, which gives `x.name`. In `allocator`.
-pub fn fieldUses(self: *Facts, allocator: std.mem.Allocator, name: []const u8) ResolveError![]const FieldUse {
-    const index = try self.memo(FieldBuiltins);
-    if (!index.built) {
-        index.built = true;
-        for (self.project.sources) |*source| {
-            if (!try self.program(source.id)) continue;
-            const tree = &source.file.tree;
-            for (0..tree.nodes.len) |i| {
-                const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-                if (!isBuiltin(tree, node, "@field")) continue;
-                var buffer: [2]Ast.Node.Index = undefined;
-                const args = builtinArgs(tree, node, &buffer);
-                if (args.len != 2) continue;
-                const spelled = try self.fieldName(source.id, args[1]);
-                try index.each.append(self.gpa, .{ .use = .{ .key = .{ .file = source.id, .node = node }, .holder = args[0], .computed = spelled == .computed }, .name = spelled });
-            }
-        }
-    }
-    var out: std.ArrayList(FieldUse) = .empty;
-    for (index.each.items) |each| if (self.mayName(each.name, name)) try out.append(allocator, each.use);
-    return out.items;
-}
 
 /// A file's own container: the struct the file is.
 pub fn rootOf(self: *const Facts, file: Project.FileId) Container {
@@ -9789,89 +9623,6 @@ fn callArguments(self: *Facts, function: Decl, position: usize) ResolveError!?[]
         try values.append(self.gpa, try self.resolve(site.file, site.params[position - site.receiver]));
     }
     return values.items;
-}
-
-/// What a declaration of a function holds on each call of the function, read with that call's
-/// bindings (`var lock: std.meta.Child(T) = .init` on `bump(Locks, …)`): a local's written
-/// type's instance, else its initializer's value; a parameter's type's instance; the function's
-/// own result. A declaration known only as the program compiles is judged so, never by its
-/// function's signature. Null where a call of the function is none the program shows
-/// (`escapes`), or the declaration is none of those.
-pub fn atBindings(self: *Facts, decl: Decl) ResolveError!?[]const Value {
-    if (self.at_bindings.get(decl)) |found| return found;
-    const found = try self.readAtBindings(decl);
-    try self.at_bindings.put(self.gpa, decl, found);
-    return found;
-}
-
-/// How `atBindings` and `atCall` read a declaration: the function it is in, the node read with a
-/// call's bindings, and what of that node's value it holds.
-const BindingRead = struct { function: Decl, node: Ast.Node.Index, read: enum { instance, value, result } };
-
-fn bindingRead(self: *Facts, decl: Decl) ?BindingRead {
-    const model = &self.project.at(decl.file).model;
-    const tree = &self.project.at(decl.file).file.tree;
-    const record = model.declarations[@backingInt(decl.index)];
-    return switch (record.kind) {
-        .variable => blk: {
-            const variable = tree.fullVarDecl(record.node) orelse return null;
-            const body = self.innermostFunction(decl.file, record.scope) orelse return null;
-            const function = for (model.declarations, 0..) |d, i| {
-                const candidate: Decl = .{ .file = decl.file, .index = @fromBackingInt(@intCast(i)) };
-                if (d.kind == .function and self.scopeNode(candidate) == body) break candidate;
-            } else return null;
-            if (variable.ast.type_node.unwrap()) |t| break :blk .{ .function = function, .node = t, .read = .instance };
-            break :blk .{ .function = function, .node = variable.ast.init_node.unwrap() orelse return null, .read = .value };
-        },
-        .parameter => .{ .function = self.functionOf(decl) orelse return null, .node = record.node, .read = .instance },
-        .function => blk: {
-            var buffer: [1]Ast.Node.Index = undefined;
-            const proto = tree.fullFnProto(&buffer, record.node) orelse return null;
-            break :blk .{ .function = decl, .node = proto.ast.return_type.unwrap() orelse return null, .read = .result };
-        },
-        else => null,
-    };
-}
-
-/// What `how` reads with the bindings `args` give its function.
-fn readWith(self: *Facts, decl: Decl, how: BindingRead, args: []const Value) ResolveError!Value {
-    const tree = &self.project.at(decl.file).file.tree;
-    const env = try self.gpa.create(Env);
-    env.* = .{ .function = how.function, .args = args, .depth = 0 };
-    const found = try self.resolveIn(env, decl.file, how.node);
-    return switch (how.read) {
-        .value => found,
-        .instance => try self.instance(found),
-        // `!T`: an error union whose error set the body infers, as `callResult` reads it.
-        .result => if (Model.inferredErrors(tree, how.node) and found != .unknown) .{ .error_union = try self.boxed(try self.instance(found)) } else try self.instance(found),
-    };
-}
-
-fn readAtBindings(self: *Facts, decl: Decl) ResolveError!?[]const Value {
-    const how = self.bindingRead(decl) orelse return null;
-    const sites = (try self.callSites(how.function)) orelse return null;
-    var values: std.ArrayList(Value) = .empty;
-    for (sites) |site| {
-        var args: std.ArrayList(Value) = .empty;
-        if (site.receiver != 0) try args.append(self.gpa, try self.resolve(site.file, site.holder));
-        for (site.params) |arg| try args.append(self.gpa, try self.resolve(site.file, arg));
-        try values.append(self.gpa, try self.readWith(decl, how, args.items));
-    }
-    return values.items;
-}
-
-/// What a declaration of a function holds on the one call `call` (`calls.at`) of it, read with
-/// that call's bindings as `atBindings` reads each: null where the declaration is none it reads,
-/// or the call's arguments are not known.
-pub fn atCall(self: *Facts, decl: Decl, call: calls.Call) ResolveError!?Value {
-    const how = self.bindingRead(decl) orelse return null;
-    const given = switch (call.args) {
-        .known => |each| each,
-        .unknown => return null,
-    };
-    var args: std.ArrayList(Value) = .empty;
-    for (given) |arg| try args.append(self.gpa, try self.resolve(call.file, arg));
-    return try self.readWith(decl, how, args.items);
 }
 
 /// One call of a function the program makes (`call`): its arguments, after the receiver a

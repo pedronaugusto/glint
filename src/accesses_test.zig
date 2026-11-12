@@ -888,7 +888,7 @@ test "accesses: a ZON file's literal writes the fields it initializes, whatever 
     try std.testing.expectEqualStrings("200", project.sources[1].file.tree.getNodeSource(site.value.?));
 }
 
-test "consolidate: a member read's step, which language field it is, the program's @fields, a primitive integer's width" {
+test "consolidate: a member read's step, which language field it is, a primitive integer's width" {
     const source =
         \\const S = struct { len: u32, ptr: u32, f: u8, g: u8 };
         \\fn f(s: *S, b: []const u8, a: [3]u8, x: anytype, comptime n: []const u8) usize {
@@ -936,20 +936,6 @@ test "consolidate: a member read's step, which language field it is, the program
     try std.testing.expect(try facts.languageField(file, spelledNode(tree, "s.len", 0).?) == .none);
     try std.testing.expect(try facts.languageField(file, spelledNode(tree, "s.ptr", 0).?) == .none);
     try std.testing.expect(try facts.languageField(file, spelledNode(tree, "x.len", 0).?) == .unknown);
-
-    // Q3: `f` is named by its literal and by the inline loop's list, and may be the computed
-    // ones (`n`, and a `var` list's, which is no `const`'s); `g` by its literal, the lists and
-    // those; a name no `@field` may be gets the computed ones only.
-    const for_f = try facts.fieldUses(arena.allocator(), "f");
-    try std.testing.expectEqual(@as(usize, 4), for_f.len);
-    var computed_seen: usize = 0;
-    for (for_f) |use| computed_seen += @intFromBool(use.computed);
-    try std.testing.expectEqual(@as(usize, 2), computed_seen);
-    // A `const` list ranged over, by value or through `&`, names only its names.
-    try std.testing.expectEqual(@as(usize, 6), (try facts.fieldUses(arena.allocator(), "g")).len);
-    const other = try facts.fieldUses(arena.allocator(), "h");
-    try std.testing.expectEqual(@as(usize, 2), other.len);
-    for (other) |use| try std.testing.expect(use.computed);
 
     // Q2, per build: a holder that is a slice in one build and a struct with a `len` field in
     // another is unknown, never one of them.
