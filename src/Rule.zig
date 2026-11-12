@@ -147,9 +147,9 @@ pub const Config = struct {
     /// a file, or a directory (`module`). The report counts each one's sites per rule
     /// (`Report.seams`), and one whose rules ran and found nothing in it is stale.
     seams: []const Seam = &.{},
-    /// The inputs that are test code beside `test` blocks: a path glob or a directory. The caller
-    /// classifies them (`Project.Input.classification`); the report counts each one's files, and
-    /// one matching none is stale.
+    /// The inputs that are test code beside `test` blocks: a path glob or a directory. Every rule
+    /// reads them as test code (`RuleContext.inTest`), whatever the caller classified; the report
+    /// counts each one's files, and one matching none is stale.
     test_inputs: []const TestInput = &.{},
     /// The directory `seams` and `test_inputs` name paths from (the configuration file's): an
     /// input named under it is matched by its path from there.

@@ -908,6 +908,20 @@ test "a test input entry counts the inputs it holds, the first entry holding one
     try std.testing.expectEqual(@as(usize, 0), report.test_inputs[2].files); // safe: no input under test/.
 }
 
+test "a test input is test code to every rule, whatever the caller classified" {
+    var project = try glint.Project.init(std.testing.allocator, &.{
+        .{ .name = "bench/main.zig", .bytes = "fn g() !void {}\npub fn f() void {\n    g() catch unreachable;\n}\n" },
+        .{ .name = "src/main.zig", .bytes = "fn g() !void {}\npub fn f() void {\n    g() catch unreachable;\n}\n" },
+    }, &.{}, .{});
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.selections = &.{.{ .rule = .Z026, .level = .gate }};
+    config.test_inputs = &.{.{ .module = "bench" }};
+    var report = try glint.run(std.testing.allocator, &project, config);
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: src/main.zig's alone.
+}
+
 test "an import no mapping names stops the run, named at its file; Zig's own builtin is none" {
     var project = try glint.Project.init(std.testing.allocator, &.{
         .{ .name = "one.zig", .bytes = "const lib = @import(\"lib\"); const other = @import(\"other\"); pub fn f() void { _ = lib; _ = other; }" },

@@ -202,11 +202,13 @@ pub fn refuse(self: *RuleContext, why: []const u8) Error!void {
     return self.sink.refuse(self.sink, why);
 }
 /// Whether a token is test code: inside a `test` block, or in an input the caller classifies as a
-/// test. Nothing else is: a file only tests import, a private function only tests call and a fuzz
-/// target outside a `test` block are production code. The one answer for every rule that exempts
-/// test code.
+/// test or the configuration's `test_inputs` names, whoever runs glint. Nothing else is: a file
+/// only tests import, a private function only tests call and a fuzz target outside a `test` block
+/// are production code. The one answer for every rule that exempts test code.
 pub fn inTest(self: *const RuleContext, token: std.zig.Ast.TokenIndex) bool {
-    return inTestScope(self.project.at(self.file), token);
+    const held = self.project.at(self.file);
+    if (self.config.testInput(held.input.name) != null) return true;
+    return inTestScope(held, token);
 }
 /// Whether a token of `held` is test code: a test input, or inside a `test` block.
 fn inTestScope(held: *const Project.Source, token: Ast.TokenIndex) bool {
