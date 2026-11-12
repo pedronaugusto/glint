@@ -11,14 +11,14 @@
         },
 
         .ensign = .{
-            .url = "git+https://github.com/pedronaugusto/ensign?ref=v0.3.1#271c75f60534b7e9eb1c79ae6d3b8f94c28be705",
-            .hash = "ensign-0.3.1-6eMTD7ejBQCKWv4nIZ0aJ1sZp8iqcM98FSGwKTnd4mVJ",
+            .url = "git+https://github.com/pedronaugusto/ensign#47ae8ac45b9ccae0b2acc151aae246da2b684517",
+            .hash = "ensign-0.3.1-6eMTD6ClBQA_Er0WgjAgPssccItf3UByYL3rymaw5baj",
         },
     },
     .dev_dependencies = .{
         .preflight = .{
-            .url = "git+https://github.com/pedronaugusto/preflight?ref=concurrent-gate-3#041af5a86405ca35ea45215478b966daef6cf745",
-            .hash = "preflight-0.18.6-LX1ZwoYgGQCiGQ5d6U8YUr1adiwiE0wwVpdwKO74LSKg",
+            .url = "git+https://github.com/pedronaugusto/preflight?ref=ci-standard#2c9f7ae854e159fdd4d99a62ea9accc647623e76",
+            .hash = "preflight-0.18.6-LX1ZwhfdGABszxizm4q2gQoTUwWG3UbYWnTZlnuZIxg5",
         },
 
         .shakedown = .{

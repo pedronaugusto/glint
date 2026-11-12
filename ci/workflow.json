@@ -1,5 +1,4 @@
 {
-  "attest": true,
   "compile_step": "check",
   "targets": [
     "x86_64-linux-gnu",
@@ -11,5 +10,7 @@
     "aarch64-macos"
   ],
   "compile_once": true,
-  "shards": {"riscv64": 3}
+  "shards": {
+    "riscv64": 3
+  }
 }

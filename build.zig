@@ -234,12 +234,23 @@ pub fn dev(b: *std.Build, tools: type) void {
     b.step("check-process-streams", "Run glint with its stdout on a file opened for append and on one shared in order").dependOn(&streams_run.step);
     check.dependOn(&executable.step);
     check.dependOn(&project_linter.step);
-    tools.preflight.addCi(b, p, .{ .tests = test_step, .portable_tests = true, .bench = .{
-        .programs = &.{ .{ .name = "glint-scan", .source = "bench/scan.zig" }, .{ .name = "glint-aegis", .source = "bench/aegis.zig" } },
-        .imports = benchImports,
-        .target = target,
-        .optimize = optimize,
-    } });
+    tools.preflight.addCi(b, p, .{
+        .tests = test_step,
+        .portable_tests = true,
+        .bench = .{
+            .programs = &.{ .{ .name = "glint-scan", .source = "bench/scan.zig" }, .{ .name = "glint-aegis", .source = "bench/aegis.zig" } },
+            .imports = &tools.preflight.Bench.Imports{
+                .make = struct {
+                    // preflight's hook hands itself back; glint's imports need no state of their own.
+                    fn make(_: *const tools.preflight.Bench.Imports, owner: *std.Build, wanted: std.Build.ResolvedTarget, mode: std.lang.Optimize) []const std.Build.Module.Import {
+                        return benchImports(owner, wanted, mode);
+                    }
+                }.make,
+            },
+            .target = target,
+            .optimize = optimize,
+        },
+    });
     // The packages a consumer's build reaches through glint's manifest.
     const ensign_dependency = p.dependency("ensign", .{ .target = target, .optimize = optimize });
     const packages = [_]*std.Build.Dependency{ aegis_dependency, ensign_dependency, ensign_dependency.builder.dependency("xenoglyph", .{ .target = target, .optimize = optimize }), ensign_dependency.builder.dependency("aegis", .{ .target = target, .optimize = optimize }) };

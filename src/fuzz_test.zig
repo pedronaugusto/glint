@@ -5,7 +5,6 @@
 //! testing allocator checks) and never hangs; what it reports is the unit tests'. A plain test
 //! run reads each target's corpus once; `zig build test --fuzz` searches from it.
 const std = @import("std");
-const File = @import("File.zig");
 const Suppression = @import("Suppression.zig");
 const Project = @import("Project.zig");
 const Facts = @import("Facts.zig");
@@ -19,16 +18,16 @@ test "fuzz: suppression and escape comments" {
             var buffer: [2048]u8 = undefined;
             const bytes = buffer[0..smith.slice(&buffer)];
             const gpa = std.testing.allocator;
-            var file = File.initWithLowering(gpa, bytes, .{}, true, .zig) catch |err| switch (err) {
+            var project = Project.init(gpa, &.{.{ .name = "fuzzed.zig", .bytes = bytes }}, &.{}, .{}) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 // A file past the limits is refused before any comment is read.
-                error.SourceTooLarge, error.SourceTooComplex => return,
+                else => return,
             };
-            defer file.deinit();
+            defer project.deinit();
             var arena: std.heap.ArenaAllocator = .init(gpa);
             defer arena.deinit();
             var malformed: std.ArrayList(Suppression.Malformed) = .empty;
-            _ = try Suppression.parseConfigured(arena.allocator(), &file, &.{}, &malformed);
+            _ = try Suppression.parseConfigured(arena.allocator(), project.sources[0].file, &.{}, &malformed);
         }
     };
     try std.testing.fuzz({}, Target.one, .{ .corpus = &.{
