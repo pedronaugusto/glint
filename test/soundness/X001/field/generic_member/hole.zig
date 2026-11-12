@@ -3,5 +3,5 @@
 const module = @import("module");
 
 pub fn f(h: module.Box(u64).Handle) u32 {
-    return h.slot;
+    return h.pkg_slot;
 }

@@ -1,12 +1,17 @@
 //! P007: the operations Zig leaves unchecked, a ban outside the seams a project declares. Inline
 //! assembly; `@setRuntimeSafety` off in a build that keeps the checks; the pointer conversions no
-//! build checks (`@ptrCast`, `@alignCast`, `@constCast`, `@volatileCast`, `@ptrFromInt`,
-//! `@fieldParentPtr`); an `extern` declaration and `@extern`; `noalias`; `@setFloatMode(.optimized)`;
+//! build checks (`@ptrCast`, `@alignCast`, `@constCast`, `@volatileCast`, `@ptrFromInt`); an
+//! `extern` declaration and `@extern`; `noalias`; `@setFloatMode(.optimized)`;
 //! arithmetic on or indexing of a many-item or C pointer, which carries no length; std's
 //! `mem.bytesAsValue` and `mem.bytesAsSlice`, a reinterpretation by another name; and any member of
 //! std's raw OS and C bindings (`std.c`, `std.os.linux`, `std.os.windows`), which the program
 //! reaches past std's checked layer. Production code only; an operation the program runs only as
-//! it compiles has none of these dangers.
+//! it compiles has none of these dangers. Zig's two interface idioms are not read, as neither has
+//! an alternative: `@fieldParentPtr`, and the `@alignCast` whose operand it is
+//! (`@alignCast(@fieldParentPtr("f", p))`, std.Io's own); and a `@ptrCast`, with or without the
+//! `@alignCast` inside it, from a `*anyopaque` to a pointer to one item, how std.mem.Allocator's
+//! `ptr`, std.Io's `userdata` and every hand-written vtable recover their owner. A `@ptrCast` from
+//! `*anyopaque` to a slice or a many-item pointer stays a finding.
 const std = @import("std");
 const Context = @import("RuleContext.zig");
 const Governed = @import("Governed.zig");
@@ -57,7 +62,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         // An address read out of a pointer (`@intFromPtr`) is never undefined behavior.
         // A cast written straight inside another (`@ptrCast(@alignCast(p))`) is one conversion:
         // the outermost is its site, so one suppression names it.
-        if (pointerCast(name) and !nestedCast(c, tree, node)) {
+        if (pointerCast(name) and !nestedCast(c, tree, node) and !recovery(tree, node, name) and !try ownerRecovery(c, tree, node, name)) {
             try c.at(rule, token, try c.allocator.print("{s}: a pointer conversion no build checks", .{name}));
         }
         if (std.mem.eql(u8, name, "@extern")) try c.at(rule, token, "@extern: a symbol whose definition Zig does not check; only the raw call, at the package's seam");
@@ -90,8 +95,43 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
 }
 
 fn pointerCast(name: []const u8) bool {
-    for ([_][]const u8{ "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@ptrFromInt", "@fieldParentPtr" }) |cast| if (std.mem.eql(u8, name, cast)) return true;
+    for ([_][]const u8{ "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@ptrFromInt" }) |cast| if (std.mem.eql(u8, name, cast)) return true;
     return false;
+}
+
+/// Whether the cast at `node` is a `@ptrCast` (of an `@alignCast` or not) of a value typed
+/// `*anyopaque` (`?*anyopaque`, `*const anyopaque` alike) to a pointer to one item.
+fn ownerRecovery(c: *Context, tree: *const Ast, node: Ast.Node.Index, name: []const u8) Context.Error!bool {
+    if (!std.mem.eql(u8, name, "@ptrCast")) return false;
+    var operand = only(tree, node) orelse return false;
+    if (std.mem.eql(u8, Facts.builtinName(tree, operand) orelse "", "@alignCast")) operand = only(tree, operand) orelse return false;
+    var from = try c.facts.resolve(c.file, operand);
+    if (from == .optional) from = from.optional.*;
+    if (from != .pointer or from.pointer.size != .one) return false;
+    if (from.pointer.child.* != .primitive or !std.mem.eql(u8, from.pointer.child.primitive, "anyopaque")) return false;
+    const made = try c.facts.castTypeIn(null, c.file, node);
+    return made == .pointer and made.pointer.size == .one;
+}
+
+/// A builtin call's one argument, past parentheses.
+fn only(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = Facts.builtinArgs(tree, node, &buffer);
+    if (args.len != 1) return null;
+    var operand = args[0];
+    while (tree.nodeTag(operand) == .grouped_expression) operand = tree.nodeData(operand).node_and_token[0];
+    return operand;
+}
+
+/// Whether the cast at `node` is `@alignCast` of a `@fieldParentPtr`, past parentheses.
+fn recovery(tree: *const Ast, node: Ast.Node.Index, name: []const u8) bool {
+    if (!std.mem.eql(u8, name, "@alignCast")) return false;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = Facts.builtinArgs(tree, node, &buffer);
+    if (args.len != 1) return false;
+    var operand = args[0];
+    while (tree.nodeTag(operand) == .grouped_expression) operand = tree.nodeData(operand).node_and_token[0];
+    return std.mem.eql(u8, Facts.builtinName(tree, operand) orelse return false, "@fieldParentPtr");
 }
 
 /// Whether the pointer cast at `node` is the operand of another, past parentheses.

@@ -9,7 +9,7 @@
 //! a capture of a list of them written in place). A shape read is a node's syntax tag, as std's
 //! `Ast.nodeTag` gives it, compared with or switched on a tag that writes a value (`.identifier`,
 //! `.field_access`, a call, an assignment, a type written in place). Each callee is read by what
-//! it resolves to, never by its spelling: one that may be std's function is undecided.
+//! it resolves to, never by its spelling: one that may be std's function cannot be shown to be none: a finding.
 const std = @import("std");
 const glint = @import("glint");
 const cli = glint.cli;
@@ -47,7 +47,7 @@ const allowed = [_]Allowed{
 /// answers joined by Facts.Join): a switch that names some tags and sends the rest to a default reads a choice of
 /// them, or a tag it does not name, as that default, which skips or clears it. A switch is found
 /// by what its operand resolves to (Facts.Value's own declaration), never by the tags it names; one
-/// whose operand does not resolve is undecided.
+/// whose operand does not resolve cannot be shown to be none: a finding.
 /// A container as Facts names it: `Value.container`'s payload.
 const ValueContainer = @FieldType(glint.Value, "container");
 const value_switches: glint.Rule = @fromBackingInt(1002); // safe: this linter owns extension ID 1002, validated by glint.
@@ -75,7 +75,7 @@ fn checkSwitches(context: *glint.RuleContext, list: []const Allowed) glint.RuleC
         const full = tree.fullSwitch(node) orelse continue;
         switch (try isValue(context, try context.facts.resolve(context.file, full.ast.condition), value_type)) {
             .no => continue,
-            .unknown => |why| try found.append(context.allocator, .{ .node = node, .what = .{ .undecided = why } }),
+            .unknown => |why| try found.append(context.allocator, .{ .node = node, .what = .{ .unshown = why } }),
             .yes => if (!namesAlternatives(tree, full)) try found.append(context.allocator, .{ .node = node, .what = .{ .read = "a switch on a resolved value names no `.alternatives` prong: a choice of values, or a tag it does not name, falls to its default; read it part by part (Facts.valueParts, joined by Facts.Join), or allow it with the row that proves its default is the safe answer" } }),
         }
     }
@@ -89,7 +89,7 @@ fn checkSwitches(context: *glint.RuleContext, list: []const Allowed) glint.RuleC
         };
         switch (each.what) {
             .read => |message| try context.at(value_switches, tree.nodeMainToken(each.node), message),
-            .undecided => |why| try context.at(value_switches, tree.nodeMainToken(each.node), try context.allocator.print("cannot be shown to read no value of a rule's own ({t})", .{why})),
+            .unshown => |why| try context.at(value_switches, tree.nodeMainToken(each.node), try context.allocator.print("cannot be shown to read no value of a rule's own ({t})", .{why})),
         }
     }
     for (list, used) |entry, use| if (inFile(name, entry.file) and !use) {
@@ -259,8 +259,8 @@ fn reads(tag: std.zig.Ast.Node.Tag) ?Read {
     };
 }
 
-/// A read found: its finding's message, or undecided and why.
-const Found = struct { node: std.zig.Ast.Node.Index, what: union(enum) { read: []const u8, undecided: glint.Unknown } };
+/// A read found: its finding's message, or a site that cannot be shown to be none and why.
+const Found = struct { node: std.zig.Ast.Node.Index, what: union(enum) { read: []const u8, unshown: glint.Unknown } };
 
 fn check(context: *glint.RuleContext, list: []const Allowed) glint.RuleContext.Error!void {
     const tree = try context.project.syntax(try context.source());
@@ -276,7 +276,7 @@ fn check(context: *glint.RuleContext, list: []const Allowed) glint.RuleContext.E
     }
     for (misread.items) |each| switch (each.what) {
         .read => |message| try context.at(rule_readers, tree.nodeMainToken(each.node), message),
-        .undecided => |why| try context.at(rule_readers, tree.nodeMainToken(each.node), try context.allocator.print("cannot be shown to read no name of a rule's own ({t})", .{why})),
+        .unshown => |why| try context.at(rule_readers, tree.nodeMainToken(each.node), try context.allocator.print("cannot be shown to read no name of a rule's own ({t})", .{why})),
     };
     const used = try context.allocator.alloc(bool, list.len);
     @memset(used, false);
@@ -288,7 +288,7 @@ fn check(context: *glint.RuleContext, list: []const Allowed) glint.RuleContext.E
         };
         switch (each.what) {
             .read => |message| try context.at(rule_readers, tree.nodeMainToken(each.node), message),
-            .undecided => |why| try context.at(rule_readers, tree.nodeMainToken(each.node), try context.allocator.print("cannot be shown to read no name of a rule's own ({t})", .{why})),
+            .unshown => |why| try context.at(rule_readers, tree.nodeMainToken(each.node), try context.allocator.print("cannot be shown to read no name of a rule's own ({t})", .{why})),
         }
     }
     for (list, used) |entry, use| if (inFile(name, entry.file) and !use) {
@@ -333,7 +333,7 @@ fn spelling(context: *glint.RuleContext, tree: *const std.zig.Ast, node: std.zig
     for (comparisons) |path| switch (try glint.stdCall(context, node, path)) {
         .no => {},
         .yes => return out.append(context.allocator, .{ .node = node, .what = .{ .read = try context.allocator.print("std's {s} matches a declaration by its name \"{s}\": find it by what it resolves to (Facts.resolve, Facts.calls, Governed)", .{ path, name }) } }),
-        .unknown => |why| return out.append(context.allocator, .{ .node = node, .what = .{ .undecided = why } }),
+        .unknown => |why| return out.append(context.allocator, .{ .node = node, .what = .{ .unshown = why } }),
     };
 }
 
@@ -344,7 +344,7 @@ fn correction(context: *glint.RuleContext, tree: *const std.zig.Ast, node: std.z
     for (corrected) |each| switch (try glint.stdCall(context, node, each[0])) {
         .no => {},
         .yes => return out.append(context.allocator, .{ .node = node, .what = .{ .read = each[1] } }),
-        .unknown => |why| return out.append(context.allocator, .{ .node = node, .what = .{ .undecided = why } }),
+        .unknown => |why| return out.append(context.allocator, .{ .node = node, .what = .{ .unshown = why } }),
     };
 }
 
@@ -403,7 +403,7 @@ fn shape(context: *glint.RuleContext, tree: *const std.zig.Ast, node: std.zig.As
             while (each.next()) |kind| try queries.append(context.allocator, try context.allocator.print("a {s} through {s}", .{ @tagName(kind), kind.query() }));
             try out.append(context.allocator, .{ .node = node, .what = .{ .read = try context.allocator.print("a node's syntax tag reads by its shape (.{s}) what the shared queries read: {s}", .{ try std.mem.join(context.allocator, ", .", found.items), try std.mem.join(context.allocator, "; ", queries.items) }) } });
         },
-        .unknown => |why| try out.append(context.allocator, .{ .node = node, .what = .{ .undecided = why } }),
+        .unknown => |why| try out.append(context.allocator, .{ .node = node, .what = .{ .unshown = why } }),
     }
 }
 
@@ -491,7 +491,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 /// A run of RULE_READERS on `root`, which imports a fixture std with text comparisons and a
-/// syntax tree: its findings, and its undecided sites.
+/// syntax tree: its findings, and its run errors.
 fn readers(root: []const u8) !struct { usize, usize } {
     return readersAllowing(root, &.{});
 }
@@ -499,7 +499,7 @@ fn readers(root: []const u8) !struct { usize, usize } {
 fn readersAllowing(root: []const u8, comptime list: []const Allowed) !struct { usize, usize } {
     return judge(root, rule_readers, &ruled(list));
 }
-/// A run of NAME_TABLES on `root`, with the tables `list` allows: its findings, and its undecided sites.
+/// A run of NAME_TABLES on `root`, with the tables `list` allows: its findings, and its run errors.
 fn tablesAllowing(root: []const u8, comptime list: []const Allowed) !struct { usize, usize } {
     return judge(root, name_tables, &tabled(list));
 }
@@ -540,11 +540,7 @@ fn judge(root: []const u8, rule: glint.Rule, with: []const glint.ProjectRule) !s
     const config: glint.Config = .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .report }} };
     var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = with });
     defer report.deinit();
-    var undecided: usize = 0;
-    for (report.coverage) |item| if (item.rule) |each| {
-        if (each == rule) undecided += 1;
-    };
-    return .{ report.diagnostics.len, undecided };
+    return .{ report.diagnostics.len, report.errors.len };
 }
 
 test "a rule's text comparison with a declaration's name is a spelling read, found by what std's function is" {
@@ -561,14 +557,14 @@ test "a rule's text comparison with a declaration's name is a spelling read, fou
         .{ "fn eql(comptime T: type, a: []const T, b: []const T) bool { return a.len == b.len; } pub fn f(name: []const u8) bool { return eql(u8, name, \"deinit\"); }", 0, 0 },
         // A test's comparisons are no rule's reads.
         .{ "test { _ = std.mem.eql(u8, \"x\", \"deinit\"); }", 0, 0 },
-        // A callee that may be std's function: undecided.
-        .{ "pub fn f(g: anytype, name: []const u8) bool { return g.eql(u8, name, \"deinit\"); }", 0, 1 },
+        // A callee that may be std's function: it cannot be shown to read no name, a finding.
+        .{ "pub fn f(g: anytype, name: []const u8) bool { return g.eql(u8, name, \"deinit\"); }", 1, 0 },
     }) |case| {
         const source = try std.mem.concat(std.testing.allocator, u8, &.{ head, case[0] });
         defer std.testing.allocator.free(source);
-        const found, const undecided = try readers(source);
+        const found, const errors = try readers(source);
         try std.testing.expectEqual(case[1], found);
-        try std.testing.expectEqual(case[2], undecided);
+        try std.testing.expectEqual(case[2], errors);
     }
 }
 
@@ -594,9 +590,9 @@ test "a rule's test of a node's syntax tag against one that writes a value is a 
     }) |case| {
         const source = try std.mem.concat(std.testing.allocator, u8, &.{ head, case[0] });
         defer std.testing.allocator.free(source);
-        const found, const undecided = try readers(source);
+        const found, const errors = try readers(source);
         try std.testing.expectEqual(case[1], found);
-        try std.testing.expectEqual(@as(usize, 0), undecided);
+        try std.testing.expectEqual(@as(usize, 0), errors);
     }
 }
 
@@ -610,16 +606,16 @@ test "an allowed function's reads are not reported, and an entry no read is in i
         \\pub fn shaped(tree: Ast, n: usize) bool { return tree.nodeTag(n) == .identifier; }
         \\pub fn spelled(g: anytype, name: []const u8) bool { return g.eql(u8, name, "deinit"); }
     ;
-    // Nothing allowed: two reads and one undecided.
-    try std.testing.expectEqual(.{ 2, 1 }, try readers(source));
-    // A function inside a container is named through it; an undecided site is allowed with its function's reads.
-    try std.testing.expectEqual(.{ 1, 1 }, try readersAllowing(source, &.{.{ .file = "root", .function = "Walk.named", .reason = "a style rule's names" }}));
+    // Nothing allowed: two reads and one site that cannot be shown to be none.
+    try std.testing.expectEqual(.{ 3, 0 }, try readers(source));
+    // A function inside a container is named through it; a site that cannot be shown to be none is allowed with its function's reads.
+    try std.testing.expectEqual(.{ 2, 0 }, try readersAllowing(source, &.{.{ .file = "root", .function = "Walk.named", .reason = "a style rule's names" }}));
     try std.testing.expectEqual(.{ 2, 0 }, try readersAllowing(source, &.{.{ .file = "root", .function = "spelled", .reason = "a style rule's names" }}));
     // An entry naming a function with no read, one that is not there, or the container alone, is a finding.
-    try std.testing.expectEqual(.{ 3, 1 }, try readersAllowing(source, &.{.{ .file = "root", .function = "Walk", .reason = "a style rule's names" }}));
-    try std.testing.expectEqual(.{ 3, 1 }, try readersAllowing(source, &.{.{ .file = "root", .function = "gone", .reason = "a style rule's names" }}));
+    try std.testing.expectEqual(.{ 4, 0 }, try readersAllowing(source, &.{.{ .file = "root", .function = "Walk", .reason = "a style rule's names" }}));
+    try std.testing.expectEqual(.{ 4, 0 }, try readersAllowing(source, &.{.{ .file = "root", .function = "gone", .reason = "a style rule's names" }}));
     // Another file's entry is that file's.
-    try std.testing.expectEqual(.{ 2, 1 }, try readersAllowing(source, &.{.{ .file = "src/Other.zig", .function = "shaped", .reason = "a style rule's names" }}));
+    try std.testing.expectEqual(.{ 3, 0 }, try readersAllowing(source, &.{.{ .file = "src/Other.zig", .function = "shaped", .reason = "a style rule's names" }}));
 }
 
 test "std's container field reading, which the model corrects, is a finding wherever a rule calls it, allowed or not" {
@@ -652,19 +648,19 @@ test "a table keyed by text is found wherever glint makes it, by what std's map 
     ;
     // A field at the file's level, one in a container, one through an alias in a function; a map
     // keyed otherwise, the program's own function so spelled and a test's are none. A callee that
-    // may be std's is undecided.
-    try std.testing.expectEqual(.{ 3, 1 }, try tablesAllowing(source, &.{}));
+    // may be std's cannot be shown to be none: a finding.
+    try std.testing.expectEqual(.{ 4, 0 }, try tablesAllowing(source, &.{}));
     // Allowed where it is made: a field by its containers' path, a function by its name.
-    try std.testing.expectEqual(.{ 1, 1 }, try tablesAllowing(source, &.{
+    try std.testing.expectEqual(.{ 2, 0 }, try tablesAllowing(source, &.{
         .{ .file = "root", .function = "Scope.by_name", .reason = "text is the identity" },
         .{ .file = "root", .function = "index", .reason = "text is the identity" },
     }));
     // An entry no table is at is a finding.
-    try std.testing.expectEqual(.{ 4, 1 }, try tablesAllowing(source, &.{.{ .file = "root", .function = "gone", .reason = "text is the identity" }}));
+    try std.testing.expectEqual(.{ 5, 0 }, try tablesAllowing(source, &.{.{ .file = "root", .function = "gone", .reason = "text is the identity" }}));
 }
 
 /// A run of VALUE_SWITCHES on `root` (glint's src/Rule.zig) beside a fixture src/Facts.zig that
-/// declares Value, with the switches `list` allows: its findings, and its undecided sites.
+/// declares Value, with the switches `list` allows: its findings, and its run errors.
 fn switchesAllowing(root: []const u8, comptime list: []const Allowed) !struct { usize, usize } {
     var project = try glint.Project.init(std.testing.allocator, &.{
         .{ .name = "src/Rule.zig", .bytes = root },
@@ -674,25 +670,21 @@ fn switchesAllowing(root: []const u8, comptime list: []const Allowed) !struct { 
     const config: glint.Config = .{ .enabled = .empty, .selections = &.{.{ .rule = value_switches, .level = .report }} };
     var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = &switched(list) });
     defer report.deinit();
-    var undecided: usize = 0;
-    for (report.coverage) |item| if (item.rule) |each| {
-        if (each == value_switches) undecided += 1;
-    };
-    return .{ report.diagnostics.len, undecided };
+    return .{ report.diagnostics.len, report.errors.len };
 }
 
-test "a switch on a resolved value with no alternatives prong is a finding, found by what its operand resolves to; one naming alternatives, one on another type, and an allowed one are not; one whose operand does not resolve is undecided" {
-    const head = "const Facts = @import(\"Facts.zig\");\nconst missing = @import(\"missing\");\nconst Kind = enum { a, b };\n";
+test "a switch on a resolved value with no alternatives prong is a finding, found by what its operand resolves to; one naming alternatives, one on another type, and an allowed one are not; one whose operand does not resolve is one too" {
+    const head = "const Facts = @import(\"Facts.zig\");\nconst Kind = enum { a, b };\n";
     inline for ([_]struct { []const u8, usize, usize }{
         .{ "pub fn f(v: Facts.Value) bool { return switch (v) { .instance => true, else => false }; }", 1, 0 },
         .{ "pub fn f(v: Facts.Value) bool { return switch (v) { .instance => true, .alternatives => |each| each.len != 0, else => false }; }", 0, 0 },
         .{ "pub fn f(k: Kind) bool { return switch (k) { .a => true, else => false }; }", 0, 0 },
-        .{ "pub fn f() bool { return switch (missing.value) { .instance => true, else => false }; }", 0, 1 },
+        .{ "pub fn f(held: anytype) bool { return switch (held.value) { .instance => true, else => false }; }", 1, 0 },
     }) |row| {
-        const source, const findings, const undecided = row;
+        const source, const findings, const errors = row;
         const got = try switchesAllowing(head ++ source, &.{});
         try std.testing.expectEqual(findings, got[0]);
-        try std.testing.expectEqual(undecided, got[1]);
+        try std.testing.expectEqual(errors, got[1]);
     }
     // Allowed by its function: none; an entry no switch of its file is in: a finding itself.
     const allowed_site = try switchesAllowing(head ++ "pub fn f(v: Facts.Value) bool { return switch (v) { .instance => true, else => false }; }", &.{.{ .file = "src/Rule.zig", .function = "f", .reason = "pending: warp-fast" }});

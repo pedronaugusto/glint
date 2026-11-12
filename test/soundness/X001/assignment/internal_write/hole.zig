@@ -3,5 +3,5 @@ const module = @import("module");
 const C = module.Counted;
 
 pub fn f(c: *C) void {
-    c.n = 7;
+    c.pkg_n = 7;
 }

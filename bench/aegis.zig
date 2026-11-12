@@ -9,7 +9,7 @@ pub fn main(init: std.process.Init) !void {
     const n: usize = if (args.len > 1 and std.mem.eql(u8, args[1], "--smoke")) 4 else 128;
     var source: std.Io.Writer.Allocating = .init(init.arena.allocator());
     try source.writer.writeAll("const S = @import(\"aegis\").Secret;\n");
-    for (0..n) |i| try source.writer.print("pub fn site{d}(s: *S(u32)) void {{ _ = s.material; }}\n", .{i});
+    for (0..n) |i| try source.writer.print("pub fn site{d}(s: *S(u32)) void {{ _ = s.aegis_material; }}\n", .{i});
     var project = try sources.project(init.gpa, source.written());
     defer project.deinit();
     // The rules aegis declares, each on by its own default: A001 finds each internal field read.

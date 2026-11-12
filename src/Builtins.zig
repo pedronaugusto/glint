@@ -323,11 +323,31 @@ fn emptyHandlers(self: *Context) RunError!void {
         if (self.inTest(token)) continue;
         if (tag == .@"orelse") continue;
         if (tree.nodeTag(ungrouped(tree, handler)) == .unreachable_literal) {
-            try self.at(.Z026, token, "catch unreachable: a panic, or undefined behaviour in a ReleaseFast build; return the error, or write the reason at this site");
+            const message = "catch unreachable: a panic, or undefined behaviour in a ReleaseFast build; return the error, or write the reason at this site";
+            // 0.7's reason comment on its line (`// unreachable: <why>`) is that reason in the form
+            // glint read then: --fix writes it as the suppression it reads now.
+            if (try oldReason(self, token)) |fix| try self.fixedAt(.Z026, token, message, fix) else try self.at(.Z026, token, message);
         } else if (emptyHandler(tree, handler)) {
             try self.at(.Z026, token, "an error handler that does nothing with the error; write the reason at this site");
         }
     }
+}
+
+/// The edit that rewrites a `// unreachable: <why>` comment on `token`'s line, 0.7's reason for a
+/// `catch unreachable`, as `// glint-ignore: Z026 -- <why>`.
+fn oldReason(self: *Context, token: Ast.TokenIndex) RunError!?[]const Report.Edit {
+    const file = self.project.at(self.file).file;
+    const line = file.line(file.tree.tokenStart(token));
+    for (file.comments) |comment| {
+        if (comment.line != line) continue;
+        const text = file.source[comment.start..comment.end];
+        const why = std.mem.trim(u8, std.mem.cutPrefix(u8, text, "// unreachable:") orelse continue, " \t");
+        if (why.len == 0) return null;
+        const fix = try self.allocator.alloc(Report.Edit, 1);
+        fix[0] = .{ .start = comment.start, .end = comment.end, .text = try self.allocator.print("// glint-ignore: Z026 -- {s}", .{why}) };
+        return fix;
+    }
+    return null;
 }
 
 /// Whether a handler is written empty, parentheses aside: a block (labeled or not) whose every

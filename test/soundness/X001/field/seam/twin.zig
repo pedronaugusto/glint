@@ -2,5 +2,5 @@
 const module = @import("module");
 
 pub fn f(c: module.Counted) u32 {
-    return c.n;
+    return c.pkg_n;
 }

@@ -3,5 +3,5 @@
 const module = @import("module");
 
 pub fn f() [2]module.Counted {
-    return .{ module.Counted{ .n = 1 }, .{ .n = 2 } };
+    return .{ module.Counted{ .pkg_n = 1 }, .{ .pkg_n = 2 } };
 }

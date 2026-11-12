@@ -236,7 +236,7 @@ fn declarationProblems(runner: *Runner, file: *const File) RunError!void {
         const start = tree.tokenStart(tree.firstToken(problem.node));
         runner.complete = false;
         try runner.malformed.append(runner.a, .{
-            .why = try std.fmt.allocPrint(runner.a, "lint_rules: {t}: glint does not read this part, so the programs that import this package do not know what it declares", .{problem.why}),
+            .why = try runner.a.print("lint_rules: {t}: glint does not read this part, so the programs that import this package do not know what it declares", .{problem.why}),
             .span = .{ .file = runner.file, .start = start, .end = start, .line = file.line(start) + 1, .column = file.column(start) },
         });
     };

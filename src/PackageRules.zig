@@ -159,6 +159,8 @@ pub const Problem = struct {
         malformed,
         /// A reference that does not resolve.
         unresolved,
+        /// An `.internal` field not named for its package (`<package>_...`).
+        internal_name,
         /// A reference to a declaration outside the declaring package.
         foreign,
     };
@@ -400,6 +402,13 @@ const Reader = struct {
             const raw = try r.enumLiteral(file, each);
             if (raw.len == 0) continue;
             const name = try r.facts.memberName(raw);
+            // An internal field is named for its package (`aegis_material`): reading B reports a
+            // reference that does not resolve where it spells an internal field's name, and a
+            // name only the package writes is one no other code spells by accident.
+            if (kind == .field and r.package.name.len != 0 and !(std.mem.startsWith(u8, name, r.package.name) and name.len > r.package.name.len and name[r.package.name.len] == '_')) {
+                try r.problem(file, each, .internal_name);
+                continue;
+            }
             for (containers) |container| {
                 const decl = r.facts.member(container, name) orelse {
                     try r.problem(file, each, .unresolved);
@@ -904,12 +913,12 @@ test "a version 2 root is read by declaration: its rules, a type function govern
         \\const own = @import("own.zig");
         \\pub fn Guarded(comptime T: type) type {
         \\    return struct {
-        \\        value: T,
+        \\        pkg_value: T,
         \\        pub fn acquire(g: *@This()) void {
         \\            _ = g;
         \\        }
         \\        pub fn raw(g: *@This()) T {
-        \\            return g.value;
+        \\            return g.pkg_value;
         \\        }
         \\    };
         \\}
@@ -922,7 +931,7 @@ test "a version 2 root is read by declaration: its rules, a type function govern
         \\        .{ .id = .X001, .name = "governed", .kind = .ban, .reads = .governed, .default = true, .purpose = "internal fields" },
         \\        .{ .id = .X002, .name = "replaced", .kind = .ban, .reads = .replaces, .default = false, .purpose = "std's raw forms" },
         \\    },
-        \\    .governed = .{.{ .type = Guarded, .internal = .{.value}, .exits = .{.raw} }},
+        \\    .governed = .{.{ .type = Guarded, .internal = .{.pkg_value}, .exits = .{.raw} }},
         \\    .replaces = .{
         \\        .{ .rule = .X002, .decl = std.Io.Mutex, .held = .field, .with = .{ Atomic, .{ .generic = Guarded, .member = .acquire } }, .why = "a lock with its data" },
         \\        .{ .rule = .X002, .members = std.Io.Reader, .except = .{std.Io.Reader.fixed}, .with = own.readUntrusted, .why = "input", .door = .{syncFile} },
@@ -953,7 +962,7 @@ test "a version 2 root is read by declaration: its rules, a type function govern
     // The type function's instances: the container it returns, its members found there.
     try std.testing.expectEqual(@as(usize, 1), rules.governance.len);
     try std.testing.expectEqual(@as(usize, 1), rules.governance[0].containers.len);
-    try std.testing.expectEqualStrings("value", f.declName(rules.governance[0].internal[0]));
+    try std.testing.expectEqualStrings("pkg_value", f.declName(rules.governance[0].internal[0]));
     try std.testing.expectEqualStrings("raw", f.declName(rules.governance[0].exits[0]));
     // The include's entry first, its rule declared by the root.
     try std.testing.expectEqual(@as(usize, 6), rules.replacements.len);
@@ -998,10 +1007,11 @@ test "what a version 2 root cannot name is a problem where it is written, one ea
         .{ ".rules = .{" ++ replaced ++ "}, .replaces = .{.{ .rule = .X002, .builtin = .@\"@atomicLoad\", .held = .field, .with = answer, .why = \"w\" }}", .malformed },
         .{ ".rules = .{" ++ replaced ++ "}, .replaces = .{.{ .rule = .X002, .decl = std.Io.Mutex, .with = answer }}", .malformed },
         .{ ".rules = .{" ++ replaced ++ "}, .replaces = .{.{ .rule = .X002, .field = .{ .type = std.Io.Reader, .name = .take }, .with = answer, .why = \"w\" }}", .malformed },
-        .{ ".governed = .{.{ .type = T, .internal = .{.g} }}", .unresolved },
+        .{ ".governed = .{.{ .type = T, .internal = .{.pkg_g} }}", .unresolved },
+        .{ ".governed = .{.{ .type = T, .internal = .{.g} }}", .internal_name },
         .{ ".governed = .{.{ .type = T, .exits = .{.f} }}", .malformed },
-        .{ ".governed = .{.{ .internal = .{.f} }}", .malformed },
-        .{ ".governed = .{.{ .type = std.Io.Mutex, .internal = .{.state} }}", .foreign },
+        .{ ".governed = .{.{ .internal = .{.pkg_f} }}", .malformed },
+        .{ ".governed = .{.{ .type = std.Io.Mutex, .internal = .{.pkg_state} }}", .foreign },
         .{ ".roles = .{}", .unknown_field },
     }) |case| {
         const source = try std.mem.concat(std.testing.allocator, u8, &.{ head, "pub const lint_rules = .{ .version = 2, ", case[0], " };\n" });

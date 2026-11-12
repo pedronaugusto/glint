@@ -366,7 +366,7 @@ test "publishing aegis's API turns the pack on and nothing more: a program file 
         \\    return buf[i];
         \\}
         \\pub fn peek(s: *const @import("aegis").Secret(u64)) u64 {
-        \\    return s.material;
+        \\    return s.aegis_material;
         \\}
         \\
     ;
@@ -395,7 +395,7 @@ test "publishing aegis's API turns the pack on and nothing more: a program file 
     try tmp.dir.createDirPath(std.testing.io, "wrap");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "wrap/build.zig.zon", .data = ".{ .name = .wrap, .version = \"0.1.0\", .fingerprint = 0x2a2a2a2a2a2a2a2a, .paths = .{\"\"} }\n" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "wrap/root.zig", .data = "pub const aegis = @import(\"aegis\");\npub const Secret = aegis.Secret;\npub const SecretBytes = aegis.SecretBytes;\npub fn pick(buf: []const u8, i: usize) u8 {\n    return buf[i];\n}\n" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app.zig", .data = "const std = @import(\"std\");\nconst w = @import(\"wrap\");\npub fn f(r: *std.Io.Reader, buf: []const u8) !u8 {\n    const k: w.Secret(u64) = .init(1);\n    _ = k.material;\n    const i: usize = try r.takeInt(u32, .little);\n    return w.pick(buf, i);\n}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app.zig", .data = "const std = @import(\"std\");\nconst w = @import(\"wrap\");\npub fn f(r: *std.Io.Reader, buf: []const u8) !u8 {\n    const k: w.Secret(u64) = .init(1);\n    _ = k.aegis_material;\n    const i: usize = try r.takeInt(u32, .little);\n    return w.pick(buf, i);\n}\n" });
     const wrapped = try runOnFiles(a, &tmp, &.{ "--only", "A001", "--zig-lib-path=lib", "--module", "aegis=aegis/src/root.zig", "--module", "wrap=wrap/root.zig", "--package", "wrap=wrap" }, &.{ "app.zig", "wrap/root.zig" }, &status);
     defer a.free(wrapped);
     try std.testing.expect(std.mem.find(u8, wrapped, "A001: ") != null);

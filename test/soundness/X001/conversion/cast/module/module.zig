@@ -1,15 +1,15 @@
 pub const Counted = struct {
-    n: u32,
+    pkg_n: u32,
     tag: u8 = 0,
 
     pub fn init(value: u32) Counted {
-        return .{ .n = value };
+        return .{ .pkg_n = value };
     }
     pub fn raw(self: Counted) u32 {
-        return self.n;
+        return self.pkg_n;
     }
     pub fn add(self: Counted, by: u32) !Counted {
-        return .{ .n = try @import("std").math.add(u32, self.n, by), .tag = self.tag };
+        return .{ .pkg_n = try @import("std").math.add(u32, self.pkg_n, by), .tag = self.tag };
     }
 };
 
@@ -22,9 +22,9 @@ pub const Id = enum(u32) {
 
 pub fn Box(comptime T: type) type {
     return struct {
-        pub const Handle = struct { slot: u32, value: T };
+        pub const Handle = struct { pkg_slot: u32, value: T };
         pub fn make(value: T) Handle {
-            return .{ .slot = 0, .value = value };
+            return .{ .pkg_slot = 0, .value = value };
         }
     };
 }
@@ -37,8 +37,8 @@ pub const lint_rules = .{
         .{ .id = .X003, .name = "bare value", .kind = .hygiene, .reads = .exits, .default = true, .purpose = "a governed type's bare value given straight to arithmetic, a comparison or a narrowing cast" },
     },
     .governed = .{
-        .{ .type = Counted, .internal = .{.n}, .exits = .{.raw} },
+        .{ .type = Counted, .internal = .{.pkg_n}, .exits = .{.raw} },
         .{ .type = Id },
-        .{ .type = .{ .generic = Box, .member = .Handle }, .internal = .{.slot} },
+        .{ .type = .{ .generic = Box, .member = .Handle }, .internal = .{.pkg_slot} },
     },
 };

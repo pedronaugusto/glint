@@ -2,6 +2,11 @@
 // was made by a reference that is P006's site.
 .{
     .na = .{.memory},
+    // A namespace captured or unwrapped from an optional reaches `print` by a receiver glint does
+    // not resolve, and `print` is not std.debug's name alone: nothing, under the unique-name
+    // reading (glint-0.8-shape).
+    .no_hole = .{ .capture, .unwrap },
+    .no_twin = .{ .capture, .unwrap },
     .open = .{
         // A var only compile-time calls evaluate may hold a type, but the value model does not
         // yet tell a pointer type from a pointer (Value.pointer is both): the var reads as its

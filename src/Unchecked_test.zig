@@ -313,7 +313,7 @@ fn expect(rule: glint.Rule, program: []const u8, findings: usize) !void {
     try std.testing.expectEqual(findings, result.findings);
 }
 
-test "P007 finds the unchecked operations, a cast nested in another once, a suppression covering one, never an address read" {
+test "P007 finds the unchecked operations, a cast nested in another once, a suppression covering one, never an address read or the interface-recovery idiom" {
     try expect(.P007,
         \\extern fn write(fd: c_int) c_int;
         \\const Sink = struct { interface: u64, n: u32 };
@@ -329,7 +329,7 @@ test "P007 finds the unchecked operations, a cast nested in another once, a supp
         \\    _ = s;
         \\    return @intFromPtr(p);
         \\}
-    , 5);
+    , 4);
 }
 
 test "P009 finds a pointer into the frame carried out of the call" {
@@ -417,9 +417,9 @@ const interface_program =
     \\
 ;
 
-test "P007 reads a module republishing aegis beside code of its own as the program's: only aegis's own package leaves it" {
+test "P007 leaves the interface-recovery idiom alone where a module republishing aegis reads the field" {
     // `wrap` republishes all of aegis's root and names a field of what it cannot resolve as
-    // `interface`: the program's code, whose use of the field leaves the conversion a finding.
+    // `interface`: `@alignCast(@fieldParentPtr(...))` is still no finding, whoever copies the field.
     const wrap: sources.Extra = .{ .name = "wrap/root.zig", .package = "wrap", .bytes =
         \\const aegis = @import("aegis");
         \\pub const Atomic = aegis.Atomic;
@@ -456,16 +456,16 @@ test "P007 reads a module republishing aegis beside code of its own as the progr
     const extra = &(std_files ++ [_]sources.Extra{wrap});
     const imports = &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "wrap", .target = std_files.len }, .{ .from = std_files.len, .spelling = "aegis", .target = sources.aegis_file }, .{ .from = std_files.len, .spelling = "std", .target = 0 } });
     const found = try runWith(.P007, comptime edited(interface_program, "const std = @import(\"std\");\n", "const std = @import(\"std\");\nconst wrap = @import(\"wrap\");\n"), extra, imports);
-    try std.testing.expectEqualSlices(u32, &.{12}, found.lines[0..found.findings]);
+    try std.testing.expectEqualSlices(u32, &.{}, found.lines[0..found.findings]);
 }
 
-test "P007 reads every file a path import joins to the program, selected or not: a copy of an interface field there leaves the conversion a finding" {
-    // `other.zig`, outside the selection, copies the field it is handed: 11, the conversion
-    // and its alignment.
+test "P007 leaves the interface-recovery idiom alone where a file a path import joins copies the field" {
+    // `other.zig`, outside the selection, copies the field it is handed: the idiom is still no
+    // finding (it has no alternative; a copy of the interface is not what P007 reads).
     const program = comptime edited(interface_program, "pub fn use() !usize {", "const other = @import(\"other.zig\");\npub fn use() !usize {\n    var t: Sink = .init();\n    other.keep(&t);");
     const other: sources.Extra = .{ .name = "other.zig", .bytes = "pub fn keep(s: anytype) void { const copy = s.interface; _ = copy; }" };
     const found = try runWith(.P007, program, &(std_files ++ [_]sources.Extra{other}), &(std_imports ++ [_]sources.ExtraImport{.{ .spelling = "other.zig", .target = std_files.len }}));
-    try std.testing.expectEqualSlices(u32, &.{11}, found.lines[0..found.findings]);
+    try std.testing.expectEqualSlices(u32, &.{}, found.lines[0..found.findings]);
 }
 
 /// `program` after the fixes of `rule`'s findings and its stale escapes.
@@ -553,6 +553,56 @@ test "the fix rewrites the aegis escape into glint-ignore under today's names, n
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     try std.testing.expectError(error.InvalidEscapeRecord, glint.Fix.escapeRecord(arena.allocator(), "glint: escape: consumer:x:1: no-danger: why (A019)\n"));
+}
+
+test "P007 leaves a vtable's owner recovery from *anyopaque alone, and reports a cast from it to a slice or a many-item pointer" {
+    try expect(.P007,
+        \\const Owner = struct { n: u32 };
+        \\pub fn one(ctx: *anyopaque) *Owner {
+        \\    return @ptrCast(@alignCast(ctx));
+        \\}
+        \\pub fn bare(ctx: *anyopaque) *u8 {
+        \\    return @ptrCast(ctx);
+        \\}
+        \\pub fn constant(ctx: *const anyopaque) *const Owner {
+        \\    const self: *const Owner = @ptrCast(@alignCast(ctx));
+        \\    return self;
+        \\}
+        \\pub fn optional(ctx: ?*anyopaque) *Owner {
+        \\    return @ptrCast(@alignCast(ctx));
+        \\}
+        \\pub fn many(ctx: *anyopaque) [*]u8 {
+        \\    return @ptrCast(ctx);
+        \\}
+        \\pub fn other(p: *u32) *u8 {
+        \\    return @ptrCast(p);
+        \\}
+    , 2);
+}
+
+test "the fix writes 0.7's reason on a catch unreachable as Z026's suppression; a bare one stays a finding" {
+    const program =
+        \\fn g() !void {}
+        \\pub fn a() void {
+        \\    g() catch unreachable; // unreachable: g fails on nothing here
+        \\}
+        \\pub fn b() void {
+        \\    g() catch unreachable;
+        \\}
+        \\
+    ;
+    const out = try fixedBy(&.{.Z026}, program, "");
+    defer std.testing.allocator.free(out.bytes);
+    try std.testing.expectEqualStrings(
+        \\fn g() !void {}
+        \\pub fn a() void {
+        \\    g() catch unreachable; // glint-ignore: Z026 -- g fails on nothing here
+        \\}
+        \\pub fn b() void {
+        \\    g() catch unreachable;
+        \\}
+        \\
+    , out.bytes);
 }
 
 test "P007 reads @setRuntimeSafety on the build mode in each mode: off where the build keeps the checks, a finding on anything it cannot decide" {

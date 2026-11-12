@@ -640,15 +640,17 @@ test "P006 binds an external symbol, the program's own declaration of it too" {
     try std.testing.expectEqual(@as(usize, 2), report.diagnostics.len); // safe: fixture sites counted by hand.
 }
 
-test "P006 reports a governed name it cannot resolve, a ban's reading, and leaves other names alone" {
+test "P006 reports a governed name it cannot resolve where no other declaration has it, a ban's reading, and leaves other names alone" {
     var report = try ownershipRun(
         \\pub const Kind = enum { sync, close };
         \\pub const Op = union(enum) { sync, read: u32 };
-        \\pub fn a(f: anytype) void { f.sync(); f.flush(); }
+        \\pub fn a(f: anytype) void { f.sync(); f.flush(); _ = f.fdatasync; }
     , &durability);
     defer report.deinit();
     try std.testing.expect(report.complete);
-    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: only `sync` is a governed name.
+    // `sync` is also Kind's and Op's tag: it cannot be shown to be File.sync. Only fdatasync is
+    // posix.fdatasync's name alone.
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: one unique governed name.
 }
 
 test "P006 production scope leaves test code out" {
@@ -677,17 +679,6 @@ test "P006 leaves an entry's owning packages alone, and only them" {
         try std.testing.expect(report.complete);
         try std.testing.expectEqual(@as(usize, case[1]), report.diagnostics.len); // safe: fixture sites counted by hand.
     }
-}
-
-/// airlock's replacement reached through a chain of `steps` private functions, each called once by
-/// the next: every one of them only the replacement reaches.
-fn chained(steps: usize) ![]u8 {
-    var text: std.ArrayList(u8) = .empty;
-    errdefer text.deinit(std.testing.allocator);
-    try text.appendSlice(std.testing.allocator, "const std = @import(\"std\");\npub fn syncFile(fd: i32) void {\n    step0(fd);\n}\n");
-    for (0..steps) |i| try text.print(std.testing.allocator, "fn step{d}(fd: i32) void {{\n    step{d}(fd);\n}}\n", .{ i, i + 1 });
-    try text.print(std.testing.allocator, "fn step{d}(fd: i32) void {{\n    std.posix.fdatasync(fd);\n}}\npub const lint_rules = .{{ .version = 1, .replaces = .{{.{{ .std = std.posix.fdatasync, .with = syncFile, .why = \"durability belongs to airlock\" }}}} }};\n", .{steps});
-    return text.toOwnedSlice(std.testing.allocator);
 }
 
 test "P006 configuration needs a symbol without dots, or a source and a path" {

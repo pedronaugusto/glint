@@ -7806,7 +7806,7 @@ pub fn memo(self: *Facts, comptime T: type) ResolveError!*T {
         made.* = .{};
         entry.value_ptr.* = made;
     }
-    return @ptrCast(@alignCast(entry.value_ptr.*)); // glint-ignore: P007 -- internal: the key is this type's own name.
+    return @ptrCast(@alignCast(entry.value_ptr.*));
 }
 
 /// A file's own container: the struct the file is.

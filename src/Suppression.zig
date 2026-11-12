@@ -61,7 +61,7 @@ fn one(file: *const File, comment: File.Comment, definitions: []const rules.Defi
     var listed_names = std.mem.tokenizeAny(u8, listed, ", \t");
     while (listed_names.next()) |id| {
         const rule = rules.parseConfigured(id, definitions) orelse return .{ .malformed = "a suppression names a rule glint does not have" };
-        if (std.mem.findScalar(rules.Rule, found.named[0..found.named_len], rule) != null) return .{ .malformed = "a suppression names each rule once" };
+        for (0..found.named_len) |i| if (found.named[i] == rule) return .{ .malformed = "a suppression names each rule once" };
         if (found.named_len == max_named) return .{ .malformed = "a suppression names at most eight rules" };
         found.named[found.named_len] = rule;
         found.named_len += 1;

@@ -158,8 +158,10 @@ fn moduleRoots(self: *Context, source: []const u8) Context.Error![]const Project
 pub const Unread = struct { node: Ast.Node.Index, why: Facts.Unknown };
 
 /// Every reference in the checked file that reaches a governed declaration, into `out`; a
-/// reference spelling a governed name that does not resolve into `unread`, for the caller to
-/// judge: under a ban a finding, under hygiene nothing.
+/// reference that does not resolve but spells a name only a governed declaration has in the
+/// program (`unique`) into `unread`, for the caller to judge: under a ban a finding, under hygiene
+/// nothing. An enum literal and a literal's field name are no reference: unresolved, they spell
+/// nothing.
 pub fn sitesLeaving(self: *Context, governed: []const Governed, out: *std.ArrayList(Site), unread: *std.ArrayList(Unread)) Context.Error!void {
     if (governed.len == 0) return;
     // What each target is also called, by an alias whose own site this run does not report.
@@ -226,6 +228,7 @@ pub fn sitesLeaving(self: *Context, governed: []const Governed, out: *std.ArrayL
                 // method of its own: the binding reaches one only through an alias its type
                 // declares, which is that alias's site.
                 if (why == .generic and tag == .field_access and methodCall(self, node) and free(self, governed, spelled)) continue;
+                if (tag == .enum_literal or !try unique(self, governed, spelled)) continue;
                 try unread.append(self.allocator, .{ .node = node, .why = why });
                 continue;
             },
@@ -247,11 +250,10 @@ fn literalSite(self: *Context, governed: []const Governed, renamed: []const []co
     const spelled = try Model.identifier(self.allocator, tree.tokenSlice(label));
     if (!spelledAny(self, governed, renamed, spelled, label)) return;
     switch (try self.facts.literalDeclaration(self.file, literal, spelled)) {
-        .unknown => |why| try leave(self, unread, value, why),
-        .none => {},
+        .unknown, .none => {},
         .decl => |decl| switch (try paired(self, decl)) {
             .pair => |pair| try append(self, governed, renamed, label, value, spelled, &pair, out),
-            .unknown => |why| try leave(self, unread, value, why),
+            .unknown => |why| if (try unique(self, governed, spelled)) try leave(self, unread, value, why),
         },
     }
 }
@@ -283,6 +285,9 @@ pub fn fieldHolder(self: *Context, node: Ast.Node.Index, by: FieldBuiltin) Conte
 /// names its holder: each governed member its holder has that the name may be is a site; a
 /// holder that does not resolve is the caller's to judge where a governed name may be named.
 fn fieldSites(self: *Context, governed: []const Governed, renamed: []const []const []const u8, node: Ast.Node.Index, by: FieldBuiltin, named: Facts.FieldName, out: *std.ArrayList(Site), unread: *std.ArrayList(Unread)) Context.Error!void {
+    // A computed name spells nothing. Reflection over a governed type is the governed ban's own
+    // site (`GovernedState`), one finding whatever the name.
+    if (named == .computed) return;
     // A name of the fields or tags of the very type the holder is, or holds, is a field's or a
     // tag's: Zig forbids a declaration of one name with them in a container, so it reaches no
     // declaration, but it does reach a governed field among them.
@@ -299,20 +304,62 @@ fn fieldSites(self: *Context, governed: []const Governed, renamed: []const []con
         const aliases: []const []const u8 = if (own) &.{} else names;
         for ([_][]const []const u8{ &.{g.name}, aliases }) |list| for (list) |name| {
             if (!self.facts.mayName(named, name) or (self.inTest(site) and g.target.production)) continue;
-            // A computed name on a holder that does not resolve spells no governed name: nothing.
-            if (value == .unknown) return if (named == .computed) {} else leave(self, unread, node, value.unknown);
+            if (value == .unknown) {
+                if (try unique(self, governed, name)) try leave(self, unread, node, value.unknown);
+                return;
+            }
             var options: std.ArrayList(Facts.Container) = .empty;
             try containers(self, value, &options);
             for (options.items) |container| {
                 const decl = self.facts.member(container, name) orelse continue;
-                if (named == .computed) return leave(self, unread, node, .unresolved);
                 switch (try paired(self, decl)) {
                     .pair => |pair| try append(self, governed, renamed, site, node, name, &pair, out),
-                    .unknown => |why| return leave(self, unread, node, why),
+                    .unknown => |why| return if (try unique(self, governed, name)) leave(self, unread, node, why),
                 }
             }
         };
     }
+}
+
+/// How many declarations of the run's program carry each name: every field, and every variable
+/// and function of a file or container, std's included. A local is never a member.
+const Names = struct {
+    built: bool = false,
+    counts: std.StringHashMapUnmanaged(u32) = .empty,
+};
+
+/// Whether `spelled` names no declaration of the program but a governed one: then a reference
+/// spelling it that does not resolve identifies it. A name another declaration also has
+/// (`read`, `init`, `run`) cannot be shown to be the governed one, and spells nothing.
+fn unique(self: *Context, governed: []const Governed, spelled: []const u8) Context.Error!bool {
+    const names = try self.facts.memo(Names);
+    if (!names.built) {
+        names.built = true;
+        for (self.project.sources) |*source| {
+            if (source.input.kind == .zon) continue;
+            for (source.model.declarations) |decl| {
+                switch (decl.kind) {
+                    .field => {},
+                    .variable, .function => switch (source.model.scopes[@backingInt(decl.scope)].kind) {
+                        .file, .container => {},
+                        else => continue,
+                    },
+                    .parameter, .capture => continue,
+                }
+                const entry = try names.counts.getOrPut(self.facts.gpa, decl.name);
+                entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
+            }
+        }
+    }
+    const all = names.counts.get(spelled) orelse return true;
+    var own: std.ArrayList(Facts.Decl) = .empty;
+    for (governed) |g| for (g.decls) |decl| {
+        if (!std.mem.eql(u8, self.project.at(decl.file).model.declarations[@backingInt(decl.index)].name, spelled)) continue;
+        for (own.items) |known| {
+            if (std.meta.eql(known, decl)) break;
+        } else try own.append(self.allocator, decl);
+    };
+    return all <= own.items.len;
 }
 
 /// Whether a governed target is a field of its container.
