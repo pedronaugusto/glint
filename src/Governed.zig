@@ -570,61 +570,15 @@ pub fn aliasNames(self: *Context, comptime among: AliasScope, decls: []const Fac
         for (self.project.sources) |*source| {
             if (source.file.status != .parsed or !try self.facts.program(source.id)) continue;
             if (among == .unreported and source.input.selected) continue;
-            const tree = &source.file.tree;
-            for (source.model.declarations, 0..) |d, i| {
-                if (d.kind != .variable) continue;
-                // A function's own constant is named only in its body: an alias another file
-                // cannot spell, so one only where the run reads that file (shakedown's
-                // `const call = @field(IoCall, name);` names nothing a `.call` elsewhere reaches).
-                const scope = source.model.scopes[@backingInt(d.scope)].kind;
-                if (scope != .file and scope != .container and !source.input.selected) continue;
-                const variable = tree.fullVarDecl(d.node) orelse continue;
-                const init = variable.ast.init_node.unwrap() orelse continue;
-                // An alias is written as a declaration's path, or a comptime choice among them:
-                // each value its initializer may give names a declaration (`std.debug.print`,
-                // `@field(ns, "print")`, `if (debug) std.debug.print else quiet`). A call's result
-                // or a literal is a value of its own, never an alias, and is not resolved here.
-                const leaves = switch (try Facts.accesses.valuesOf(self.facts, source.id, init)) {
-                    .leaves => |each| each,
-                    .unknown => continue,
-                };
-                if (leaves.len == 0) continue;
-                const spelled = try self.allocator.alloc(?[]const u8, leaves.len);
-                var named = true;
-                for (leaves, spelled) |leaf, *name| {
-                    const path = try Facts.accesses.pathOf(self.facts, source.id, leaf);
-                    named = path.root != .none;
-                    for (path.steps) |step| named = named and (step.kind == .field or step.kind == .root);
-                    if (!named) break;
-                    // The name it spells last (null: `@field`'s computed name, which may be any).
-                    const last = path.steps[0];
-                    name.* = if (last.kind == .field) last.name else try Model.identifier(self.allocator, tree.tokenSlice(tree.nodeMainToken(last.node)));
-                }
-                if (!named) continue;
-                const decl: Facts.Decl = .{ .file = source.id, .index = @fromBackingInt(@intCast(i)) };
-                // A function the value is, or one a comptime choice may give in the build that
-                // takes it, is what the alias calls; any other declaration it names (a type's, a
-                // constant's) is reached by its origin.
-                var unknown = false;
-                switch (try self.facts.declaration(decl)) {
-                    .function => |function| try aliasOf(self, found, function, decl, d.name),
-                    .alternatives => |each| for (each) |one| switch (one) {
-                        .function => |function| try aliasOf(self, found, function, decl, d.name),
-                        // A choice, which a choice never holds, is read as one not known.
-                        .unknown, .alternatives => unknown = true,
-                        else => {},
-                    },
-                    .unknown => unknown = true,
-                    else => switch (try self.facts.origin(decl)) {
-                        .decl => |reached| try aliasOf(self, found, reached, decl, d.name),
-                        .none => {},
-                        .unknown => unknown = true,
-                    },
-                }
-                // A value that does not resolve may be what each name it spells last is.
-                if (unknown) for (spelled) |name| try found.unknown.append(self.allocator, .{ .name = d.name, .spells = name });
-            }
+            try aliasesIn(self, among, found, source);
         }
+    }
+    // std's own aliases of a std target (`ArrayListUnmanaged = ArrayList`, `ArrayListAligned =
+    // array_list.Aligned`): in the target's file, or a std file that imports it, each once.
+    for (decls) |decl| {
+        if (!try self.facts.standard(decl.file)) continue;
+        try stdAliasesIn(self, among, found, decl.file);
+        for (self.project.imports) |edge| if (edge.target == decl.file and try self.facts.standard(edge.from)) try stdAliasesIn(self, among, found, edge.from);
     }
     const start = out.items.len;
     for (decls) |decl| if (found.by_origin.get(decl)) |names| try out.appendSlice(self.allocator, names.items);
@@ -657,6 +611,72 @@ pub fn aliasNames(self: *Context, comptime among: AliasScope, decls: []const Fac
         }
     }
 }
+/// The aliases one file declares, into the memo.
+fn aliasesIn(self: *Context, comptime among: AliasScope, found: *Aliases(among), source: anytype) Context.Error!void {
+    const tree = &source.file.tree;
+    for (source.model.declarations, 0..) |d, i| {
+        if (d.kind != .variable) continue;
+        // A function's own constant is named only in its body: an alias another file
+        // cannot spell, so one only where the run reads that file (shakedown's
+        // `const call = @field(IoCall, name);` names nothing a `.call` elsewhere reaches).
+        const scope = source.model.scopes[@backingInt(d.scope)].kind;
+        if (scope != .file and scope != .container and !source.input.selected) continue;
+        const variable = tree.fullVarDecl(d.node) orelse continue;
+        const init = variable.ast.init_node.unwrap() orelse continue;
+        // An alias is written as a declaration's path, or a comptime choice among them:
+        // each value its initializer may give names a declaration (`std.debug.print`,
+        // `@field(ns, "print")`, `if (debug) std.debug.print else quiet`). A call's result
+        // or a literal is a value of its own, never an alias, and is not resolved here.
+        const leaves = switch (try Facts.accesses.valuesOf(self.facts, source.id, init)) {
+            .leaves => |each| each,
+            .unknown => continue,
+        };
+        if (leaves.len == 0) continue;
+        const spelled = try self.allocator.alloc(?[]const u8, leaves.len);
+        var named = true;
+        for (leaves, spelled) |leaf, *name| {
+            const path = try Facts.accesses.pathOf(self.facts, source.id, leaf);
+            named = path.root != .none;
+            for (path.steps) |step| named = named and (step.kind == .field or step.kind == .root);
+            if (!named) break;
+            // The name it spells last (null: `@field`'s computed name, which may be any).
+            const last = path.steps[0];
+            name.* = if (last.kind == .field) last.name else try Model.identifier(self.allocator, tree.tokenSlice(tree.nodeMainToken(last.node)));
+        }
+        if (!named) continue;
+        const decl: Facts.Decl = .{ .file = source.id, .index = @fromBackingInt(@intCast(i)) };
+        // A function the value is, or one a comptime choice may give in the build that
+        // takes it, is what the alias calls; any other declaration it names (a type's, a
+        // constant's) is reached by its origin.
+        var unknown = false;
+        switch (try self.facts.declaration(decl)) {
+            .function => |function| try aliasOf(self, found, function, decl, d.name),
+            .alternatives => |each| for (each) |one| switch (one) {
+                .function => |function| try aliasOf(self, found, function, decl, d.name),
+                // A choice, which a choice never holds, is read as one not known.
+                .unknown, .alternatives => unknown = true,
+                else => {},
+            },
+            .unknown => unknown = true,
+            else => switch (try self.facts.origin(decl)) {
+                .decl => |reached| try aliasOf(self, found, reached, decl, d.name),
+                .none => {},
+                .unknown => unknown = true,
+            },
+        }
+        // A value that does not resolve may be what each name it spells last is.
+        if (unknown) for (spelled) |name| try found.unknown.append(self.allocator, .{ .name = d.name, .spells = name });
+    }
+}
+
+/// std's own aliases in `file`, once a run.
+fn stdAliasesIn(self: *Context, comptime among: AliasScope, found: *Aliases(among), file: Project.FileId) Context.Error!void {
+    const source = self.project.at(file);
+    if (source.file.status != .parsed) return;
+    if ((try found.std_files.getOrPut(self.facts.gpa, file)).found_existing) return;
+    try aliasesIn(self, among, found, source);
+}
+
 /// `name`, an alias `decl` declares, as a name of `reached`.
 fn aliasOf(self: *Context, found: anytype, reached: Facts.Decl, decl: Facts.Decl, name: []const u8) Context.Error!void {
     if (std.meta.eql(reached, decl)) return;
@@ -673,6 +693,8 @@ fn Aliases(comptime among: AliasScope) type {
         /// The aliases whose value does not resolve: each name, and the name its value spells
         /// last (null for `@field`'s, which may be any).
         unknown: std.ArrayList(struct { name: []const u8, spells: ?[]const u8 }) = .empty,
+        /// The std files whose aliases are in it.
+        std_files: std.AutoHashMapUnmanaged(Project.FileId, void) = .empty,
     };
 }
 

@@ -140,7 +140,8 @@ fn builtinSites(c: *Context, definition: Rule.Definition, all: []const Entry, in
 }
 
 /// Each struct field whose type is an entry's target held by value (`.held = .field`): the
-/// type itself or an optional of it, never a pointer, slice or optional pointer to it.
+/// type itself, or an optional, an array or an error union of it, each holding one or more by
+/// value, never a pointer, slice or optional pointer to it.
 fn heldSites(c: *Context, definition: Rule.Definition, all: []const Entry, indexes: []const usize) Context.Error!void {
     if (indexes.len == 0) return;
     const tree = &c.project.at(c.file).file.tree;
@@ -161,7 +162,8 @@ fn heldSites(c: *Context, definition: Rule.Definition, all: []const Entry, index
     }
 }
 
-/// Whether a field's type `value` holds `target`'s type by value: it, or an optional of it.
+/// Whether a field's type `value` holds `target`'s type by value: it, or an optional, array or
+/// error union of it, through any number of them (`[2]?std.Io.File`).
 fn heldBy(c: *Context, value: Facts.Value, target: Facts.Decl) Context.Error!bool {
     const made = try c.facts.declaration(target);
     const want = switch (made) {
@@ -170,7 +172,7 @@ fn heldBy(c: *Context, value: Facts.Value, target: Facts.Decl) Context.Error!boo
     };
     var current = value;
     while (true) switch (current) {
-        .optional => |inner| current = inner.*,
+        .optional, .array, .error_union => |inner| current = inner.*,
         .container, .instance => |container| return container.file == want.file and container.scope == want.scope,
         .alternatives => |parts| {
             for (parts) |part| if (try heldBy(c, part, target)) return true;
