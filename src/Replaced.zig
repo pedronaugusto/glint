@@ -12,7 +12,9 @@ const Context = @import("RuleContext.zig");
 const Governed = @import("Governed.zig");
 const PackageRules = @import("PackageRules.zig");
 const Facts = @import("Facts.zig");
+const Model = @import("Model.zig");
 const Project = @import("Project.zig");
+const Report = @import("Report.zig");
 const Rule = @import("Rule.zig");
 
 /// One entry as the run reads it, with the package that declares it.
@@ -80,7 +82,8 @@ pub fn check(c: *Context, definition: Rule.Definition) Context.Error!void {
     for (sites.items) |site| {
         const entry = all[site.index];
         if (!try applies(c, entry, site.node)) continue;
-        try c.atDefinition(definition.id, site.token, try message(c, entry), site.decl);
+        const fix = if (entry.replacement.drop_in) |drop_in| try dropInFix(c, entry, drop_in, site, sites.items) else &.{};
+        try c.atDefinitionFixed(definition.id, site.token, try message(c, entry), site.decl, fix);
     }
     // Under a ban, a reference spelling a target's name that does not resolve cannot be shown
     // not to be it: a finding. A hygiene rule reports only what it resolves.
@@ -186,6 +189,205 @@ fn message(c: *Context, entry: Entry) Context.Error![]const u8 {
         try answers.appendSlice(c.allocator, declName(c.project, decl));
     }
     return c.allocator.print("replaced by {s}: {s}; use {s}", .{ entry.package.name, entry.replacement.why, answers.items });
+}
+
+/// The fix of a site of an entry with a `.drop_in`: the call written with the answer, and the
+/// message argument where the answer takes one, the call's arguments as written. A private
+/// container alias of the target (`const assert = std.debug.assert;`) is fixed with every call
+/// through it, the alias spelling the answer, and each finding of it carries that whole fix:
+/// a use that is no call leaves the alias, and its sites, unfixed. Where the file reaches the
+/// declaring package through no import, the fix adds the one the package's other files make.
+/// No fix where the answer cannot be spelled from the file: the declaring package's own code,
+/// a file a build script compiles, or a package its module reaches under no one name.
+fn dropInFix(c: *Context, entry: Entry, drop_in: PackageRules.Replacement.DropIn, site: Governed.Site, sites: []const Governed.Site) Context.Error![]const Report.Edit {
+    if (entry.package.eql(PackageRules.Identity.of(c.project, c.file))) return &.{};
+    if (c.project.at(c.file).input.compilations != .program) return &.{};
+    const spelled = (try answerSpelling(c, entry, drop_in.answer)) orelse return &.{};
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    var edits: std.ArrayList(Report.Edit) = .empty;
+    if (spelled.import) |import| try edits.append(c.allocator, import);
+    if (aliasOf(c, site, sites)) |alias| {
+        try edits.append(c.allocator, replacing(tree, alias.init, spelled.path));
+        const record = model.declarations[@backingInt(alias.decl)];
+        for (model.references) |reference| {
+            if (reference.declaration != alias.decl or reference.node == record.node) continue;
+            const call = callOf(tree, model, reference.node) orelse return &.{};
+            if (drop_in.message) try edits.append(c.allocator, (try messageArgument(c, tree, call)) orelse return &.{});
+        }
+        return edits.items;
+    }
+    const call = callOf(tree, model, site.node) orelse return &.{};
+    // A use of an alias this fix does not write (one in a function, or a public one).
+    if (site.through_alias and tree.nodeTag(site.node) == .identifier) return &.{};
+    try edits.append(c.allocator, replacing(tree, site.node, spelled.path));
+    if (drop_in.message) try edits.append(c.allocator, (try messageArgument(c, tree, call)) orelse return &.{});
+    return edits.items;
+}
+
+/// How the checked file spells an answer: a path from an import of the declaring package, and
+/// the import the fix adds where the file makes none.
+const Spelled = struct { path: []const u8, import: ?Report.Edit };
+
+fn answerSpelling(c: *Context, entry: Entry, answer: Facts.Decl) Context.Error!?Spelled {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    const root = c.facts.rootOf(c.file);
+    // An import the file makes, of a file of the package the answer is reached from.
+    for (model.declarations) |record| {
+        if (record.kind != .variable or record.scope != root.scope) continue;
+        const spelling = importSpelling(c, tree, record.node) orelse continue;
+        const target = c.project.imported(c.file, spelling) orelse continue;
+        if (!entry.package.eql(PackageRules.Identity.of(c.project, target))) continue;
+        const inner = (try pathTo(c, c.facts.rootOf(target), answer, 0)) orelse continue;
+        return .{ .path = try c.allocator.print("{s}.{s}", .{ record.name, inner }), .import = null };
+    }
+    // The one module name the package's other files of this program import it by.
+    const here = PackageRules.Identity.of(c.project, c.file);
+    var found: ?struct { spelling: []const u8, path: []const u8 } = null;
+    for (c.project.imports) |edge| {
+        if (!edge.in.inProgram() or std.mem.endsWith(u8, edge.spelling, ".zig") or std.mem.endsWith(u8, edge.spelling, ".zon")) continue;
+        if (!here.eql(PackageRules.Identity.of(c.project, edge.from)) or !entry.package.eql(PackageRules.Identity.of(c.project, edge.target))) continue;
+        const inner = (try pathTo(c, c.facts.rootOf(edge.target), answer, 0)) orelse continue;
+        if (found) |known| {
+            if (!std.mem.eql(u8, known.spelling, edge.spelling)) return null;
+        } else found = .{ .spelling = edge.spelling, .path = inner };
+    }
+    const chosen = found orelse return null;
+    if (!std.zig.isValidId(chosen.spelling)) return null;
+    // A name the file declares anywhere would shadow, or be shadowed by, the import.
+    for (model.declarations) |record| if (std.mem.eql(u8, record.name, chosen.spelling)) return null;
+    return .{
+        .path = try c.allocator.print("{s}.{s}", .{ chosen.spelling, chosen.path }),
+        .import = .{ .start = importOffset(c, tree, model, root), .end = importOffset(c, tree, model, root), .text = try c.allocator.print("const {s} = @import(\"{s}\");\n", .{ chosen.spelling, chosen.spelling }) },
+    };
+}
+
+/// The module or file `@import` names where `node` declares `const x = @import("...")`.
+fn importSpelling(c: *Context, tree: *const Ast, node: Ast.Node.Index) ?[]const u8 {
+    const variable = tree.fullVarDecl(node) orelse return null;
+    const init = variable.ast.init_node.unwrap() orelse return null;
+    if (!std.mem.eql(u8, Facts.builtinName(tree, init) orelse return null, "@import")) return null;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const arguments = tree.builtinCallParams(&buffer, init) orelse return null;
+    if (arguments.len != 1 or tree.nodeTag(arguments[0]) != .string_literal) return null;
+    return std.zig.string_literal.parseAlloc(c.allocator, tree.tokenSlice(tree.nodeMainToken(arguments[0]))) catch null;
+}
+
+/// Where an added import goes: the line after the file's last container-level import, or
+/// after its leading `//!` comment lines where it makes none.
+fn importOffset(c: *Context, tree: *const Ast, model: *const Model, root: Facts.Container) u32 {
+    var after: ?u32 = null;
+    for (model.declarations) |record| {
+        if (record.kind != .variable or record.scope != root.scope) continue;
+        if (importSpelling(c, tree, record.node) == null) continue;
+        const end = tree.tokenToSpan(tree.lastToken(record.node) + 1).end;
+        if (after == null or end > after.?) after = end;
+    }
+    const bytes = tree.source;
+    var at: usize = after orelse 0;
+    if (after == null) {
+        while (std.mem.startsWith(u8, bytes[at..], "//!")) at = if (std.mem.findScalarPos(u8, bytes, at, '\n')) |newline| newline + 1 else bytes.len;
+        return @intCast(at);
+    }
+    return @intCast(if (std.mem.findScalarPos(u8, bytes, at, '\n')) |newline| newline + 1 else bytes.len);
+}
+
+/// The public path from `container` to `answer`, through public declarations whose value is a
+/// container, at most three deep: `assert.invariant`.
+fn pathTo(c: *Context, container: Facts.Container, answer: Facts.Decl, depth: u8) Context.Error!?[]const u8 {
+    const model = &c.project.at(container.file).model;
+    for (model.declarations, 0..) |record, i| {
+        if (record.scope != container.scope or !record.public) continue;
+        const decl: Facts.Decl = .{ .file = container.file, .index = @fromBackingInt(@intCast(i)) };
+        if (std.meta.eql(decl, answer)) return record.name;
+    }
+    if (depth == 2) return null;
+    for (model.declarations, 0..) |record, i| {
+        if (record.scope != container.scope or !record.public or record.kind != .variable) continue;
+        const value = try c.facts.declaration(.{ .file = container.file, .index = @fromBackingInt(@intCast(i)) });
+        const inner = switch (value) {
+            .container => |held| held,
+            else => continue,
+        };
+        if (inner.file == container.file and inner.scope == container.scope) continue;
+        const rest = (try pathTo(c, inner, answer, depth + 1)) orelse continue;
+        return try c.allocator.print("{s}.{s}", .{ record.name, rest });
+    }
+    return null;
+}
+
+/// A container alias of the target a site is part of: the site is its value, or a use of it.
+/// Only a private one whose value is itself a site, so every use of it is in this file.
+const Alias = struct { decl: Model.Declaration.Id, init: Ast.Node.Index };
+
+fn aliasOf(c: *Context, site: Governed.Site, sites: []const Governed.Site) ?Alias {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    const decl: Model.Declaration.Id = if (site.through_alias) found: {
+        const reference = model.node_references[@backingInt(site.node)] orelse return null;
+        break :found model.references[@backingInt(reference)].declaration orelse return null;
+    } else found: {
+        const parent = model.parentOf(site.node) orelse return null;
+        for (model.declarations, 0..) |record, i| if (record.node == parent and record.kind == .variable) break :found @fromBackingInt(@intCast(i));
+        return null;
+    };
+    const record = model.declarations[@backingInt(decl)];
+    if (record.kind != .variable or record.public or record.exported) return null;
+    const variable = tree.fullVarDecl(record.node) orelse return null;
+    if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
+    if (c.facts.functionHolding(c.file, record.node) != null) return null;
+    const init = variable.ast.init_node.unwrap() orelse return null;
+    for (sites) |each| if (each.node == init and !each.through_alias and each.index == site.index) return .{ .decl = decl, .init = init };
+    return null;
+}
+
+/// The call whose callee is `node`.
+fn callOf(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Ast.Node.Index {
+    const parent = model.parentOf(node) orelse return null;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, parent) orelse return null;
+    return if (call.ast.fn_expr == node) parent else null;
+}
+
+/// The edit writing `text` in place of `node`.
+fn replacing(tree: *const Ast, node: Ast.Node.Index, text: []const u8) Report.Edit {
+    return .{ .start = tree.tokenStart(tree.firstToken(node)), .end = tree.tokenToSpan(tree.lastToken(node)).end, .text = text };
+}
+
+/// The edit adding a call's arguments as written, as a string, as its last argument: after
+/// the last argument, or on a line of its own where the arguments end with a comma.
+fn messageArgument(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!?Report.Edit {
+    var buffer: [1]Ast.Node.Index = undefined;
+    const arguments = (tree.fullCall(&buffer, node) orelse return null).ast.params;
+    if (arguments.len == 0) return null;
+    const first = tree.tokenStart(tree.firstToken(arguments[0]));
+    const last_token = tree.lastToken(arguments[arguments.len - 1]);
+    const written = tree.source[first..tree.tokenToSpan(last_token).end];
+    var text: std.ArrayList(u8) = .empty;
+    var spaced = false;
+    for (written) |byte| {
+        if (std.ascii.isWhitespace(byte)) {
+            spaced = true;
+            continue;
+        }
+        if (spaced and text.items.len != 0) try text.append(c.allocator, ' ');
+        spaced = false;
+        switch (byte) {
+            '\\', '"' => try text.appendSlice(c.allocator, &.{ '\\', byte }),
+            0...0x1f, 0x7f => try text.print(c.allocator, "\\x{x:0>2}", .{byte}),
+            else => try text.append(c.allocator, byte),
+        }
+    }
+    if (tree.tokenTag(last_token + 1) == .comma) {
+        const comma_end = tree.tokenToSpan(last_token + 1).end;
+        const line_start = if (std.mem.findScalarLast(u8, tree.source[0..first], '\n')) |newline| newline + 1 else 0;
+        var indent_end = line_start;
+        while (indent_end < first and (tree.source[indent_end] == ' ' or tree.source[indent_end] == '\t')) indent_end += 1;
+        return .{ .start = comma_end, .end = comma_end, .text = try c.allocator.print("\n{s}\"{s}\",", .{ tree.source[line_start..indent_end], text.items }) };
+    }
+    const end = tree.tokenToSpan(last_token).end;
+    return .{ .start = end, .end = end, .text = try c.allocator.print(", \"{s}\"", .{text.items}) };
 }
 
 fn declName(project: *const Project, decl: Facts.Decl) []const u8 {

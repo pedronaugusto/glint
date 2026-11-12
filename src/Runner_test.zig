@@ -938,3 +938,93 @@ test "an import no mapping names stops the run, named at its file; Zig's own bui
     try std.testing.expectEqual(@as(usize, 3), report.errors.len); // safe: fixture imports counted by hand.
     try std.testing.expect(!report.complete);
 }
+
+/// A run of aegis's A013, its drop-in `assert.invariant`, on `program`, beside `other.zig`, a
+/// file of the same package that imports aegis: the program's bytes after the run's fixes.
+fn dropInFixed(a: std.mem.Allocator, program: []const u8, findings: usize) ![]const u8 {
+    const P = glint.Project;
+    const pack = "const std = @import(\"std\");\npub const assert = @import(\"assert.zig\");\npub const lint_rules = .{ .version = 2, .rules = .{.{ .id = .A013, .name = \"contracts\", .kind = .ban, .reads = .replaces, .default = false, .purpose = \"p\" }}, .replaces = .{.{ .rule = .A013, .decl = std.debug.assert, .with = .{ assert.invariant, assert.never }, .drop_in = assert.invariant, .why = \"w\" }} };";
+    const inputs = [_]P.Input{
+        .{ .name = "program.zig", .bytes = program },
+        .{ .name = "std.zig", .bytes = "pub const debug = @import(\"debug.zig\");", .selected = false },
+        .{ .name = "debug.zig", .bytes = "pub fn assert(ok: bool) void { if (!ok) unreachable; }", .selected = false },
+        .{ .name = "aegis.zig", .bytes = pack, .selected = false, .package = "aegis", .fingerprint = 7 },
+        .{ .name = "assert.zig", .bytes = "pub fn invariant(ok: bool, comptime m: []const u8) void { if (!ok) @panic(m); }\npub inline fn never(comptime m: []const u8) noreturn { @panic(m); }", .selected = false, .package = "aegis", .fingerprint = 7 },
+        .{ .name = "other.zig", .bytes = "const aegis = @import(\"aegis\");\ncomptime { _ = aegis; }", .selected = false },
+    };
+    const imports = [_]P.Import{
+        .{ .from = 0, .spelling = "std", .target = 1 },
+        .{ .from = 0, .spelling = "aegis", .target = 3 },
+        .{ .from = 1, .spelling = "debug.zig", .target = 2 },
+        .{ .from = 3, .spelling = "assert.zig", .target = 4 },
+        .{ .from = 3, .spelling = "std", .target = 1 },
+        .{ .from = 5, .spelling = "aegis", .target = 3 },
+    };
+    var project = try P.init(std.testing.allocator, &inputs, &imports, .{});
+    defer project.deinit();
+    const declared = try glint.packageRules(a, &project);
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = declared[0].id, .level = .report }} }, .{});
+    defer report.deinit();
+    try std.testing.expect(report.complete);
+    try std.testing.expectEqual(findings, report.diagnostics.len);
+    const changed = try glint.Fix.apply(a, &project, &report, .{});
+    for (changed) |one| if (@backingInt(one.file) == 0) return one.bytes;
+    return program;
+}
+
+test "A013's drop-in fix writes each call with the answer and its condition as written, an alias with every call through it, and the import the file lacks" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const program =
+        \\//! doc
+        \\const std = @import("std");
+        \\const assert = std.debug.assert;
+        \\pub fn a(x: u8) u8 {
+        \\    assert(x < 9);
+        \\    assert(
+        \\        x != "\\"[0],
+        \\    );
+        \\    return x;
+        \\}
+        \\pub fn b(x: u8) u8 { std.debug.assert(x  !=
+        \\    3); return x; }
+        \\
+    ;
+    const fixed =
+        \\//! doc
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\const assert = aegis.assert.invariant;
+        \\pub fn a(x: u8) u8 {
+        \\    assert(x < 9, "x < 9");
+        \\    assert(
+        \\        x != "\\"[0],
+        \\        "x != \"\\\\\"[0]",
+        \\    );
+        \\    return x;
+        \\}
+        \\pub fn b(x: u8) u8 { aegis.assert.invariant(x  !=
+        \\    3, "x != 3"); return x; }
+        \\
+    ;
+    // The alias, its two calls and the direct call.
+    try std.testing.expectEqualStrings(fixed, try dropInFixed(arena.allocator(), program, 4));
+}
+
+test "A013's drop-in fix spells the answer through the file's own import of the package, under its name" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const program = "const std = @import(\"std\");\nconst contract = @import(\"aegis\");\npub fn f(x: u8) void { std.debug.assert(x > 1); }\n";
+    try std.testing.expectEqualStrings("const std = @import(\"std\");\nconst contract = @import(\"aegis\");\npub fn f(x: u8) void { contract.assert.invariant(x > 1, \"x > 1\"); }\n", try dropInFixed(arena.allocator(), program, 1));
+}
+
+test "A013's drop-in fix leaves an alias used other than by a call, and its sites, as they are; a name the file declares keeps the import out" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    // `check` hands the alias on: writing it to the answer would change what `check` is.
+    const handed = "const std = @import(\"std\");\nconst assert = std.debug.assert;\nconst check: fn (bool) void = assert;\npub fn f(x: u8) void { assert(x > 1); check(x > 2); }\n";
+    try std.testing.expectEqualStrings(handed, try dropInFixed(arena.allocator(), handed, 3));
+    // A local `aegis` would shadow an added import of that name, which Zig refuses.
+    const shadowed = "const std = @import(\"std\");\npub fn f(aegis: u8) void { std.debug.assert(aegis > 1); }\n";
+    try std.testing.expectEqualStrings(shadowed, try dropInFixed(arena.allocator(), shadowed, 1));
+}

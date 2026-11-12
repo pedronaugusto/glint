@@ -233,9 +233,13 @@ pub fn spanOf(self: *const RuleContext, file: Project.FileId, token: std.zig.Ast
     return .{ .file = file, .start = named.start, .end = named.end, .line = line + 1, .column = held.column(named.start) };
 }
 pub fn atDefinition(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.TokenIndex, message: []const u8, definition: Facts.Decl) Error!void {
+    return self.atDefinitionFixed(rule, token, message, definition, &.{});
+}
+/// A site at `token` naming `definition`, with its deterministic fix.
+pub fn atDefinitionFixed(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.TokenIndex, message: []const u8, definition: Facts.Decl, fix: []const Report.Edit) Error!void {
     const named = self.project.at(definition.file).model.declarations[@backingInt(definition.index)].token;
     const related = [_]Report.Span{self.spanOf(definition.file, named)};
     const site_tree = try self.project.syntax(try self.source());
     const site = site_tree.tokenToSpan(token);
-    try self.emitRelated(rule, site.start, site.end, message, &related);
+    try self.emitFixed(rule, site.start, site.end, message, &related, fix);
 }

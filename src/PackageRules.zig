@@ -58,8 +58,16 @@ pub const Replacement = struct {
     why: []const u8 = "",
     /// Where the declaring package itself may use the target; null for the whole package.
     door: ?[]const Reference = null,
+    /// `.drop_in = D`: the answer, one of `.with`, that takes a call of the target one for one,
+    /// so a site has a fix; null where the answer is a choice the author makes.
+    drop_in: ?DropIn = null,
     file: Project.FileId,
     node: Ast.Node.Index,
+
+    /// An answer that takes the target's place in a call: the target's parameters, as written,
+    /// and then at most one `comptime` `[]const u8` one, which the fix fills with the call's
+    /// arguments as written (`std.debug.assert(n < 9)` is `assert.invariant(n < 9, "n < 9")`).
+    pub const DropIn = struct { answer: Facts.Decl, message: bool };
 
     pub const Form = union(enum) {
         /// `.decl`: the declaration, or the name's declaration in each per-target holder.
@@ -462,6 +470,7 @@ const Reader = struct {
         var members: ?Ast.Node.Index = null;
         var except: ?Ast.Node.Index = null;
         var held: ?Ast.Node.Index = null;
+        var drop_in: ?Ast.Node.Index = null;
         for (literal.ast.fields) |field| {
             const name = fieldName(t, field);
             if (std.mem.eql(u8, name, "rule")) {
@@ -487,6 +496,8 @@ const Reader = struct {
                 entry.target = if (symbol.len == 0) .unresolved else .{ .symbol = symbol };
             } else if (std.mem.eql(u8, name, "held")) {
                 held = field;
+            } else if (std.mem.eql(u8, name, "drop_in")) {
+                drop_in = field;
             } else if (std.mem.eql(u8, name, "with")) {
                 entry.with = try r.references(file, field);
             } else if (std.mem.eql(u8, name, "why")) {
@@ -508,6 +519,7 @@ const Reader = struct {
             if (!std.mem.eql(u8, said, "field") or entry.target != .decl) return r.problem(file, at, .malformed);
             entry.held = true;
         }
+        if (drop_in) |at| entry.drop_in = try r.dropIn(file, at, entry);
         try r.named_rules.append(r.facts.gpa, .{ .file = file, .node = rule_node.? });
         try r.replacements.append(r.facts.gpa, entry);
     }
@@ -609,6 +621,75 @@ const Reader = struct {
             return .unresolved;
         }
         return .{ .builtin = name };
+    }
+
+    /// `.drop_in = D`: one of the entry's `.with`, a function whose parameters are its one
+    /// target function's, each type as written, and then at most one `comptime` `[]const u8`.
+    /// Anything else is malformed: no fix is made from a guess at how the answer is called.
+    fn dropIn(r: *Reader, file: Project.FileId, node: Ast.Node.Index, entry: Replacement) Error!?Replacement.DropIn {
+        const answer = (try r.resolved(file, node, .own)).declaration() orelse return null;
+        const listed = for (entry.with) |each| {
+            if (each.declaration()) |decl| if (std.meta.eql(decl, answer)) break true;
+        } else false;
+        const targets = if (entry.target == .decl and !entry.held) entry.target.decl else &.{};
+        if (!listed or targets.len != 1) {
+            try r.problem(file, node, .malformed);
+            return null;
+        }
+        var target_buffer: [1]Ast.Node.Index = undefined;
+        var answer_buffer: [1]Ast.Node.Index = undefined;
+        const target = r.functionProto(targets[0], &target_buffer);
+        const made = r.functionProto(answer, &answer_buffer);
+        if (target == null or made == null) {
+            try r.problem(file, node, .malformed);
+            return null;
+        }
+        const target_tree = r.tree(targets[0].file);
+        const answer_tree = r.tree(answer.file);
+        var target_params = target.?.iterate(target_tree);
+        var answer_params = made.?.iterate(answer_tree);
+        while (target_params.next()) |want| {
+            const have = answer_params.next() orelse break;
+            if (!sameType(target_tree, want, answer_tree, have)) break;
+        } else {
+            const extra = answer_params.next() orelse return .{ .answer = answer, .message = false };
+            const comptime_param = if (extra.comptime_noalias) |token| answer_tree.tokenTag(token) == .keyword_comptime else false;
+            const written = if (extra.type_expr) |type_expr| answer_tree.getNodeSource(type_expr) else "";
+            if (comptime_param and answer_params.next() == null and spelledAlike(written, "[]const u8")) return .{ .answer = answer, .message = true };
+        }
+        try r.problem(file, node, .malformed);
+        return null;
+    }
+
+    /// The prototype of the function `decl` declares, or null where it declares none.
+    fn functionProto(r: *const Reader, decl: Facts.Decl, buffer: *[1]Ast.Node.Index) ?Ast.full.FnProto {
+        const record = r.facts.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+        if (record.kind != .function) return null;
+        return r.tree(decl.file).fullFnProto(buffer, record.node);
+    }
+
+    /// Whether two parameters are alike as written: both `comptime` or neither, the same type.
+    fn sameType(a_tree: *const Ast, a: Ast.full.FnProto.Param, b_tree: *const Ast, b: Ast.full.FnProto.Param) bool {
+        const a_comptime = if (a.comptime_noalias) |token| a_tree.tokenTag(token) == .keyword_comptime else false;
+        const b_comptime = if (b.comptime_noalias) |token| b_tree.tokenTag(token) == .keyword_comptime else false;
+        if (a_comptime != b_comptime or (a.anytype_ellipsis3 == null) != (b.anytype_ellipsis3 == null)) return false;
+        const a_type = if (a.type_expr) |t| a_tree.getNodeSource(t) else "";
+        const b_type = if (b.type_expr) |t| b_tree.getNodeSource(t) else "";
+        return spelledAlike(a_type, b_type);
+    }
+
+    /// Two spellings alike but for white space.
+    fn spelledAlike(a: []const u8, b: []const u8) bool {
+        var i: usize = 0;
+        var j: usize = 0;
+        while (true) {
+            while (i < a.len and std.ascii.isWhitespace(a[i])) i += 1;
+            while (j < b.len and std.ascii.isWhitespace(b[j])) j += 1;
+            if (i == a.len or j == b.len) return i == a.len and j == b.len;
+            if (a[i] != b[j]) return false;
+            i += 1;
+            j += 1;
+        }
     }
 
     /// `.with = D` or `.with = .{ D, ... }`: the package's answers.
@@ -902,6 +983,9 @@ const fake_std_v2 =
     \\        pub fn peek() void {}
     \\    };
     \\};
+    \\pub const debug = struct {
+    \\    pub fn assert(ok: bool) void { _ = ok; }
+    \\};
     \\
 ;
 
@@ -990,6 +1074,8 @@ test "what a version 2 root cannot name is a problem where it is written, one ea
         \\    pub fn m() void {}
         \\};
         \\pub fn answer() void {}
+        \\pub fn sure(ok: bool, comptime m: []const u8) void { _ = ok; _ = m; }
+        \\pub fn loose(ok: bool, m: []const u8) void { _ = ok; _ = m; }
         \\
     ;
     const replaced = ".{ .id = .X002, .name = \"r\", .kind = .ban, .reads = .replaces, .default = true, .purpose = \"p\" }";
@@ -1007,6 +1093,10 @@ test "what a version 2 root cannot name is a problem where it is written, one ea
         .{ ".rules = .{" ++ replaced ++ "}, .replaces = .{.{ .rule = .X002, .builtin = .@\"@atomicLoad\", .held = .field, .with = answer, .why = \"w\" }}", .malformed },
         .{ ".rules = .{" ++ replaced ++ "}, .replaces = .{.{ .rule = .X002, .decl = std.Io.Mutex, .with = answer }}", .malformed },
         .{ ".rules = .{" ++ replaced ++ "}, .replaces = .{.{ .rule = .X002, .field = .{ .type = std.Io.Reader, .name = .take }, .with = answer, .why = \"w\" }}", .malformed },
+        .{ ".rules = .{" ++ replaced ++ "}, .replaces = .{.{ .rule = .X002, .decl = std.debug.assert, .with = answer, .drop_in = sure, .why = \"w\" }}", .malformed },
+        .{ ".rules = .{" ++ replaced ++ "}, .replaces = .{.{ .rule = .X002, .decl = std.debug.assert, .with = .{ answer, loose }, .drop_in = loose, .why = \"w\" }}", .malformed },
+        .{ ".rules = .{" ++ replaced ++ "}, .replaces = .{.{ .rule = .X002, .decl = std.debug.assert, .with = answer, .drop_in = answer, .why = \"w\" }}", .malformed },
+        .{ ".rules = .{" ++ replaced ++ "}, .replaces = .{.{ .rule = .X002, .decl = std.Io.Mutex, .with = sure, .drop_in = sure, .why = \"w\" }}", .malformed },
         .{ ".governed = .{.{ .type = T, .internal = .{.pkg_g} }}", .unresolved },
         .{ ".governed = .{.{ .type = T, .internal = .{.g} }}", .internal_name },
         .{ ".governed = .{.{ .type = T, .exits = .{.f} }}", .malformed },
@@ -1029,6 +1119,32 @@ test "what a version 2 root cannot name is a problem where it is written, one ea
         };
         try std.testing.expectEqual(case[1], rules.problems[0].why);
     }
+}
+
+test "a drop-in answer is read with whether it takes the call's arguments as its message" {
+    const source =
+        \\const std = @import("std");
+        \\pub fn sure(ok: bool, comptime m: []const u8) void { _ = ok; _ = m; }
+        \\pub fn same(ok: bool) void { _ = ok; }
+        \\pub const lint_rules = .{ .version = 2, .rules = .{.{ .id = .X002, .name = "r", .kind = .ban, .reads = .replaces, .default = true, .purpose = "p" }}, .replaces = .{
+        \\    .{ .rule = .X002, .decl = std.debug.assert, .with = .{ same, sure }, .drop_in = sure, .why = "w" },
+        \\    .{ .rule = .X002, .decl = std.debug.assert, .with = same, .drop_in = same, .why = "w" },
+        \\    .{ .rule = .X002, .decl = std.debug.assert, .with = sure, .why = "w" },
+        \\} };
+        \\
+    ;
+    var f: Fixture = undefined;
+    try f.init(&.{
+        .{ .name = "pkg/root.zig", .package = "pkg", .fingerprint = 7, .bytes = source },
+        .{ .name = "std", .bytes = fake_std_v2, .selected = false },
+    }, &.{.{ .from = 0, .spelling = "std", .target = 1 }});
+    defer f.deinit();
+    const rules = try of(&f.facts, f.project.sources[0].id);
+    try std.testing.expectEqual(@as(usize, 0), rules.problems.len);
+    try std.testing.expectEqual(@as(usize, 3), rules.replacements.len);
+    try std.testing.expect(rules.replacements[0].drop_in.?.message);
+    try std.testing.expect(!rules.replacements[1].drop_in.?.message);
+    try std.testing.expect(rules.replacements[2].drop_in == null);
 }
 
 test "the run's rule table: every package's declared rules once, ordered by id, given ids from the first package id; one id declared by two packages is refused" {
