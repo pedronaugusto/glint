@@ -396,7 +396,6 @@ pub const Definition = struct {
     purpose: []const u8,
     version: u32 = 1,
     report_only: bool = false,
-    exception: enum { generic, aegis } = .generic,
     /// Where a package declares the rule in its `lint_rules`; null for glint's own and a
     /// caller's compiled rules.
     declared: ?Declared = null,
