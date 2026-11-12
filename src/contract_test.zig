@@ -86,14 +86,6 @@ test "contract a report cannot silently render against another project snapshot"
     try std.testing.expectError(error.InvalidProject, report.write(&output.writer, &other, .json));
 }
 
-test "contract public lowered references disclose partial std ZIR coverage" {
-    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "fixture", .bytes = "const x = 1; pub fn f() u32 { return x; }" }}, &.{}, .{});
-    defer project.deinit();
-    const handle = project.handle(project.sources[0].id);
-    try std.testing.expectEqual(.partial, try project.loweredCoverage(handle));
-    try std.testing.expect((try project.loweredReferences(handle)).len != 0);
-}
-
 test "contract deprecation diagnostic carries its resolved declaration span" {
     var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "fixture label", .bytes = "/// Deprecated: use fresh.\nfn old() void {} pub fn run() void { old(); }" }}, &.{}, .{});
     defer project.deinit();

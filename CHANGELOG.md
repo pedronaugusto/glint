@@ -32,6 +32,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 - `RuleContext.Drift` is `.{ .detail, .start }`, where it held `RuleContext.Drift.module`, `RuleContext.Drift.path` and `RuleContext.Drift.why`: drift is a root of the library that declares no `lint_rules`, declares a version glint does not read, or names what does not resolve, said with where it is written.
 - `Facts.publication`, `Facts.role`, `Facts.Publication`, `Facts.Entry`, `Facts.Target` and `Facts.Gap` are `PackageRules.publication`, `PackageRules.role`, `PackageRules.Publication`, `PackageRules.Entry`, `PackageRules.Target` and `PackageRules.Gap`, read from the package's `lint_rules`; `PackageRules.Gap` is `.{ .root, .problem }` (`Facts.Gap.module`, `Facts.Gap.path` and `Facts.Gap.why` are gone).
 - `Facts.moduleRoots`, `Facts.publishes`, `Facts.publishesAny` and `Facts.Publishes` are gone: `Facts.packageRoots(package)` gives the roots of a package the program reaches.
+- `glint.RuleGroup` is gone (a rule's `Definition.group` is filled by literal, `.zig_style`), and so are `Project.loweredReferences` and `Project.loweredCoverage`: nothing outside glint's own tests named them. The std-ZIR reference index they read stays, glint's own.
 
 ### Added
 

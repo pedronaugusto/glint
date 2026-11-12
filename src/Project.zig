@@ -272,18 +272,9 @@ pub fn references(self: *const Project, source_handle: Handle) QueryError![]cons
     return (try self.checked(source_handle)).model.references;
 }
 
-/// Returns indexed std-ZIR references. Consult loweredCoverage; this is a partial index.
-pub fn loweredReferences(self: *const Project, source_handle: Handle) QueryError![]const Model.LoweredReference {
-    return (try self.checked(source_handle)).model.zir_references;
-}
 /// Source-mapped call/member/reflection operations from actual std ZIR bodies.
 pub fn operations(self: *const Project, h: Handle) QueryError![]const Model.Operation {
     return (try self.checked(h)).model.operations;
-}
-
-/// Reports the bounds of the std-ZIR reference index without implying type checking.
-pub fn loweredCoverage(self: *const Project, source_handle: Handle) QueryError!@FieldType(Model, "lowered_coverage") {
-    return (try self.checked(source_handle)).model.lowered_coverage;
 }
 
 /// Returns source declarations, including lazy declarations and public/export provenance.

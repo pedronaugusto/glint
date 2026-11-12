@@ -64,7 +64,6 @@ pub const Unknown = @import("Facts.zig").Unknown;
 pub const Declaration = @import("Model.zig").Declaration;
 pub const Scope = @import("Model.zig").Scope;
 pub const Reference = @import("Model.zig").Reference;
-pub const RuleGroup = @import("Rule.zig").Group;
 
 /// A library's published roles, found through the module a program imports it by.
 pub const Library = @import("Library.zig").Library;
