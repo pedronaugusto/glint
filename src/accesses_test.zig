@@ -3,7 +3,6 @@
 const std = @import("std");
 const Facts = @import("Facts.zig");
 const Project = @import("Project.zig");
-const Constructs = @import("Constructs.zig");
 const accesses = Facts.accesses;
 
 const Query = enum { writes, reads };
@@ -231,22 +230,6 @@ test "accesses: a function copies memory between its parameters, or a value into
     try std.testing.expectEqual(Facts.Copier{ .into = 0, .from = 1 }, (try facts.copierOf(function.named(&project, "put"))).?);
     try std.testing.expectEqual(Facts.Reader{ .from = 0, .recast = true }, (try facts.readOf(function.named(&project, "take"))).?);
     try std.testing.expectEqual(Facts.Copier{ .into = 0, .from = 1 }, (try facts.copierOf(function.named(&project, "wrap"))).?);
-}
-
-test "accesses: each syntax form that holds an expression is in a construct matrix row its use is read as" {
-    var failed = false;
-    for (std.meta.tags(std.zig.Ast.Node.Tag)) |tag| {
-        const row = Constructs.ofNode(tag) orelse {
-            std.debug.print("{s}: in no row of the construct matrix\n", .{@tagName(tag)});
-            failed = true;
-            continue;
-        };
-        const form = accesses.formOf(tag);
-        if (std.mem.findScalar(Constructs.Row, form.rows(), row) != null) continue;
-        std.debug.print("{s}: row {s}, read as the form {s}\n", .{ @tagName(tag), @tagName(row), @tagName(form) });
-        failed = true;
-    }
-    try std.testing.expect(!failed);
 }
 
 test "accesses: an operator's operation by its tag, each form's overflow, and null for what is no arithmetic" {

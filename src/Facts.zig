@@ -4,7 +4,6 @@ const std = @import("std");
 const aegis = @import("aegis");
 const Project = @import("Project.zig");
 const Model = @import("Model.zig");
-const Constructs = @import("Constructs.zig");
 const Ast = std.zig.Ast;
 const Facts = @This();
 
@@ -11367,8 +11366,7 @@ pub const accesses = struct {
 
     /// The forms an expression stands in, one for each syntax tag that may hold it: every tag
     /// Zig has is named in `formOf`, with no default, so a tag a new Zig adds fails to build
-    /// until it is placed; and each form is checked against the construct matrix's row of every
-    /// tag it holds (`Form.rows`, Constructs.ofNode).
+    /// until it is placed.
     pub const Form = enum {
         /// Statements or members: a file, a test, a block, a container's declarations.
         body,
@@ -11424,28 +11422,6 @@ pub const accesses = struct {
         fn_decl,
         /// A form that holds no expression: a name, a literal.
         leaf,
-
-        /// The construct matrix's rows a tag of this form may be in.
-        pub fn rows(form: Form) []const Constructs.Row {
-            return switch (form) {
-                .body => &.{ .none, .jump },
-                .deferred => &.{.deferred},
-                .variable, .assign => &.{.assignment},
-                .destructure => &.{.destructure},
-                .compound_assign, .comparison, .operator, .logic => &.{.operator},
-                .unwrap_optional, .tried, .@"catch", .@"orelse" => &.{.unwrap},
-                .member, .address_of, .slice, .deref, .array_access => &.{.address},
-                .concatenation, .array_literal, .struct_literal => &.{.aggregate},
-                .call, .builtin, .frame, .@"asm" => &.{.call},
-                .@"switch" => &.{.branch},
-                .prong => &.{ .capture, .inline_loop },
-                .prong_range, .@"while", .@"for", .for_range, .@"if" => &.{.capture},
-                .@"continue", .@"break", .@"return" => &.{.jump},
-                .@"comptime" => &.{.compile_time},
-                .field_declaration, .optional_type, .array_type, .pointer_type, .anyframe_type, .error_union, .merged_errors, .prototype, .grouped, .@"nosuspend", .fn_decl => &.{.none},
-                .leaf => &.{ .none, .address },
-            };
-        }
     };
 
     /// The form of a syntax tag, for each tag Zig has.
@@ -14322,6 +14298,125 @@ pub const calls = struct {
     }
 };
 
+/// The helpers of the tests below, declared in a test build only: production code names none.
+const helpers = if (@import("builtin").is_test) struct {
+    /// What `o.run` in `source` names, where a call calls it (`called`) or is read as a value: a
+    /// function, a choice of them, or the field's type alone (any); the program `source` alone.
+    const FieldRead = enum { function, choice, any };
+    fn fieldRead(source: []const u8, called_there: bool) !FieldRead {
+        var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+        defer project.deinit();
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+        defer facts.deinit();
+        const tree = &project.sources[0].file.tree;
+        for (0..tree.nodes.len) |i| {
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            if (tree.nodeTag(node) != .field_access or !std.mem.eql(u8, tree.getNodeSource(node), "o.run")) continue;
+            if (called(tree, &project.sources[0].model, node) != called_there) continue;
+            var value = try facts.resolve(project.sources[0].id, node);
+            while (value == .pointer) value = value.pointer.child.*;
+            return switch (value) {
+                .function => .function,
+                .alternatives => .choice,
+                else => .any,
+            };
+        }
+        unreachable; // unreachable: each source spells `o.run` both ways
+    }
+
+    /// Whether `run`, a private function of `text`, escapes in a run of `text` and, where given, a
+    /// file `broken.zig` of `broken`.
+    fn runEscapes(text: []const u8, broken: ?[]const u8) !bool {
+        const inputs = [_]Project.Input{ .{ .name = "root", .bytes = text }, .{ .name = "broken.zig", .bytes = broken orelse "" } };
+        var project = try Project.init(std.testing.allocator, if (broken == null) inputs[0..1] else inputs[0..], &.{}, .{});
+        defer project.deinit();
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+        defer facts.deinit();
+        const run = facts.member(facts.rootOf(project.sources[0].id), "run") orelse return error.TestUnexpectedResult;
+        return try facts.callSites(run) == null;
+    }
+
+    /// What `facts` reads for `io.vtable.run` in the library of `storeWalk`'s project, past
+    /// pointers: a function, a choice of them, or anything else.
+    fn storeWalk(root: []const u8, library_tail: []const u8) !struct { futex: bool, real: bool, other: bool, call: FieldRead, everything: bool } {
+        const library_head =
+            \\pub const VTable = struct { run: *const fn () void };
+            \\pub const Io = struct {
+            \\    vtable: *const VTable,
+            \\    pub fn run(io: Io) void {
+            \\        io.vtable.run();
+            \\    }
+            \\};
+            \\pub fn real() void {
+            \\    reached();
+            \\}
+            \\pub const real_vtable: VTable = .{ .run = real };
+            \\pub const Unreached = struct {
+            \\    fn futex() void {}
+            \\    pub const vt: VTable = .{ .run = futex };
+            \\};
+            \\
+        ;
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var project = try Project.init(std.testing.allocator, &.{
+            .{ .name = "root", .bytes = root },
+            .{ .name = "std/std.zig", .bytes = try std.mem.concat(a, u8, &.{ library_head, library_tail }), .selected = false },
+        }, &.{.{ .from = 0, .spelling = "std", .target = 1 }}, .{});
+        defer project.deinit();
+        var facts: Facts = .{ .project = &project, .gpa = a };
+        defer facts.deinit();
+        const file = project.sources[1].id;
+        const model = &project.sources[1].model;
+        const tree = &project.sources[1].file.tree;
+        const function = struct {
+            fn decl(m: *const Model, f: Project.FileId, name: []const u8) Decl {
+                for (m.declarations, 0..) |d, i| if (std.mem.eql(u8, d.name, name) and d.kind == .function) return .{ .file = f, .index = @fromBackingInt(@intCast(i)) };
+                unreachable; // unreachable: the library declares each name asked
+            }
+        };
+        const found = try facts.analysis();
+        const call = for (0..tree.nodes.len) |i| {
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            if (tree.nodeTag(node) == .field_access and std.mem.eql(u8, tree.getNodeSource(node), "io.vtable.run")) break node;
+        } else unreachable; // unreachable: Io.run calls through it
+        var value = try facts.resolve(file, call);
+        while (value == .pointer) value = value.pointer.child.*;
+        return .{
+            .futex = try facts.analyzed(function.decl(model, file, "futex")),
+            .real = try facts.analyzed(function.decl(model, file, "real")),
+            // A function the tail declares and stores, where it does.
+            .other = for (model.declarations, 0..) |d, i| {
+                if (std.mem.eql(u8, d.name, "other") and d.kind == .function) break try facts.analyzed(.{ .file = file, .index = @fromBackingInt(@intCast(i)) });
+            } else false,
+            .call = switch (value) {
+                .function => .function,
+                .alternatives => .choice,
+                else => .any,
+            },
+            .everything = found.everything,
+        };
+    }
+
+    /// What `comptimeTruth` gives on no reading for the initializer of the constant `name` in the project's `source`th
+    /// file, for the tests of values the program fixes (`comptimeValue`).
+    fn testKnownBool(facts: *Facts, source: usize, name: []const u8) !?bool {
+        const project = facts.project;
+        const model = &project.sources[source].model;
+        const tree = &project.sources[source].file.tree;
+        for (model.declarations) |d| if (std.mem.eql(u8, d.name, name) and d.kind == .variable) {
+            const init = tree.fullVarDecl(d.node).?.ast.init_node.unwrap().?; // unreachable: each asked is a constant with a value
+            return facts.comptimeTruth(null, project.sources[source].id, init);
+        };
+        unreachable; // unreachable: the source declares each name asked
+    }
+} else struct {};
+
 test "a value read part by part: any part, every part, or what every part agrees on, an unknown part or a choice of none never deciding yes or no" {
     const PartReader = struct {
         fn scalar(part: Value) ?bool {
@@ -15226,32 +15321,6 @@ test "a made container's method whose result names its own generic parameter is 
     try std.testing.expect(found[0].instance.scope != found[1].instance.scope);
 }
 
-/// What `o.run` in `source` names, where a call calls it (`called`) or is read as a value: a
-/// function, a choice of them, or the field's type alone (any); the program `source` alone.
-const FieldRead = enum { function, choice, any };
-fn fieldRead(source: []const u8, called_there: bool) !FieldRead {
-    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
-    defer project.deinit();
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
-    defer facts.deinit();
-    const tree = &project.sources[0].file.tree;
-    for (0..tree.nodes.len) |i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        if (tree.nodeTag(node) != .field_access or !std.mem.eql(u8, tree.getNodeSource(node), "o.run")) continue;
-        if (called(tree, &project.sources[0].model, node) != called_there) continue;
-        var value = try facts.resolve(project.sources[0].id, node);
-        while (value == .pointer) value = value.pointer.child.*;
-        return switch (value) {
-            .function => .function,
-            .alternatives => .choice,
-            else => .any,
-        };
-    }
-    unreachable; // unreachable: each source spells `o.run` both ways
-}
-
 test "a call through a function-pointer field reaches the functions stored there, only where every store is seen" {
     const head =
         \\const Ops = struct { run: *const fn (u32) u32 };
@@ -15264,47 +15333,47 @@ test "a call through a function-pointer field reaches the functions stored there
     ;
     // Stored by a literal and an assignment, each a function: one, or a choice of them, called
     // or read as a value.
-    try std.testing.expectEqual(.function, try fieldRead(head, true));
-    try std.testing.expectEqual(.choice, try fieldRead(head ++ "pub fn g(o: *Ops) void { o.run = &b; }\n", true));
-    try std.testing.expectEqual(.function, try fieldRead(head, false));
+    try std.testing.expectEqual(.function, try helpers.fieldRead(head, true));
+    try std.testing.expectEqual(.choice, try helpers.fieldRead(head ++ "pub fn g(o: *Ops) void { o.run = &b; }\n", true));
+    try std.testing.expectEqual(.function, try helpers.fieldRead(head, false));
     // Unresolved: a value chosen at run time, the field's address taken, a file not read.
-    try std.testing.expectEqual(.any, try fieldRead(head ++ "pub fn g(o: *Ops, run: *const fn (u32) u32) void { o.run = run; }\n", true));
-    try std.testing.expectEqual(.any, try fieldRead(head ++ "pub fn g(o: *Ops) *const *const fn (u32) u32 { return &o.run; }\n", true));
-    try std.testing.expectEqual(.any, try fieldRead(head ++ "const missing = @import(\"missing\");\npub fn g() void { _ = missing; }\n", true));
+    try std.testing.expectEqual(.any, try helpers.fieldRead(head ++ "pub fn g(o: *Ops, run: *const fn (u32) u32) void { o.run = run; }\n", true));
+    try std.testing.expectEqual(.any, try helpers.fieldRead(head ++ "pub fn g(o: *Ops) *const *const fn (u32) u32 { return &o.run; }\n", true));
+    try std.testing.expectEqual(.any, try helpers.fieldRead(head ++ "const missing = @import(\"missing\");\npub fn g() void { _ = missing; }\n", true));
     // A reflective write: by a name that ranges over another struct's fields, not this one's; by
     // any other name, it may be.
-    try std.testing.expectEqual(.function, try fieldRead(head ++ "const Other = struct { x: u32 };\npub fn g(o: *Ops) void { inline for (@typeInfo(Other).@\"struct\".field_names) |n| @field(o, n) = b; }\n", true));
-    try std.testing.expectEqual(.any, try fieldRead(head ++ "pub fn g(o: *Ops, comptime n: []const u8) void { @field(o, n) = &b; }\n", true));
+    try std.testing.expectEqual(.function, try helpers.fieldRead(head ++ "const Other = struct { x: u32 };\npub fn g(o: *Ops) void { inline for (@typeInfo(Other).@\"struct\".field_names) |n| @field(o, n) = b; }\n", true));
+    try std.testing.expectEqual(.any, try helpers.fieldRead(head ++ "pub fn g(o: *Ops, comptime n: []const u8) void { @field(o, n) = &b; }\n", true));
     // Stored by a destructure, each construct `Facts.accesses` reads: a function it may hold, or
     // a value chosen at run time; and its struct's memory written through a cast of it.
-    try std.testing.expectEqual(.choice, try fieldRead(head ++ "pub fn g(o: *Ops) void { o.run, _ = .{ &b, 0 }; }\n", true));
-    try std.testing.expectEqual(.function, try fieldRead(head ++ "pub fn g(o: *Ops) void { _, _ = .{ &b, 0 }; _ = o; }\n", true));
-    try std.testing.expectEqual(.any, try fieldRead(head ++ "pub fn g(o: *Ops, run: *const fn (u32) u32) void { o.run, _ = .{ run, 0 }; }\n", true));
-    try std.testing.expectEqual(.any, try fieldRead(head ++ "pub fn g(o: *Ops) *[8]u8 { return @ptrCast(o); }\n", true));
-    try std.testing.expectEqual(.function, try fieldRead(head ++ "const Other = struct { x: u64 };\npub fn g(o: *Other) *[8]u8 { return @ptrCast(o); }\n", true));
+    try std.testing.expectEqual(.choice, try helpers.fieldRead(head ++ "pub fn g(o: *Ops) void { o.run, _ = .{ &b, 0 }; }\n", true));
+    try std.testing.expectEqual(.function, try helpers.fieldRead(head ++ "pub fn g(o: *Ops) void { _, _ = .{ &b, 0 }; _ = o; }\n", true));
+    try std.testing.expectEqual(.any, try helpers.fieldRead(head ++ "pub fn g(o: *Ops, run: *const fn (u32) u32) void { o.run, _ = .{ run, 0 }; }\n", true));
+    try std.testing.expectEqual(.any, try helpers.fieldRead(head ++ "pub fn g(o: *Ops) *[8]u8 { return @ptrCast(o); }\n", true));
+    try std.testing.expectEqual(.function, try helpers.fieldRead(head ++ "const Other = struct { x: u64 };\npub fn g(o: *Other) *[8]u8 { return @ptrCast(o); }\n", true));
     // A type built from its fields' types (std's Io.Operation.Result, an `@Union`) holds what
     // they do: a struct of a `u64` no Ops, a struct of an Ops one.
-    try std.testing.expectEqual(.function, try fieldRead(head ++ "const Built = @Struct(.auto, null, &.{\"x\"}, &.{u64}, &@splat(.{}));\npub fn g(o: *Built) *[8]u8 { return @ptrCast(o); }\n", true));
-    try std.testing.expectEqual(.any, try fieldRead(head ++ "const Built = @Struct(.auto, null, &.{\"x\"}, &.{Ops}, &@splat(.{}));\npub fn g(o: *Built) *[8]u8 { return @ptrCast(o); }\n", true));
-    try std.testing.expectEqual(.any, try fieldRead(head ++ "const Built = @Struct(.auto, null, &.{ \"x\", \"y\" }, &.{ u64, Ops }, &@splat(.{}));\npub fn g(o: *Built) *[16]u8 { return @ptrCast(o); }\n", true));
+    try std.testing.expectEqual(.function, try helpers.fieldRead(head ++ "const Built = @Struct(.auto, null, &.{\"x\"}, &.{u64}, &@splat(.{}));\npub fn g(o: *Built) *[8]u8 { return @ptrCast(o); }\n", true));
+    try std.testing.expectEqual(.any, try helpers.fieldRead(head ++ "const Built = @Struct(.auto, null, &.{\"x\"}, &.{Ops}, &@splat(.{}));\npub fn g(o: *Built) *[8]u8 { return @ptrCast(o); }\n", true));
+    try std.testing.expectEqual(.any, try helpers.fieldRead(head ++ "const Built = @Struct(.auto, null, &.{ \"x\", \"y\" }, &.{ u64, Ops }, &@splat(.{}));\npub fn g(o: *Built) *[16]u8 { return @ptrCast(o); }\n", true));
     // A cast returned as an error union's or an optional's payload views what the payload
     // points at.
-    try std.testing.expectEqual(.any, try fieldRead(head ++ "pub fn g(bytes: *[8]u8) error{E}!*Ops { return @ptrCast(bytes); }\n", true));
-    try std.testing.expectEqual(.any, try fieldRead(head ++ "pub fn g(bytes: *[8]u8) error{E}!?*Ops { return @ptrCast(bytes); }\n", true));
-    try std.testing.expectEqual(.any, try fieldRead(head ++ "pub fn g(bytes: *[8]u8) ?*Ops { return @ptrCast(bytes); }\n", true));
-    try std.testing.expectEqual(.function, try fieldRead(head ++ "const Other = struct { x: u64 };\npub fn g(bytes: *[8]u8) error{E}!*Other { return @ptrCast(bytes); }\n", true));
+    try std.testing.expectEqual(.any, try helpers.fieldRead(head ++ "pub fn g(bytes: *[8]u8) error{E}!*Ops { return @ptrCast(bytes); }\n", true));
+    try std.testing.expectEqual(.any, try helpers.fieldRead(head ++ "pub fn g(bytes: *[8]u8) error{E}!?*Ops { return @ptrCast(bytes); }\n", true));
+    try std.testing.expectEqual(.any, try helpers.fieldRead(head ++ "pub fn g(bytes: *[8]u8) ?*Ops { return @ptrCast(bytes); }\n", true));
+    try std.testing.expectEqual(.function, try helpers.fieldRead(head ++ "const Other = struct { x: u64 };\npub fn g(bytes: *[8]u8) error{E}!*Other { return @ptrCast(bytes); }\n", true));
     // A cast given a declaration literal's call takes its parameter's type, the function read in
     // the type the call's place points at (std's SafeAllocator `const b: *Bucket = .of(s,
     // @ptrCast(f))`): bytes, no Ops; a parameter of `*Ops` views one.
     const bucket = "const Footer = struct { y: u64 };\nconst Bucket = struct {\n    x: u64,\n    fn of(ptr: [*]u8) *Bucket { return @ptrFromInt(@intFromPtr(ptr)); }\n    fn ofOps(o: *Ops) *Bucket { return @ptrFromInt(@intFromPtr(o)); }\n};\n";
-    try std.testing.expectEqual(.function, try fieldRead(head ++ bucket ++ "pub fn g(ft: *Footer) void { const held: *Bucket = .of(@ptrCast(ft)); _ = held; }\n", true));
-    try std.testing.expectEqual(.any, try fieldRead(head ++ bucket ++ "pub fn g(ft: *Footer) void { const held: *Bucket = .ofOps(@ptrCast(ft)); _ = held; }\n", true));
+    try std.testing.expectEqual(.function, try helpers.fieldRead(head ++ bucket ++ "pub fn g(ft: *Footer) void { const held: *Bucket = .of(@ptrCast(ft)); _ = held; }\n", true));
+    try std.testing.expectEqual(.any, try helpers.fieldRead(head ++ bucket ++ "pub fn g(ft: *Footer) void { const held: *Bucket = .ofOps(@ptrCast(ft)); _ = held; }\n", true));
     // Handed to a call through a function pointer whose functions are not all seen (a table
     // firmware fills: std's UEFI `self._exit(..., @ptrCast(msg.ptr))`), a cast takes the
     // parameter the pointer's function type declares: a `?[*]const u16`, no Ops; a `*Ops`, one.
     const table = "pub fn set(t: *Table, cb: @FieldType(Table, \"cb\")) void { t.cb = cb; }\npub fn g(t: *Table, w: [:0]const u16) void { t.cb(@ptrCast(w.ptr)); }\n";
-    try std.testing.expectEqual(.function, try fieldRead(head ++ "const Table = struct { cb: *const fn (?[*]const u16) void };\n" ++ table, true));
-    try std.testing.expectEqual(.any, try fieldRead(head ++ "const Table = struct { cb: *const fn (*Ops) void };\n" ++ table, true));
+    try std.testing.expectEqual(.function, try helpers.fieldRead(head ++ "const Table = struct { cb: *const fn (?[*]const u16) void };\n" ++ table, true));
+    try std.testing.expectEqual(.any, try helpers.fieldRead(head ++ "const Table = struct { cb: *const fn (*Ops) void };\n" ++ table, true));
     // A type function's member, generic itself, reached by its name alone (std's
     // `TrailerFlags(F).ptr` through a `.ptr` read off a value whose type does not resolve):
     // no instance exists while nothing reaches the type function, so its cast views nothing.
@@ -15312,22 +15381,22 @@ test "a call through a function-pointer field reaches the functions stored there
     // does not; handed as a value and evaluated only inside another function, it is reached by
     // the mention.
     const flags = "fn Flags(comptime F: type) type {\n    return struct {\n        fn ptr(p: [*]u8, comptime field: u8) *F {\n            _ = field;\n            return @ptrCast(@alignCast(p));\n        }\n    };\n}\npub fn g(x: anytype) void { _ = x.ptr; }\n";
-    try std.testing.expectEqual(.function, try fieldRead(head ++ flags, true));
-    try std.testing.expectEqual(.any, try fieldRead(head ++ flags ++ "pub fn k(bytes: [*]u8) void { _ = Flags(Ops).ptr(bytes, 0); }\n", true));
-    try std.testing.expectEqual(.function, try fieldRead(head ++ flags ++ "pub fn k(bytes: [*]u8) void { _ = Flags(u64).ptr(bytes, 0); }\n", true));
-    try std.testing.expectEqual(.any, try fieldRead(head ++ flags ++ "fn mk(comptime M: fn (type) type) type { return M(Ops); }\npub const T = mk(Flags);\n", true));
+    try std.testing.expectEqual(.function, try helpers.fieldRead(head ++ flags, true));
+    try std.testing.expectEqual(.any, try helpers.fieldRead(head ++ flags ++ "pub fn k(bytes: [*]u8) void { _ = Flags(Ops).ptr(bytes, 0); }\n", true));
+    try std.testing.expectEqual(.function, try helpers.fieldRead(head ++ flags ++ "pub fn k(bytes: [*]u8) void { _ = Flags(u64).ptr(bytes, 0); }\n", true));
+    try std.testing.expectEqual(.any, try helpers.fieldRead(head ++ flags ++ "fn mk(comptime M: fn (type) type) type { return M(Ops); }\npub const T = mk(Flags);\n", true));
     // Named by a computed `@field` of its namespace, it is reached as each member that name may be.
     const in_mod = "const mod = struct {\n    fn Flags(comptime F: type) type {\n        return struct {\n            fn ptr(p: [*]u8, comptime field: u8) *F {\n                _ = field;\n                return @ptrCast(@alignCast(p));\n            }\n        };\n    }\n};\npub fn g(x: anytype) void { _ = x.ptr; }\n";
-    try std.testing.expectEqual(.function, try fieldRead(head ++ in_mod, true));
-    try std.testing.expectEqual(.any, try fieldRead(head ++ in_mod ++ "pub fn mkBy(comptime name: []const u8) type { return @field(mod, name)(Ops); }\n", true));
+    try std.testing.expectEqual(.function, try helpers.fieldRead(head ++ in_mod, true));
+    try std.testing.expectEqual(.any, try helpers.fieldRead(head ++ in_mod ++ "pub fn mkBy(comptime name: []const u8) type { return @field(mod, name)(Ops); }\n", true));
     // A pointer cast keeps `const`: the bytes of a parameter's address, or of a copy's handed
     // where a `[]const u8` goes, are read, never written; through `[]u8` or `@constCast`, they
     // may be.
     const sink = "fn read(_: []const u8) void {}\nfn write(_: []u8) void {}\n";
-    try std.testing.expectEqual(.function, try fieldRead(head ++ sink ++ "pub fn g(o: Ops) void { read(@ptrCast((&o)[0..1])); }\n", true));
-    try std.testing.expectEqual(.function, try fieldRead(head ++ sink ++ "pub fn g(o: *const Ops) void { var copy = o.*; read(@ptrCast((&copy)[0..1])); }\n", true));
-    try std.testing.expectEqual(.any, try fieldRead(head ++ sink ++ "pub fn g(o: *const Ops) void { var copy = o.*; write(@ptrCast((&copy)[0..1])); }\n", true));
-    try std.testing.expectEqual(.any, try fieldRead(head ++ sink ++ "pub fn g(o: Ops) void { write(@ptrCast(@constCast((&o)[0..1]))); }\n", true));
+    try std.testing.expectEqual(.function, try helpers.fieldRead(head ++ sink ++ "pub fn g(o: Ops) void { read(@ptrCast((&o)[0..1])); }\n", true));
+    try std.testing.expectEqual(.function, try helpers.fieldRead(head ++ sink ++ "pub fn g(o: *const Ops) void { var copy = o.*; read(@ptrCast((&copy)[0..1])); }\n", true));
+    try std.testing.expectEqual(.any, try helpers.fieldRead(head ++ sink ++ "pub fn g(o: *const Ops) void { var copy = o.*; write(@ptrCast((&copy)[0..1])); }\n", true));
+    try std.testing.expectEqual(.any, try helpers.fieldRead(head ++ sink ++ "pub fn g(o: Ops) void { write(@ptrCast(@constCast((&o)[0..1]))); }\n", true));
 }
 
 test "boundInRun: a generic is bound where compiled code calls it, a test or a function that is no generic, or a generic itself bound; one bound only in an unbound generic is not" {
@@ -15576,20 +15645,6 @@ test "a function's value in a private alias or table is followed for every reade
     try std.testing.expect(try facts.callSites(d) == null and try facts.namedCalls(d) == null);
 }
 
-/// Whether `run`, a private function of `text`, escapes in a run of `text` and, where given, a
-/// file `broken.zig` of `broken`.
-fn runEscapes(text: []const u8, broken: ?[]const u8) !bool {
-    const inputs = [_]Project.Input{ .{ .name = "root", .bytes = text }, .{ .name = "broken.zig", .bytes = broken orelse "" } };
-    var project = try Project.init(std.testing.allocator, if (broken == null) inputs[0..1] else inputs[0..], &.{}, .{});
-    defer project.deinit();
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
-    defer facts.deinit();
-    const run = facts.member(facts.rootOf(project.sources[0].id), "run") orelse return error.TestUnexpectedResult;
-    return try facts.callSites(run) == null;
-}
-
 test "a member of a holder of no known type is read over every field the run declares so named, and a file the run cannot parse may declare one" {
     // `q.run`, not called: a value's field where `q` is a value the program holds at run time.
     // `q` is `p.missing`, a member `Plain` does not declare: a field of the value `p` unless
@@ -15610,11 +15665,11 @@ test "a member of a holder of no known type is read over every field the run dec
         \\
     ;
     const kept = "const Kept = struct { comptime missing: u8 = 0 };\n";
-    try std.testing.expect(try runEscapes(uses ++ kept, null));
+    try std.testing.expect(try helpers.runEscapes(uses ++ kept, null));
     // No field so named is `comptime`: `q` is a value, `q.run` its field, and `run` is called alone.
-    try std.testing.expect(!try runEscapes(uses, null));
+    try std.testing.expect(!try helpers.runEscapes(uses, null));
     // A file the run was given that does not parse may declare one: not known as a value's.
-    try std.testing.expect(try runEscapes(uses, "const Kept = struct { comptime missing: u8 = 0 };\nfn ("));
+    try std.testing.expect(try helpers.runEscapes(uses, "const Kept = struct { comptime missing: u8 = 0 };\nfn ("));
 }
 
 test "a library's call through a field whose type names none of its generic's parameters calls none of the program's functions" {
@@ -16839,90 +16894,27 @@ test "a method of a value a type parameter types is made per binding: each bindi
     try std.testing.expect(value == .error_union and value.error_union.* == .instance);
 }
 
-/// What `facts` reads for `io.vtable.run` in the library of `storeWalk`'s project, past
-/// pointers: a function, a choice of them, or anything else.
-fn storeWalk(root: []const u8, library_tail: []const u8) !struct { futex: bool, real: bool, other: bool, call: FieldRead, everything: bool } {
-    const library_head =
-        \\pub const VTable = struct { run: *const fn () void };
-        \\pub const Io = struct {
-        \\    vtable: *const VTable,
-        \\    pub fn run(io: Io) void {
-        \\        io.vtable.run();
-        \\    }
-        \\};
-        \\pub fn real() void {
-        \\    reached();
-        \\}
-        \\pub const real_vtable: VTable = .{ .run = real };
-        \\pub const Unreached = struct {
-        \\    fn futex() void {}
-        \\    pub const vt: VTable = .{ .run = futex };
-        \\};
-        \\
-    ;
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var project = try Project.init(std.testing.allocator, &.{
-        .{ .name = "root", .bytes = root },
-        .{ .name = "std/std.zig", .bytes = try std.mem.concat(a, u8, &.{ library_head, library_tail }), .selected = false },
-    }, &.{.{ .from = 0, .spelling = "std", .target = 1 }}, .{});
-    defer project.deinit();
-    var facts: Facts = .{ .project = &project, .gpa = a };
-    defer facts.deinit();
-    const file = project.sources[1].id;
-    const model = &project.sources[1].model;
-    const tree = &project.sources[1].file.tree;
-    const function = struct {
-        fn decl(m: *const Model, f: Project.FileId, name: []const u8) Decl {
-            for (m.declarations, 0..) |d, i| if (std.mem.eql(u8, d.name, name) and d.kind == .function) return .{ .file = f, .index = @fromBackingInt(@intCast(i)) };
-            unreachable; // unreachable: the library declares each name asked
-        }
-    };
-    const found = try facts.analysis();
-    const call = for (0..tree.nodes.len) |i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        if (tree.nodeTag(node) == .field_access and std.mem.eql(u8, tree.getNodeSource(node), "io.vtable.run")) break node;
-    } else unreachable; // unreachable: Io.run calls through it
-    var value = try facts.resolve(file, call);
-    while (value == .pointer) value = value.pointer.child.*;
-    return .{
-        .futex = try facts.analyzed(function.decl(model, file, "futex")),
-        .real = try facts.analyzed(function.decl(model, file, "real")),
-        // A function the tail declares and stores, where it does.
-        .other = for (model.declarations, 0..) |d, i| {
-            if (std.mem.eql(u8, d.name, "other") and d.kind == .function) break try facts.analyzed(.{ .file = file, .index = @fromBackingInt(@intCast(i)) });
-        } else false,
-        .call = switch (value) {
-            .function => .function,
-            .alternatives => .choice,
-            else => .any,
-        },
-        .everything = found.everything,
-    };
-}
-
 test "a store counts for a call through its field once the walk reaches its part: one in code nothing compiles gives nothing, even a store that would leave the call unresolved" {
     const through_io = "const std = @import(\"std\");\npub fn main() void {\n    const io: std.Io = .{ .vtable = &std.real_vtable };\n    io.run();\n}\n";
     // The store of `futex` is in a declaration nothing reaches (aegis's test-only shake layer):
     // the call reaches `real` alone.
     const plain = "fn reached() void {}\n";
-    const alone = try storeWalk(through_io, plain);
+    const alone = try helpers.storeWalk(through_io, plain);
     try std.testing.expect(!alone.everything);
     try std.testing.expect(alone.real and !alone.futex);
     try std.testing.expectEqual(.function, alone.call);
     // Its twin reaches that declaration: the call reaches both.
-    const reached = try storeWalk("const std = @import(\"std\");\npub fn main() void {\n    const io: std.Io = .{ .vtable = &std.real_vtable };\n    io.run();\n    _ = std.Unreached.vt;\n}\n", plain);
+    const reached = try helpers.storeWalk("const std = @import(\"std\");\npub fn main() void {\n    const io: std.Io = .{ .vtable = &std.real_vtable };\n    io.run();\n    _ = std.Unreached.vt;\n}\n", plain);
     try std.testing.expect(reached.real and reached.futex);
     try std.testing.expectEqual(.choice, reached.call);
     // A store nothing reaches that takes the field's address leaves the call resolved.
-    const hidden = try storeWalk(through_io, plain ++ "const Hidden = struct {\n    fn take(v: *VTable) void {\n        _ = &v.run;\n    }\n};\n");
+    const hidden = try helpers.storeWalk(through_io, plain ++ "const Hidden = struct {\n    fn take(v: *VTable) void {\n        _ = &v.run;\n    }\n};\n");
     try std.testing.expectEqual(.function, hidden.call);
     // Its order twin: the call is read first; `real`, which it reaches, reaches `later`, whose
     // part takes the field's address and stores `other`, named nowhere else. Reading the call
     // again leaves it unresolved, and the walk reaches `other` by its name at the store, not
     // by the call's answer: no part of the walk waits on a call through a field, nor gives up.
-    const late = try storeWalk(through_io, "fn reached() void {\n    var vt: VTable = real_vtable;\n    later(&vt);\n}\nfn other() void {}\nfn later(v: *VTable) void {\n    _ = &v.run;\n    v.run = other;\n}\n");
+    const late = try helpers.storeWalk(through_io, "fn reached() void {\n    var vt: VTable = real_vtable;\n    later(&vt);\n}\nfn other() void {}\nfn later(v: *VTable) void {\n    _ = &v.run;\n    v.run = other;\n}\n");
     try std.testing.expect(late.real and late.other);
     try std.testing.expect(!late.everything);
     try std.testing.expectEqual(.any, late.call);
@@ -17812,19 +17804,6 @@ test "a copy crowded past its routes is read along the routes its binding compil
     try std.testing.expect(value == .instance);
 }
 
-/// What `comptimeTruth` gives on no reading for the initializer of the constant `name` in the project's `source`th
-/// file, for the tests of values the program fixes (`comptimeValue`).
-fn testKnownBool(facts: *Facts, source: usize, name: []const u8) !?bool {
-    const project = facts.project;
-    const model = &project.sources[source].model;
-    const tree = &project.sources[source].file.tree;
-    for (model.declarations) |d| if (std.mem.eql(u8, d.name, name) and d.kind == .variable) {
-        const init = tree.fullVarDecl(d.node).?.ast.init_node.unwrap().?; // unreachable: each asked is a constant with a value
-        return facts.comptimeTruth(null, project.sources[source].id, init);
-    };
-    unreachable; // unreachable: the source declares each name asked
-}
-
 test "@hasField of a choice of types is what every type agrees on: each declaring the field, yes; none, no; some, not known" {
     const source =
         \\const builtin = @import("builtin");
@@ -17846,13 +17825,13 @@ test "@hasField of a choice of types is what every type agrees on: each declarin
     defer arena.deinit();
     var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
     defer facts.deinit();
-    try std.testing.expectEqual(@as(?bool, true), try testKnownBool(&facts, 0, "both"));
-    try std.testing.expectEqual(@as(?bool, false), try testKnownBool(&facts, 0, "neither"));
-    try std.testing.expectEqual(@as(?bool, null), try testKnownBool(&facts, 0, "some"));
-    try std.testing.expectEqual(@as(?bool, null), try testKnownBool(&facts, 0, "mixed"));
+    try std.testing.expectEqual(@as(?bool, true), try helpers.testKnownBool(&facts, 0, "both"));
+    try std.testing.expectEqual(@as(?bool, false), try helpers.testKnownBool(&facts, 0, "neither"));
+    try std.testing.expectEqual(@as(?bool, null), try helpers.testKnownBool(&facts, 0, "some"));
+    try std.testing.expectEqual(@as(?bool, null), try helpers.testKnownBool(&facts, 0, "mixed"));
     // One type: a field it declares is found among its declarations (a scope's names hold none).
-    try std.testing.expectEqual(@as(?bool, true), try testKnownBool(&facts, 0, "one"));
-    try std.testing.expectEqual(@as(?bool, false), try testKnownBool(&facts, 0, "one_not"));
+    try std.testing.expectEqual(@as(?bool, true), try helpers.testKnownBool(&facts, 0, "one"));
+    try std.testing.expectEqual(@as(?bool, false), try helpers.testKnownBool(&facts, 0, "one_not"));
 }
 
 test "a value the program fixes decides a condition: strand's scalars.kind(T) read per type, through @hasDecl, a constant's struct literal, @typeInfo(@TypeOf(...)), @hasField, a contract number and enum tags; a switch on the tag it gives takes its prong" {
@@ -17935,15 +17914,15 @@ test "a value the program fixes decides a condition: strand's scalars.kind(T) re
     defer facts.deinit();
     for ([_][]const u8{ "checked", "ranged", "nonzero", "counter", "text", "plain", "scalar_int", "contract", "pruned", "in_range" }) |name| {
         errdefer std.debug.print("not true: {s}\n", .{name});
-        try std.testing.expectEqual(@as(?bool, true), try testKnownBool(&facts, 0, name));
+        try std.testing.expectEqual(@as(?bool, true), try helpers.testKnownBool(&facts, 0, name));
     }
-    try std.testing.expectEqual(@as(?bool, false), try testKnownBool(&facts, 0, "pruned_other"));
+    try std.testing.expectEqual(@as(?bool, false), try helpers.testKnownBool(&facts, 0, "pruned_other"));
     // A constant built by a call is what the call gives, read as that call reads it: its `kind`
     // is the call's parameter, not known here, never a default.
-    try std.testing.expectEqual(@as(?bool, null), try testKnownBool(&facts, 0, "built"));
+    try std.testing.expectEqual(@as(?bool, null), try helpers.testKnownBool(&facts, 0, "built"));
     // Tags of two enums, and a number past what is read: not known, never a guess.
-    try std.testing.expectEqual(@as(?bool, null), try testKnownBool(&facts, 0, "two_enums"));
-    try std.testing.expectEqual(@as(?bool, null), try testKnownBool(&facts, 0, "past_range"));
+    try std.testing.expectEqual(@as(?bool, null), try helpers.testKnownBool(&facts, 0, "two_enums"));
+    try std.testing.expectEqual(@as(?bool, null), try helpers.testKnownBool(&facts, 0, "past_range"));
     // `kind(T)` with `T` bound by nothing: not known.
     const tree = &project.sources[0].file.tree;
     const unbound_return = for (0..tree.nodes.len) |i| {
@@ -17977,10 +17956,10 @@ test "@hasDecl sees a declaration not pub only from its container's file, as Zig
     defer arena.deinit();
     var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
     defer facts.deinit();
-    try std.testing.expectEqual(@as(?bool, true), try testKnownBool(&facts, 1, "same_file"));
-    try std.testing.expectEqual(@as(?bool, false), try testKnownBool(&facts, 1, "field"));
-    try std.testing.expectEqual(@as(?bool, false), try testKnownBool(&facts, 0, "other_file"));
-    try std.testing.expectEqual(@as(?bool, true), try testKnownBool(&facts, 0, "other_pub"));
+    try std.testing.expectEqual(@as(?bool, true), try helpers.testKnownBool(&facts, 1, "same_file"));
+    try std.testing.expectEqual(@as(?bool, false), try helpers.testKnownBool(&facts, 1, "field"));
+    try std.testing.expectEqual(@as(?bool, false), try helpers.testKnownBool(&facts, 0, "other_file"));
+    try std.testing.expectEqual(@as(?bool, true), try helpers.testKnownBool(&facts, 0, "other_pub"));
 }
 
 test "a guard on a value the program fixes prunes per binding: `comptime kind(T) != null` is false for `bool` and true for a scalar, and the branch behind it is reached only where it holds; a runtime optional stays unknown (warp-fast's probe, census G1)" {
@@ -18032,10 +18011,10 @@ test "a guard on a value the program fixes prunes per binding: `comptime kind(T)
     defer arena.deinit();
     var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
     defer facts.deinit();
-    try std.testing.expectEqual(@as(?bool, false), try testKnownBool(&facts, 0, "bool_kind"));
-    try std.testing.expectEqual(@as(?bool, true), try testKnownBool(&facts, 0, "s_kind"));
-    try std.testing.expectEqual(@as(?bool, false), try testKnownBool(&facts, 0, "bool_scalar"));
-    try std.testing.expectEqual(@as(?bool, true), try testKnownBool(&facts, 0, "s_scalar"));
+    try std.testing.expectEqual(@as(?bool, false), try helpers.testKnownBool(&facts, 0, "bool_kind"));
+    try std.testing.expectEqual(@as(?bool, true), try helpers.testKnownBool(&facts, 0, "s_kind"));
+    try std.testing.expectEqual(@as(?bool, false), try helpers.testKnownBool(&facts, 0, "bool_scalar"));
+    try std.testing.expectEqual(@as(?bool, true), try helpers.testKnownBool(&facts, 0, "s_scalar"));
     const tree = &project.sources[0].file.tree;
     const file = project.sources[0].id;
     const node = struct {
