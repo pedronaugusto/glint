@@ -516,7 +516,7 @@ test "one suppression names each rule it covers on its line, one site each; the 
     try std.testing.expect(!report.complete);
 }
 
-test "the fix rewrites the aegis escape into glint-ignore under today's names, names an older one from a run's record, and removes one naming only a rule that went" {
+test "the fix rewrites the aegis escape into glint-ignore under today's names, names an older one from a run's record or else by what finds on its line now, and removes one naming only a rule that went" {
     const program =
         \\pub fn a(p: usize) *u8 {
         \\    return @ptrFromInt(p); // aegis: internal(A019, A014): the page the kernel hands back
@@ -545,7 +545,7 @@ test "the fix rewrites the aegis escape into glint-ignore under today's names, n
         \\    return @ptrFromInt(p);
         \\}
         \\pub fn d(p: usize) *u8 {
-        \\    return @ptrFromInt(p); // aegis: design: no record names it
+        \\    return @ptrFromInt(p); // glint-ignore: P007 -- design: no record names it
         \\}
         \\
     , out.bytes);

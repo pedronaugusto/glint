@@ -113,7 +113,7 @@ pub fn apply(a: std.mem.Allocator, project: *const Project, report: *const Repor
     }
     for (report.malformed) |entry| {
         const file = project.at(entry.span.file).file;
-        const edit = (try oldSuppression(a, file, entry.span.start, entry.span.end)) orelse (try oldEscape(a, project, entry.span, options.escapes_before)) orelse continue;
+        const edit = (try oldSuppression(a, file, entry.span.start, entry.span.end)) orelse (try oldEscape(a, project, report, entry.span, options.escapes_before)) orelse continue;
         const slot = try by_file.getOrPut(a, entry.span.file);
         if (!slot.found_existing) slot.value_ptr.* = .empty;
         try slot.value_ptr.append(a, edit);
@@ -194,8 +194,10 @@ fn oldSuppression(a: std.mem.Allocator, file: *const File, start: u32, end: u32)
 /// An escape in the aegis pack's form, as the suppression glint reads: `// aegis: <reason>(<rules>):
 /// <why>` becomes `// glint-ignore: <rules> -- <reason>: <why>` under today's names. One in the
 /// older form, naming no rules, takes those a record of a run before shows it covered, at that
-/// place with those words; one the record does not hold is left for its owner to name.
-fn oldEscape(a: std.mem.Allocator, project: *const Project, span: Report.Span, before: []const Escaped) std.mem.Allocator.Error!?Report.Edit {
+/// place with those words; with no record, the rules that find something on its site's line now
+/// and that the older form covered (P007, P008, P009 and the rules packages declare), as it
+/// covered every pack finding on its line. One with neither is left for its owner to name.
+fn oldEscape(a: std.mem.Allocator, project: *const Project, report: *const Report, span: Report.Span, before: []const Escaped) std.mem.Allocator.Error!?Report.Edit {
     const file = project.at(span.file).file;
     const text = spanned(file, span.start, span.end) orelse return null;
     const rest = std.mem.trim(u8, std.mem.cutPrefix(u8, text, "// aegis:") orelse return null, " ");
@@ -211,8 +213,20 @@ fn oldEscape(a: std.mem.Allocator, project: *const Project, span: Report.Span, b
             if (escaped.line != span.line or escaped.column != span.column) continue;
             if (!std.mem.eql(u8, escaped.path, project.at(span.file).input.name)) continue;
             if (std.mem.eql(u8, escaped.reason, reason) and std.mem.eql(u8, escaped.why, why)) break escaped;
-        } else return null;
-        try names.appendSlice(a, recorded.rules);
+        } else null;
+        if (recorded) |found| try names.appendSlice(a, found.rules) else {
+            // The line the escape covers: its own, or the next where it stands alone.
+            const line_start = file.lines[file.line(span.start)];
+            const alone = std.mem.trim(u8, file.source[line_start..span.start], " \t").len == 0;
+            const site = span.line + @intFromBool(alone);
+            for (report.diagnostics) |d| {
+                if (d.span.file != span.file or d.span.line != site) continue;
+                const id = @backingInt(d.rule);
+                const covered = d.rule == .P007 or d.rule == .P008 or d.rule == .P009 or id >= 1000;
+                if (covered) try names.append(a, d.name);
+            }
+            if (names.items.len == 0) return null;
+        }
     }
     const now = try today(a, names.items);
     if (now.empty) return removal(file, span.start, span.end);
