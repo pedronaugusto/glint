@@ -251,11 +251,12 @@ test "accesses: each syntax form that holds an expression is in a construct matr
 
 test "accesses: an operator's operation by its tag, each form's overflow, and null for what is no arithmetic" {
     const Tag = std.zig.Ast.Node.Tag;
-    // Both directions against `formOf`: a tag of the operator forms maps to exactly one of the two
-    // readers, a compound assignment to the binary one's; every other tag to neither.
+    // Both directions against `formOf`: a tag of the operator forms is read by `operatorOf` unless
+    // it is an operator on one number (`-`, `-%`, `~`), a compound assignment always; every other
+    // tag never.
     for (std.meta.tags(Tag)) |tag| {
         const binary = accesses.operatorOf(tag) != null;
-        const unary = accesses.unaryOf(tag) != null;
+        const unary = tag == .negation or tag == .negation_wrap or tag == .bit_not;
         switch (accesses.formOf(tag)) {
             .operator => try std.testing.expect(binary != unary),
             .compound_assign => try std.testing.expect(binary and !unary),
@@ -288,14 +289,10 @@ test "accesses: an operator's operation by its tag, each form's overflow, and nu
         try std.testing.expectEqual(row[2], read.op);
         try std.testing.expectEqual(row[3], read.overflow);
     };
-    try std.testing.expectEqual(accesses.Unary.negation, accesses.unaryOf(.negation).?);
-    try std.testing.expectEqual(accesses.Unary.negation_wrap, accesses.unaryOf(.negation_wrap).?);
-    try std.testing.expectEqual(accesses.Unary.bit_not, accesses.unaryOf(.bit_not).?);
     // What is no arithmetic, however an operator it looks: a condition's, a comparison's, a
     // pointer's and a type's.
     for ([_]Tag{ .bool_not, .bool_and, .bool_or, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .address_of, .deref, .optional_type, .assign, .assign_destructure }) |tag| {
         try std.testing.expectEqual(@as(?accesses.Operator, null), accesses.operatorOf(tag));
-        try std.testing.expectEqual(@as(?accesses.Unary, null), accesses.unaryOf(tag));
     }
 }
 
@@ -467,10 +464,6 @@ test "accesses: a place's path, whether two name one place, a discarded value, a
     try std.testing.expect(path.steps[2].crosses);
     try std.testing.expectEqual(.root, path.steps[3].kind);
     try std.testing.expect(path.root == .decl);
-    // `_ = d;` discards `d`; the store into the element discards nothing.
-    const discard = spelledNode(tree, "_ = d", 0).?;
-    try std.testing.expectEqualStrings("d", tree.getNodeSource((try accesses.discardedBy(&facts, file, discard)).?));
-    try std.testing.expectEqual(null, try accesses.discardedBy(&facts, file, spelledNode(tree, "s.b[1..][0] = 2", 0).?));
 }
 
 test "Facts: an enum's and a union's tags written with no type are members" {
@@ -728,13 +721,6 @@ test "batch 2: an update's operation, error names and sets, a condition's truths
     const update = (try accesses.storeInto(&facts, file, spelledNode(tree, "x.*", 0).?)).?;
     try std.testing.expectEqual(.add, update.operator.?.op.op);
     try std.testing.expectEqual(.wrapping, update.operator.?.op.overflow);
-    var buffer: [1]std.zig.Ast.Node.Index = undefined;
-    const g = facts.member(facts.rootOf(file), "g").?;
-    const g_proto = tree.fullFnProto(&buffer, project.sources[0].model.declarations[@backingInt(g.index)].node).?;
-    try std.testing.expect(try facts.returnedErrors(file, g_proto) == .set);
-    const h = facts.member(facts.rootOf(file), "h").?;
-    const h_proto = tree.fullFnProto(&buffer, project.sources[0].model.declarations[@backingInt(h.index)].node).?;
-    try std.testing.expect(try facts.returnedErrors(file, h_proto) == .inferred);
     // The values the `if` gives: `.{}`, `c`, `3`, `5`.
     const result = spelledNode(tree, "if (a) .{} else blk: { if (b) break :blk c orelse 3; break :blk @as(u8, 5); }", 0).?;
     const leaves = (try accesses.valuesOf(&facts, file, result)).leaves;

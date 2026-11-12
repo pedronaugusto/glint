@@ -3280,35 +3280,6 @@ fn constantValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resol
     return .{ decl.file, variable.ast.init_node.unwrap() orelse return null };
 }
 
-/// The errors a function's prototype says it returns: none (no error union), a set written
-/// there or in a const its result names (`E!T`, the set's node and file), inferred (`!T`), which
-/// the body decides, or unknown: an error union the result names in a way not read here.
-pub const Returned = union(enum) { none, set: struct { file: Project.FileId, node: Ast.Node.Index }, inferred, unknown: Unknown };
-
-pub fn returnedErrors(self: *Facts, file: Project.FileId, proto: Ast.full.FnProto) ResolveError!Returned {
-    const tree = &self.project.at(file).file.tree;
-    const result = proto.ast.return_type.unwrap() orelse return .none;
-    if (tree.tokenTag(tree.firstToken(result) - 1) == .bang) return .inferred;
-    var at_file = file;
-    var at = result;
-    for (0..16) |_| {
-        const source = &self.project.at(at_file).file.tree;
-        at = ungrouped(source, at);
-        if (source.nodeTag(at) == .error_union) return .{ .set = .{ .file = at_file, .node = source.nodeData(at).node_and_node[0] } };
-        at_file, at = (try self.constantValue(at_file, at)) orelse break;
-    }
-    return switch (try self.resolve(file, result)) {
-        .error_union => .{ .unknown = .unsupported },
-        .unknown => |why| .{ .unknown = why },
-        // A choice of result types: none only where no part is an error union or unknown.
-        .alternatives => |parts| for (parts) |part| {
-            if (part == .unknown) break .{ .unknown = part.unknown };
-            if (part == .error_union) break .{ .unknown = .unsupported };
-        } else .none,
-        else => .none,
-    };
-}
-
 /// The names a capture takes from a list written in place that a `for` ranges over alone, each
 /// element one name spells (`nameIn`); null where one does not.
 fn rangedNames(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?[]const []const u8 {
@@ -11942,15 +11913,6 @@ pub const accesses = struct {
         };
     }
 
-    /// The value the statement `statement` discards: `_ = v`'s `v`; null for any other.
-    pub fn discardedBy(facts: *Facts, file: Project.FileId, statement: Ast.Node.Index) Error!?Ast.Node.Index {
-        const tree = &facts.project.at(file).file.tree;
-        if (formOf(tree.nodeTag(statement)) != .assign) return null;
-        const target, const value = tree.nodeData(statement).node_and_node;
-        if (try storeInto(facts, file, target) != null or !discard(tree, target)) return null;
-        return value;
-    }
-
     /// One step of a place's path (`pathOf`), from the place in toward its root.
     pub const Step = struct {
         /// The node of the place this step reaches: a member read, `@field`, an element, a slice,
@@ -12276,20 +12238,6 @@ pub const accesses = struct {
             .mul_sat, .assign_mul_sat => .{ .op = .mul, .overflow = .saturating },
             .add_sat, .assign_add_sat => .{ .op = .add, .overflow = .saturating },
             .sub_sat, .assign_sub_sat => .{ .op = .sub, .overflow = .saturating },
-            else => null,
-        };
-    }
-
-    /// An operator on one number.
-    pub const Unary = enum { negation, negation_wrap, bit_not };
-
-    /// The operator on one number a tag writes. Null for any other tag, `!` among them (a
-    /// condition's, `conditionOf`): it is no arithmetic, which says nothing of overflow.
-    pub fn unaryOf(tag: Ast.Node.Tag) ?Unary {
-        return switch (tag) {
-            .negation => .negation,
-            .negation_wrap => .negation_wrap,
-            .bit_not => .bit_not,
             else => null,
         };
     }
