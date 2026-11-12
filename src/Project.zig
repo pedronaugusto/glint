@@ -347,13 +347,13 @@ pub fn comments(self: *const Project, h: Handle) QueryError![]const File.Comment
 }
 /// Validates distinct node identity before converting to std's AST index.
 pub fn node(self: *const Project, h: Handle, id: NodeId) QueryError!std.zig.Ast.Node.Index {
-    // aegis: no-danger(A004): an identity checked against the length of the table it indexes; the comparison is the bound
+    // glint-ignore: A004 -- an identity checked against the length of the table it indexes; the comparison is the bound
     if (id.raw() >= (try self.syntax(h)).nodes.len) return error.InvalidHandle;
     return @fromBackingInt(id.raw());
 }
 /// Validates distinct token identity before crossing the std boundary.
 pub fn token(self: *const Project, h: Handle, id: TokenId) QueryError!std.zig.Ast.TokenIndex {
-    // aegis: no-danger(A004): an identity checked against the length of the table it indexes; the comparison is the bound
+    // glint-ignore: A004 -- an identity checked against the length of the table it indexes; the comparison is the bound
     if (id.raw() >= (try self.syntax(h)).tokens.len) return error.InvalidHandle;
     return id.raw();
 }

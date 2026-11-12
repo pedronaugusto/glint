@@ -19,9 +19,6 @@
       }
     ],
     "escapes": {
-      "no-danger": {
-        "A004": 2
-      },
       "internal": {
         "A019": 2
       }
