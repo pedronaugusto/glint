@@ -344,9 +344,9 @@ test "a seam holds a file, a glob of files or a directory for the rules it names
 }
 
 test "review inventory excludes removed identities without compatibility aliases" {
-    try std.testing.expectEqual(@as(usize, 44), std.meta.tags(Rule).len); // safe: explicit compile-time type selection; the value is representable in that type.
+    try std.testing.expectEqual(@as(usize, 47), std.meta.tags(Rule).len); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expectEqual(null, Rule.parse("Z008"));
-    // Folded into the aegis pack's danger rules (A010, A013, A014, A019), never aliased.
+    // Folded into P007, P009 and Z026, never aliased.
     for ([_][]const u8{ "P001", "P002", "P004", "E001" }) |id| try std.testing.expectEqual(null, Rule.parse(id));
     try std.testing.expectEqual(null, Rule.parse("Z013-extra"));
     for ([_][]const u8{ "Z002", "Z004", "Z019", "Z020", "Z021", "Z022", "Z029", "Z030", "Z033" }) |id| try std.testing.expectEqual(null, Rule.parse(id));
@@ -467,9 +467,12 @@ pub const removed_rules = [_]Removed{
     .{ .id = "A011", .now = .{ .declared = "aegis" } },
     .{ .id = "A012", .now = .{ .declared = "aegis" } },
     .{ .id = "A013", .now = .{ .declared = "aegis" } },
+    .{ .id = "A014", .now = .{ .renamed = "P009" } },
     .{ .id = "A015", .now = .{ .declared = "aegis" } },
+    .{ .id = "A016", .now = .{ .renamed = "P008" } },
     .{ .id = "A017", .now = .removed },
     .{ .id = "A018", .now = .removed },
+    .{ .id = "A019", .now = .{ .renamed = "P007" } },
     .{ .id = "A020", .now = .removed },
     .{ .id = "A021", .now = .{ .declared = "aegis" } },
 };
@@ -491,9 +494,9 @@ test "a removed rule's refusal says it was removed in 0.8 and what to write inst
     w.end = 0;
     try Removed.refuse(&w, "Z008");
     try std.testing.expectEqualStrings("`Z008` is not a rule glint has", w.buffered());
-    // A renamed id names its successor (A019's row, P007, comes with the rule that takes its check).
+    // A renamed id names its successor.
     w.end = 0;
-    try (Removed{ .id = "A019", .now = .{ .renamed = "P007" } }).write(&w);
+    try Removed.refuse(&w, "A019");
     try std.testing.expectEqualStrings("`A019` was removed in glint 0.8: its check is `P007`, name that", w.buffered());
     // No row names a rule glint has, nor names one twice; a successor is a rule glint has.
     for (removed_rules, 0..) |gone, i| {
