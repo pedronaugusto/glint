@@ -38,7 +38,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
             // A condition on the build mode: off in the modes whose checks it turns off. A mode
             // that builds without them (fast, small) loses nothing to it.
             const on = (try Model.modes(c.allocator, tree, &c.project.at(c.file).model, args[0], 0)) orelse {
-                try c.unknown(rule, node, .comptime_dependent);
+                try c.at(rule, token, "@setRuntimeSafety on a value the build mode does not decide: the checks cannot be shown to stay on; only a measured hot loop validated at its boundary");
                 continue;
             };
             // Off in every mode (`false`, a constant that holds it).
@@ -138,7 +138,7 @@ fn reinterpreted(c: *Context, rule: Rule) Context.Error!void {
     }
     var sites: std.ArrayList(Governed.Site) = .empty;
     var unread: std.ArrayList(Governed.Unread) = .empty;
-    try Governed.sitesLeaving(c, rule, found.items, &sites, &unread);
+    try Governed.sitesLeaving(c, found.items, &sites, &unread);
     for (sites.items) |site| try c.atDefinition(rule, site.token, "a reinterpretation of bytes as another type no build checks", site.decl);
     const tree = &c.project.at(c.file).file.tree;
     for (unread.items) |missed| try c.at(rule, tree.firstToken(missed.node), try c.allocator.print("a reference spelling std's mem.bytesAsValue or bytesAsSlice does not resolve ({t}), so it cannot be shown to be another", .{missed.why}));

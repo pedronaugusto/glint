@@ -18,7 +18,9 @@ fn completionCase(findings: bool) !void {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "input.zig", .data = if (findings) "const unused = @import(\"not-a-file\");" else "pub const value = 1;" });
+    // An import of a file of the run that nothing uses: Z013's finding (one no mapping names would stop the run).
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "other.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "input.zig", .data = if (findings) "const unused = @import(\"other.zig\");" else "pub const value = 1;" });
     const input = try resultPath(a, &tmp, "input.zig");
     defer a.free(input);
     const result = try resultPath(a, &tmp, "result.json");
@@ -285,7 +287,8 @@ test "--only beside --config runs only its rules, under the configuration's opti
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "const unused = @import(\"std\");\nextern \"c\" fn fsync(fd: c_int) c_int;\npub fn f() void {\n    _ = fsync(0);\n}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "const unused = @import(\"b.zig\");\nextern \"c\" fn fsync(fd: c_int) c_int;\npub fn f() void {\n    _ = fsync(0);\n}\n" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data =
         \\{"profile": "reviewed", "rules": [{"id": "Z013", "level": "gate"}],
         \\ "disallowed": [{"declaration": "fsync", "reason": "durability belongs to airlock", "replacement": "airlock.syncFile", "owners": ["airlock"]}]}

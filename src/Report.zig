@@ -1,4 +1,4 @@
-//! Owned diagnostics and independent coverage. Rendering cannot alter model results.
+//! Owned findings, reports and run errors. Rendering cannot alter model results.
 const std = @import("std");
 const release = @import("version.zig");
 const Project = @import("Project.zig");
@@ -8,7 +8,10 @@ const Report = @This();
 arena: std.heap.ArenaAllocator,
 snapshot: u64,
 diagnostics: []const Diagnostic,
-coverage: []const Coverage,
+/// What stops the run: a file glint cannot parse, an import no mapping names, a file whose
+/// analysis ran out of its fact budget, a configuration that names nothing. Any makes the run
+/// incomplete; there is no other kind of output beside the findings.
+errors: []const RunError = &.{},
 suppressed: usize,
 /// How many suppressions matched no finding.
 stale_suppressions: usize,
@@ -24,9 +27,6 @@ metrics: ?Metrics = null,
 seams: []const SeamCount = &.{},
 /// Each test input entry (`Config.test_inputs`), with how many files it holds.
 test_inputs: []const TestInputCount = &.{},
-/// How many files had an import no module mapping names: a partial map, on which every count
-/// depends.
-unmapped_import_files: usize = 0,
 
 /// A seam, where it is and why, the sites it held per rule, and whether it is stale: its rules
 /// all ran and it held none.
@@ -65,15 +65,11 @@ pub const Metrics = struct {
         /// Functions whose own body makes at least one assertion call.
         asserted: u32 = 0,
         assertions: [std.meta.tags(Kind).len]u32 = @splat(0),
-        /// Calls spelled `assert`, `invariant`, `pre`, `post`, `never` or `debugCheck` whose
-        /// callee does not resolve: assertions the counts above may miss.
-        unresolved: u32 = 0,
 
         pub fn add(self: *Counts, other: Counts) void {
             self.functions += other.functions;
             self.asserted += other.asserted;
             for (&self.assertions, other.assertions) |*sum, n| sum.* += n;
-            self.unresolved += other.unresolved;
         }
         pub fn total(self: Counts) u32 {
             var sum: u32 = 0;
@@ -108,15 +104,8 @@ pub const Edit = struct {
     /// share otherwise is made once.
     nests: bool = false,
 };
-pub const Coverage = struct {
-    file: Project.FileId,
-    rule: ?rules.Rule = null,
-    rule_name: []const u8 = "",
-    start: u32 = 0,
-    reason: Reason,
-    detail: []const u8 = "",
-    pub const Reason = enum { parsed, invalid_syntax, invalid_lowering, budget_exhausted, unresolved, unsupported };
-};
+/// A run error, and the file it is of where it is one file's.
+pub const RunError = struct { file: ?Project.FileId = null, why: []const u8 };
 /// A suppression that suppressed nothing: a rule it names that ran, and its comment's site.
 pub const Stale = struct { name: []const u8, span: Span };
 pub const Malformed = struct { why: []const u8, span: Span };
@@ -137,9 +126,9 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
                 diagnostic.span.line, diagnostic.span.column,
                 diagnostic.message,
             });
-            for (self.coverage) |coverage| if (coverage.reason != .parsed) {
-                try writer.print("coverage: {s}: {s}: {s}\n", .{ project.at(coverage.file).input.name, @tagName(coverage.reason), coverage.detail });
-            };
+            for (self.errors) |run_error| if (run_error.file) |file| {
+                try writer.print("error: {s}: {s}\n", .{ project.at(file).input.name, run_error.why });
+            } else try writer.print("error: {s}\n", .{run_error.why});
             for (self.stale) |stale| try writer.print("suppression: {s}:{d}:{d}: {s} suppresses nothing\n", .{ project.at(stale.span.file).input.name, stale.span.line, stale.span.column, stale.name });
             for (self.malformed) |entry| try writer.print("suppression: {s}:{d}:{d}: malformed: {s}\n", .{ project.at(entry.span.file).input.name, entry.span.line, entry.span.column, entry.why });
             for (self.seams) |seam| {
@@ -148,7 +137,6 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
                 try writer.writeAll(if (seam.stale) " (stale: it holds no site)\n" else "\n");
             }
             for (self.test_inputs) |entry| try writer.print("test inputs: {s}: {d} files{s}\n", .{ entry.pattern, entry.files, if (entry.files == 0) " (stale)" else "" });
-            if (self.unmapped_import_files != 0) try writer.print("module map: {d} files import a module no mapping names; the counts above depend on it\n", .{self.unmapped_import_files});
             if (self.metrics) |metrics| try textMetrics(writer, metrics);
         },
         .json => {
@@ -167,16 +155,15 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
                 if (i != 0) try writer.writeByte(',');
                 try jsonDiagnostic(writer, project, d); // safe: enum identities index their owning frozen tables without narrowing.
             }
-            try writer.writeAll("],\"coverage\":[");
-            for (self.coverage, 0..) |c, i| {
+            try writer.writeAll("],\"errors\":[");
+            for (self.errors, 0..) |e, i| {
                 if (i != 0) try writer.writeByte(',');
-                try std.json.Stringify.value(.{ .source = project.at(c.file).input.name, .rule = if (c.rule == null) @as(?[]const u8, null) else c.rule_name, .start = c.start, .reason = c.reason, .detail = c.detail }, .{}, writer);
+                try std.json.Stringify.value(.{ .source = if (e.file) |file| project.at(file).input.name else null, .why = e.why }, .{}, writer);
             }
             try writer.writeAll("],\"seams\":");
             try std.json.Stringify.value(self.seams, .{}, writer);
             try writer.writeAll(",\"test_inputs\":");
             try std.json.Stringify.value(self.test_inputs, .{}, writer);
-            try writer.print(",\"unmapped_import_files\":{d}", .{self.unmapped_import_files});
             if (self.metrics) |metrics| {
                 try writer.writeAll(",\"metrics\":{");
                 try jsonCounts(writer, metrics.total);
@@ -204,11 +191,11 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
                 if (i != 0) try writer.writeByte(',');
                 try std.json.Stringify.value(.{ .file = @backingInt(stale.span.file), .rule = stale.name, .start = stale.span.start, .line = stale.span.line, .column = stale.span.column }, .{}, writer);
             }
-            try writer.writeAll("],\"coverage\":");
+            try writer.writeAll("],\"errors\":");
             try writer.writeByte('[');
-            for (self.coverage, 0..) |c, i| {
+            for (self.errors, 0..) |e, i| {
                 if (i != 0) try writer.writeByte(',');
-                try std.json.Stringify.value(.{ .file = @backingInt(c.file), .rule = if (c.rule == null) @as(?[]const u8, null) else c.rule_name, .start = c.start, .reason = c.reason, .detail = c.detail }, .{}, writer); // safe: explicit nullable metadata representation, without narrowing.
+                try std.json.Stringify.value(.{ .file = if (e.file) |file| @as(?u32, @backingInt(file)) else null, .why = e.why }, .{}, writer);
             }
             try writer.writeByte(']');
             try writer.writeAll("}}]}\n");
@@ -225,12 +212,11 @@ fn textMetrics(writer: *std.Io.Writer, metrics: Metrics) std.Io.Writer.Error!voi
         first = false;
     };
     if (!first) try writer.writeByte(')');
-    if (t.unresolved != 0) try writer.print(", {d} assertion-like calls unresolved", .{t.unresolved});
     try writer.writeByte('\n');
 }
 
 fn jsonCounts(writer: *std.Io.Writer, counts: Metrics.Counts) std.Io.Writer.Error!void {
-    try writer.print("\"functions\":{d},\"asserted\":{d},\"unresolved\":{d},\"assertions\":{{", .{ counts.functions, counts.asserted, counts.unresolved });
+    try writer.print("\"functions\":{d},\"asserted\":{d},\"assertions\":{{", .{ counts.functions, counts.asserted });
     for (std.meta.tags(Metrics.Kind), counts.assertions, 0..) |kind, n, i| try writer.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", kind.label(), n });
     try writer.writeByte('}');
 }

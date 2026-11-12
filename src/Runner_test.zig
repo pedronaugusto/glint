@@ -3,7 +3,26 @@ const std = @import("std");
 const glint = @import("glint");
 
 fn check(rule: glint.Rule, source: []const u8, expected: usize) !void {
-    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "fixture", .stem = "Fixture", .bytes = source }}, &.{}, .{});
+    // Each module the fixture imports by name is an empty file of the run: an import no mapping
+    // names stops it, and these fixtures read what a module's name gives, not what it holds.
+    var inputs: std.ArrayList(glint.Project.Input) = .empty;
+    defer inputs.deinit(std.testing.allocator);
+    var imports: std.ArrayList(glint.Project.Import) = .empty;
+    defer imports.deinit(std.testing.allocator);
+    try inputs.append(std.testing.allocator, .{ .name = "fixture", .stem = "Fixture", .bytes = source });
+    var rest = source;
+    while (std.mem.find(u8, rest, "@import(\"")) |at| {
+        rest = rest[at + "@import(\"".len ..];
+        const name = rest[0 .. std.mem.findScalar(u8, rest, '"') orelse break];
+        if (std.mem.endsWith(u8, name, ".zig") or std.mem.endsWith(u8, name, ".zon") or std.mem.eql(u8, name, "builtin") or std.mem.eql(u8, name, "std")) continue;
+        const known = for (imports.items) |each| {
+            if (std.mem.eql(u8, each.spelling, name)) break true;
+        } else false;
+        if (known) continue;
+        try imports.append(std.testing.allocator, .{ .from = 0, .spelling = name, .target = inputs.items.len });
+        try inputs.append(std.testing.allocator, .{ .name = name, .bytes = "", .selected = false });
+    }
+    var project = try glint.Project.init(std.testing.allocator, inputs.items, imports.items, .{});
     defer project.deinit();
     var config = glint.Config.none();
     config.set(rule, true);
@@ -129,9 +148,7 @@ test "each file's analysis has its own fact budget" {
     defer three.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &three, config, .{});
     defer report.deinit();
-    for (report.coverage) |item| if (item.reason == .budget_exhausted) {
-        try std.testing.expectEqual(three.sources[0].id, item.file);
-    };
+    for (report.errors) |item| try std.testing.expectEqual(three.sources[0].id, item.file.?);
 }
 
 test "compatibility suppression rejects multiple distinct binding sites" {
@@ -310,11 +327,10 @@ test "Z016 reads std's assert by meaning: a choice of callees one of which is it
     defer no_assert.deinit();
     try std.testing.expectEqual(@as(usize, 0), no_assert.diagnostics.len); // safe: expected count fits usize.
     try std.testing.expect(no_assert.complete);
-    // A callee that may be any function, named as std's assert is: silent, no undecided.
+    // A callee that may be any function, named as std's assert is: silent.
     var unknown = try withStd(.Z016, "pub fn f(a: bool, b: bool, g: anytype) void { g.assert(a and b); }");
     defer unknown.deinit();
     try std.testing.expectEqual(@as(usize, 0), unknown.diagnostics.len); // safe: expected count fits usize.
-    for (unknown.coverage) |item| try std.testing.expect(item.rule != glint.Rule.Z016);
 }
 
 test "an import of Zig's own builtin is no file glint lacks; a missing one is" {
@@ -327,12 +343,8 @@ test "an import of Zig's own builtin is no file glint lacks; a missing one is" {
         var report = try glint.run(std.testing.allocator, &project, config);
         defer report.deinit();
         try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: expected count fits usize.
-        // The file notes of imports that do not resolve: no rule's, unresolved.
-        var imports: usize = 0;
-        for (report.coverage) |item| {
-            if (item.rule == null and item.reason == .unresolved) imports += 1;
-        }
-        try std.testing.expectEqual(each[1], imports);
+        // An import that does not resolve stops the run.
+        try std.testing.expectEqual(each[1], report.errors.len);
     }
 }
 
@@ -443,7 +455,6 @@ test "D001 withholds a file with a computed @field name, and writes no coverage"
     var report = try glint.run(std.testing.allocator, &project, config);
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: the computed name withholds the file.
-    for (report.coverage) |item| if (item.rule) |rule| try std.testing.expect(rule != .D001);
 }
 
 test "G2 function length follows configured code policy" {
@@ -624,20 +635,15 @@ test "P006 binds an external symbol, the program's own declaration of it too" {
     try std.testing.expectEqual(@as(usize, 2), report.diagnostics.len); // safe: fixture sites counted by hand.
 }
 
-test "P006 leaves a governed name it cannot resolve undecided, and other names alone" {
+test "P006 reports a governed name it cannot resolve, a ban's reading, and leaves other names alone" {
     var report = try ownershipRun(
         \\pub const Kind = enum { sync, close };
         \\pub const Op = union(enum) { sync, read: u32 };
         \\pub fn a(f: anytype) void { f.sync(); f.flush(); }
     , &durability);
     defer report.deinit();
-    try std.testing.expect(!report.complete);
-    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: nothing resolved.
-    var undecided: usize = 0;
-    for (report.coverage) |note| if (note.rule != null and note.rule.? == .P006) {
-        undecided += 1;
-    };
-    try std.testing.expectEqual(@as(usize, 1), undecided); // safe: only `sync` is a governed name.
+    try std.testing.expect(report.complete);
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: only `sync` is a governed name.
 }
 
 test "P006 production scope leaves test code out" {
@@ -719,7 +725,7 @@ test "Z013 reads @field's literal name as a use and @hasDecl's as none" {
 
 test "Z013 withholds a file's reports where a @field name is computed, and stays complete" {
     const bytes = "const Self = @This(); const dep = @import(\"dep\"); pub fn run(comptime name: []const u8) void { _ = @field(Self, name); }";
-    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = bytes }}, &.{}, .{});
+    var project = try glint.Project.init(std.testing.allocator, &.{ .{ .name = "root", .bytes = bytes }, .{ .name = "dep", .bytes = "", .selected = false } }, &.{.{ .from = 0, .spelling = "dep", .target = 1 }}, .{});
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = .Z013, .level = .gate }} }, .{});
     defer report.deinit();
@@ -768,11 +774,10 @@ test "metrics count assertion calls by the declaration their callee resolves to"
     try std.testing.expectEqual(@as(u32, 2), t.asserted); // safe: expected count fits u32.
     try std.testing.expectEqual(@as(u32, 3), t.assertions[@backingInt(glint.Report.Metrics.Kind.std_assert)]); // safe: a kind indexes its own count table.
     try std.testing.expectEqual(@as(u32, 2), t.assertions[@backingInt(glint.Report.Metrics.Kind.replacement)]); // safe: a kind indexes its own count table.
-    try std.testing.expectEqual(@as(u32, 1), t.unresolved); // safe: expected count fits u32.
     var text: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer text.deinit();
     try report.write(&text.writer, &project, .text);
-    try std.testing.expect(std.mem.find(u8, text.written(), "metrics: 1 files, 5 functions, 2 with an assertion, 5 assertions (std.debug.assert 3, its replacements 2), 1 assertion-like calls unresolved\n") != null);
+    try std.testing.expect(std.mem.find(u8, text.written(), "metrics: 1 files, 5 functions, 2 with an assertion, 5 assertions (std.debug.assert 3, its replacements 2)\n") != null);
 }
 
 test "P006 decides an unresolved receiver by what Zig allows at the site" {
@@ -783,13 +788,8 @@ test "P006 decides an unresolved receiver by what Zig allows at the site" {
         \\pub fn b(db: anytype) void { db.file().sync(); }
     , &durability);
     defer report.deinit();
-    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: nothing resolved.
-    var undecided: usize = 0;
-    for (report.coverage) |note| if (note.rule != null and note.rule.? == .P006) {
-        undecided += 1;
-    };
-    // `db.file().sync()` may be File.sync: it stays undecided.
-    try std.testing.expectEqual(@as(usize, 1), undecided); // safe: one site cannot be refuted.
+    // `db.file().sync()` may be File.sync: a ban reports what it cannot refute.
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: one site cannot be refuted.
 }
 
 test "review Z006 accepts a name a generic reads on its type parameter that an outside type declares" {
@@ -912,7 +912,7 @@ test "a test input entry counts the inputs it holds, the first entry holding one
     try std.testing.expectEqual(@as(usize, 0), report.test_inputs[2].files); // safe: no input under test/.
 }
 
-test "the report counts the files with an import no module mapping names, each file once" {
+test "an import no mapping names stops the run, named at its file; Zig's own builtin is none" {
     var project = try glint.Project.init(std.testing.allocator, &.{
         .{ .name = "one.zig", .bytes = "const lib = @import(\"lib\"); const other = @import(\"other\"); pub fn f() void { _ = lib; _ = other; }" },
         .{ .name = "two.zig", .bytes = "const lib = @import(\"lib\"); pub fn g() void { _ = lib; }" },
@@ -923,5 +923,8 @@ test "the report counts the files with an import no module mapping names, each f
     config.set(.Z012, true);
     var report = try glint.run(std.testing.allocator, &project, config);
     defer report.deinit();
-    try std.testing.expectEqual(@as(usize, 2), report.unmapped_import_files); // safe: one.zig and two.zig; Zig's own builtin is no mapping's.
+    // Each import no mapping names stops the run, at its file: one.zig's two and two.zig's one;
+    // Zig's own builtin is no file glint lacks.
+    try std.testing.expectEqual(@as(usize, 3), report.errors.len); // safe: fixture imports counted by hand.
+    try std.testing.expect(!report.complete);
 }

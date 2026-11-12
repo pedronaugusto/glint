@@ -16,7 +16,7 @@ const Ast = std.zig.Ast;
 /// parameter) or what a reached type function returns. Two names are one integer when their
 /// types resolve to it, or are spelled the same and are an integer whatever a build chooses
 /// (`const Id = if (wide) u64 else u32`); a type that does not resolve, or a choice that may
-/// meet the other's, is undecided.
+/// meet the other's, is a finding: it cannot be shown to be another.
 pub fn check(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
@@ -52,7 +52,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         }
         const pair = meet(names.items, kinds.items) orelse continue;
         if (pair.same == .maybe) {
-            try c.undecided(rule, tree.tokenStart(pair.second), .unresolved, try c.allocator.print("fields '{s}' and '{s}' identify, and their types may be one integer: one may be stored for the other", .{ tree.tokenSlice(pair.first), tree.tokenSlice(pair.second) }));
+            try c.at(rule, pair.second, try c.allocator.print("fields '{s}' and '{s}' identify, and their types may be one integer: one may be stored for the other", .{ tree.tokenSlice(pair.first), tree.tokenSlice(pair.second) }));
             continue;
         }
         try c.at(rule, pair.second, try c.allocator.print("fields '{s}' and '{s}' are both {s} that identify: one may be stored for the other; a distinct type for each (an enum, or a package's id type) keeps them apart", .{ tree.tokenSlice(pair.first), tree.tokenSlice(pair.second), pair.kind }));
@@ -74,7 +74,7 @@ fn signature(c: *Context, rule: Rule, tree: *const Ast, proto: Ast.full.FnProto,
         try kinds.append(c.allocator, kind);
     }
     const pair = meet(names.items, kinds.items) orelse return;
-    if (pair.same == .maybe) return c.undecided(rule, tree.tokenStart(at), .unresolved, try c.allocator.print("'{s}' and '{s}' identify, and their types may be one integer: one may be passed for the other", .{ tree.tokenSlice(pair.first), tree.tokenSlice(pair.second) }));
+    if (pair.same == .maybe) return c.at(rule, at, try c.allocator.print("'{s}' and '{s}' identify, and their types may be one integer: one may be passed for the other", .{ tree.tokenSlice(pair.first), tree.tokenSlice(pair.second) }));
     try c.at(rule, at, try c.allocator.print("'{s}' and '{s}' are both {s} that identify: one may be passed for the other; a distinct type for each (an enum, or a package's id type) keeps them apart", .{ tree.tokenSlice(pair.first), tree.tokenSlice(pair.second), pair.kind }));
 }
 

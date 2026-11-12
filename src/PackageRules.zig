@@ -108,7 +108,7 @@ pub const Reference = union(enum) {
     /// The declaration, a member of a type function's returned container included: a call
     /// matches it by declaration in any instantiation (`Facts.calls`), never by its name.
     decl: Facts.Decl,
-    /// It does not resolve: in a consumer the rules that need it are undecided; in the
+    /// It does not resolve: in a consumer a ban reports what spells its name; in the
     /// declaring package it is drift.
     unresolved,
     /// It resolves outside the declaring package (std's aside for `.std`): a package declares

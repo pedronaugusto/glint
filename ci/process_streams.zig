@@ -7,7 +7,8 @@ const programs = @import("programs");
 const aegis = @import("aegis");
 
 /// A run that prints: a one-line coverage report over a file in the package.
-const arguments = [_][]const u8{ programs.glint, "--only", "Z026", "examples/report.zig" };
+// A finding, so the run writes something: a clean run writes nothing.
+const arguments = [_][]const u8{ programs.glint, "--only", "Z045", "examples/report.zig" };
 
 test "glint >> f keeps what f held and appends each run" {
     // Windows has no O_APPEND to match.

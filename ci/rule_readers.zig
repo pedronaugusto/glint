@@ -89,7 +89,7 @@ fn checkSwitches(context: *glint.RuleContext, list: []const Allowed) glint.RuleC
         };
         switch (each.what) {
             .read => |message| try context.at(value_switches, tree.nodeMainToken(each.node), message),
-            .undecided => |why| try context.unknown(value_switches, each.node, why),
+            .undecided => |why| try context.at(value_switches, tree.nodeMainToken(each.node), try context.allocator.print("cannot be shown to read no value of a rule's own ({t})", .{why})),
         }
     }
     for (list, used) |entry, use| if (inFile(name, entry.file) and !use) {
@@ -190,7 +190,7 @@ fn checkTables(context: *glint.RuleContext, list: []const Allowed) glint.RuleCon
                 .no => {},
                 .yes => break each[0],
                 .unknown => |why| {
-                    try context.unknown(name_tables, node, why);
+                    try context.at(name_tables, tree.nodeMainToken(node), try context.allocator.print("cannot be shown to be no table of names ({t})", .{why}));
                     continue :nodes;
                 },
             }
@@ -276,7 +276,7 @@ fn check(context: *glint.RuleContext, list: []const Allowed) glint.RuleContext.E
     }
     for (misread.items) |each| switch (each.what) {
         .read => |message| try context.at(rule_readers, tree.nodeMainToken(each.node), message),
-        .undecided => |why| try context.unknown(rule_readers, each.node, why),
+        .undecided => |why| try context.at(rule_readers, tree.nodeMainToken(each.node), try context.allocator.print("cannot be shown to read no name of a rule's own ({t})", .{why})),
     };
     const used = try context.allocator.alloc(bool, list.len);
     @memset(used, false);
@@ -288,7 +288,7 @@ fn check(context: *glint.RuleContext, list: []const Allowed) glint.RuleContext.E
         };
         switch (each.what) {
             .read => |message| try context.at(rule_readers, tree.nodeMainToken(each.node), message),
-            .undecided => |why| try context.unknown(rule_readers, each.node, why),
+            .undecided => |why| try context.at(rule_readers, tree.nodeMainToken(each.node), try context.allocator.print("cannot be shown to read no name of a rule's own ({t})", .{why})),
         }
     }
     for (list, used) |entry, use| if (inFile(name, entry.file) and !use) {

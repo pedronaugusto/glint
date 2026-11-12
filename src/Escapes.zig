@@ -49,8 +49,9 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         if (stored) |target| if (try self.restored(function, target, node)) continue;
         const local = switch (reached) {
             .none => unreachable, // unreachable: left above
+            // A ban that cannot show the pointer stays out of the frame reports it.
             .unknown => |why| {
-                try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(operand)), why.reason, why.detail);
+                try c.at(rule, tree.nodeMainToken(operand), try c.allocator.print("cannot be shown not to point into the frame the return frees: {s}", .{why.detail}));
                 continue;
             },
             .local => |d| d,
@@ -69,7 +70,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
 const Reached = union(enum) {
     local: Model.Declaration.Id,
     none,
-    unknown: struct { reason: @import("Report.zig").Coverage.Reason, detail: []const u8 },
+    unknown: struct { detail: []const u8 },
 };
 
 const Walk = struct {
@@ -123,12 +124,12 @@ const Walk = struct {
     fn escaping(self: Walk, written: Ast.Node.Index, function: Ast.Node.Index, depth: u8) Context.Error!Reached {
         const tree = self.tree;
         const node = Facts.ungrouped(tree, written);
-        if (depth > 8) return .{ .unknown = .{ .reason = .budget_exhausted, .detail = "a pointer followed through more aliases than are read may point into a local the return frees" } };
+        if (depth > 8) return .{ .unknown = .{ .detail = "a pointer followed through more aliases than are read may point into a local the return frees" } };
         // A value carried or chosen (`.?`, `try`, both sides of `orelse` and `catch`, an `if`'s
         // or a `switch`'s results, a labeled block's `break`s, `@as`): each value it may give.
         switch (try Facts.accesses.valuesOf(self.c.facts, self.c.file, node)) {
             .leaves => |leaves| if (leaves.len != 1 or leaves[0] != node) return self.first(leaves, function, depth + 1),
-            .unknown => |why| return .{ .unknown = .{ .reason = if (why == .budget) .budget_exhausted else .unresolved, .detail = "a value whose possible values are not read may point into a local the return frees" } },
+            .unknown => return .{ .unknown = .{ .detail = "a value whose possible values are not read may point into a local the return frees" } },
         }
         switch (tree.nodeTag(node)) {
             .address_of => return self.addressOf(tree.nodeData(node).node, function, depth),
@@ -142,7 +143,7 @@ const Walk = struct {
                 // a slice of itself (`s = s[1..]`), which holds no memory it did not.
                 if (try self.c.facts.holdsNoAddress(try self.typeOf(d))) return .none;
                 const given = (try self.c.facts.givenTo(.{ .file = self.c.file, .index = d }, true)) orelse
-                    return .{ .unknown = .{ .reason = .unresolved, .detail = "a pointer named by a local given a value no store here shows (its address taken, its bytes written) may point into a local the return frees" } };
+                    return .{ .unknown = .{ .detail = "a pointer named by a local given a value no store here shows (its address taken, its bytes written) may point into a local the return frees" } };
                 var others: std.ArrayList(Facts.Key) = .empty;
                 for (given) |each| if (!try self.slicesItself(each.node, d)) try others.append(self.c.allocator, each);
                 return self.first(others.items, function, depth + 1);
@@ -166,7 +167,7 @@ const Walk = struct {
                 // A value that holds no pointer (`[4]u8` returned whole) points nowhere.
                 if (try self.c.facts.holdsNoAddress(try self.typeOf(d))) return .none;
                 const given = (try self.c.facts.givenTo(.{ .file = self.c.file, .index = d }, true)) orelse
-                    return .{ .unknown = .{ .reason = .unresolved, .detail = "a pointer named by a local given a value no store here shows (its address taken, its bytes written) may point into a local the return frees" } };
+                    return .{ .unknown = .{ .detail = "a pointer named by a local given a value no store here shows (its address taken, its bytes written) may point into a local the return frees" } };
                 return self.first(given, function, depth + 1);
             },
             // A pointer moved by a number points into the memory it did (`p + 1`); a difference
@@ -226,7 +227,7 @@ const Walk = struct {
         if (pointer or unknown) out = try self.escaping(source, function, depth);
         if (out == .local) return out;
         if (holder or unknown) switch (try self.addressOf(source, function, depth)) {
-            .local => |d| return if (holder) .{ .local = d } else .{ .unknown = .{ .reason = .unresolved, .detail = "a pointer capture of a local whose type is not known may point into the local the return frees" } },
+            .local => |d| return if (holder) .{ .local = d } else .{ .unknown = .{ .detail = "a pointer capture of a local whose type is not known may point into the local the return frees" } },
             .unknown => |why| out = .{ .unknown = why },
             .none => {},
         };

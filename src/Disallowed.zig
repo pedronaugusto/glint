@@ -21,11 +21,15 @@ pub fn check(self: *Context) Context.Error!void {
     }
     const configured = try Governed.resolve(self, .P006, targets.items, indexes.items);
     var sites: std.ArrayList(Governed.Site) = .empty;
-    try Governed.sites(self, .P006, configured, &sites);
+    var unread: std.ArrayList(Governed.Unread) = .empty;
+    try Governed.sitesLeaving(self, configured, &sites, &unread);
     for (sites.items) |site| {
         const entry = self.config.disallowed[site.index];
         try self.atDefinition(.P006, site.token, try self.allocator.print("disallowed declaration: {s}; use {s}", .{ entry.reason, entry.replacement }), site.decl);
     }
+    // A ban: a reference spelling a disallowed name that does not resolve cannot be shown to be another.
+    const tree = &self.project.at(self.file).file.tree;
+    for (unread.items) |missed| try self.at(.P006, tree.firstToken(missed.node), try self.allocator.print("a reference spelling a disallowed declaration does not resolve ({t}), so it cannot be shown to be another", .{missed.why}));
 }
 
 /// Whether `package` is one of the entry's owners. An unknown package owns nothing.

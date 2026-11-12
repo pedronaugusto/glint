@@ -76,7 +76,7 @@ pub fn check(c: *Context, definition: Rule.Definition) Context.Error!void {
     }
     var sites: std.ArrayList(Governed.Site) = .empty;
     var unread: std.ArrayList(Governed.Unread) = .empty;
-    try Governed.sitesLeaving(c, definition.id, governed.items, &sites, &unread);
+    try Governed.sitesLeaving(c, governed.items, &sites, &unread);
     for (sites.items) |site| {
         const entry = all[site.index];
         if (!try applies(c, entry, site.node)) continue;
@@ -200,7 +200,7 @@ pub fn debugPrints(c: *Context) Context.Error!void {
     const found = try Governed.resolve(c, .P005, &.{.{ .source = "std", .declaration = "debug.print", .production = true }}, &.{0});
     var sites: std.ArrayList(Governed.Site) = .empty;
     var unread: std.ArrayList(Governed.Unread) = .empty;
-    try Governed.sitesLeaving(c, .P005, found, &sites, &unread);
+    try Governed.sitesLeaving(c, found, &sites, &unread);
     for (sites.items) |site| try c.atDefinition(.P005, site.token, "production debug print; use the program's output or logging", site.decl);
 }
 

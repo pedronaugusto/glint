@@ -4,7 +4,7 @@
 //! through aliases, a member of every alternative of a per-build choice, `@field` with a written
 //! name. Any reference to a declaration spells its name, and an alias spells it where it is
 //! made, so only sites spelling a governed name are resolved; one that does not resolve is
-//! undecided, never passed. P006 reads a project's policy through it; the aegis pack's danger
+//! the caller's to judge, never passed. P006 reads a project's policy through it; the aegis pack's danger
 //! rules read the std declarations their predicates name.
 const std = @import("std");
 const Context = @import("RuleContext.zig");
@@ -49,7 +49,7 @@ pub const Site = struct {
 };
 
 /// Each target's declarations in this project. A source nothing names, or a path that does not
-/// resolve, leaves the run undecided for `rule`: a policy that cannot be read is not a policy
+/// resolve, stops the run (`RuleContext.refuse`): a policy that cannot be read is not a policy
 /// that passed. A module no file imports is one nothing here can reach.
 pub fn resolve(self: *Context, rule: Rule, targets: []const Target, indexes: []const usize) Context.Error![]const Governed {
     var kept: std.ArrayList(Governed) = .empty;
@@ -69,13 +69,13 @@ pub fn resolve(self: *Context, rule: Rule, targets: []const Target, indexes: []c
             try roots.append(self.allocator, each.id);
         };
         if (roots.items.len == 0) {
-            if (!module) try self.undecided(rule, 0, .unresolved, "governed declaration source is not a project input");
+            if (!module) try self.refuse(try self.allocator.print("{s}: a declaration the configuration names in `{s}`, which is no input of the run", .{ @tagName(rule), source }));
             continue;
         }
         g.decls = switch (try walk(self, roots.items, target.declaration, module)) {
             .decls => |decls| decls,
             .none, .unknown => {
-                try self.undecided(rule, 0, .unresolved, try self.allocator.print("governed declaration {s}.{s} could not be resolved", .{ source, target.declaration }));
+                try self.refuse(try self.allocator.print("{s}: `{s}.{s}`, which the configuration names, does not resolve", .{ @tagName(rule), source, target.declaration }));
                 continue;
             },
         };
@@ -154,18 +154,13 @@ fn moduleRoots(self: *Context, source: []const u8) Context.Error![]const Project
     return roots.items;
 }
 
-/// Every reference in the checked file that reaches a governed declaration, into `out`; a
-/// reference spelling a governed name that does not resolve is undecided for `rule`.
-pub fn sites(self: *Context, rule: Rule, governed: []const Governed, out: *std.ArrayList(Site)) Context.Error!void {
-    return sitesLeaving(self, rule, governed, out, null);
-}
-
 /// A reference spelling a governed name that does not resolve, and why.
 pub const Unread = struct { node: Ast.Node.Index, why: Facts.Unknown };
 
-/// `sites`, a reference that does not resolve given to `unread` where there is one, for the
-/// caller to judge, instead of undecided.
-pub fn sitesLeaving(self: *Context, rule: Rule, governed: []const Governed, out: *std.ArrayList(Site), unread: ?*std.ArrayList(Unread)) Context.Error!void {
+/// Every reference in the checked file that reaches a governed declaration, into `out`; a
+/// reference spelling a governed name that does not resolve into `unread`, for the caller to
+/// judge: under a ban a finding, under hygiene nothing.
+pub fn sitesLeaving(self: *Context, governed: []const Governed, out: *std.ArrayList(Site), unread: *std.ArrayList(Unread)) Context.Error!void {
     if (governed.len == 0) return;
     // What each target is also called, by an alias whose own site this run does not report.
     const renamed = try self.allocator.alloc([]const []const u8, governed.len);
@@ -200,7 +195,7 @@ pub fn sitesLeaving(self: *Context, rule: Rule, governed: []const Governed, out:
                 }
                 // A name it ranges over or computes, or a holder only its result names
                 // (`@fieldParentPtr`): each governed name it may be.
-                try fieldSites(self, rule, governed, renamed, node, by, named, out, unread);
+                try fieldSites(self, governed, renamed, node, by, named, out, unread);
                 continue;
             },
             // A decl literal (`.fromMilliseconds(ms)`, `.zero`): a member of the type its place
@@ -211,7 +206,7 @@ pub fn sitesLeaving(self: *Context, rule: Rule, governed: []const Governed, out:
                 var buffer: [2]Ast.Node.Index = undefined;
                 if (tree.fullStructInit(&buffer, node)) |literal| for (literal.ast.fields) |value| {
                     const label = Model.initName(tree, value) orelse continue;
-                    try literalSite(self, rule, governed, renamed, node, value, label, out, unread);
+                    try literalSite(self, governed, renamed, node, value, label, out, unread);
                 };
                 continue;
             },
@@ -231,7 +226,7 @@ pub fn sitesLeaving(self: *Context, rule: Rule, governed: []const Governed, out:
                 // method of its own: the binding reaches one only through an alias its type
                 // declares, which is that alias's site.
                 if (why == .generic and tag == .field_access and methodCall(self, node) and free(self, governed, spelled)) continue;
-                if (unread) |list| try list.append(self.allocator, .{ .node = node, .why = why }) else try self.unknown(rule, node, why);
+                try unread.append(self.allocator, .{ .node = node, .why = why });
                 continue;
             },
             .decls => |decls| decls,
@@ -241,24 +236,22 @@ pub fn sitesLeaving(self: *Context, rule: Rule, governed: []const Governed, out:
     }
 }
 
-/// A reference that does not resolve: to `unread` where the caller gives one, to judge; else
-/// undecided.
-fn leave(self: *Context, rule: Rule, unread: ?*std.ArrayList(Unread), node: Ast.Node.Index, why: Facts.Unknown) Context.Error!void {
-    if (unread) |list| return list.append(self.allocator, .{ .node = node, .why = why });
-    return self.unknown(rule, node, why);
+/// A reference that does not resolve, for the caller to judge.
+fn leave(self: *Context, unread: *std.ArrayList(Unread), node: Ast.Node.Index, why: Facts.Unknown) Context.Error!void {
+    return unread.append(self.allocator, .{ .node = node, .why = why });
 }
 
 /// A literal field's name spelling a governed member: a site where the literal's type has it.
-fn literalSite(self: *Context, rule: Rule, governed: []const Governed, renamed: []const []const []const u8, literal: Ast.Node.Index, value: Ast.Node.Index, label: Ast.TokenIndex, out: *std.ArrayList(Site), unread: ?*std.ArrayList(Unread)) Context.Error!void {
+fn literalSite(self: *Context, governed: []const Governed, renamed: []const []const []const u8, literal: Ast.Node.Index, value: Ast.Node.Index, label: Ast.TokenIndex, out: *std.ArrayList(Site), unread: *std.ArrayList(Unread)) Context.Error!void {
     const tree = &self.project.at(self.file).file.tree;
     const spelled = try Model.identifier(self.allocator, tree.tokenSlice(label));
     if (!spelledAny(self, governed, renamed, spelled, label)) return;
     switch (try self.facts.literalDeclaration(self.file, literal, spelled)) {
-        .unknown => |why| try leave(self, rule, unread, value, why),
+        .unknown => |why| try leave(self, unread, value, why),
         .none => {},
         .decl => |decl| switch (try paired(self, decl)) {
             .pair => |pair| try append(self, governed, renamed, label, value, spelled, &pair, out),
-            .unknown => |why| try leave(self, rule, unread, value, why),
+            .unknown => |why| try leave(self, unread, value, why),
         },
     }
 }
@@ -288,8 +281,8 @@ pub fn fieldHolder(self: *Context, node: Ast.Node.Index, by: FieldBuiltin) Conte
 
 /// A field builtin by a name it ranges over or computes, or by any name where only its result
 /// names its holder: each governed member its holder has that the name may be is a site; a
-/// holder that does not resolve is undecided where a governed name may be named.
-fn fieldSites(self: *Context, rule: Rule, governed: []const Governed, renamed: []const []const []const u8, node: Ast.Node.Index, by: FieldBuiltin, named: Facts.FieldName, out: *std.ArrayList(Site), unread: ?*std.ArrayList(Unread)) Context.Error!void {
+/// holder that does not resolve is the caller's to judge where a governed name may be named.
+fn fieldSites(self: *Context, governed: []const Governed, renamed: []const []const []const u8, node: Ast.Node.Index, by: FieldBuiltin, named: Facts.FieldName, out: *std.ArrayList(Site), unread: *std.ArrayList(Unread)) Context.Error!void {
     // A name of the fields or tags of the very type the holder is, or holds, is a field's or a
     // tag's: Zig forbids a declaration of one name with them in a container, so it reaches no
     // declaration, but it does reach a governed field among them.
@@ -306,15 +299,15 @@ fn fieldSites(self: *Context, rule: Rule, governed: []const Governed, renamed: [
         const aliases: []const []const u8 = if (own) &.{} else names;
         for ([_][]const []const u8{ &.{g.name}, aliases }) |list| for (list) |name| {
             if (!self.facts.mayName(named, name) or (self.inTest(site) and g.target.production)) continue;
-            if (value == .unknown) return leave(self, rule, unread, node, value.unknown);
+            if (value == .unknown) return leave(self, unread, node, value.unknown);
             var options: std.ArrayList(Facts.Container) = .empty;
             try containers(self, value, &options);
             for (options.items) |container| {
                 const decl = self.facts.member(container, name) orelse continue;
-                if (named == .computed) return self.undecided(rule, tree.tokenStart(site), .unresolved, "a name @field computes may name a governed declaration");
+                if (named == .computed) return leave(self, unread, node, .unresolved);
                 switch (try paired(self, decl)) {
                     .pair => |pair| try append(self, governed, renamed, site, node, name, &pair, out),
-                    .unknown => |why| return leave(self, rule, unread, node, why),
+                    .unknown => |why| return leave(self, unread, node, why),
                 }
             }
         };

@@ -121,7 +121,8 @@ fn semanticRows(gpa: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, roun
     }
     try row(writer, "warm_cross_module", elapsed(io, warm, small), rounds, 1);
     const source = "const unused = @import(\"unused\");";
-    var import_project = try glint.Project.init(gpa, &.{.{ .name = "private_import", .bytes = source }}, &.{}, .{});
+    // The import names a file of the run: one no mapping names would stop it.
+    var import_project = try glint.Project.init(gpa, &.{ .{ .name = "private_import", .bytes = source }, .{ .name = "unused", .bytes = "", .selected = false } }, &.{.{ .from = 0, .spelling = "unused", .target = 1 }}, .{});
     defer import_project.deinit();
     try writer.print("case=private_import bytes={d} files=1 rounds={d}\n", .{ source.len, rounds });
     const import_start = now(io, small);

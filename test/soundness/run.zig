@@ -2,10 +2,9 @@
 //! aegis real, every case its own program. The cases are judged on a pool of workers, each with
 //! its own store that reads each file once, and their verdicts read in case order, so a run's
 //! output is the same at any number of workers. A
-//! `hole.zig` must flag or be left undecided; a `twin.zig` must be clean. Undecided is any
-//! coverage glint writes of the case (std's note that its ZIR references are indexed in part
-//! aside, unless the budget cut it), a malformed suppression, or a run glint says is incomplete
-//! for nothing it wrote. The row is a
+//! `hole.zig` must flag or be refused; a `twin.zig` must be clean. Refused is a run error glint
+//! writes of the case (a file it cannot parse, an import no mapping names, a budget run out), a
+//! malformed suppression, or a run glint says is incomplete for nothing it wrote: never a pass. The row is a
 //! `Constructs.Row`: how the case moves the value its rule judges. A case's `glint.json` is the
 //! policy its rule reads (P006's disallowed declarations, A018's peer writers): its options
 //! alone, since the case's rule is the one that runs. A case's `before.zig` is a file the run
@@ -49,7 +48,7 @@ const Expected = struct {
 };
 
 const Role = enum { hole, twin };
-const Verdict = enum { flagged, undecided, clean };
+const Verdict = enum { flagged, refused, clean };
 
 /// A row's cases under one rule.
 const Cell = struct { holes: usize = 0, twins: usize = 0 };
@@ -169,7 +168,7 @@ pub fn main(init: std.process.Init) !void {
         };
         if (!passes) column.failing += 1;
         if (passes and job.listed) try w.print("{s}/{s}: passes now; take it off {s}/expected.zon's open list\n", .{ column.rule, job.path, column.rule });
-        if (!passes and !job.listed and compiles) try w.print("{s}/{s}: {t}, where a {t} must be {s}\n", .{ column.rule, job.path, verdict, job.role, if (job.role == .hole) "flagged or undecided" else "clean" });
+        if (!passes and !job.listed and compiles) try w.print("{s}/{s}: {t}, where a {t} must be {s}\n", .{ column.rule, job.path, verdict, job.role, if (job.role == .hole) "flagged or refused" else "clean" });
     }
 
     // The matrix: per cell its holes and twins, `.` where it has neither. Streaming, not
@@ -532,48 +531,35 @@ fn judge(gpa: std.mem.Allocator, io: std.Io, store: *glint.Project.Store, rule: 
 }
 
 /// What a run's text output and exit status say of the case: flagged where `rule` finds
-/// anything outside `before`; else undecided where glint writes coverage of any file but
-/// `before` (`--only` runs its rule at report level, where its coverage leaves the run
-/// complete), a malformed suppression, or, without `before`, says the run is incomplete
-/// (status 2); else clean.
+/// anything outside `before`; else refused where glint writes a run error of any file but
+/// `before`, a malformed suppression, or, without `before`, says the run is incomplete (status
+/// 2); else clean.
 fn verdictOf(output: []const u8, status: u8, rule: []const u8, before: ?[]const u8) Verdict {
     var verdict: Verdict = .clean;
     var lines = std.mem.splitScalar(u8, output, '\n');
     while (lines.next()) |line| {
-        if (before) |path| if (about(line, rule, path) or about(line, "coverage", path) or about(line, "suppression", path)) continue;
+        if (before) |path| if (about(line, rule, path) or about(line, "error", path) or about(line, "suppression", path)) continue;
         if (std.mem.startsWith(u8, line, rule) and std.mem.startsWith(u8, line[rule.len..], ": ")) return .flagged;
-        if ((std.mem.startsWith(u8, line, "coverage: ") or std.mem.startsWith(u8, line, "suppression: ")) and !note(line)) verdict = .undecided;
+        if (std.mem.startsWith(u8, line, "error: ")) verdict = .refused;
+        if (std.mem.startsWith(u8, line, "suppression: ") and !std.mem.endsWith(u8, line, " suppresses nothing")) verdict = .refused;
     }
     // An incomplete run no line explains is the case's, where no `before` is there to be it.
-    if (verdict == .clean and status == 2 and before == null) return .undecided;
+    if (verdict == .clean and status == 2 and before == null) return .refused;
     return verdict;
 }
 
-/// Whether `line` is a note that decides nothing: std's ZIR references indexed in part, which
-/// every parsed file gets (its budget cut short is no note), or a suppression that suppresses
-/// nothing.
-fn note(line: []const u8) bool {
-    if (std.mem.startsWith(u8, line, "suppression: ")) return std.mem.endsWith(u8, line, " suppresses nothing");
-    return std.mem.find(u8, line, ": unsupported: std-ZIR declaration references ") != null;
-}
-
-test "a case's verdict: any coverage of its files is undecided, std's note alone is not" {
-    const zir = "coverage: /s/case.zig: unsupported: std-ZIR declaration references are indexed only through supported structured bodies; lexical references are indexed separately\n";
-    const exhausted = "coverage: /s/case.zig: budget_exhausted: std-ZIR declaration references are indexed only through supported structured bodies; lexical references are indexed separately\n";
-    try std.testing.expectEqual(Verdict.clean, verdictOf(zir, 0, "A009", null));
-    try std.testing.expectEqual(Verdict.undecided, verdictOf(exhausted, 2, "A009", null));
-    try std.testing.expectEqual(Verdict.undecided, verdictOf("suppression: /s/case.zig:1:1: malformed: an aegis escape names the rules it covers\n", 2, "A009", null));
+test "a case's verdict: a run error of its files refuses it" {
+    try std.testing.expectEqual(Verdict.clean, verdictOf("", 0, "A009", null));
+    try std.testing.expectEqual(Verdict.refused, verdictOf("error: /s/case.zig: its analysis ran out of the fact budget\n", 2, "A009", null));
+    try std.testing.expectEqual(Verdict.refused, verdictOf("suppression: /s/case.zig:1:1: malformed: an aegis escape is read no more\n", 2, "A009", null));
     try std.testing.expectEqual(Verdict.clean, verdictOf("suppression: /s/case.zig:1:1: A009 suppresses nothing\n", 0, "A009", null));
-    // A rule at report level leaves the run complete with its coverage: still undecided.
-    try std.testing.expectEqual(Verdict.undecided, verdictOf("coverage: /s/case.zig: unsupported: cleanup/error exits require unsupported flow facts; no leak claimed\n" ++ zir, 0, "A003", null));
-    try std.testing.expectEqual(Verdict.undecided, verdictOf(zir, 2, "A009", null));
-    try std.testing.expectEqual(Verdict.flagged, verdictOf("A009: /s/case.zig:3:5: input used\ncoverage: /s/case.zig: unresolved: x\n", 2, "A009", null));
+    try std.testing.expectEqual(Verdict.refused, verdictOf("", 2, "A009", null));
+    try std.testing.expectEqual(Verdict.flagged, verdictOf("A009: /s/case.zig:3:5: input used\nerror: /s/case.zig: x\n", 2, "A009", null));
 }
 test "what a run says of before.zig alone is not the case's" {
     const before = "/s/before.zig";
-    const zir = "coverage: /s/case.zig: unsupported: std-ZIR declaration references are indexed only through supported structured bodies; lexical references are indexed separately\n";
-    try std.testing.expectEqual(Verdict.clean, verdictOf("A009: /s/before.zig:1:1: input used\ncoverage: /s/before.zig: budget_exhausted: semantic fact budget exhausted\n" ++ zir, 2, "A009", before));
-    try std.testing.expectEqual(Verdict.undecided, verdictOf("coverage: /s/before.zig: budget_exhausted: x\ncoverage: /s/case.zig: budget_exhausted: semantic fact budget exhausted\n", 2, "A009", before));
+    try std.testing.expectEqual(Verdict.clean, verdictOf("A009: /s/before.zig:1:1: input used\nerror: /s/before.zig: its analysis ran out of the fact budget\n", 2, "A009", before));
+    try std.testing.expectEqual(Verdict.refused, verdictOf("error: /s/before.zig: x\nerror: /s/case.zig: its analysis ran out of the fact budget\n", 2, "A009", before));
     try std.testing.expectEqual(Verdict.flagged, verdictOf("A009: /s/before.zig:1:1: input used\nA009: /s/case.zig:2:1: input used\n", 1, "A009", before));
 }
 
@@ -627,7 +613,7 @@ fn sortedEntries(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, sub: []const
     return names.items;
 }
 
-/// Whether `line` is `<kind>: <path>:...`, a finding or coverage line of the file at `path`.
+/// Whether `line` is `<kind>: <path>:...`, a finding or run error of the file at `path`.
 fn about(line: []const u8, kind: []const u8, path: []const u8) bool {
     if (!std.mem.startsWith(u8, line, kind) or !std.mem.startsWith(u8, line[kind.len..], ": ")) return false;
     const rest = line[kind.len + 2 ..];

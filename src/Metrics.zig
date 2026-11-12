@@ -1,7 +1,6 @@
 //! Assertion metrics: how many functions a file declares and the assertion calls in them, each
 //! counted by the declaration its callee resolves to (std's `debug.assert`, and each declaration a
-//! package's `lint_rules` names in its place, a `.with` of an entry replacing it), never by spelling. A call named like one whose callee does not resolve is counted
-//! apart. A report, never a proof or a gate: a count says nothing about what an assertion checks.
+//! package's `lint_rules` names in its place, a `.with` of an entry replacing it), never by spelling. A call whose callee does not resolve counts as none. A report, never a proof or a gate: a count says nothing about what an assertion checks.
 const std = @import("std");
 const Context = @import("RuleContext.zig");
 const Model = @import("Model.zig");
@@ -35,7 +34,7 @@ pub fn count(context: *Context) Context.Error!Counts {
         if (kind) |k| {
             counts.assertions[@backingInt(k)] += 1; // safe: a kind indexes its own count table.
             if (function(tree, model, node)) |f| asserted[@backingInt(f)] = true; // safe: the checked AST indexes its own node table.
-        } else if (value == .unknown and spelledLike(tree, call.ast.fn_expr)) counts.unresolved += 1;
+        }
     }
     for (asserted) |yes| {
         if (yes) counts.asserted += 1;
@@ -54,17 +53,6 @@ fn function(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Ast.No
         }
     }
     return null;
-}
-
-fn spelledLike(tree: *const Ast, callee: Ast.Node.Index) bool {
-    const token = switch (tree.nodeTag(callee)) {
-        .identifier => tree.nodeMainToken(callee),
-        .field_access => tree.nodeData(callee).node_and_token[1],
-        else => return false,
-    };
-    const name = tree.tokenSlice(token);
-    for ([_][]const u8{ "assert", "invariant", "pre", "post", "never", "debugCheck" }) |spelling| if (std.mem.eql(u8, name, spelling)) return true;
-    return false;
 }
 
 fn among(decls: []const Facts.Decl, decl: Facts.Decl) bool {

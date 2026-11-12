@@ -8,7 +8,7 @@ fn check(context: *glint.RuleContext) glint.RuleContext.Error!void {
 }
 fn uncertain(context: *glint.RuleContext) glint.RuleContext.Error!void {
     try check(context);
-    try context.undecided(own, 0, .unresolved, "generic target lacks a concrete operation contract");
+    try context.refuse("generic target lacks a concrete operation contract");
 }
 fn configuration(level: glint.Config.Level) glint.Config {
     return .{ .enabled = .empty, .selections = switch (level) {
@@ -76,7 +76,7 @@ test "G2 a finding is one per rule, site and cause, however many times its rule 
     try std.testing.expectEqual(@as(usize, 2), repeated.related.len); // safe: two distinct related places of three.
     try std.testing.expect(repeated.related[0].start != repeated.related[1].start);
 }
-test "G2 incomplete required project rule stays incomplete with every finding allowed" {
+test "G2 a project rule's run error leaves the run incomplete with every finding allowed" {
     var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "// glint-ignore: CUSTOM_API -- intentionally exported test contract\npub const allowed = 2;" }}, &.{}, .{});
     defer project.deinit();
     var modified = rule;
@@ -92,11 +92,11 @@ test "G2 incomplete required project rule stays incomplete with every finding al
         try report.write(&output.writer, &project, format);
         const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.written(), .{});
         defer parsed.deinit();
-        try std.testing.expect(std.mem.find(u8, output.written(), "CUSTOM_API") != null);
+        try std.testing.expect(std.mem.find(u8, output.written(), "generic target lacks a concrete operation contract") != null);
     }
-    try std.testing.expectEqualStrings("CUSTOM_API", report.coverage[report.coverage.len - 1].rule_name);
+    try std.testing.expectEqualStrings("generic target lacks a concrete operation contract", report.errors[report.errors.len - 1].why);
 }
-test "a project linter skips a suppression for a rule glint has that its run does not enable, counted in one coverage line; a rule glint does not have is malformed, and an enabled rule's unused suppression is stale" {
+test "a project linter skips a suppression for a rule glint has that its run does not enable; a rule glint does not have is malformed, and an enabled rule's unused suppression is stale" {
     // P007 and Z013 are off: neither suppression is judged.
     var inactive = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "pub fn f(buffer: []u8) void {\n    // glint-ignore: P007 -- read only below what it wrote\n    _ = buffer;\n    // glint-ignore: Z013 -- the deprecated name is kept for one release\n    _ = buffer;\n}\n" }}, &.{}, .{});
     defer inactive.deinit();
@@ -104,11 +104,6 @@ test "a project linter skips a suppression for a rule glint has that its run doe
     defer skipped.deinit();
     try std.testing.expectEqual(@as(usize, 0), skipped.malformed.len); // safe: no malformed comment.
     try std.testing.expectEqual(@as(usize, 0), skipped.stale_suppressions); // safe: a rule that does not run judges nothing.
-    var lines: usize = 0;
-    for (skipped.coverage) |item| if (std.mem.eql(u8, item.detail, "2 suppressions for rules this run does not enable")) {
-        lines += 1;
-    };
-    try std.testing.expectEqual(@as(usize, 1), lines); // safe: one line for the file's two.
     // A rule no core, pack or project has: malformed, as before.
     var unknown = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "pub fn f(buffer: []u8) void {\n    // glint-ignore: A999 -- read only below what it wrote\n    _ = buffer;\n}\n" }}, &.{}, .{});
     defer unknown.deinit();
@@ -140,7 +135,7 @@ test "G2 compiled rules reject missing definitions collisions and invalid spans"
     try std.testing.expectError(error.InvalidHandle, glint.runConfigured(std.testing.allocator, &project, configuration(.report), .{ .project_rules = &.{bad} }));
     const InvalidNode = struct {
         fn run(context: *glint.RuleContext) glint.RuleContext.Error!void {
-            try context.unknown(own, @fromBackingInt(1000), .unresolved); // safe: deliberately invalid frozen node for boundary rejection.
+            try context.at(own, 1_000_000, "outside source"); // safe: deliberately invalid token for boundary rejection.
         }
     };
     bad.check = InvalidNode.run;

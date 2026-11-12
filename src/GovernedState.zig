@@ -77,7 +77,7 @@ pub fn check(c: *Context, definition: Rule.Definition) Context.Error!void {
     }
     var sites: std.ArrayList(Governed.Site) = .empty;
     var unread: std.ArrayList(Governed.Unread) = .empty;
-    try Governed.sitesLeaving(c, definition.id, fields.items, &sites, &unread);
+    try Governed.sitesLeaving(c, fields.items, &sites, &unread);
     for (sites.items) |site| {
         if ((try reported.getOrPut(c.allocator, site.token)).found_existing) continue;
         const entry = all[site.index];

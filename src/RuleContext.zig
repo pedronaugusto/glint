@@ -37,7 +37,8 @@ pub fn keep(self: *RuleContext) std.mem.Allocator {
 /// the sink a callback is given with `@fieldParentPtr`.
 pub const Sink = struct {
     diagnostic: *const fn (*Sink, rules.Rule, u32, u32, []const u8, []const Report.Span, []const Report.Edit) Error!void,
-    coverage: *const fn (*Sink, Report.Coverage) Error!void,
+    /// A run error of the checked file: a configuration that names nothing there.
+    refuse: *const fn (*Sink, []const u8) Error!void,
     /// The configuration another selected file is checked with.
     config: *const fn (*Sink, Project.FileId) rules.Config,
     /// Whether a finding of the rule at the offset would be suppressed, asked without using
@@ -174,13 +175,6 @@ pub fn emitFixed(self: *RuleContext, rule: rules.Rule, start: u32, end: u32, mes
     // Rules may retain no temporary message storage in the report: the sink copies it.
     return self.sink.diagnostic(self.sink, rule, start, end, message, related, fix);
 }
-/// Required uncertainty cannot be suppressed into a completed gating run.
-pub fn undecided(self: *RuleContext, rule: rules.Rule, start: u32, reason: Report.Coverage.Reason, detail: []const u8) Error!void {
-    if (!self.config.has(rule)) return;
-    if (rules.definition(rule, self.definitions) == null) return error.InvalidSelection;
-    if (start > (try self.project.source(try self.source())).len) return error.InvalidHandle;
-    return self.sink.coverage(self.sink, .{ .file = self.file, .rule = rule, .start = start, .reason = reason, .detail = detail });
-}
 /// A site at `token` with its deterministic fix.
 pub fn fixedAt(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.TokenIndex, message: []const u8, fix: []const Report.Edit) Error!void {
     const tree = try self.project.syntax(try self.source());
@@ -201,10 +195,11 @@ pub fn suppressedAt(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.Tok
     if (token >= tree.tokens.len) return error.InvalidHandle;
     return self.sink.suppresses(self.sink, rule, tree.tokenStart(token));
 }
-pub fn unknown(self: *RuleContext, rule: rules.Rule, node: std.zig.Ast.Node.Index, reason: Facts.Unknown) Error!void {
-    const tree = try self.project.syntax(try self.source());
-    if (@backingInt(node) >= tree.nodes.len) return error.InvalidHandle; // safe: reject compiler node indexes outside the frozen source.
-    try self.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), if (reason == .budget) .budget_exhausted else .unresolved, @tagName(reason));
+/// Stops the run: what the configuration asks of the checked file names nothing in it (a stale
+/// function-length exception, a disallowed declaration that does not resolve). A site is a
+/// finding or nothing; a configuration that cannot be read is neither.
+pub fn refuse(self: *RuleContext, why: []const u8) Error!void {
+    return self.sink.refuse(self.sink, why);
 }
 /// Whether a token is test code: inside a `test` block, or in an input the caller classifies as a
 /// test. Nothing else is: a file only tests import, a private function only tests call and a fuzz

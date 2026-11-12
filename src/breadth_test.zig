@@ -87,11 +87,11 @@ pub const fixture_std =
     \\};
 ;
 
-/// What a run of one breadth rule over one file found (`run`): its findings' messages and
-/// whether it left anything undecided.
+/// What a run of one breadth rule over one file found (`run`): its findings' messages and any
+/// run error it raised.
 pub const Found = struct {
     messages: std.ArrayList([]const u8) = .empty,
-    undecided: usize = 0,
+    refused: usize = 0,
     fixes: std.ArrayList([]const u8) = .empty,
 
     pub fn deinit(self: *Found, gpa: std.mem.Allocator) void {
@@ -115,7 +115,7 @@ pub fn runWith(gpa: std.mem.Allocator, project: *const Project, file: Project.Fi
     const a = arena.allocator();
     var facts: Facts = .{ .project = project, .gpa = a, .backing = gpa };
     defer facts.deinit();
-    var sink: Context.Sink = .{ .diagnostic = Collect.diagnostic, .coverage = Collect.coverage, .config = Collect.configOf };
+    var sink: Context.Sink = .{ .diagnostic = Collect.diagnostic, .refuse = Collect.refuse, .config = Collect.configOf };
     var collector: Collect = .{ .gpa = gpa, .config = selected(base) };
     const before = collecting;
     collecting = &collector;
@@ -140,9 +140,9 @@ const Collect = struct {
         try self.found.messages.append(self.gpa, try self.gpa.dupe(u8, message));
         for (fix) |edit| try self.found.fixes.append(self.gpa, try self.gpa.dupe(u8, edit.text));
     }
-    fn coverage(_: *Context.Sink, _: Report.Coverage) Context.Error!void {
+    fn refuse(_: *Context.Sink, _: []const u8) Context.Error!void {
         const self = collecting orelse return;
-        self.found.undecided += 1;
+        self.found.refused += 1;
     }
     fn configOf(_: *Context.Sink, _: Project.FileId) rules.Config {
         const self = collecting orelse return selected(.none());
@@ -157,7 +157,7 @@ fn selected(base: rules.Config) rules.Config {
 }
 
 /// Runs `check` over `source` (with `fixture_std` as std) and expects `expected` findings and
-/// nothing undecided.
+/// no run error.
 pub fn expectFindings(comptime check: Check, source: []const u8, expected: usize) !void {
     return expectFindingsNamed(check, "fixture", source, expected);
 }
@@ -173,7 +173,7 @@ pub fn expectFindingsNamed(comptime check: Check, name: []const u8, source: []co
     var found = try run(gpa, &project, project.sources[0].id, check);
     defer found.deinit(gpa);
     try std.testing.expectEqual(expected, found.messages.items.len);
-    try std.testing.expectEqual(@as(usize, 0), found.undecided);
+    try std.testing.expectEqual(@as(usize, 0), found.refused);
 }
 
 /// As `expectFindings`, under `base`'s options (its limits).
@@ -187,7 +187,7 @@ pub fn expectFindingsWith(comptime check: Check, base: rules.Config, source: []c
     var found = try runWith(gpa, &project, project.sources[0].id, check, base);
     defer found.deinit(gpa);
     try std.testing.expectEqual(expected, found.messages.items.len);
-    try std.testing.expectEqual(@as(usize, 0), found.undecided);
+    try std.testing.expectEqual(@as(usize, 0), found.refused);
 }
 
 /// As `expectFindings`, and the fix edits' texts, in order, are `fixes`.

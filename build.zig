@@ -205,10 +205,11 @@ pub fn dev(b: *std.Build, tools: type) void {
     check.dependOn(&rule_readers.step);
     const helper_check = b.step("check-helper", "Verify the public helper's exact source and directory inputs");
     helper_check.dependOn(&project_smoke.step);
-    // The project linter on each test platform, over its own source, which its rule passes.
+    // The project linter on each test platform, over a file its rule passes, which imports
+    // nothing a run would have to map.
     const portable_smoke = b.addRunArtifact(project_linter);
-    portable_smoke.addArgs(&.{ "--only", "LOCAL_EXPORT", "examples/project.zig" });
-    portable_smoke.addFileInput(p.path("examples/project.zig"));
+    portable_smoke.addArgs(&.{ "--only", "LOCAL_EXPORT", "examples/plain.zig" });
+    portable_smoke.addFileInput(p.path("examples/plain.zig"));
     test_step.dependOn(&portable_smoke.step);
     // glint's output on a file opened for append, and on one it shares with writes around it:
     // each run lands at the file's offset, after what is there.

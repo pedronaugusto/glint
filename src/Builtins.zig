@@ -57,7 +57,7 @@ pub fn check(context: *Context) RunError!void {
     try Disallowed.check(context);
     try DeadDeclarations.check(context);
     try breadth(context);
-    try unknownCoverage(context);
+    try unmappedImports(context);
 }
 
 /// The breadth rules (glint 0.8), each in its own file, each run where it is selected.
@@ -247,9 +247,6 @@ fn unusedImports(self: *Context) RunError!void {
 
 fn selected(self: *const Context, selection: []const rules.Rule) bool {
     return self.selected(selection);
-}
-fn unknown(self: *Context, rule: rules.Rule, node: Ast.Node.Index, reason: Facts.Unknown) RunError!void {
-    return self.unknown(rule, node, reason);
 }
 
 /// Z011: each call by meaning (`Facts.calls`: a direct call, a method's, `@call`, a callee
@@ -596,12 +593,10 @@ fn syntaxRules(self: *Context) RunError!void {
                     else => break .{ .unknown = .unsupported },
                 } else value.alternatives[0];
                 switch (value) {
-                    // A parameter declared `type` is a type whatever each binding gives it.
-                    .unknown => |reason| if (try typeParameter(self, expr)) {
+                    // A parameter declared `type` is a type whatever each binding gives it; a value
+                    // that does not resolve is no sure shape, and a style rule says nothing of it.
+                    .unknown => if (try typeParameter(self, expr)) {
                         if (names.acronymIssue(name)) try self.at(.Z032, decl.token, "treat acronyms in type names as ordinary words, for example XmlParser");
-                    } else {
-                        try unknown(self, .Z006, expr, reason);
-                        if (names.acronymIssue(name)) try unknown(self, .Z032, expr, reason);
                     },
                     .container, .primitive, .error_set, .pointer, .array, .optional, .error_union, .fn_type => {
                         if (names.acronymIssue(name)) try self.at(.Z032, decl.token, "treat acronyms in type names as ordinary words, for example XmlParser");
@@ -725,17 +720,35 @@ fn contextRules(self: *Context) RunError!void {
     }
 }
 
-fn unknownCoverage(self: *Context) RunError!void {
+/// Each `@import` that names no file of the run stops it: the bans read none of what it would
+/// bring. Zig's own per-build file (`builtin`) is no file glint lacks. One written under a branch
+/// (an `if`, a `switch`, an `orelse`) may be one a build for another target takes, whose module
+/// this build does not provide: nothing (preflight maps the modules of every target the repository
+/// builds for, so only a module none of them provides is left out, a limit the design names).
+fn unmappedImports(self: *Context) RunError!void {
     const tree = &self.project.at(self.file).file.tree;
-    for (self.project.at(self.file).model.import_nodes) |node| {
+    const model = &self.project.at(self.file).model;
+    for (model.import_nodes) |node| {
         var b: [2]Ast.Node.Index = undefined;
         const args = Facts.builtinArgs(tree, node, &b);
         if (args.len != 1 or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import")) continue;
         const value = try self.facts.resolve(self.file, node);
-        // Zig's own per-build file is no file glint lacks: what is read of it stays unknown
-        // where it is read.
-        if (value == .unknown and value.unknown != .zig_own) try self.sink.coverage(self.sink, .{ .file = self.file, .start = tree.tokenStart(tree.nodeMainToken(node)), .reason = .unresolved, .detail = @tagName(value.unknown) });
+        if (value != .unknown or value.unknown == .zig_own) continue;
+        if (underBranch(tree, model, node)) continue;
+        const at = tree.tokenLocation(0, tree.nodeMainToken(node));
+        try self.refuse(try self.allocator.print("{d}:{d}: `@import({s})` names no module or file this run maps, so no rule read what it brings: map it (`--module NAME=FILE`, or the build graph's module preflight passes)", .{ at.line + 1, at.column + 1, tree.getNodeSource(args[0]) }));
     }
+}
+
+/// Whether `node` is written under a branch of its declaration: an `if`, a `switch` or an `orelse`.
+fn underBranch(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
+    var at = model.parentOf(node);
+    while (at) |parent| : (at = model.parentOf(parent)) switch (tree.nodeTag(parent)) {
+        .@"if", .if_simple, .@"switch", .switch_comma, .switch_case, .switch_case_one, .switch_case_inline, .switch_case_inline_one, .@"orelse" => return true,
+        .fn_decl, .simple_var_decl, .global_var_decl, .local_var_decl, .aligned_var_decl, .container_field, .container_field_init, .container_field_align => return false,
+        else => {},
+    };
+    return false;
 }
 
 /// P005: each call by meaning (`Facts.calls`) of std's `debug.print`, wherever the file reaches
@@ -776,5 +789,5 @@ fn functionLengths(self: *Context) RunError!void {
         };
         if (count > limit) try self.at(.P003, function.name_token.?, try self.allocator.print("function has {d} lines (configured limit {d}); returned type body is subtracted", .{ count, limit }));
     }
-    for (used) |hit| if (!hit) try self.undecided(.P003, 0, .unsupported, "stale function-length exception does not match a function");
+    for (used, self.config.function_exceptions) |hit, exception| if (!hit) try self.refuse(try self.allocator.print("the function-length exception for `{s}` names no function of this file: remove it, or name the function", .{exception.function}));
 }

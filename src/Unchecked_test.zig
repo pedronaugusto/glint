@@ -282,20 +282,10 @@ const std_imports = [_]sources.ExtraImport{
     .{ .from = 0, .spelling = "Random.zig", .target = 23 },
 };
 
-/// `program`'s findings of `rule` at report level, and its undecided sites of it.
-/// A run's findings and undecided sites of a rule; `unbound` of the undecided are the pack's
-/// note at a public generic nothing the run binds.
+/// A run's findings of a rule, and the lines they stand on.
 const Run = struct {
     findings: usize,
-    undecided: usize,
-    unbound: usize = 0,
     lines: [32]u32 = @splat(0),
-    fn countUndecided(result: *Run, report: glint.Report, rule: glint.Rule) void {
-        for (report.coverage) |item| if (item.rule != null and item.rule.? == rule) {
-            result.undecided += 1;
-            if (std.mem.eql(u8, item.detail, "unbound generic: judged at its consumers' bindings")) result.unbound += 1;
-        };
-    }
 };
 fn run(rule: glint.Rule, program: []const u8) !Run {
     return runWith(rule, program, &std_files, &std_imports);
@@ -309,19 +299,17 @@ fn runAs(rule: glint.Rule, program: []const u8, as: sources.Consumer, extra: []c
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .report }} }, .{});
     defer report.deinit();
-    var result: Run = .{ .findings = 0, .undecided = 0 };
-    // A fixture std's AstGen refuses is not checked at all: it would pass any count of none.
-    for (report.coverage) |item| try std.testing.expect(item.reason != .invalid_syntax and item.reason != .invalid_lowering);
+    var result: Run = .{ .findings = 0 };
+    // A fixture std's AstGen refuses stops the run: it would pass any count of none.
+    try std.testing.expectEqual(@as(usize, 0), report.errors.len);
     for (report.diagnostics) |d| if (d.rule == rule) {
         if (result.findings < result.lines.len) result.lines[result.findings] = d.span.line;
         result.findings += 1;
     };
-    result.countUndecided(report, rule);
     return result;
 }
 fn expect(rule: glint.Rule, program: []const u8, findings: usize) !void {
     const result = try run(rule, program);
-    try std.testing.expectEqual(@as(usize, 0), result.undecided); // safe: fixture counts are representable.
     try std.testing.expectEqual(findings, result.findings);
 }
 
@@ -567,7 +555,7 @@ test "the fix rewrites the aegis escape into glint-ignore under today's names, n
     try std.testing.expectError(error.InvalidEscapeRecord, glint.Fix.escapeRecord(arena.allocator(), "glint: escape: consumer:x:1: no-danger: why (A019)\n"));
 }
 
-test "P007 reads @setRuntimeSafety on the build mode in each mode: off where the build keeps the checks, undecided on anything else" {
+test "P007 reads @setRuntimeSafety on the build mode in each mode: off where the build keeps the checks, a finding on anything it cannot decide" {
     // fiat-crypto's form: checked only in debug, so off in safe builds.
     try expect(.P007,
         \\const mode = @import("builtin").mode;
@@ -604,7 +592,7 @@ test "P007 reads @setRuntimeSafety on the build mode in each mode: off where the
         \\    return a +% b;
         \\}
     );
-    try std.testing.expectEqual(@as(usize, 1), other.undecided);
+    try std.testing.expectEqual(@as(usize, 1), other.findings);
 }
 
 test "Z034's fix nests the parentheses two findings open at one offset" {
@@ -643,10 +631,8 @@ const captured_field_program =
 
 test "P007 reads a call through a function field's captured payload as one through the field" {
     // `if (o.f) |f| f(o)` hands the interface as `o.f.?(o)` does: what the field holds is judged
-    // where it is installed, never left undecided at the call.
+    // where it is installed.
     const captured = try run(.P007, captured_field_program);
     const unwrapped = try runEdited(.P007, captured_field_program, "if (observer.boundary) |boundary| boundary(observer);", "observer.boundary.?(observer);");
-    try std.testing.expectEqual(@as(usize, 0), captured.undecided);
-    try std.testing.expectEqual(unwrapped.undecided, captured.undecided);
     try std.testing.expectEqual(unwrapped.findings, captured.findings);
 }

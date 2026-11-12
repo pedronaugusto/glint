@@ -26,12 +26,12 @@ diagnostics: std.ArrayList(Report.Diagnostic) = .empty,
 /// a suppression took it. A finding is one however many times its rule reaches it (a generic's
 /// instances, paths to one site); the related spans of each time are its.
 emitted: std.StringHashMapUnmanaged(?usize) = .empty,
-coverage: std.ArrayList(Report.Coverage) = .empty,
+errors: std.ArrayList(Report.RunError) = .empty,
 suppressions: []Suppression = &.{},
 suppressed: usize = 0,
 stale: std.ArrayList(Report.Stale) = .empty,
 /// Where the rules' findings come in; each callback gets the runner back from it.
-sink: Context.Sink = .{ .diagnostic = sinkDiagnostic, .coverage = sinkCoverage, .config = sinkConfig, .suppresses = sinkSuppresses },
+sink: Context.Sink = .{ .diagnostic = sinkDiagnostic, .refuse = sinkRefuse, .config = sinkConfig, .suppresses = sinkSuppresses },
 malformed: std.ArrayList(Report.Malformed) = .empty,
 complete: bool = true,
 definitions: []const rules.Definition = &.{},
@@ -92,7 +92,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer scratch.deinit();
     for (project.sources) |*source| {
-        // A ZON file is data, not code: no rule runs on it and no coverage is reported for it;
+        // A ZON file is data, not code: no rule runs on it and it raises no run error;
         // what it holds is read through the value an import of it resolves to.
         if (!source.input.selected or source.input.kind == .zon) continue;
         if (options.io) |io| try io.checkCancel();
@@ -115,23 +115,15 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
             try runner.malformed.append(a, .{ .why = entry.why, .span = .{ .file = runner.file, .start = start, .end = entry.comment.end, .line = entry.comment.line + 1, .column = file.column(start) } });
         }
         if (file.status == .parsed) try runner.declarationProblems(file);
-        try runner.coverage.append(a, .{ .file = runner.file, .reason = switch (file.status) {
-            .parsed => .parsed,
-            .invalid_syntax => .invalid_syntax,
-            .invalid_lowering => .invalid_lowering,
-            .budget_exhausted => .budget_exhausted,
-        }, .detail = switch (file.status) {
-            .parsed => if (file.zir == null) "std AST parsed; optional AstGen/ZIR lowering not requested" else "std AST and AstGen/ZIR lowered; no compiler type checking or generic evaluation",
-            .invalid_syntax => "std parser rejected source; semantic rules skipped",
-            .invalid_lowering => "std AstGen rejected source; semantic rules skipped",
-            .budget_exhausted => "front-end work budget exhausted; semantic rules skipped",
-        } });
-        if (file.status == .parsed) {
-            if (file.zir == null) runner.complete = false;
-            const lowered_coverage = source.model.lowered_coverage;
-            try runner.coverage.append(a, .{ .file = runner.file, .reason = if (lowered_coverage == .budget_exhausted) .budget_exhausted else .unsupported, .detail = if (file.zir == null) "required semantic lowering was not requested" else "std-ZIR declaration references are indexed only through supported structured bodies; lexical references are indexed separately" });
-            if (lowered_coverage == .budget_exhausted) runner.complete = false;
+        switch (file.status) {
+            .parsed => {},
+            // The compiler would refuse it too: the bans read none of it.
+            .invalid_syntax => try runner.runError(try parseError(a, file)),
+            .invalid_lowering => try runner.runError("Zig's AstGen rejects it, so no rule read it: `zig ast-check` names the error"),
+            .budget_exhausted => try runner.runError("its front-end work ran out of budget, so no rule read it"),
         }
+        if (file.status == .parsed and source.model.lowered_coverage == .budget_exhausted) try runner.runError("its lowering ran out of budget, so no rule read all of it");
+        if (file.status == .parsed and file.zir == null) try runner.runError("its semantic lowering was not asked for, so the rules that read it did not run");
         var context: Context = .{ .allocator = scratch.allocator(), .backing = gpa, .project = project, .file = runner.file, .config = runner.config, .facts = &runner.facts, .definitions = definitions, .sink = &runner.sink, .compiled = options.project_rules };
         try Builtins.check(&context);
         if (config.metrics) {
@@ -168,7 +160,11 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     }
     if (config.strict_suppressions and runner.stale.items.len != 0) runner.complete = false;
     std.mem.sort(Report.Diagnostic, runner.diagnostics.items, project, diagnosticLess);
-    return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .coverage = runner.coverage.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale.items.len, .stale = runner.stale.items, .malformed = runner.malformed.items, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null, .seams = try runner.seamCounts(config), .test_inputs = try testInputCounts(a, project, config), .unmapped_import_files = unmappedImportFiles(runner.coverage.items) };
+    // Everything the report holds is made before the arena is handed to it: what is allocated
+    // after the copy would be lost with the arena's earlier state.
+    const seams = try runner.seamCounts(config);
+    const test_inputs = try testInputCounts(a, project, config);
+    return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .errors = runner.errors.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale.items.len, .stale = runner.stale.items, .malformed = runner.malformed.items, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null, .seams = seams, .test_inputs = test_inputs };
 }
 
 /// Each seam of `config` with the sites it held per rule; stale where every rule it names ran
@@ -200,19 +196,6 @@ fn testInputCounts(a: std.mem.Allocator, project: *const Project, config: rules.
         counts[i].files += 1;
     };
     return counts;
-}
-
-/// How many files reported an import no module mapping names.
-fn unmappedImportFiles(coverage: []const Report.Coverage) usize {
-    var count: usize = 0;
-    for (coverage, 0..) |entry, i| {
-        if (entry.reason != .unresolved or !std.mem.eql(u8, entry.detail, "missing_mapping")) continue;
-        const earlier = for (coverage[0..i]) |before| {
-            if (before.file == entry.file and before.reason == .unresolved and std.mem.eql(u8, before.detail, "missing_mapping")) break true;
-        } else false;
-        if (!earlier) count += 1;
-    }
-    return count;
 }
 
 /// `config` with each package rule that is on by default selected at report level, where the
@@ -271,23 +254,15 @@ fn declaredRules(facts: *Facts) RunError![]const rules.Definition {
 /// ran and met no site of its on the line is stale. One for a rule this run does not enable is not
 /// judged, and is counted as such.
 fn judgeSuppressions(runner: *Runner, file: *const File, known: []const rules.Definition) RunError!void {
-    var inactive: usize = 0;
     for (runner.suppressions) |suppression| {
         const start = suppression.comment.start;
         const span: Report.Span = .{ .file = runner.file, .start = start, .end = suppression.comment.end, .line = suppression.comment.line + 1, .column = file.column(start) };
         for (suppression.names(), suppression.matched[0..suppression.named_len]) |rule, matched| {
             if (matched != null) continue;
-            if (!runner.config.has(rule)) {
-                inactive += 1;
-                continue;
-            }
+            if (!runner.config.has(rule)) continue;
             if (runner.config.strict_suppressions) runner.complete = false;
             try runner.stale.append(runner.a, .{ .name = (rules.definition(rule, known) orelse return error.InvalidSelection).name, .span = span });
         }
-    }
-    if (inactive != 0) {
-        const detail = try std.fmt.allocPrint(runner.a, "{d} {s} for rules this run does not enable", .{ inactive, if (inactive == 1) "suppression" else "suppressions" });
-        try runner.coverage.append(runner.a, .{ .file = runner.file, .reason = .unsupported, .detail = detail });
     }
 }
 
@@ -295,7 +270,7 @@ fn judgeSuppressions(runner: *Runner, file: *const File, known: []const rules.De
 /// short of the budget, no later file reads (`Facts.forget`).
 fn exhausted(runner: *Runner) error{OutOfMemory}!void {
     runner.complete = false;
-    try runner.coverage.append(runner.a, .{ .file = runner.file, .reason = .budget_exhausted, .detail = "semantic fact budget exhausted" });
+    try runner.runError("its analysis ran out of the fact budget (`fact_budget`): raise it, or split the file");
     runner.facts.forget();
 }
 
@@ -365,18 +340,27 @@ fn sinkSuppresses(sink: *Context.Sink, rule: rules.Rule, start: u32) bool {
     for (runner.suppressions) |suppression| if (suppression.applies(rule, line)) return true;
     return false;
 }
-fn sinkCoverage(sink: *Context.Sink, coverage: Report.Coverage) Context.Error!void {
+fn sinkRefuse(sink: *Context.Sink, why: []const u8) Context.Error!void {
     const runner: *Runner = @fieldParentPtr("sink", sink);
-    try runner.addCoverage(coverage);
+    try runner.runError(why);
 }
-/// Records `coverage`: a file's budget exhausted, or a site a gated rule could not judge, makes
-/// the run incomplete.
-fn addCoverage(runner: *Runner, coverage: Report.Coverage) Context.Error!void {
-    var owned = coverage;
-    owned.detail = try runner.a.dupe(u8, coverage.detail);
-    if (coverage.rule) |id| owned.rule_name = (rules.definition(id, runner.definitions) orelse return error.InvalidSelection).name;
-    try runner.coverage.append(runner.a, owned);
-    if (coverage.reason == .budget_exhausted or (coverage.rule != null and runner.config.level(coverage.rule.?) == .gate)) runner.complete = false;
+/// A run error of the current file, once for its words: the run is incomplete.
+fn runError(runner: *Runner, why: []const u8) error{OutOfMemory}!void {
+    runner.complete = false;
+    for (runner.errors.items) |known| if (known.file != null and known.file.? == runner.file and std.mem.eql(u8, known.why, why)) return;
+    try runner.errors.append(runner.a, .{ .file = runner.file, .why = try runner.a.dupe(u8, why) });
+}
+/// The parser's first error, in its words, at its line and column.
+fn parseError(a: std.mem.Allocator, file: *const File) error{OutOfMemory}![]const u8 {
+    const tree = &file.tree;
+    if (tree.errors.len == 0) return "Zig's parser rejects it, so no rule read it";
+    const first = tree.errors[0];
+    const at = tree.tokenLocation(0, first.token);
+    var out: std.Io.Writer.Allocating = .init(a);
+    out.writer.print("{d}:{d}: ", .{ at.line + 1, at.column + 1 }) catch return error.OutOfMemory;
+    tree.renderError(first, &out.writer) catch return error.OutOfMemory;
+    out.writer.writeAll(": Zig's parser rejects it, so no rule read it") catch return error.OutOfMemory;
+    return out.written();
 }
 fn validateRules(config: rules.Config, definitions: []const rules.Definition) error{InvalidSelection}!void {
     for (definitions, 0..) |definition, i| {
@@ -416,16 +400,16 @@ test "core diagnostics suppression cannot hide incomplete lowering" {
     var report = try run(std.testing.allocator, &project, .{});
     defer report.deinit();
     try std.testing.expect(!report.complete);
-    try std.testing.expectEqual(.invalid_lowering, report.coverage[0].reason);
+    try std.testing.expectEqual(@as(usize, 1), report.errors.len);
 }
 
-test "a ZON file is data: no rule runs on it and no coverage is reported for it" {
+test "a ZON file is data: no rule runs on it and it stops no run" {
     var project = try Project.init(std.testing.allocator, &.{.{ .name = "k.zon", .bytes = ".{ .bytes = .{ 1, 2 } }", .kind = .zon }}, &.{}, .{});
     defer project.deinit();
     var report = try run(std.testing.allocator, &project, .{});
     defer report.deinit();
     try std.testing.expect(report.complete);
-    try std.testing.expectEqual(0, report.coverage.len);
+    try std.testing.expectEqual(0, report.errors.len);
     try std.testing.expectEqual(0, report.diagnostics.len);
 }
 
