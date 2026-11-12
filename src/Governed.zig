@@ -299,7 +299,8 @@ fn fieldSites(self: *Context, governed: []const Governed, renamed: []const []con
         const aliases: []const []const u8 = if (own) &.{} else names;
         for ([_][]const []const u8{ &.{g.name}, aliases }) |list| for (list) |name| {
             if (!self.facts.mayName(named, name) or (self.inTest(site) and g.target.production)) continue;
-            if (value == .unknown) return leave(self, unread, node, value.unknown);
+            // A computed name on a holder that does not resolve spells no governed name: nothing.
+            if (value == .unknown) return if (named == .computed) {} else leave(self, unread, node, value.unknown);
             var options: std.ArrayList(Facts.Container) = .empty;
             try containers(self, value, &options);
             for (options.items) |container| {

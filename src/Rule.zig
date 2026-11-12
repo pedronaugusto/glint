@@ -143,13 +143,6 @@ pub const Config = struct {
     fact_budget: usize = 100_000,
     /// Count each selected file's functions and assertion calls into the report.
     metrics: bool = false,
-    /// The functions whose result writes to a peer, as the packages that own them declare
-    /// (A018's sinks beside std's `net.Stream.writer`).
-    peer_writers: []const PeerWriter = &.{},
-    /// The pointer widths of the targets the package builds for: A010 and the ranges the flow
-    /// rules read hold a value at each (`usize` is as wide as the pointer). Empty reads both 32
-    /// and 64 bits, for a package that does not say.
-    pointer_widths: []const u16 = &.{},
     /// Where the project declares the rules it names are not reported, with one written reason:
     /// a file, or a directory (`module`). The report counts each one's sites per rule
     /// (`Report.seams`), and one whose rules ran and found nothing in it is stale.
@@ -193,16 +186,6 @@ pub const Config = struct {
         return name;
     }
     pub const FunctionException = struct { function: []const u8, lines: u32, reason: []const u8 };
-    /// A declaration a project keeps out of its code (P006), named by what a reference reaches.
-    /// `source` is what `@import` takes: a `.zig` project input's name, or a module as programs
-    /// import it (`std`, `aegis`), one no file imports being one nothing can reach; `declaration`
-    /// is its path from there, through public namespaces from a module (`posix.fdatasync`), each
-    /// per-build choice on the way read in every alternative. Null `source` names an external
-    /// function by its symbol: every `extern fn` of that symbol, std's or the program's own, is
-    /// the one the linker binds. A governed `extern fn` governs its symbol the same way.
-    /// A declaration by the module that publishes it and its path there (`uplink`,
-    /// `server.Response.writer`).
-    pub const PeerWriter = struct { module: []const u8, declaration: []const u8 };
     pub const Disallowed = struct {
         source: ?[]const u8 = null,
         declaration: []const u8,
@@ -239,7 +222,6 @@ pub const Config = struct {
             } else if (entry.declaration.len == 0 or std.mem.findScalar(u8, entry.declaration, '.') != null) return error.InvalidSelection;
         }
         for (self.selections, 0..) |selection, i| for (self.selections[0..i]) |earlier| if (selection.rule == earlier.rule) return error.InvalidSelection;
-        for (self.pointer_widths) |width| if (width != 16 and width != 32 and width != 64) return error.InvalidSelection;
         for (self.seams) |seam| {
             if ((seam.file == null) == (seam.module == null) or seam.rules.len == 0) return error.InvalidSelection;
             if (std.mem.trim(u8, seam.reason, " \t\r\n").len == 0) return error.InvalidSelection;

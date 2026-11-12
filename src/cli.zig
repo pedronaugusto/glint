@@ -616,8 +616,6 @@ pub const Configuration = struct {
     strict_suppressions: bool = false,
     metrics: bool = false,
     fact_budget: usize = 100_000,
-    peer_writers: []const Rule.Config.PeerWriter = &.{},
-    pointer_widths: []const u16 = &.{},
     seams: []const Rule.Config.Seam = &.{},
     test_inputs: []const Rule.Config.TestInput = &.{},
     pub const Setting = struct { id: []const u8, level: Rule.Config.Level };
@@ -653,8 +651,6 @@ fn configure(a: std.mem.Allocator, bytes: []const u8) ConfigureError!Configured 
     config.strict_suppressions = document.strict_suppressions;
     config.metrics = document.metrics;
     config.fact_budget = document.fact_budget;
-    config.peer_writers = document.peer_writers;
-    config.pointer_widths = document.pointer_widths;
     config.seams = document.seams;
     config.test_inputs = document.test_inputs;
     try config.validate();
