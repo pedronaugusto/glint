@@ -1,0 +1,1 @@
+{"seams":[{"rules":["A021"],"file":"twin.zig","reason":"a single lock nothing else nests, ranked by review"}]}

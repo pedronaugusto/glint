@@ -222,13 +222,16 @@ test "a role no pack of the run reads is drift where the package is imported, an
     defer run.report.deinit();
     try std.testing.expect(!run.report.complete);
     try std.testing.expectEqualStrings("gadgets's lint_rules at gadgets.zig:2: a role no pack of this run reads; the roles it declares are not all read in this file", coverage(run.report).?);
-    // The package's own lint: its root is the program's file, and A001 reports the role there.
+    // The package's own lint: its root is the program's file, and the run is incomplete where the
+    // role is written, whatever rules it selects.
     var own_lint = try P.init(std.testing.allocator, &.{.{ .name = "gadgets.zig", .bytes = misspelt[0].bytes, .package = gadgets.name, .fingerprint = gadgets.fingerprint }}, &.{}, .{});
     defer own_lint.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &own_lint, .{ .enabled = .empty, .selections = &.{.{ .rule = glint.AegisPack.access, .level = .gate }} }, .{ .project_rules = &(glint.AegisPack.rules ++ [_]glint.ProjectRule{rule}) });
+    var report = try glint.run(std.testing.allocator, &own_lint, glint.Config.none());
     defer report.deinit();
-    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len);
-    try std.testing.expectEqualStrings("lint_rules: unknown_role: glint does not read this part, so the programs that import this package do not know what it declares", report.diagnostics[0].message);
+    try std.testing.expect(!report.complete);
+    try std.testing.expectEqual(@as(usize, 1), report.malformed.len);
+    try std.testing.expectEqual(@as(u32, 2), report.malformed[0].span.line);
+    try std.testing.expectEqualStrings("lint_rules: unknown_role: glint does not read this part, so the programs that import this package do not know what it declares", report.malformed[0].why);
 }
 test "two packs that give one role name in different lists are refused, so a package's role names one pack" {
     var built = try project(std.testing.allocator, consumer, &flat);

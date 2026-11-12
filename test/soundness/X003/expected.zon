@@ -1,0 +1,7 @@
+.{
+    // X003 is the vocabulary's `exits` kind (hygiene), declared by each case's module: an exit's
+    // result given straight to arithmetic, a comparison or a narrowing cast. One case, the certain
+    // shape and the value kept in a name first.
+    .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .conversion, .unwrap, .aggregate, .memory, .branch },
+    .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .conversion, .unwrap, .aggregate, .memory, .branch },
+}

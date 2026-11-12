@@ -1,0 +1,1 @@
+{"seams":[{"rules":["X001"],"file":"twin.zig","reason":"the codec that writes Counted, reviewed"}]}

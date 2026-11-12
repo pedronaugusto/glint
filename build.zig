@@ -128,7 +128,6 @@ pub fn dev(b: *std.Build, tools: type) void {
         .sources = &.{
             p.path("src/AegisContract.zig"),
             p.path("src/AegisPack.zig"),
-            p.path("src/AegisPack_test.zig"),
             p.path("src/BuildGate.zig"),
             p.path("src/Builtins.zig"),
             p.path("src/Completion.zig"),

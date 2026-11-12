@@ -1,0 +1,8 @@
+.{
+    // X001 is the vocabulary's `governed` kind, declared by each case's module (module/module.zig,
+    // its own package): a touch of a governed type's internal field (a read, a write, a literal
+    // naming it), and a cast or reflection over the type. Its cases are test/vocabulary's governed
+    // table, so most rows hold none yet.
+    .no_hole = .{ .branch, .destructure, .capture, .call, .deferred, .jump, .inline_loop, .operator, .unwrap, .memory },
+    .no_twin = .{ .branch, .destructure, .capture, .call, .deferred, .jump, .inline_loop, .operator, .unwrap, .memory, .address, .assignment },
+}

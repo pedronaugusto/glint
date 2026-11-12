@@ -14,6 +14,7 @@ const Metrics = @import("Metrics.zig");
 const Contract = @import("AegisContract.zig");
 const PackageRules = @import("PackageRules.zig");
 const Replaced = @import("Replaced.zig");
+const GovernedState = @import("GovernedState.zig");
 const AegisPack = @import("AegisPack.zig");
 
 a: std.mem.Allocator,
@@ -118,6 +119,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
             const start = entry.comment.start;
             try runner.malformed.append(a, .{ .why = entry.why, .span = .{ .file = runner.file, .start = start, .end = entry.comment.end, .line = entry.comment.line + 1, .column = file.column(start) } });
         }
+        if (file.status == .parsed) try runner.declarationProblems(file);
         try runner.coverage.append(a, .{ .file = runner.file, .reason = switch (file.status) {
             .parsed => .parsed,
             .invalid_syntax => .invalid_syntax,
@@ -149,7 +151,8 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
             if (!runner.config.has(definition.id)) continue;
             switch (declared_by.reads) {
                 .replaces => try Replaced.check(&context, definition),
-                .governed, .exits => {},
+                .governed => try GovernedState.check(&context, definition),
+                .exits => try GovernedState.exits(&context, definition),
             }
             _ = scratch.reset(.free_all);
         };
@@ -244,18 +247,30 @@ pub fn packageRules(a: std.mem.Allocator, project: *const Project) RunError![]co
     defer facts.deinit();
     return declaredRules(&facts);
 }
-/// Two packages declaring one rule id, or more rules than ids, is no selection a run can make.
-/// A rule that reads `.replaces` joins the run; one that reads `.governed` or `.exits` waits for
-/// the engines that read them, which retire the compiled A001 and A004 of the same names (vocabulary
-/// push 4). Each keeps the id the table gave it.
-fn declaredRules(facts: *Facts) RunError![]const rules.Definition {
-    const all = PackageRules.table(facts) catch |err| switch (err) {
-        error.DuplicateRule, error.TooManyRules => return error.InvalidSelection,
-        else => |other| return other,
+/// Each part of a `lint_rules` this file declares that glint cannot read (PackageRules.Problem: a
+/// reference that does not resolve, a rule no entry may name, ...), where it is written: the
+/// declaring package's own run is incomplete, so its lint catches what would leave its rules
+/// unread in the programs that import it.
+fn declarationProblems(runner: *Runner, file: *const File) RunError!void {
+    if (runner.facts.member(runner.facts.rootOf(runner.file), "lint_rules") == null) return;
+    const declared = try PackageRules.of(&runner.facts, runner.file);
+    const tree = &file.tree;
+    for (declared.problems) |problem| if (problem.file == runner.file) {
+        const start = tree.tokenStart(tree.firstToken(problem.node));
+        runner.complete = false;
+        try runner.malformed.append(runner.a, .{
+            .why = try std.fmt.allocPrint(runner.a, "lint_rules: {t}: glint does not read this part, so the programs that import this package do not know what it declares", .{problem.why}),
+            .span = .{ .file = runner.file, .start = start, .end = start, .line = file.line(start) + 1, .column = file.column(start) },
+        });
     };
-    var read: std.ArrayList(rules.Definition) = .empty;
-    for (all) |definition| if (definition.declared.?.reads == .replaces) try read.append(facts.gpa, definition);
-    return read.items;
+}
+
+/// Two packages declaring one rule id, or more rules than ids, is no selection a run can make.
+fn declaredRules(facts: *Facts) RunError![]const rules.Definition {
+    return PackageRules.table(facts) catch |err| switch (err) {
+        error.DuplicateRule, error.TooManyRules => error.InvalidSelection,
+        else => |other| other,
+    };
 }
 
 /// Only a rule that ran shows that a suppression of it suppresses nothing; an escape is

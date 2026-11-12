@@ -13,9 +13,8 @@ pub fn main(init: std.process.Init) !void {
     for (0..n) |i| try source.writer.print("pub fn site{d}(s: *S(u32)) void {{ _ = s.material; }}\n", .{i});
     var project = try sources.project(init.gpa, source.written());
     defer project.deinit();
-    const config: glint.Config = .{ .enabled = .empty, .selections = &.{
-        .{ .rule = pack.access, .level = .report }, .{ .rule = pack.scalar, .level = .report },
-    } };
+    // The rules aegis declares, each on by its own default: A001 finds each internal field read.
+    const config: glint.Config = .{ .enabled = .empty };
     const start = std.Io.Clock.awake.now(init.io);
     var findings: usize = 0;
     for (0..rounds) |_| {

@@ -1,4 +1,6 @@
 .{
-    .no_hole = .{},
-    .no_twin = .{},
+    // A001 is a rule aegis declares (its lint_rules, read from the pinned aegis): one site it reports
+    // and one it must not, through the aegis type. Its other rows hold none.
+    .no_hole = .{ .assignment, .destructure, .capture, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch },
+    .no_twin = .{ .assignment, .destructure, .capture, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch },
 }
