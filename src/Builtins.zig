@@ -606,6 +606,12 @@ fn syntaxRules(self: *Context) RunError!void {
                         value = .scalar;
                     }
                 }
+                // A call of a function declared to return `type` names a type, whatever its result
+                // is read as (`std.meta.Child(@TypeOf(x))`).
+                if (v.ast.type_node.unwrap() == null and try callsTypeFunction(self, expr)) {
+                    if (names.acronymIssue(name)) try self.at(.Z032, decl.token, "treat acronyms in type names as ordinary words, for example XmlParser");
+                    continue;
+                }
                 // A choice between types names a type; any other choice is undecided here.
                 if (value == .alternatives) value = for (value.alternatives) |one| switch (one) {
                     .container, .primitive, .error_set, .pointer, .array, .optional, .error_union, .fn_type => {},
@@ -646,6 +652,22 @@ fn syntaxRules(self: *Context) RunError!void {
             }
         }
     }
+}
+
+/// Whether `node` is a call whose callee, every one it may be, is a function declared to return
+/// `type`.
+fn callsTypeFunction(self: *Context, node: Ast.Node.Index) RunError!bool {
+    const call = (try Facts.calls.at(self.facts, self.file, node)) orelse return false;
+    const definition = switch (call.callee) {
+        .function => |function| function,
+        .choice, .any => return false,
+    };
+    const target = &self.project.at(definition.file).file.tree;
+    const record = self.project.at(definition.file).model.declarations[@backingInt(definition.index)];
+    var buffer: [1]Ast.Node.Index = undefined;
+    const function = target.fullFnProto(&buffer, record.node) orelse return false;
+    const returned = function.ast.return_type.unwrap() orelse return false;
+    return namesType(self, definition.file, returned);
 }
 
 /// Whether a container's declaration `name` spells a member a generic reads on its type

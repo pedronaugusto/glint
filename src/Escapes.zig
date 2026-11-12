@@ -10,7 +10,7 @@
 //! stored through a parameter or into a container's variable. Those are this rule's.
 //!
 //! A heuristic (designs/glint.md §6), reported. A `var` local counts, and a `const` one but where
-//! its value is a literal the program compiles in (static memory). A path through a field or an
+//! its value is a literal or a `comptime` expression the program compiles in (static memory). A path through a field or an
 //! element counts but where the local's type, written or of its value, is a pointer, which Zig
 //! dereferences on access. Nothing inside `comptime` or in a function returning `type` counts,
 //! where frames are comptime memory. A store the function undoes does not outlive the call: a
@@ -22,6 +22,7 @@ const Context = @import("RuleContext.zig");
 const Model = @import("Model.zig");
 const Rule = @import("Rule.zig").Rule;
 const Facts = @import("Facts.zig");
+const Project = @import("Project.zig");
 const Ast = std.zig.Ast;
 
 /// A value that may leave the call: a `return`'s, or a store's into `stored`.
@@ -137,7 +138,7 @@ const Walk = struct {
                 const sliced = (tree.fullSlice(node) orelse return .none).ast.sliced;
                 const root = (try self.storage(sliced)) orelse return .none;
                 if (root != Facts.ungrouped(tree, sliced)) return .none;
-                const d = self.variable(root, function) orelse return .none;
+                const d = (try self.variable(root, function)) orelse return .none;
                 if (try self.array(d)) return .{ .local = d };
                 // A pointer's slice points where the pointer does: what the local is given, but
                 // a slice of itself (`s = s[1..]`), which holds no memory it did not.
@@ -203,8 +204,8 @@ const Walk = struct {
         if (try self.crossed(inner)) |pointer| return self.escaping(pointer, function, depth + 1);
         const root = (try self.storage(inner)) orelse return .none;
         // The local itself is its frame's memory, whatever its type.
-        if (root == Facts.ungrouped(self.tree, inner)) return reach(self.variable(root, function));
-        const d = self.variable(root, function) orelse return .none;
+        if (root == Facts.ungrouped(self.tree, inner)) return reach(try self.variable(root, function));
+        const d = (try self.variable(root, function)) orelse return .none;
         return if (try self.value(d)) .{ .local = d } else .none;
     }
 
@@ -276,16 +277,93 @@ const Walk = struct {
     }
 
     /// A local of `function`'s own in its frame: a `var` not comptime, or a `const` whose value
-    /// is no literal the program compiles in.
-    fn variable(self: Walk, identifier: Ast.Node.Index, function: Ast.Node.Index) ?Model.Declaration.Id {
+    /// is not one the program compiles in (`compiledIn`).
+    fn variable(self: Walk, identifier: Ast.Node.Index, function: Ast.Node.Index) Context.Error!?Model.Declaration.Id {
         const d = self.own(identifier, function) orelse return null;
         const decl = self.tree.fullVarDecl(self.model.declarations[@backingInt(d)].node) orelse return null;
         if (decl.comptime_token != null) return null;
         if (self.tree.tokenTag(decl.ast.mut_token) == .keyword_const) {
             const init = decl.ast.init_node.unwrap() orelse return null;
-            if (compiledIn(self.tree, init)) return null;
+            if (try self.compiledIn(self.c.file, init, 0)) return null;
         }
         return d;
+    }
+
+    /// Whether a value of `file` is one the program compiles in, so a `const` holding it is
+    /// static memory: a literal (a number, a character, a string, an enum literal, an array or
+    /// struct literal of such values, a concatenation of them), `comptime x`, `true`, `false`,
+    /// `null`, a comptime parameter, a declaration of a file or container, a local `const` of
+    /// such a value, arithmetic and negation of such values, and a call of an `inline fn` given
+    /// only such values (`std.math.inf(T)`, which Zig evaluates as it compiles).
+    fn compiledIn(self: Walk, file: Project.FileId, written: Ast.Node.Index, depth: u8) Context.Error!bool {
+        if (depth == 8) return false;
+        const tree = &self.c.project.at(file).file.tree;
+        const node = Facts.ungrouped(tree, written);
+        switch (tree.nodeTag(node)) {
+            .number_literal, .char_literal, .string_literal, .multiline_string_literal, .enum_literal => return true,
+            .@"comptime" => return true,
+            .array_cat, .add, .sub, .mul, .div, .mod, .shl, .shr, .bit_and, .bit_or, .bit_xor, .add_wrap, .sub_wrap, .mul_wrap => {
+                const lhs, const rhs = tree.nodeData(node).node_and_node;
+                return try self.compiledIn(file, lhs, depth + 1) and try self.compiledIn(file, rhs, depth + 1);
+            },
+            .negation, .negation_wrap, .bit_not => return self.compiledIn(file, tree.nodeData(node).node, depth + 1),
+            .identifier => {
+                const spelled = tree.tokenSlice(tree.nodeMainToken(node));
+                for ([_][]const u8{ "true", "false", "null" }) |each| if (std.mem.eql(u8, spelled, each)) return true;
+                return self.declaredIn(try self.c.facts.definition(file, node), depth);
+            },
+            .field_access => return self.declaredIn(try self.c.facts.definition(file, node), depth),
+            else => {},
+        }
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (tree.fullArrayInit(&buffer, node)) |literal| {
+            for (literal.ast.elements) |element| if (!try self.compiledIn(file, element, depth + 1)) return false;
+            return true;
+        }
+        if (tree.fullStructInit(&buffer, node)) |literal| {
+            for (literal.ast.fields) |field| if (!try self.compiledIn(file, field, depth + 1)) return false;
+            return true;
+        }
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        if (tree.fullCall(&call_buffer, node)) |call| {
+            const found = (try Facts.calls.at(self.c.facts, file, node)) orelse return false;
+            const callee = switch (found.callee) {
+                .function => |function| function,
+                .choice, .any => return false,
+            };
+            const target = &self.c.project.at(callee.file).file.tree;
+            var proto_buffer: [1]Ast.Node.Index = undefined;
+            const proto = target.fullFnProto(&proto_buffer, self.c.project.at(callee.file).model.declarations[@backingInt(callee.index)].node) orelse return false;
+            const keyword = proto.extern_export_inline_token orelse return false;
+            if (target.tokenTag(keyword) != .keyword_inline) return false;
+            for (call.ast.params) |argument| if (!try self.compiledIn(file, argument, depth + 1)) return false;
+            return true;
+        }
+        return false;
+    }
+
+    /// Whether what a name refers to holds a value the program compiles in.
+    fn declaredIn(self: Walk, named: Facts.Named, depth: u8) Context.Error!bool {
+        const decl = switch (named) {
+            .decl => |decl| decl,
+            .none, .unknown => return false,
+        };
+        const model = &self.c.project.at(decl.file).model;
+        const tree = &self.c.project.at(decl.file).file.tree;
+        const record = model.declarations[@backingInt(decl.index)];
+        switch (record.kind) {
+            .parameter => return record.token > 0 and tree.tokenTag(record.token - 1) == .keyword_comptime,
+            .variable => {},
+            .function, .field, .capture => return false,
+        }
+        const holder = tree.fullVarDecl(record.node) orelse return false;
+        if (tree.tokenTag(holder.ast.mut_token) != .keyword_const) return false;
+        switch (model.scopes[@backingInt(record.scope)].kind) {
+            .file, .container => return true,
+            else => {},
+        }
+        const init = holder.ast.init_node.unwrap() orelse return false;
+        return self.compiledIn(decl.file, init, depth + 1);
     }
 
     /// The name at the root of a path of fields and elements that stay in its memory: no step
@@ -426,26 +504,3 @@ const Walk = struct {
     }
 };
 
-/// Whether a value is a literal the program compiles in: numbers, characters, strings, enum
-/// literals, and array and struct literals and concatenations of them.
-fn compiledIn(tree: *const Ast, written: Ast.Node.Index) bool {
-    const node = Facts.ungrouped(tree, written);
-    switch (tree.nodeTag(node)) {
-        .number_literal, .char_literal, .string_literal, .multiline_string_literal, .enum_literal => return true,
-        .array_cat => {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            return compiledIn(tree, lhs) and compiledIn(tree, rhs);
-        },
-        else => {},
-    }
-    var buffer: [2]Ast.Node.Index = undefined;
-    if (tree.fullArrayInit(&buffer, node)) |literal| {
-        for (literal.ast.elements) |element| if (!compiledIn(tree, element)) return false;
-        return true;
-    }
-    if (tree.fullStructInit(&buffer, node)) |literal| {
-        for (literal.ast.fields) |field| if (!compiledIn(tree, field)) return false;
-        return true;
-    }
-    return false;
-}

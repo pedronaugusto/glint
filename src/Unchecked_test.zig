@@ -332,6 +332,22 @@ test "P007 finds the unchecked operations, a cast nested in another once, a supp
     , 4);
 }
 
+test "Z006 leaves a type std's type function gives alone; a labeled block's value is a value" {
+    try expect(.Z006,
+        \\const std = @import("std");
+        \\const S = struct {
+        \\    fn trace(s: *S) *S {
+        \\        return s;
+        \\    }
+        \\    fn records(_: *S) []const u32 {
+        \\        return &.{};
+        \\    }
+        \\};
+        \\const Record = std.meta.Child(@TypeOf(@as(*S, undefined).trace().records()));
+        \\pub const r: Record = 0;
+    , 0);
+}
+
 test "P009 finds a pointer into the frame carried out of the call" {
     try expect(.P009, "pub fn f(n: usize) []u8 { var buf: [16]u8 = undefined; buf[0] = 1; return buf[0..n]; }", 1);
     try expect(.P009, "pub fn f() *u32 { var x: u32 = 1; x += 1; const out = &x; return out; }", 1);
@@ -355,6 +371,11 @@ test "P009 finds a pointer into the frame carried out of the call" {
 
 test "P009 leaves static storage, pointers, copies and a store a defer clears on every exit alone" {
     try expect(.P009, "pub fn f() []const u8 { const table = [_]u8{ 1, 2 }; return table[0..]; }", 0);
+    // A const whose value is a comptime expression, or inline calls on a comptime parameter, is
+    // compiled in (shakedown's edge values).
+    try expect(.P009, "inline fn top(comptime T: type) T { return 7; } pub fn f(comptime T: type) []const T { const high = top(T); const out = [_]T{ 0, high, -high, high / 2 }; return &out; }", 0);
+    try expect(.P009, "fn top(comptime T: type) T { return 7; } pub fn f(comptime T: type) []const T { const high = top(T); const out = [_]T{ 0, high }; return &out; }", 1);
+    try expect(.P009, "pub fn f(comptime T: type) []const T { const out = comptime [_]T{ 0, @as(T, 1) + 1 }; return &out; }", 0);
     try expect(.P009, "pub fn f() []const u8 { comptime { var buf: [2]u8 = .{ 1, 2 }; buf[0] = 3; const out = buf; return &out; } }", 0);
     try expect(.P009, "pub fn Make(comptime n: usize) type { var x: [n]u8 = undefined; x[0] = 1; _ = &x; return struct {}; }", 0);
     try expect(.P009, "const N = struct { v: u32 }; pub fn f(head: *N) *u32 { var node: *N = head; node.v += 1; return &node.v; }", 0);
