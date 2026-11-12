@@ -1,8 +1,7 @@
-//! Optional pack cost on the pinned aegis sources; fixtures are not admission evidence.
+//! The cost of the rules aegis declares, on the pinned aegis sources; fixtures are not admission evidence.
 const std = @import("std");
 const glint = @import("glint");
 const sources = @import("aegis_sources");
-const pack = glint.AegisPack;
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const rounds: usize = if (args.len > 2 and std.mem.eql(u8, args[1], "--rounds")) try std.fmt.parseInt(usize, args[2], 10) else 100;
@@ -18,7 +17,7 @@ pub fn main(init: std.process.Init) !void {
     const start = std.Io.Clock.awake.now(init.io);
     var findings: usize = 0;
     for (0..rounds) |_| {
-        var report = try glint.runConfigured(init.gpa, &project, if (core) glint.Config.none() else config, .{ .project_rules = &pack.rules });
+        var report = try glint.runConfigured(init.gpa, &project, if (core) glint.Config.none() else config, .{});
         defer report.deinit();
         if (!report.complete or report.diagnostics.len != (if (core) @as(usize, 0) else n)) return error.UnexpectedPackResult;
         findings = report.diagnostics.len;

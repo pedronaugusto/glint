@@ -9,7 +9,6 @@ const Project = @import("Project.zig");
 
 /// The files std's import reaches, and aegis's.
 std_files: *const Facts.FileSet = &none,
-aegis_files: *const Facts.FileSet = &none,
 outside: ?*const Facts.Outside = null,
 
 const Program = @This();
@@ -23,7 +22,7 @@ pub fn get(c: *Context) Context.Error!*const Program {
     const program = try c.facts.memo(Program);
     if (program.outside != null) return program;
     const outside = try c.facts.outside();
-    program.* = .{ .std_files = &outside.std_files, .aegis_files = &outside.known_files, .outside = outside };
+    program.* = .{ .std_files = &outside.std_files, .outside = outside };
     return program;
 }
 

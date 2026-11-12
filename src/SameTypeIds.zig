@@ -1,5 +1,5 @@
-//! A016, read from the shape of a signature or a struct (designs/aegis.md §7): two identifying
-//! integers of one type meeting where nothing keeps one from standing for the other.
+//! P008: two identifying integers of one type meeting in one public signature or one public
+//! struct, where nothing keeps one from standing for the other, read from the shape alone.
 const std = @import("std");
 const Context = @import("RuleContext.zig");
 const Facts = @import("Facts.zig");
@@ -7,7 +7,7 @@ const Model = @import("Model.zig");
 const Rule = @import("Rule.zig").Rule;
 const Ast = std.zig.Ast;
 
-/// A016: two or more identifying integers of one type meeting in one public signature or one
+/// Two or more identifying integers of one type meeting in one public signature or one
 /// public struct, where nothing keeps one from standing for the other. A signature is a
 /// function's or a function type's (`*const fn (parent_id: u32, child_id: u32) void`), a public
 /// function being a `pub` or an `export` one (`exported`), and a
@@ -17,7 +17,7 @@ const Ast = std.zig.Ast;
 /// types resolve to it, or are spelled the same and are an integer whatever a build chooses
 /// (`const Id = if (wide) u64 else u32`); a type that does not resolve, or a choice that may
 /// meet the other's, is undecided.
-pub fn identity(c: *Context, rule: Rule) Context.Error!void {
+pub fn check(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
     const reaches = try reached(c, tree, model);
@@ -55,7 +55,7 @@ pub fn identity(c: *Context, rule: Rule) Context.Error!void {
             try c.undecided(rule, tree.tokenStart(pair.second), .unresolved, try c.allocator.print("fields '{s}' and '{s}' identify, and their types may be one integer: one may be stored for the other", .{ tree.tokenSlice(pair.first), tree.tokenSlice(pair.second) }));
             continue;
         }
-        try c.at(rule, pair.second, try c.allocator.print("fields '{s}' and '{s}' are both {s} that identify: one may be stored for the other; aegis id.Id or a handle gives each its own type", .{ tree.tokenSlice(pair.first), tree.tokenSlice(pair.second), pair.kind }));
+        try c.at(rule, pair.second, try c.allocator.print("fields '{s}' and '{s}' are both {s} that identify: one may be stored for the other; a distinct type for each (an enum, or a package's id type) keeps them apart", .{ tree.tokenSlice(pair.first), tree.tokenSlice(pair.second), pair.kind }));
     }
 }
 
@@ -75,7 +75,7 @@ fn signature(c: *Context, rule: Rule, tree: *const Ast, proto: Ast.full.FnProto,
     }
     const pair = meet(names.items, kinds.items) orelse return;
     if (pair.same == .maybe) return c.undecided(rule, tree.tokenStart(at), .unresolved, try c.allocator.print("'{s}' and '{s}' identify, and their types may be one integer: one may be passed for the other", .{ tree.tokenSlice(pair.first), tree.tokenSlice(pair.second) }));
-    try c.at(rule, at, try c.allocator.print("'{s}' and '{s}' are both {s} that identify: one may be passed for the other; aegis id.Id or a handle gives each its own type", .{ tree.tokenSlice(pair.first), tree.tokenSlice(pair.second), pair.kind }));
+    try c.at(rule, at, try c.allocator.print("'{s}' and '{s}' are both {s} that identify: one may be passed for the other; a distinct type for each (an enum, or a package's id type) keeps them apart", .{ tree.tokenSlice(pair.first), tree.tokenSlice(pair.second), pair.kind }));
 }
 
 /// What an identifying name's type may be as an integer (`kindOf`): the integers it resolves

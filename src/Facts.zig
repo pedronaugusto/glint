@@ -14,14 +14,6 @@ gpa: std.mem.Allocator,
 /// An allocator that frees, beside `gpa`: what a query makes and drops within its own work (a
 /// site's checking reach, `reachedFromSite`) is made on it, so dropping it gives the memory back.
 backing: std.mem.Allocator = std.heap.page_allocator,
-/// The library the analyses know by its declarations (aegis): its package's own files, like
-/// std's, are not the program's (`program`), under whatever name a program imports it. Only
-/// files the caller states are that package's: a module republishing it stays the program's.
-known: ?Package = null,
-/// The role names the run's packs read (`RuleContext.Rule.roles` and glint's own packs'), set by
-/// the run: a role a package's `lint_rules` names that none of them is, is a problem where it is
-/// written (PackageRules). Null where no run states them: no name is then judged.
-role_names: ?[]const []const u8 = null,
 cache: std.AutoHashMapUnmanaged(Settled, Value) = .empty,
 /// What a node gives in a reading (`resolveIn`), by the reading's address and the node.
 bound: std.AutoHashMapUnmanaged(Bound, Value) = .empty,
@@ -54,8 +46,6 @@ run_held: ?bool = null,
 cast_sites: std.AutoHashMapUnmanaged(Key, Decl) = .empty,
 /// Whether a file declares any `comptime` parameter of type `bool`, found per file once.
 conditional_files: std.AutoHashMapUnmanaged(Project.FileId, bool) = .empty,
-/// Each package's roots the program reaches (`packageRoots`), by its fingerprint.
-package_roots: std.AutoHashMapUnmanaged(u64, []const Project.FileId) = .empty,
 templates: std.AutoHashMapUnmanaged(Decl, ?Value) = .empty,
 /// The values a function's own `return`s give, by function, found once (`ownReturns`).
 type_returns: std.AutoHashMapUnmanaged(Decl, []const Ast.Node.Index) = .empty,
@@ -330,45 +320,12 @@ pub fn deinit(self: *Facts) void {
     if (self.copies) |*found| found.deinit(self.gpa);
     self.cast_sites.deinit(self.gpa);
     self.conditional_files.deinit(self.gpa);
-    self.package_roots.deinit(self.gpa);
     self.templates.deinit(self.gpa);
     self.type_returns.deinit(self.gpa);
     self.comptime_fields.deinit(self.gpa);
     self.dereferences.deinit(self.gpa);
     self.dereferences_found.deinit(self.gpa);
     self.* = undefined;
-}
-
-/// A package by its identity: the name and fingerprint its `build.zig.zon` gives.
-pub const Package = @import("Library.zig").Package;
-
-/// Whether `file` is one of the known library's own (`known`): its package is the library's,
-/// as the caller states it. A file whose package the caller does not state is not.
-pub fn knownFile(self: *const Facts, file: Project.FileId) bool {
-    return self.ofPackage(file, self.known orelse return false);
-}
-
-/// Whether the caller states `file` to be of `package`, by name and fingerprint.
-pub fn ofPackage(self: *const Facts, file: Project.FileId, package: Package) bool {
-    const input = self.project.at(file).input;
-    return input.fingerprint == package.fingerprint and std.mem.eql(u8, input.package, package.name);
-}
-
-/// The roots of `package` the program reaches: each file of that package, as the caller states
-/// it, that a file of another package imports, under any name or path. A build script's import
-/// counts, as the build runner names the package's modules. Found once per run.
-pub fn packageRoots(self: *Facts, package: Package) ResolveError![]const Project.FileId {
-    const key = package.fingerprint;
-    if (self.package_roots.get(key)) |found| return found;
-    var roots: std.ArrayList(Project.FileId) = .empty;
-    for (self.project.imports) |mapping| {
-        if (!mapping.in.inProgram()) continue;
-        if (!self.ofPackage(mapping.target, package) or self.ofPackage(mapping.from, package)) continue;
-        if (std.mem.findScalar(Project.FileId, roots.items, mapping.target) != null) continue;
-        try roots.append(self.gpa, mapping.target);
-    }
-    try self.package_roots.put(self.gpa, key, roots.items);
-    return roots.items;
 }
 
 /// The containers a type function's template is (`template`): the one it returns, or each it
@@ -418,7 +375,7 @@ fn declarationLiteral(self: *Facts, file: Project.FileId, node: Ast.Node.Index) 
 /// nothing built short (the program's solve, `Taint.get`), or the mark that it ran short. What
 /// one keeps is the run's (`gpa`), never a part of an index dropped here.
 pub fn forget(self: *Facts) void {
-    var fresh: Facts = .{ .project = self.project, .gpa = self.gpa, .known = self.known, .role_names = self.role_names, .remaining = self.remaining, .cache = self.cache, .bound = self.bound, .readings = self.readings, .settled = self.settled, .lasting = self.lasting };
+    var fresh: Facts = .{ .project = self.project, .gpa = self.gpa, .remaining = self.remaining, .cache = self.cache, .bound = self.bound, .readings = self.readings, .settled = self.settled, .lasting = self.lasting };
     self.cache = .empty;
     self.bound = .empty;
     self.readings = .empty;
@@ -813,7 +770,7 @@ pub fn program(self: *Facts, file: Project.FileId) ResolveError!bool {
     return (try self.outside()).own(file);
 }
 
-/// The files that are not the program's, found once: std's and the known libraries'.
+/// The files that are not the program's, found once: std's.
 pub fn outside(self: *Facts) ResolveError!*const Outside {
     const found = try self.memo(Outside);
     if (found.built) return found;
@@ -821,14 +778,11 @@ pub fn outside(self: *Facts) ResolveError!*const Outside {
     found.project = self.project;
     for (self.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, Project.std_module)) try found.std_files.put(self.gpa, @backingInt(mapping.target), {});
     try self.reach(&found.std_files, .standard);
-    for (self.project.sources) |*source| if (self.knownFile(source.id)) try found.known_files.put(self.gpa, @backingInt(source.id), {});
     return found;
 }
 pub const Outside = struct {
     /// The files std's import reaches.
     std_files: FileSet = .empty,
-    /// The files a known library's module roots reach, std's aside.
-    known_files: FileSet = .empty,
     project: *const Project = undefined,
     built: bool = false,
 
@@ -836,7 +790,7 @@ pub const Outside = struct {
     /// program, a library's own sources among them when the run is the library's.
     pub fn own(self: *const Outside, file: Project.FileId) bool {
         if (self.project.at(file).input.selected) return true;
-        return !self.std_files.contains(@backingInt(file)) and !self.known_files.contains(@backingInt(file));
+        return !self.std_files.contains(@backingInt(file));
     }
 };
 
@@ -7852,7 +7806,7 @@ pub fn memo(self: *Facts, comptime T: type) ResolveError!*T {
         made.* = .{};
         entry.value_ptr.* = made;
     }
-    return @ptrCast(@alignCast(entry.value_ptr.*)); // aegis: internal(A019): the key is this type's own name.
+    return @ptrCast(@alignCast(entry.value_ptr.*)); // glint-ignore: P007 -- internal: the key is this type's own name.
 }
 
 /// A file's own container: the struct the file is.
@@ -15291,13 +15245,13 @@ test "a function handed to code outside the program as a value escapes: its call
     // `less` is handed to a known library's `sort`, which may call it with anything; `twice`
     // is only called, and every call the program makes shows what it is given.
     var project = try Project.init(std.testing.allocator, &.{
-        .{ .name = "root", .bytes = "const lib = @import(\"lib\");\nfn less(a: u8, b: u8) bool {\n    return a < b;\n}\nfn twice(a: u8) u8 {\n    return a *% 2;\n}\npub fn f(x: u8) u8 {\n    lib.sort(less);\n    return twice(x);\n}" },
+        .{ .name = "root", .bytes = "const lib = @import(\"std\");\nfn less(a: u8, b: u8) bool {\n    return a < b;\n}\nfn twice(a: u8) u8 {\n    return a *% 2;\n}\npub fn f(x: u8) u8 {\n    lib.sort(less);\n    return twice(x);\n}" },
         .{ .name = "lib", .bytes = "pub fn sort(comptime order: anytype) void {\n    _ = order;\n}", .selected = false, .package = "lib", .fingerprint = 1 },
-    }, &.{.{ .from = 0, .spelling = "lib", .target = 1 }}, .{});
+    }, &.{.{ .from = 0, .spelling = "std", .target = 1 }}, .{});
     defer project.deinit();
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    var facts: Facts = .{ .project = &project, .gpa = arena.allocator(), .known = .{ .name = "lib", .fingerprint = 1 } };
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
     defer facts.deinit();
     const model = &project.sources[0].model;
     var less: ?Decl = null;
@@ -15447,13 +15401,13 @@ test "a library's call through a field whose type names none of its generic's pa
         \\}
     ;
     var project = try Project.init(std.testing.allocator, &.{
-        .{ .name = "root", .bytes = "const lib = @import(\"lib\");\npub fn load(x: u8) u8 {\n    return x;\n}\npub fn hash(x: u8) u8 {\n    return x;\n}\npub fn use(comptime C: type, t: *lib.Table(C)) u32 {\n    return t.find();\n}\n" },
+        .{ .name = "root", .bytes = "const lib = @import(\"std\");\npub fn load(x: u8) u8 {\n    return x;\n}\npub fn hash(x: u8) u8 {\n    return x;\n}\npub fn use(comptime C: type, t: *lib.Table(C)) u32 {\n    return t.find();\n}\n" },
         .{ .name = "lib", .bytes = lib, .selected = false, .package = "lib", .fingerprint = 1 },
-    }, &.{.{ .from = 0, .spelling = "lib", .target = 1 }}, .{});
+    }, &.{.{ .from = 0, .spelling = "std", .target = 1 }}, .{});
     defer project.deinit();
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    var facts: Facts = .{ .project = &project, .gpa = arena.allocator(), .known = .{ .name = "lib", .fingerprint = 1 } };
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
     defer facts.deinit();
     const model = &project.sources[0].model;
     var load: ?Decl = null;

@@ -358,7 +358,10 @@ pub fn projectAs(gpa: std.mem.Allocator, consumer: []const u8, as: Consumer, ext
     return Project.init(gpa, inputs, all, try options());
 }
 
+/// aegis's package, as its `build.zig.zon` names it.
+pub const package: struct { name: []const u8, fingerprint: u64 } = .{ .name = "aegis", .fingerprint = 0x5e23831cba68ccae };
+
 /// An aegis source as a caller states it: not selected, a file of aegis's package.
 fn aegisInput(source: anytype) Project.Input {
-    return .{ .name = source.name, .bytes = source.bytes, .selected = false, .package = glint.AegisPack.package.name, .fingerprint = glint.AegisPack.package.fingerprint };
+    return .{ .name = source.name, .bytes = source.bytes, .selected = false, .package = package.name, .fingerprint = package.fingerprint };
 }

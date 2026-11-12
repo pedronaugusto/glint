@@ -11,11 +11,9 @@ const Context = @import("RuleContext.zig");
 const Fix = @import("Fix.zig");
 const Builtins = @import("Builtins.zig");
 const Metrics = @import("Metrics.zig");
-const Contract = @import("AegisContract.zig");
 const PackageRules = @import("PackageRules.zig");
 const Replaced = @import("Replaced.zig");
 const GovernedState = @import("GovernedState.zig");
-const AegisPack = @import("AegisPack.zig");
 
 a: std.mem.Allocator,
 project: *const Project,
@@ -25,7 +23,7 @@ base: rules.Config = .{},
 facts: Facts,
 diagnostics: std.ArrayList(Report.Diagnostic) = .empty,
 /// Each finding made, by its rule, span and message: the index of its diagnostic, or null where
-/// an escape took it. A finding is one however many times its rule reaches it (a generic's
+/// a suppression took it. A finding is one however many times its rule reaches it (a generic's
 /// instances, paths to one site); the related spans of each time are its.
 emitted: std.StringHashMapUnmanaged(?usize) = .empty,
 coverage: std.ArrayList(Report.Coverage) = .empty,
@@ -34,10 +32,7 @@ suppressed: usize = 0,
 stale: std.ArrayList(Report.Stale) = .empty,
 /// Where the rules' findings come in; each callback gets the runner back from it.
 sink: Context.Sink = .{ .diagnostic = sinkDiagnostic, .coverage = sinkCoverage, .config = sinkConfig, .suppresses = sinkSuppresses },
-escapes: std.ArrayList(Report.Escape) = .empty,
 malformed: std.ArrayList(Report.Malformed) = .empty,
-/// What each of the current file's aegis escapes covered, by its index in `suppressions`.
-covered: std.array_hash_map.Auto(usize, std.ArrayList(Report.Covered)) = .empty,
 complete: bool = true,
 definitions: []const rules.Definition = &.{},
 files: []const FileConfig = &.{},
@@ -71,7 +66,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
         if (@backingInt(setting.file) >= project.count()) return error.InvalidHandle;
         for (options.files[0..i]) |earlier| if (setting.file == earlier.file) return error.InvalidSelection;
     }
-    var runner: Runner = .{ .a = a, .project = project, .config = config, .base = config, .files = options.files, .facts = .{ .project = project, .gpa = a, .backing = gpa, .known = Contract.package, .role_names = try roleNames(a, options.project_rules), .remaining = config.fact_budget } };
+    var runner: Runner = .{ .a = a, .project = project, .config = config, .base = config, .files = options.files, .facts = .{ .project = project, .gpa = a, .backing = gpa, .remaining = config.fact_budget } };
     defer runner.facts.deinit();
     // The caller's rules, then those the project's packages declare (`PackageRules.table`).
     const declared = try declaredRules(&runner.facts);
@@ -86,7 +81,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     }
     try validateRules(config, definitions);
     runner.definitions = definitions;
-    const known = try knownRules(a, definitions);
+    const known = definitions;
     var metrics: std.ArrayList(Report.Metrics.File) = .empty;
     var total: Report.Metrics.Counts = .{};
     // A rule's own memory for one file (`Context.allocator`), given back when the rule is done
@@ -163,7 +158,6 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
         };
         if (file.status != .parsed) runner.complete = false;
         try runner.judgeSuppressions(file, known);
-        runner.covered.clearRetainingCapacity();
         if (runner.facts.remaining == 0) {
             try runner.exhausted();
         } else if (runner.facts.short) {
@@ -174,7 +168,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     }
     if (config.strict_suppressions and runner.stale.items.len != 0) runner.complete = false;
     std.mem.sort(Report.Diagnostic, runner.diagnostics.items, project, diagnosticLess);
-    return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .coverage = runner.coverage.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale.items.len, .stale = runner.stale.items, .escapes = runner.escapes.items, .malformed = runner.malformed.items, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null, .seams = try runner.seamCounts(config), .test_inputs = try testInputCounts(a, project, config), .unmapped_import_files = unmappedImportFiles(runner.coverage.items) };
+    return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .coverage = runner.coverage.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale.items.len, .stale = runner.stale.items, .malformed = runner.malformed.items, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null, .seams = try runner.seamCounts(config), .test_inputs = try testInputCounts(a, project, config), .unmapped_import_files = unmappedImportFiles(runner.coverage.items) };
 }
 
 /// Each seam of `config` with the sites it held per rule; stale where every rule it names ran
@@ -273,45 +267,27 @@ fn declaredRules(facts: *Facts) RunError![]const rules.Definition {
     };
 }
 
-/// Only a rule that ran shows that a suppression of it suppresses nothing; an escape is
-/// stale when every rule it names ran and none of their findings stood on the line (an
-/// escape in the older form, every pack rule). One for a rule this run does not enable
-/// is not judged, and is counted as such.
+/// Only a rule that ran shows that a suppression of it suppresses nothing: each rule it names that
+/// ran and met no site of its on the line is stale. One for a rule this run does not enable is not
+/// judged, and is counted as such.
 fn judgeSuppressions(runner: *Runner, file: *const File, known: []const rules.Definition) RunError!void {
-    var inactive: std.ArrayList(Report.Span) = .empty;
-    for (runner.suppressions, 0..) |suppression, i| {
+    var inactive: usize = 0;
+    for (runner.suppressions) |suppression| {
         const start = suppression.comment.start;
         const span: Report.Span = .{ .file = runner.file, .start = start, .end = suppression.comment.end, .line = suppression.comment.line + 1, .column = file.column(start) };
-        if (suppression.escape) |reason| {
-            // An escape in the older form covers what any pack rule finds on its line, a
-            // finding added later too: it is read so the fix can name what it covers, and
-            // the run that reads one is incomplete.
-            if (suppression.unnamed) {
-                runner.complete = false;
-                try runner.malformed.append(runner.a, .{ .why = "an aegis escape names the rules it covers: `// aegis: <reason>(<rule>, ...): <why>`", .span = span });
+        for (suppression.names(), suppression.matched[0..suppression.named_len]) |rule, matched| {
+            if (matched != null) continue;
+            if (!runner.config.has(rule)) {
+                inactive += 1;
+                continue;
             }
-            if (suppression.used) {
-                try runner.escapes.append(runner.a, .{ .span = span, .reason = @tagName(reason), .why = suppression.reason, .covered = runner.covered.get(i).?.items });
-            } else if (runner.escapeRan(suppression, known)) {
-                if (runner.config.strict_suppressions) runner.complete = false;
-                try runner.stale.append(runner.a, .{ .name = "aegis", .span = span });
-            } else try inactive.append(runner.a, span);
-            continue;
+            if (runner.config.strict_suppressions) runner.complete = false;
+            try runner.stale.append(runner.a, .{ .name = (rules.definition(rule, known) orelse return error.InvalidSelection).name, .span = span });
         }
-        const rule = suppression.rule.?;
-        if (suppression.used) continue;
-        if (!runner.config.has(rule)) {
-            try inactive.append(runner.a, span);
-            continue;
-        }
-        if (runner.config.strict_suppressions) runner.complete = false;
-        try runner.stale.append(runner.a, .{ .name = (rules.definition(rule, known) orelse return error.InvalidSelection).name, .span = span });
     }
-    if (inactive.items.len != 0) {
-        var detail: std.Io.Writer.Allocating = .init(runner.a);
-        // An allocating writer fails only when memory does.
-        detail.writer.print("{d} {s} for rules this run does not enable", .{ inactive.items.len, if (inactive.items.len == 1) "escape" else "escapes" }) catch return error.OutOfMemory;
-        try runner.coverage.append(runner.a, .{ .file = runner.file, .reason = .unsupported, .detail = detail.written() });
+    if (inactive != 0) {
+        const detail = try std.fmt.allocPrint(runner.a, "{d} {s} for rules this run does not enable", .{ inactive, if (inactive == 1) "suppression" else "suppressions" });
+        try runner.coverage.append(runner.a, .{ .file = runner.file, .reason = .unsupported, .detail = detail });
     }
 }
 
@@ -321,68 +297,6 @@ fn exhausted(runner: *Runner) error{OutOfMemory}!void {
     runner.complete = false;
     try runner.coverage.append(runner.a, .{ .file = runner.file, .reason = .budget_exhausted, .detail = "semantic fact budget exhausted" });
     runner.facts.forget();
-}
-
-/// Every rule glint has: the core's, this run's own and the aegis pack's, whether or not this
-/// run gives the pack. A suppression naming one this run does not enable is not judged; a name
-/// The role names the run's packs read: glint's own (the aegis pack's and the metrics'), then
-/// each project rule's (`Context.Rule.roles`), a list several rules give once. A name two packs
-/// give in different lists is refused, so a package's role names one pack.
-fn roleNames(a: std.mem.Allocator, project_rules: []const Context.Rule) error{ OutOfMemory, InvalidSelection }![]const []const u8 {
-    var lists: std.ArrayList([]const []const u8) = .empty;
-    try lists.append(a, namesOf(Contract.Kind));
-    try lists.append(a, namesOf(Report.Metrics.Kind));
-    each: for (project_rules) |rule| {
-        if (rule.roles.len == 0) continue;
-        for (lists.items) |list| if (sameNames(list, rule.roles)) continue :each;
-        try lists.append(a, rule.roles);
-    }
-    var names: std.ArrayList([]const u8) = .empty;
-    for (lists.items, 0..) |list, i| for (list) |name| {
-        for (lists.items[i + 1 ..]) |other| for (other) |given| if (std.mem.eql(u8, given, name)) return error.InvalidSelection;
-        try names.append(a, name);
-    };
-    return names.items;
-}
-fn namesOf(comptime E: type) []const []const u8 {
-    return &Names(E).list;
-}
-/// An enum's tag names, once per enum.
-fn Names(comptime E: type) type {
-    return struct {
-        const list = blk: {
-            const given = @typeInfo(E).@"enum".field_names;
-            var out: [given.len][]const u8 = undefined;
-            for (given, &out) |name, *each| each.* = name;
-            break :blk out;
-        };
-    };
-}
-fn sameNames(a: []const []const u8, b: []const []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
-    return true;
-}
-
-/// none of them has is malformed.
-fn knownRules(a: std.mem.Allocator, definitions: []const rules.Definition) std.mem.Allocator.Error![]const rules.Definition {
-    var known: std.ArrayList(rules.Definition) = .empty;
-    try known.appendSlice(a, definitions);
-    pack: for (AegisPack.rules) |rule| {
-        for (definitions) |own| if (own.id == rule.definition.id or std.mem.eql(u8, own.name, rule.definition.name)) continue :pack;
-        try known.append(a, rule.definition);
-    }
-    return known.items;
-}
-
-/// Whether every rule an escape covers ran: those it names, or, in the older form, the pack.
-fn escapeRan(self: *const Runner, escape: Suppression, known: []const rules.Definition) bool {
-    if (!escape.unnamed) {
-        for (escape.covers[0..escape.covers_len]) |rule| if (!self.config.has(rule)) return false;
-        return true;
-    }
-    for (known) |rule| if (rule.exception == .aegis and !self.config.has(rule.id)) return false;
-    return true;
 }
 
 fn diagnosticLess(project: *const Project, lhs: Report.Diagnostic, rhs: Report.Diagnostic) bool {
@@ -420,20 +334,8 @@ fn emitRelated(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: [
         return;
     }
     seen.value_ptr.* = null;
-    // An escape in the older form names no rule it was judged for: what it covers is recorded
-    // for the fix to name, and stays a finding, its fix held back, until its rules are named.
-    var held = false;
-    for (self.suppressions, 0..) |*suppression, i| {
-        if (!try suppression.matches(rule, metadata.exception == .aegis, line, start)) continue;
-        if (suppression.escape != null) {
-            const entry = try self.covered.getOrPut(self.a, i);
-            if (!entry.found_existing) entry.value_ptr.* = .empty;
-            try entry.value_ptr.append(self.a, .{ .name = metadata.name, .span = span });
-        }
-        if (suppression.unnamed) {
-            held = true;
-            break;
-        }
+    for (self.suppressions) |*suppression| {
+        if (!try suppression.matches(rule, line, start)) continue;
         self.suppressed += 1;
         return;
     }
@@ -442,7 +344,7 @@ fn emitRelated(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: [
         .correctness => .correctness,
         .zig_style => .zig_style,
         .family_policy => .family_policy,
-    }, .level = self.config.level(rule), .severity = if (rule == .Z003) .@"error" else .warning, .span = span, .message = try self.a.dupe(u8, message), .related = try self.a.dupe(Report.Span, related), .bug_class = metadata.purpose, .fix = if (fix.len != 0 and !held) try Fix.copy(self.a, fix) else &.{} });
+    }, .level = self.config.level(rule), .severity = if (rule == .Z003) .@"error" else .warning, .span = span, .message = try self.a.dupe(u8, message), .related = try self.a.dupe(Report.Span, related), .bug_class = metadata.purpose, .fix = if (fix.len != 0) try Fix.copy(self.a, fix) else &.{} });
 }
 
 fn sinkDiagnostic(sink: *Context.Sink, rule: rules.Rule, start: u32, end: u32, message: []const u8, related: []const Report.Span, fix: []const Report.Edit) Context.Error!void {
@@ -455,14 +357,12 @@ fn sinkConfig(sink: *Context.Sink, file: Project.FileId) rules.Config {
     return runner.base;
 }
 /// Whether a finding of `rule` at `start` of the current file would be suppressed: a
-/// `glint-ignore` of it, or an escape naming it, on its line. An escape in the older form holds
-/// its findings as findings (`emitRelated`), so it suppresses none.
+/// suppression naming it on its line.
 fn sinkSuppresses(sink: *Context.Sink, rule: rules.Rule, start: u32) bool {
     const runner: *Runner = @fieldParentPtr("sink", sink);
     if (!runner.config.has(rule)) return false;
-    const metadata = rules.definition(rule, runner.definitions) orelse return false;
     const line = runner.project.at(runner.file).file.line(start);
-    for (runner.suppressions) |suppression| if (!suppression.unnamed and suppression.applies(rule, metadata.exception == .aegis, line)) return true;
+    for (runner.suppressions) |suppression| if (suppression.applies(rule, line)) return true;
     return false;
 }
 fn sinkCoverage(sink: *Context.Sink, coverage: Report.Coverage) Context.Error!void {

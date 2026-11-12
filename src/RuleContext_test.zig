@@ -96,27 +96,26 @@ test "G2 incomplete required project rule stays incomplete with every finding al
     }
     try std.testing.expectEqualStrings("CUSTOM_API", report.coverage[report.coverage.len - 1].rule_name);
 }
-test "a project linter skips an escape for a rule glint has that its run does not enable, counted in one coverage line; a rule glint does not have is malformed, and an enabled rule's unused suppression is stale" {
-    // The pack is not this run's, and Z013 is off: neither escape is judged.
-    var inactive = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "pub fn f(buffer: []u8) void {\n    // aegis: design(A019): read only below what it wrote\n    _ = buffer;\n    // glint-ignore: Z013 -- the deprecated name is kept for one release\n    _ = buffer;\n}\n" }}, &.{}, .{});
+test "a project linter skips a suppression for a rule glint has that its run does not enable, counted in one coverage line; a rule glint does not have is malformed, and an enabled rule's unused suppression is stale" {
+    // P007 and Z013 are off: neither suppression is judged.
+    var inactive = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "pub fn f(buffer: []u8) void {\n    // glint-ignore: P007 -- read only below what it wrote\n    _ = buffer;\n    // glint-ignore: Z013 -- the deprecated name is kept for one release\n    _ = buffer;\n}\n" }}, &.{}, .{});
     defer inactive.deinit();
     var skipped = try glint.runConfigured(std.testing.allocator, &inactive, configuration(.report), .{ .project_rules = &.{rule} });
     defer skipped.deinit();
     try std.testing.expectEqual(@as(usize, 0), skipped.malformed.len); // safe: no malformed comment.
     try std.testing.expectEqual(@as(usize, 0), skipped.stale_suppressions); // safe: a rule that does not run judges nothing.
-    try std.testing.expectEqual(@as(usize, 0), skipped.escapes.len); // safe: an unjudged escape covers nothing.
     var lines: usize = 0;
-    for (skipped.coverage) |item| if (std.mem.eql(u8, item.detail, "2 escapes for rules this run does not enable")) {
+    for (skipped.coverage) |item| if (std.mem.eql(u8, item.detail, "2 suppressions for rules this run does not enable")) {
         lines += 1;
     };
     try std.testing.expectEqual(@as(usize, 1), lines); // safe: one line for the file's two.
     // A rule no core, pack or project has: malformed, as before.
-    var unknown = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "pub fn f(buffer: []u8) void {\n    // aegis: design(A999): read only below what it wrote\n    _ = buffer;\n}\n" }}, &.{}, .{});
+    var unknown = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "pub fn f(buffer: []u8) void {\n    // glint-ignore: A999 -- read only below what it wrote\n    _ = buffer;\n}\n" }}, &.{}, .{});
     defer unknown.deinit();
     var refused = try glint.runConfigured(std.testing.allocator, &unknown, configuration(.report), .{ .project_rules = &.{rule} });
     defer refused.deinit();
     try std.testing.expectEqual(@as(usize, 1), refused.malformed.len); // safe: the one unknown name.
-    try std.testing.expectEqualStrings("an aegis escape names a rule glint does not have", refused.malformed[0].why);
+    try std.testing.expectEqualStrings("a suppression names a rule glint does not have", refused.malformed[0].why);
     try std.testing.expect(!refused.complete);
     // The project's own rule runs: its suppression that suppresses nothing is stale.
     var enabled = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "// glint-ignore: CUSTOM_API -- the boundary exports this constant\nconst kept = 2;\npub fn f() u32 {\n    return kept;\n}\n" }}, &.{}, .{});

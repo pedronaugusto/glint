@@ -108,17 +108,16 @@ test "compatibility strict stale suppressions and exhausted facts are incomplete
 }
 
 test "each file's analysis has its own fact budget" {
-    // A019 follows the pointer a parent is recovered from: facts each file's analysis spends.
+    // P007 follows the pointer a parent is recovered from: facts each file's analysis spends.
     const source = "const W = struct { x: u32 };\nconst H = struct { n: u32, w: W };\nfn of(w: *W) *H {\n    return @fieldParentPtr(\"w\", w);\n}\npub fn run(h: *H) u32 {\n    return of(&h.w).n;\n}\n";
-    const pack = glint.AegisPack;
-    const selected: glint.Config = .{ .enabled = .empty, .selections = &.{.{ .rule = pack.unsafe_set, .level = .report }} };
+    const selected: glint.Config = .{ .enabled = .empty, .selections = &.{.{ .rule = .P007, .level = .report }} };
     var one = try glint.Project.init(std.testing.allocator, &.{.{ .name = "one", .bytes = source }}, &.{}, .{});
     defer one.deinit();
     // The least budget one file completes in.
     var config = selected;
     config.fact_budget = 1;
     while (config.fact_budget < 100_000) : (config.fact_budget += 1) {
-        var report = try glint.runConfigured(std.testing.allocator, &one, config, .{ .project_rules = &pack.rules });
+        var report = try glint.runConfigured(std.testing.allocator, &one, config, .{});
         defer report.deinit();
         if (report.complete) break;
     }
@@ -128,7 +127,7 @@ test "each file's analysis has its own fact budget" {
     // leave nothing for them; each has its own and completes in it.
     var three = try glint.Project.init(std.testing.allocator, &.{ .{ .name = "one", .bytes = source }, .{ .name = "two", .bytes = source }, .{ .name = "three", .bytes = source } }, &.{}, .{});
     defer three.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &three, config, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &three, config, .{});
     defer report.deinit();
     for (report.coverage) |item| if (item.reason == .budget_exhausted) {
         try std.testing.expectEqual(three.sources[0].id, item.file);
@@ -669,184 +668,6 @@ test "P006 leaves an entry's owning packages alone, and only them" {
     }
 }
 
-/// A run of P006 over a program (`app`), the package that declares the replacements (`airlock`)
-/// and one that does not import it (`lone`), every file selected; std a fixture of its own.
-fn replacedRun(airlock: []const u8) !glint.Report {
-    return replacedRunOn(airlock, glint.Config.none().fact_budget);
-}
-
-/// `replacedRun` on a budget of `budget` resolutions.
-fn replacedRunOn(airlock: []const u8, budget: usize) !glint.Report {
-    const P = glint.Project;
-    const inputs = [_]P.Input{
-        .{ .name = "app/main.zig", .package = "app", .fingerprint = 1, .bytes =
-        \\const std = @import("std");
-        \\const airlock = @import("airlock");
-        \\extern "c" fn fsync(fd: c_int) c_int;
-        \\pub fn main() void {
-        \\    std.posix.fdatasync(1);
-        \\    _ = fsync(1);
-        \\    airlock.syncFile(1);
-        \\    std.posix.read(1);
-        \\}
-        },
-        .{ .name = "airlock/root.zig", .package = "airlock", .fingerprint = 2, .bytes = airlock },
-        .{ .name = "lone/root.zig", .package = "lone", .fingerprint = 3, .bytes = "const std = @import(\"std\");\npub fn f() void {\n    std.posix.fdatasync(1);\n}\n" },
-        .{ .name = "std/std.zig", .selected = false, .bytes = "pub const posix = @import(\"posix.zig\");\n" },
-        .{ .name = "std/posix.zig", .selected = false, .bytes = "pub fn fdatasync(fd: i32) void {\n    _ = fd;\n}\npub fn read(fd: i32) void {\n    _ = fd;\n}\n" },
-    };
-    const imports = [_]P.Import{
-        .{ .from = 0, .spelling = "std", .target = 3 },
-        .{ .from = 0, .spelling = "airlock", .target = 1 },
-        .{ .from = 1, .spelling = "std", .target = 3 },
-        .{ .from = 2, .spelling = "std", .target = 3 },
-        .{ .from = 3, .spelling = "posix.zig", .target = 4 },
-    };
-    var project = try P.init(std.testing.allocator, &inputs, &imports, .{});
-    defer project.deinit();
-    var config = glint.Config.none();
-    config.selections = &.{.{ .rule = .P006, .level = .gate }};
-    config.fact_budget = budget;
-    return glint.run(std.testing.allocator, &project, config);
-}
-
-test "P006 reads what a package declares it replaces: in every package that imports it, its own included, save the replacement and what only the replacement reaches" {
-    var report = try replacedRun(
-        \\const std = @import("std");
-        \\pub fn syncFile(fd: i32) void {
-        \\    std.posix.fdatasync(fd);
-        \\    flush(fd);
-        \\    helper(fd);
-        \\}
-        \\fn flush(fd: i32) void {
-        \\    deeper(fd);
-        \\}
-        \\fn deeper(fd: i32) void {
-        \\    std.posix.fdatasync(fd);
-        \\}
-        \\pub fn other(fd: i32) void {
-        \\    std.posix.fdatasync(fd);
-        \\}
-        \\fn helper(fd: i32) void {
-        \\    std.posix.fdatasync(fd);
-        \\}
-        \\pub const hook: *const fn (i32) void = &helper;
-        \\pub const lint_rules = .{
-        \\    .version = 1,
-        \\    .replaces = .{
-        \\        .{ .std = std.posix.fdatasync, .with = syncFile, .why = "durability belongs to airlock" },
-        \\        .{ .symbol = "fsync", .with = syncFile, .why = "durability belongs to airlock" },
-        \\    },
-        \\};
-    );
-    defer report.deinit();
-    try std.testing.expect(report.complete);
-    // The program's fdatasync and its own fsync; airlock's `other` and its handed-out `helper`.
-    // syncFile, and flush and deeper, which only it reaches, are the replacement's own; `lone`
-    // does not import airlock; `read` is not replaced.
-    // By file (0 the program, 1 airlock) and line.
-    var lines: [8]u32 = undefined;
-    var n: usize = 0;
-    for (report.diagnostics) |d| {
-        try std.testing.expectEqual(glint.Rule.P006, d.rule);
-        try std.testing.expect(std.mem.find(u8, d.message, "replaced by airlock: durability belongs to airlock; use syncFile") != null);
-        lines[n] = @backingInt(d.span.file) * 100 + d.span.line;
-        n += 1;
-    }
-    std.mem.sort(u32, lines[0..n], {}, std.sort.asc(u32));
-    try std.testing.expectEqualSlices(u32, &.{ 5, 6, 114, 117 }, lines[0..n]);
-}
-
-/// An airlock whose two replacements, `syncFile` and `syncDir`, share their implementation: a
-/// helper both call, a container-level constant and an `extern` only they reach; `extra` is more
-/// of its file.
-fn door(comptime extra: []const u8) []const u8 {
-    return "const std = @import(\"std\");\n" ++
-        "pub fn syncFile(fd: i32) void {\n    shared(fd);\n    flushAll();\n}\n" ++
-        "pub fn syncDir(fd: i32) void {\n    shared(fd);\n    _ = full;\n}\n" ++
-        "fn shared(fd: i32) void {\n    std.posix.fdatasync(fd);\n}\n" ++
-        "const full = std.posix.fdatasync;\n" ++
-        "extern \"c\" fn fsync(fd: c_int) c_int;\n" ++
-        "fn flushAll() void {\n    _ = fsync(1);\n}\n" ++ extra ++
-        "pub const lint_rules = .{ .version = 1, .replaces = .{ .{ .std = std.posix.fdatasync, .with = syncFile, .why = \"durability belongs to airlock\" }, .{ .symbol = \"fsync\", .with = syncDir, .why = \"durability belongs to airlock\" } } };\n";
-}
-
-/// The lines of a report's P006 findings in airlock's file (file 1).
-fn airlockLines(report: glint.Report, out: []u32) []u32 {
-    var n: usize = 0;
-    for (report.diagnostics) |d| if (@backingInt(d.span.file) == 1) {
-        out[n] = d.span.line;
-        n += 1;
-    };
-    std.mem.sort(u32, out[0..n], {}, std.sort.asc(u32));
-    return out[0..n];
-}
-
-test "P006 reads the replacements a package declares as one door: what only they reach, shared or not, is theirs, a container-level constant and an extern by what references them; a use from outside the door is judged, an unresolved call into it undecided" {
-    var buffer: [8]u32 = undefined;
-    // A helper two replacements share (line 11), a constant only syncDir reads (13) and an extern
-    // only syncFile's helper calls (its call, 16): the door's own.
-    var shared = try replacedRun(door(""));
-    defer shared.deinit();
-    try std.testing.expect(shared.complete);
-    try std.testing.expectEqualSlices(u32, &.{}, airlockLines(shared, &buffer));
-    // The helper and the constant, also reached from a private function outside the door that a
-    // public one calls, are judged where they are written (11, 13), as is that function's own call
-    // of the extern (21); the door's call of it (16) stays the door's.
-    var stray = try replacedRun(door("fn stray() void {\n    shared(1);\n    _ = full;\n    _ = fsync(1);\n}\npub fn other() void {\n    stray();\n}\n"));
-    defer stray.deinit();
-    try std.testing.expect(stray.complete);
-    try std.testing.expectEqualSlices(u32, &.{ 11, 13, 21 }, airlockLines(stray, &buffer));
-    // A method whose one call is on a value whose type does not resolve: that call may be of it, so
-    // its site is undecided, never exempt nor a finding.
-    var unresolved = try replacedRun(door("const Box = struct {\n    fd: i32,\n    fn flush(b: Box) void {\n        std.posix.fdatasync(b.fd);\n    }\n};\npub fn reach(b: anytype) void {\n    b.flush();\n}\n"));
-    defer unresolved.deinit();
-    try std.testing.expect(!unresolved.complete);
-    try std.testing.expectEqualSlices(u32, &.{}, airlockLines(unresolved, &buffer));
-}
-
-test "P006 leaves the declarer's files no module of its reaches, and judges a file a module reaches and another package's" {
-    const P = glint.Project;
-    const raw = "const std = @import(\"std\");\npub fn probe() void {\n    std.posix.fdatasync(1);\n}\n";
-    const inputs = [_]P.Input{
-        .{ .name = "airlock/root.zig", .package = "airlock", .fingerprint = 2, .bytes = "const std = @import(\"std\");\nconst part = @import(\"part.zig\");\npub fn syncFile(fd: i32) void {\n    std.posix.fdatasync(fd);\n    part.probe();\n}\npub const lint_rules = .{ .version = 1, .replaces = .{.{ .std = std.posix.fdatasync, .with = syncFile, .why = \"durable\" }} };\n" },
-        .{ .name = "airlock/part.zig", .package = "airlock", .fingerprint = 2, .bytes = raw ++ "pub fn other() void {\n    probe();\n}\n" },
-        .{ .name = "airlock/bench/main.zig", .package = "airlock", .fingerprint = 2, .bytes = "const airlock = @import(\"airlock\");\nconst baseline = @import(\"baseline.zig\");\npub fn main() void {\n    airlock.syncFile(1);\n    baseline.probe();\n}\n" },
-        .{ .name = "airlock/bench/baseline.zig", .package = "airlock", .fingerprint = 2, .bytes = raw },
-        .{ .name = "app/main.zig", .package = "app", .fingerprint = 1, .bytes = "const airlock = @import(\"airlock\");\nconst std = @import(\"std\");\npub fn main() void {\n    airlock.syncFile(1);\n    std.posix.fdatasync(1);\n}\n" },
-        .{ .name = "std/std.zig", .selected = false, .bytes = "pub const posix = @import(\"posix.zig\");\n" },
-        .{ .name = "std/posix.zig", .selected = false, .bytes = "pub fn fdatasync(fd: i32) void {\n    _ = fd;\n}\n" },
-    };
-    const imports = [_]P.Import{
-        .{ .from = 0, .spelling = "std", .target = 5 },
-        .{ .from = 0, .spelling = "part.zig", .target = 1 },
-        .{ .from = 1, .spelling = "std", .target = 5 },
-        .{ .from = 2, .spelling = "airlock", .target = 0 },
-        .{ .from = 2, .spelling = "baseline.zig", .target = 3 },
-        .{ .from = 3, .spelling = "std", .target = 5 },
-        .{ .from = 4, .spelling = "airlock", .target = 0 },
-        .{ .from = 4, .spelling = "std", .target = 5 },
-        .{ .from = 5, .spelling = "posix.zig", .target = 6 },
-    };
-    var project = try P.init(std.testing.allocator, &inputs, &imports, .{});
-    defer project.deinit();
-    var config = glint.Config.none();
-    config.selections = &.{.{ .rule = .P006, .level = .gate }};
-    var report = try glint.run(std.testing.allocator, &project, config);
-    defer report.deinit();
-    try std.testing.expect(report.complete);
-    // The module's part, reached from outside the door by `other` (line 3), and the importer (5);
-    // neither benchmark file, the baseline's raw call included.
-    var files: [4]u32 = undefined;
-    var n: usize = 0;
-    for (report.diagnostics) |d| {
-        files[n] = @backingInt(d.span.file);
-        n += 1;
-    }
-    std.mem.sort(u32, files[0..n], {}, std.sort.asc(u32));
-    try std.testing.expectEqualSlices(u32, &.{ 1, 4 }, files[0..n]);
-}
-
 /// airlock's replacement reached through a chain of `steps` private functions, each called once by
 /// the next: every one of them only the replacement reaches.
 fn chained(steps: usize) ![]u8 {
@@ -856,29 +677,6 @@ fn chained(steps: usize) ![]u8 {
     for (0..steps) |i| try text.print(std.testing.allocator, "fn step{d}(fd: i32) void {{\n    step{d}(fd);\n}}\n", .{ i, i + 1 });
     try text.print(std.testing.allocator, "fn step{d}(fd: i32) void {{\n    std.posix.fdatasync(fd);\n}}\npub const lint_rules = .{{ .version = 1, .replaces = .{{.{{ .std = std.posix.fdatasync, .with = syncFile, .why = \"durability belongs to airlock\" }}}} }};\n", .{steps});
     return text.toOwnedSlice(std.testing.allocator);
-}
-
-test "P006 follows a function's callers to their end: a chain only the replacement reaches is its own, and one the budget does not read to its end is undecided" {
-    const long = try chained(10);
-    defer std.testing.allocator.free(long);
-    // Read to its end: the chain is the replacement's; only the program's fdatasync is judged (this
-    // airlock replaces no symbol).
-    var whole = try replacedRun(long);
-    defer whole.deinit();
-    try std.testing.expect(whole.complete);
-    for (whole.diagnostics) |d| try std.testing.expectEqual(@as(u32, 0), @backingInt(d.span.file));
-    try std.testing.expectEqual(@as(usize, 1), whole.diagnostics.len);
-    // Past the budget: the site in the chain is undecided, for want of budget, never exempt.
-    const longer = try chained(200);
-    defer std.testing.allocator.free(longer);
-    var short = try replacedRunOn(longer, 150);
-    defer short.deinit();
-    try std.testing.expect(!short.complete);
-    var noted = false;
-    for (short.coverage) |note| if (note.rule != null and note.rule.? == .P006 and std.mem.find(u8, note.detail, "may be reached only from the replacement") != null) {
-        noted = true;
-    };
-    try std.testing.expect(noted);
 }
 
 test "P006 configuration needs a symbol without dots, or a source and a path" {
@@ -947,14 +745,15 @@ test "metrics count assertion calls by the declaration their callee resolves to"
         .{ .name = "program.zig", .bytes = program },
         .{ .name = "std.zig", .bytes = "pub const debug = @import(\"debug.zig\");", .selected = false },
         .{ .name = "debug.zig", .bytes = "pub fn assert(ok: bool) void { if (!ok) unreachable; }", .selected = false },
-        .{ .name = "aegis.zig", .bytes = "pub const assert = @import(\"assert.zig\");\npub const lint_rules = .{ .version = 1, .roles = .{ .{ .type = assert.invariant, .role = .invariant }, .{ .type = assert.never, .role = .never } } };", .selected = false, .package = glint.AegisPack.package.name, .fingerprint = glint.AegisPack.package.fingerprint },
-        .{ .name = "assert.zig", .bytes = "pub fn invariant(ok: bool, comptime m: []const u8) void { if (!ok) @panic(m); }\npub inline fn never(comptime m: []const u8) noreturn { @panic(m); }", .selected = false, .package = glint.AegisPack.package.name, .fingerprint = glint.AegisPack.package.fingerprint },
+        .{ .name = "aegis.zig", .bytes = "const std = @import(\"std\");\npub const assert = @import(\"assert.zig\");\npub const lint_rules = .{ .version = 2, .rules = .{.{ .id = .A013, .name = \"contracts\", .kind = .ban, .reads = .replaces, .default = false, .purpose = \"p\" }}, .replaces = .{.{ .rule = .A013, .decl = std.debug.assert, .with = .{ assert.invariant, assert.never }, .why = \"w\" }} };", .selected = false, .package = "aegis", .fingerprint = 7 },
+        .{ .name = "assert.zig", .bytes = "pub fn invariant(ok: bool, comptime m: []const u8) void { if (!ok) @panic(m); }\npub inline fn never(comptime m: []const u8) noreturn { @panic(m); }", .selected = false, .package = "aegis", .fingerprint = 7 },
     };
     const imports = [_]P.Import{
         .{ .from = 0, .spelling = "std", .target = 1 },
         .{ .from = 1, .spelling = "debug.zig", .target = 2 },
         .{ .from = 0, .spelling = "aegis", .target = 3 },
         .{ .from = 3, .spelling = "assert.zig", .target = 4 },
+        .{ .from = 3, .spelling = "std", .target = 1 },
     };
     var project = try P.init(std.testing.allocator, &inputs, &imports, .{});
     defer project.deinit();
@@ -968,13 +767,12 @@ test "metrics count assertion calls by the declaration their callee resolves to"
     try std.testing.expectEqual(@as(u32, 5), t.functions); // safe: expected count fits u32.
     try std.testing.expectEqual(@as(u32, 2), t.asserted); // safe: expected count fits u32.
     try std.testing.expectEqual(@as(u32, 3), t.assertions[@backingInt(glint.Report.Metrics.Kind.std_assert)]); // safe: a kind indexes its own count table.
-    try std.testing.expectEqual(@as(u32, 1), t.assertions[@backingInt(glint.Report.Metrics.Kind.invariant)]); // safe: a kind indexes its own count table.
-    try std.testing.expectEqual(@as(u32, 1), t.assertions[@backingInt(glint.Report.Metrics.Kind.never)]); // safe: a kind indexes its own count table.
+    try std.testing.expectEqual(@as(u32, 2), t.assertions[@backingInt(glint.Report.Metrics.Kind.replacement)]); // safe: a kind indexes its own count table.
     try std.testing.expectEqual(@as(u32, 1), t.unresolved); // safe: expected count fits u32.
     var text: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer text.deinit();
     try report.write(&text.writer, &project, .text);
-    try std.testing.expect(std.mem.find(u8, text.written(), "metrics: 1 files, 5 functions, 2 with an assertion, 5 assertions (std.debug.assert 3, aegis.assert.invariant 1, aegis.assert.never 1), 1 assertion-like calls unresolved\n") != null);
+    try std.testing.expect(std.mem.find(u8, text.written(), "metrics: 1 files, 5 functions, 2 with an assertion, 5 assertions (std.debug.assert 3, its replacements 2), 1 assertion-like calls unresolved\n") != null);
 }
 
 test "P006 decides an unresolved receiver by what Zig allows at the site" {

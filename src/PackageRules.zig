@@ -15,8 +15,6 @@ const Inventory = @import("Rule.zig");
 /// The vocabulary's version this reader knows. A root declaring another is read as no rules,
 /// with the version a problem: a finding in the declarer.
 pub const version: u64 = 2;
-/// The roles-and-pairs vocabulary, read only until the rules that read roles are gone.
-const legacy_version: u64 = 1;
 
 /// A rule a package declares (`.rules`): the id a selection and a suppression name, the name its
 /// report gives, its kind, the entries it reads, whether a run selects it unasked, and its purpose.
@@ -134,66 +132,15 @@ pub const Reference = union(enum) {
     }
 };
 
-/// A declaration the package's replacement stands for (P006's): a std declaration (`.std`), or an
-/// external symbol by its link name (`.symbol = "fsync"`), which every `extern` of it binds; one or
-/// the other.
-pub const Replace = struct { std: ?Reference = null, symbol: ?[]const u8 = null, with: Reference, why: []const u8 };
-/// A declaration of the package's to move off (Z011's).
-/// A function of the package that itself does the work a replacement stands for (`.door`, P006):
-/// with every `.with`, the package's door. `node` is where the list names it.
-pub const Door = struct { reference: Reference, file: Project.FileId, node: Ast.Node.Index };
-
-pub const Deprecated = struct { decl: Reference, with: ?Reference, why: []const u8 };
-/// What a type means: its role, by the enum literal's name, and the fields only the package may
-/// touch (A001's), by name.
-pub const Role = struct { type: Reference, role: []const u8, internal: []const []const u8 };
-/// An obligation no body shows: what makes it, and what ends, moves or checks it.
-pub const Pair = struct {
-    /// Where the pair is written.
-    file: Project.FileId = undefined,
-    node: Ast.Node.Index = undefined,
-    /// The function whose result owes it; null where `type` names the owing type instead.
-    acquire: ?Reference = null,
-    /// The type every value of which owes it (`Secret`, `Guarded(T).Guard`): its operations are
-    /// written as its members (`.deinit`), each resolved once in its container.
-    type: ?Reference = null,
-    /// What discharges it.
-    release: []const Reference = &.{},
-    /// What moves it off this value, each with where to (`Transfer`).
-    transfer: []const Transfer = &.{},
-    /// What ends the value, checking that a release came first (`MustUse.deinit`).
-    teardown: []const Reference = &.{},
-    /// Refused as written (`Problem.Why.refused`): what its operations do is not known.
-    refused: bool = false,
-};
-
-/// A member that moves an obligation off its value, and where it goes, read from the member's
-/// declaration, never declared beside it: to the call's result where the declared result (through
-/// `!` and `?`) is a pair's type (`Guard.handOff` returning `Handoff`); else into the one parameter,
-/// the receiver aside, that points to a pair's type (`moveInto(self, destination: *Self)`).
-pub const Transfer = struct {
-    member: Reference,
-    to: union(enum) {
-        /// The call's result owes it: on success where the result is an error union, and only when
-        /// not null where it is optional; otherwise the source still owes it.
-        result,
-        /// The parameter at this position (the receiver counted) is given it.
-        argument: usize,
-        /// Not settled: the member does not resolve, or the pair was refused.
-        unknown,
-    } = .unknown,
-};
-
 /// Why part of a root's rules could not be read, and where.
 pub const Problem = struct {
     file: Project.FileId,
     node: Ast.Node.Index,
     why: Why,
-    /// The part of the rules it is in: one in a replacement or a deprecation leaves the roles and
-    /// pairs read (`publication`), the declarer's to fix where its own lint reports it.
-    part: Part = .roles,
+    /// The part of the rules it is in.
+    part: Part = .version,
 
-    pub const Part = enum { roles, replaces, deprecated, rules, governed };
+    pub const Part = enum { version, rules, governed, replaces };
 
     pub const Why = enum {
         /// `.version` is not this reader's (`version`), or an `.include` is of another version
@@ -214,13 +161,6 @@ pub const Problem = struct {
         unresolved,
         /// A reference to a declaration outside the declaring package.
         foreign,
-        /// A pair refused as written: an operation that is no function, a transfer whose
-        /// destination its declaration does not settle (no parameter or several), or a teardown
-        /// with no release to check for.
-        refused,
-        /// A role no pack of the run reads (`Facts.role_names`): a misspelt role would leave its
-        /// type plain, which clears its sites.
-        unknown_role,
     };
 };
 
@@ -235,11 +175,6 @@ pub const Rules = struct {
     rule_table: []const Declared = &.{},
     governance: []const Governance = &.{},
     replacements: []const Replacement = &.{},
-    replaces: []const Replace = &.{},
-    door: []const Door = &.{},
-    deprecated: []const Deprecated = &.{},
-    roles: []const Role = &.{},
-    pairs: []const Pair = &.{},
     problems: []const Problem = &.{},
 };
 
@@ -255,17 +190,11 @@ pub fn of(facts: *Facts, root: Project.FileId) Facts.ResolveError!*const Rules {
     if (facts.member(facts.rootOf(root), "lint_rules")) |decl| {
         found.declared = decl;
         try reader.declaration(decl);
-        try reader.settlePairs();
         try reader.settleRules();
         found.version = reader.version;
         found.rule_table = try reader.rule_table.toOwnedSlice(facts.gpa);
         found.governance = try reader.governance.toOwnedSlice(facts.gpa);
         found.replacements = try reader.replacements.toOwnedSlice(facts.gpa);
-        found.replaces = try reader.replaces.toOwnedSlice(facts.gpa);
-        found.door = try reader.door.toOwnedSlice(facts.gpa);
-        found.deprecated = try reader.deprecated.toOwnedSlice(facts.gpa);
-        found.roles = try reader.roles.toOwnedSlice(facts.gpa);
-        found.pairs = try reader.pairs.toOwnedSlice(facts.gpa);
         found.problems = try reader.problems.toOwnedSlice(facts.gpa);
     }
     try memo.roots.put(facts.gpa, root, found);
@@ -322,172 +251,13 @@ pub fn roots(facts: *Facts) Facts.ResolveError![]const Project.FileId {
     return found.toOwnedSlice(facts.gpa);
 }
 
-/// A library's declared roles in this project (`publication`): what its package's roots declare.
-/// Roles are the caller's enum values; the reader never interprets them.
-pub const Publication = struct {
-    entries: []const Entry,
-    /// Where the roles are not all read: undecided where a file imports that root, never silence.
-    gaps: []const Gap,
-    /// The library's own files: those of its package's identity. A file republishing its API,
-    /// or a copy vendored without its manifest, stays the program's.
-    files: []const Project.FileId,
-    /// The obligations no body shows, each pair as its root declares it (`of`).
-    pairs: []const Pair = &.{},
-};
-/// A role on a declaration, with the fields only its package touches (`.internal`, A001's).
-pub const Entry = struct { role: u32, target: Target, internal: []const []const u8 = &.{} };
-pub const Target = union(enum) { function: Facts.Decl, container: Facts.Container };
-/// A root of the library whose roles are not all read: it declares no `lint_rules` (`problem`
-/// null), or part of what it declares could not be read (`Problem`, where it is written).
-/// Reported where a file imports that root, under whatever name.
-pub const Gap = struct { root: Project.FileId, problem: ?Problem };
-
-const Publications = struct { found: std.AutoHashMapUnmanaged(u64, *const Publication) = .empty };
-
-/// What `library`'s package declares (`Library`): each role its roots' `lint_rules` give (`of`)
-/// that the library's `Role` names, on the declaration it names; a type function's role on each
-/// container it returns too (`Facts.returnedContainers`), which its instances are. A root that
-/// declares no `lint_rules`, or whose rules are not all read (a version this reader does not know,
-/// a reference that does not resolve, a role no pack reads), is a gap: its roles may be missing,
-/// so a rule reading them is undecided where that root is imported, never plain. Found once per
-/// run and shared by every rule.
-pub fn publication(facts: *Facts, comptime R: type, library: @import("Library.zig").Library(R)) Facts.ResolveError!*const Publication {
-    const vocabulary = comptime std.hash.Wyhash.hash(0, @typeName(R));
-    const keyed = vocabulary ^ library.package.fingerprint;
-    const memo = try facts.memo(Publications);
-    if (memo.found.get(keyed)) |known| return known;
-    var entries: std.ArrayList(Entry) = .empty;
-    var gaps: std.ArrayList(Gap) = .empty;
-    var pairs: std.ArrayList(Pair) = .empty;
-    for (try facts.packageRoots(library.package)) |root| {
-        const rules = try of(facts, root);
-        if (rules.declared == null) try gaps.append(facts.gpa, .{ .root = root, .problem = null });
-        // A replacement or a deprecation that does not resolve leaves the roles read: the
-        // declarer's own lint reports it, and P006 skips the entry.
-        for (rules.problems) |problem| if (problem.part == .roles) try gaps.append(facts.gpa, .{ .root = root, .problem = problem });
-        try pairs.appendSlice(facts.gpa, rules.pairs);
-        for (rules.roles) |declared| {
-            const role_value = roleValue(R, declared.role) orelse continue;
-            const decl = declared.type.declaration() orelse continue;
-            // A declaration that is a choice (a type chosen per build): each part the role's.
-            const declared_value = try facts.declaration(decl);
-            for (Facts.valueParts(&declared_value)) |part| switch (part) {
-                .function => |function| {
-                    try entries.append(facts.gpa, .{ .role = role_value, .target = .{ .function = function }, .internal = declared.internal });
-                    // The container a type function returns is also its type: instances declared
-                    // with it are the role's, each container it may return where it chooses one
-                    // by a comptime option (aegis 0.3's `SlotPool(T, Tag, options)`).
-                    if (try facts.template(function)) |returned| for (try Facts.returnedContainers(facts.gpa, returned)) |made| {
-                        try entries.append(facts.gpa, .{ .role = role_value, .target = .{ .container = .{ .file = made.file, .scope = made.scope } }, .internal = declared.internal });
-                    };
-                },
-                .container => |made| try entries.append(facts.gpa, .{ .role = role_value, .target = .{ .container = .{ .file = made.file, .scope = made.scope } }, .internal = declared.internal }),
-                .alternatives => unreachable, // unreachable: valueParts gives no choice as a part
-                // A role on what is no type and no function: the declarer's own lint reports
-                // the form; for its consumers the role is not read.
-                else => try gaps.append(facts.gpa, .{ .root = root, .problem = .{ .file = decl.file, .node = facts.project.at(decl.file).model.declarations[@backingInt(decl.index)].node, .why = .malformed } }),
-            };
-        }
-    }
-    var files: std.ArrayList(Project.FileId) = .empty;
-    for (facts.project.sources) |*source| if (facts.ofPackage(source.id, library.package)) try files.append(facts.gpa, source.id);
-    const result = try facts.gpa.create(Publication);
-    result.* = .{ .entries = entries.items, .gaps = gaps.items, .files = files.items, .pairs = pairs.items };
-    try memo.found.put(facts.gpa, keyed, result);
-    return result;
-}
-
-/// What a call of a declaration does to an obligation a pair declares (`Pair`): discharges it,
-/// moves it (to the call's result, or into an argument), checks at the value's end that it was
-/// discharged, or none of these (`operation` answers null). A refused pair's operations, and a
-/// transfer whose destination did not settle, are `unknown`.
-pub const Operation = union(enum) { release, transfer: @FieldType(Transfer, "to"), teardown, unknown };
-
-/// What `callee`, by its declaration, does to an obligation `library`'s package declares.
-pub fn operation(facts: *Facts, comptime R: type, library: @import("Library.zig").Library(R), callee: Facts.Decl) Facts.ResolveError!?Operation {
-    const found = try publication(facts, R, library);
-    for (found.pairs) |pair| {
-        for (pair.release) |each| if (namesDecl(each, callee)) return if (pair.refused) .unknown else .release;
-        for (pair.transfer) |move| if (namesDecl(move.member, callee)) return if (pair.refused or move.to == .unknown) .unknown else .{ .transfer = move.to };
-        for (pair.teardown) |each| if (namesDecl(each, callee)) return if (pair.refused) .unknown else .teardown;
-    }
-    return null;
-}
-fn namesDecl(reference: Reference, decl: Facts.Decl) bool {
-    return std.meta.eql(reference.declaration() orelse return false, decl);
-}
-
-/// The value of the tag of `Roles` named `name`, or null where it names none: a role another pack reads.
-fn roleValue(comptime Roles: type, name: []const u8) ?u32 {
-    const info = @typeInfo(Roles).@"enum";
-    inline for (info.field_names, info.field_values) |field, value| if (std.mem.eql(u8, field, name)) return value;
-    return null;
-}
-
-/// The role `library`'s package declares for a function declaration, or a type or instance of a
-/// container with a role, seen through pointers, optionals and error unions; of a choice, the
-/// role every part agrees on.
-pub fn role(facts: *Facts, comptime R: type, library: @import("Library.zig").Library(R), value: Facts.Value) Facts.ResolveError!?R {
-    const raw = (try roleNumber(facts, R, library, value)) orelse return null;
-    return @as(R, @fromBackingInt(@intCast(raw)));
-}
-
-/// The number of the role `role` reads, compared as a number (no value of the library's `R` is
-/// compared or copied): of a choice, the one every part agrees on, none where they
-/// differ or one has none.
-fn roleNumber(facts: *Facts, comptime R: type, library: @import("Library.zig").Library(R), value: Facts.Value) Facts.ResolveError!?@FieldType(Entry, "role") {
-    if (value == .alternatives) {
-        if (value.alternatives.len == 0) return null;
-        const first = ((try entryOf(facts, R, library, value.alternatives[0])) orelse return null).role;
-        for (value.alternatives[1..]) |part| {
-            const other = ((try entryOf(facts, R, library, part)) orelse return null).role;
-            if (other != first) return null;
-        }
-        return first;
-    }
-    return ((try entryOf(facts, R, library, value)) orelse return null).role;
-}
-
-/// The fields only `library`'s package touches of a value's type (`.internal`), where its type is
-/// one the package gives a role, seen as `role` sees it; null where it is none.
-pub fn internalOf(facts: *Facts, comptime R: type, library: @import("Library.zig").Library(R), value: Facts.Value) Facts.ResolveError!?[]const []const u8 {
-    const found = (try entryOf(facts, R, library, value)) orelse return null;
-    return found.internal;
-}
-
-/// The entry of the declaration `value` is, or is a type or instance of.
-fn entryOf(facts: *Facts, comptime R: type, library: @import("Library.zig").Library(R), value: Facts.Value) Facts.ResolveError!?Entry {
-    const found = try publication(facts, R, library);
-    var current = value;
-    while (true) switch (current) {
-        .pointer => |inner| current = inner.child.*,
-        .array, .optional, .error_union => |inner| current = inner.*,
-        .function => |decl| {
-            for (found.entries) |entry| if (entry.target == .function and std.meta.eql(entry.target.function, decl)) return entry;
-            return null;
-        },
-        .container, .instance => |c| {
-            for (found.entries) |entry| if (entry.target == .container and entry.target.container.file == c.file and entry.target.container.scope == c.scope) return entry;
-            return null;
-        },
-        // A choice is no one declaration's entry: `role` reads it part by part.
-        .alternatives => return null,
-        else => return null,
-    };
-}
-
 const Reader = struct {
     facts: *Facts,
     package: Identity,
     /// Each `lint_rules` read, so an `.include` cycle or repeat is read once.
     seen: std.AutoHashMapUnmanaged(Facts.Decl, void) = .empty,
-    replaces: std.ArrayList(Replace) = .empty,
-    door: std.ArrayList(Door) = .empty,
-    deprecated: std.ArrayList(Deprecated) = .empty,
     /// The part of the rules being read, which a problem found there records.
-    part: Problem.Part = .roles,
-    roles: std.ArrayList(Role) = .empty,
-    pairs: std.ArrayList(Pair) = .empty,
+    part: Problem.Part = .version,
     problems: std.ArrayList(Problem) = .empty,
     /// The root's version, which every `.include` shares; 0 until the root's is read.
     version: u64 = 0,
@@ -522,36 +292,12 @@ const Reader = struct {
         for (literal.ast.fields) |field| if (std.mem.eql(u8, fieldName(t, field), "version")) {
             if (t.nodeTag(field) == .number_literal) declared = std.fmt.parseInt(u64, t.tokenSlice(t.nodeMainToken(field)), 10) catch 0;
         };
-        if (declared != version and declared != legacy_version) return r.problem(decl.file, init, .unknown_version);
+        if (declared != version) return r.problem(decl.file, init, .unknown_version);
         if (r.version == 0) r.version = declared;
         if (r.version != declared) return r.problem(decl.file, init, .unknown_version);
-        if (declared == version) return r.fields(decl.file, literal.ast.fields);
-        for (literal.ast.fields) |field| {
-            const name = fieldName(t, field);
-            if (std.mem.eql(u8, name, "version")) continue;
-            if (std.mem.eql(u8, name, "include")) {
-                try r.includes(decl.file, field);
-            } else if (std.mem.eql(u8, name, "replaces")) {
-                r.part = .replaces;
-                defer r.part = .roles;
-                for (try r.list(decl.file, field) orelse continue) |entry| try r.replace(decl.file, entry);
-            } else if (std.mem.eql(u8, name, "door")) {
-                r.part = .replaces;
-                defer r.part = .roles;
-                for (try r.list(decl.file, field) orelse continue) |entry| try r.door.append(r.facts.gpa, .{ .reference = try r.reference(decl.file, entry, .own), .file = decl.file, .node = entry });
-            } else if (std.mem.eql(u8, name, "deprecated")) {
-                r.part = .deprecated;
-                defer r.part = .roles;
-                for (try r.list(decl.file, field) orelse continue) |entry| try r.deprecation(decl.file, entry);
-            } else if (std.mem.eql(u8, name, "roles")) {
-                for (try r.list(decl.file, field) orelse continue) |entry| try r.role(decl.file, entry);
-            } else if (std.mem.eql(u8, name, "pairs")) {
-                for (try r.list(decl.file, field) orelse continue) |entry| try r.pair(decl.file, entry);
-            } else try r.problem(decl.file, field, .unknown_field);
-        }
+        return r.fields(decl.file, literal.ast.fields);
     }
 
-    /// A version 2 `lint_rules`'s fields.
     fn fields(r: *Reader, file: Project.FileId, all: []const Ast.Node.Index) Error!void {
         for (all) |field| {
             const name = fieldName(r.tree(file), field);
@@ -569,7 +315,7 @@ const Reader = struct {
                 .governed => .governed,
                 .replaces => .replaces,
             };
-            defer r.part = .roles;
+            defer r.part = .version;
             for (try r.list(file, field) orelse continue) |entry| switch (part) {
                 .rules => try r.declaredRule(file, entry),
                 .governed => try r.governedType(file, entry),
@@ -761,7 +507,7 @@ const Reader = struct {
     /// declares, to read `replaces`.
     fn settleRules(r: *Reader) Error!void {
         r.part = .replaces;
-        defer r.part = .roles;
+        defer r.part = .version;
         for (r.replacements.items, r.named_rules.items) |entry, at| {
             for (r.rule_table.items) |declared| {
                 if (std.mem.eql(u8, declared.id, entry.rule) and declared.reads == .replaces) break;
@@ -931,166 +677,6 @@ const Reader = struct {
         };
     }
 
-    fn replace(r: *Reader, file: Project.FileId, node: Ast.Node.Index) Error!void {
-        var entry: Replace = .{ .with = .unresolved, .why = "" };
-        var buffer: [2]Ast.Node.Index = undefined;
-        const literal = r.tree(file).fullStructInit(&buffer, node) orelse return r.problem(file, node, .malformed);
-        for (literal.ast.fields) |field| {
-            const name = fieldName(r.tree(file), field);
-            if (std.mem.eql(u8, name, "std")) {
-                entry.std = try r.reference(file, field, .std);
-            } else if (std.mem.eql(u8, name, "symbol")) {
-                entry.symbol = try r.string(file, field);
-            } else if (std.mem.eql(u8, name, "with")) {
-                entry.with = try r.reference(file, field, .own);
-            } else if (std.mem.eql(u8, name, "why")) {
-                entry.why = try r.string(file, field);
-            } else try r.problem(file, field, .unknown_field);
-        }
-        // One of a std declaration and an external symbol, never both or neither.
-        if ((entry.std == null) == (entry.symbol == null)) return r.problem(file, node, .malformed);
-        try r.replaces.append(r.facts.gpa, entry);
-    }
-
-    fn deprecation(r: *Reader, file: Project.FileId, node: Ast.Node.Index) Error!void {
-        var entry: Deprecated = .{ .decl = .unresolved, .with = null, .why = "" };
-        var buffer: [2]Ast.Node.Index = undefined;
-        const literal = r.tree(file).fullStructInit(&buffer, node) orelse return r.problem(file, node, .malformed);
-        for (literal.ast.fields) |field| {
-            const name = fieldName(r.tree(file), field);
-            if (std.mem.eql(u8, name, "decl")) {
-                entry.decl = try r.reference(file, field, .own);
-            } else if (std.mem.eql(u8, name, "with")) {
-                entry.with = if (r.tree(file).nodeTag(field) == .identifier and std.mem.eql(u8, r.tree(file).tokenSlice(r.tree(file).nodeMainToken(field)), "null")) null else try r.reference(file, field, .own);
-            } else if (std.mem.eql(u8, name, "why")) {
-                entry.why = try r.string(file, field);
-            } else try r.problem(file, field, .unknown_field);
-        }
-        try r.deprecated.append(r.facts.gpa, entry);
-    }
-
-    fn role(r: *Reader, file: Project.FileId, node: Ast.Node.Index) Error!void {
-        var entry: Role = .{ .type = .unresolved, .role = "", .internal = &.{} };
-        var buffer: [2]Ast.Node.Index = undefined;
-        const literal = r.tree(file).fullStructInit(&buffer, node) orelse return r.problem(file, node, .malformed);
-        for (literal.ast.fields) |field| {
-            const name = fieldName(r.tree(file), field);
-            if (std.mem.eql(u8, name, "type")) {
-                entry.type = try r.reference(file, field, .own);
-            } else if (std.mem.eql(u8, name, "role")) {
-                entry.role = try r.enumLiteral(file, field);
-                if (r.facts.role_names) |known| {
-                    for (known) |each| {
-                        if (std.mem.eql(u8, each, entry.role)) break;
-                    } else try r.problem(file, field, .unknown_role);
-                }
-            } else if (std.mem.eql(u8, name, "internal")) {
-                var names: std.ArrayList([]const u8) = .empty;
-                for (try r.list(file, field) orelse continue) |each| try names.append(r.facts.gpa, try r.enumLiteral(file, each));
-                entry.internal = try names.toOwnedSlice(r.facts.gpa);
-            } else try r.problem(file, field, .unknown_field);
-        }
-        try r.roles.append(r.facts.gpa, entry);
-    }
-
-    fn pair(r: *Reader, file: Project.FileId, node: Ast.Node.Index) Error!void {
-        var entry: Pair = .{ .file = file, .node = node };
-        var buffer: [2]Ast.Node.Index = undefined;
-        const literal = r.tree(file).fullStructInit(&buffer, node) orelse return r.problem(file, node, .malformed);
-        // The type first, wherever it is written: the operations are its members.
-        var owing: ?Facts.Container = null;
-        for (literal.ast.fields) |field| if (std.mem.eql(u8, fieldName(r.tree(file), field), "type")) {
-            entry.type = try r.reference(file, field, .own);
-            if (entry.type.?.declaration()) |decl| owing = try r.containerOf(decl);
-            if (owing == null and entry.type.? == .decl) try r.problem(file, field, .unresolved);
-        };
-        for (literal.ast.fields) |field| {
-            const name = fieldName(r.tree(file), field);
-            if (std.mem.eql(u8, name, "type")) continue;
-            if (std.mem.eql(u8, name, "acquire")) {
-                entry.acquire = try r.reference(file, field, .own);
-                continue;
-            }
-            if (std.mem.eql(u8, name, "transfer")) {
-                var moves: std.ArrayList(Transfer) = .empty;
-                for (try r.list(file, field) orelse continue) |one| try moves.append(r.facts.gpa, .{ .member = try r.operation(file, one, owing) });
-                entry.transfer = try moves.toOwnedSlice(r.facts.gpa);
-                continue;
-            }
-            const operations: *[]const Reference = if (std.mem.eql(u8, name, "release"))
-                &entry.release
-            else if (std.mem.eql(u8, name, "teardown"))
-                &entry.teardown
-            else {
-                try r.problem(file, field, .unknown_field);
-                continue;
-            };
-            var each: std.ArrayList(Reference) = .empty;
-            for (try r.list(file, field) orelse continue) |one| try each.append(r.facts.gpa, try r.operation(file, one, owing));
-            operations.* = try each.toOwnedSlice(r.facts.gpa);
-        }
-        try r.pairs.append(r.facts.gpa, entry);
-    }
-
-    /// Settles each pair once every pair is read: where each transfer goes, and the pairs refused.
-    fn settlePairs(r: *Reader) Error!void {
-        var owing: std.ArrayList(Facts.Container) = .empty;
-        for (r.pairs.items) |each| {
-            const decl = (each.type orelse continue).declaration() orelse continue;
-            try owing.append(r.facts.gpa, (try r.containerOf(decl)) orelse continue);
-        }
-        for (r.pairs.items) |*each| {
-            var refused = each.teardown.len != 0 and each.release.len == 0;
-            for ([_][]const Reference{ each.release, each.teardown }) |operations| for (operations) |named| {
-                if (named.declaration()) |decl| if (try r.facts.declaration(decl) != .function) {
-                    refused = true;
-                };
-            };
-            const moves = try r.facts.gpa.dupe(Transfer, each.transfer);
-            for (moves) |*move| {
-                const decl = move.member.declaration() orelse continue;
-                move.to = (try r.destination(decl, owing.items)) orelse {
-                    refused = true;
-                    continue;
-                };
-            }
-            if (refused) {
-                for (moves) |*move| move.to = .unknown;
-                each.refused = true;
-                try r.problem(each.file, each.node, .refused);
-            }
-            each.transfer = moves;
-        }
-    }
-
-    /// Where the function `decl` moves an obligation: its result where its declared result
-    /// (through `!` and `?`) is an owing type; else the one parameter, the receiver aside, that
-    /// points to an owing type. Null where neither settles it.
-    fn destination(r: *Reader, decl: Facts.Decl, owing: []const Facts.Container) Error!?@FieldType(Transfer, "to") {
-        if (try r.facts.declaration(decl) != .function) return null;
-        const t = r.tree(decl.file);
-        var buffer: [1]Ast.Node.Index = undefined;
-        const proto = t.fullFnProto(&buffer, r.facts.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return null;
-        if (proto.ast.return_type.unwrap()) |result| {
-            // A result that may or may not be an owing type does not settle it.
-            switch (owes(try r.facts.resolve(decl.file, result), owing, false) orelse return null) {
-                true => return .result,
-                false => {},
-            }
-        }
-        var found: ?usize = null;
-        var it = proto.iterate(t);
-        var position: usize = 0;
-        while (it.next()) |param| : (position += 1) {
-            const written = param.type_expr orelse continue;
-            if (position == 0) continue; // The receiver is the value the obligation leaves.
-            if (!(owes(try r.facts.resolve(decl.file, written), owing, true) orelse return null)) continue;
-            if (found != null) return null;
-            found = position;
-        }
-        return if (found) |at| .{ .argument = at } else null;
-    }
-
     /// The container a type declaration names: the type itself, or the one a type function
     /// returns, where every part of a choice names that one. Null where it resolves to neither,
     /// or a choice names different ones.
@@ -1125,21 +711,6 @@ const Reader = struct {
             found = one;
         }
         return found;
-    }
-
-    /// An operation of a pair: a member of the owing type written as an enum literal (`.deinit`),
-    /// resolved in its container, or a reference.
-    fn operation(r: *Reader, file: Project.FileId, node: Ast.Node.Index, owing: ?Facts.Container) Error!Reference {
-        if (r.tree(file).nodeTag(node) != .enum_literal) return r.reference(file, node, .own);
-        const container = owing orelse {
-            try r.problem(file, node, .unresolved);
-            return .unresolved;
-        };
-        const found = r.facts.member(container, try r.enumLiteral(file, node)) orelse {
-            try r.problem(file, node, .unresolved);
-            return .unresolved;
-        };
-        return .{ .decl = found };
     }
 
     /// A reference: an expression naming a declaration, or `.{ .generic = F, .member = .m }`,
@@ -1446,313 +1017,6 @@ test "what a version 2 root cannot name is a problem where it is written, one ea
             std.debug.print("case: {s}\n", .{case[0]});
             return err;
         };
-        try std.testing.expectEqual(case[1], rules.problems[0].why);
-    }
-}
-
-test "an include of another version than its root's is not read" {
-    var f: Fixture = undefined;
-    try f.init(&.{
-        .{ .name = "pkg/root.zig", .package = "pkg", .fingerprint = 7, .bytes = "const old = @import(\"old.zig\");\npub const lint_rules = .{ .version = 2, .include = .{old.lint_rules} };\n" },
-        .{ .name = "pkg/old.zig", .package = "pkg", .fingerprint = 7, .bytes = "pub const Once = struct {};\npub const lint_rules = .{ .version = 1, .roles = .{.{ .type = Once, .role = .once }} };\n" },
-    }, &.{.{ .from = 0, .spelling = "old.zig", .target = 1 }});
-    defer f.deinit();
-    const rules = try of(&f.facts, f.project.sources[0].id);
-    try std.testing.expectEqual(@as(usize, 1), rules.problems.len);
-    try std.testing.expectEqual(Problem.Why.unknown_version, rules.problems[0].why);
-    try std.testing.expectEqual(@as(usize, 0), rules.roles.len);
-}
-
-const fake_std = "pub const Io = struct {\n    pub const Dir = struct {\n        pub fn createFileAtomic() void {}\n    };\n};\n";
-
-test "a root's lint_rules are read by declaration: std's replaced, the package's own deprecated, roles, a generic's member as a pair, and an include cycle read once" {
-    var f: Fixture = undefined;
-    try f.init(&.{
-        .{ .name = "consumer", .bytes = "const pkg = @import(\"pkg\");\npub fn f() void {\n    _ = pkg;\n}\n" },
-        .{ .name = "pkg/root.zig", .package = "pkg", .fingerprint = 7, .selected = false, .bytes =
-        \\const std = @import("std");
-        \\const sync = @import("sync.zig");
-        \\pub const Pending = struct {
-        \\    pub fn publish() void {}
-        \\    pub fn old() void {}
-        \\};
-        \\pub fn Guarded(comptime T: type) type {
-        \\    return struct {
-        \\        value: T,
-        \\        pub fn acquire(g: *@This()) void {
-        \\            _ = g;
-        \\        }
-        \\    };
-        \\}
-        \\pub const Secret = struct { data: u8 };
-        \\pub const lint_rules = .{
-        \\    .version = 1,
-        \\    .include = .{sync.lint_rules},
-        \\    .replaces = .{.{ .std = std.Io.Dir.createFileAtomic, .with = Pending.publish, .why = "airlock's publish is durable" }},
-        \\    .deprecated = .{.{ .decl = Pending.old, .with = Pending.publish, .why = "renamed" }},
-        \\    .roles = .{.{ .type = Secret, .role = .secret, .internal = .{.data} }},
-        \\    .pairs = .{.{ .acquire = .{ .generic = Guarded, .member = .acquire }, .release = .{Pending.publish} }},
-        \\};
-        },
-        .{ .name = "pkg/sync.zig", .package = "pkg", .fingerprint = 7, .selected = false, .bytes =
-        \\const root = @import("root.zig");
-        \\pub const Once = struct {};
-        \\pub const lint_rules = .{ .version = 1, .include = .{root.lint_rules}, .roles = .{.{ .type = Once, .role = .once }} };
-        },
-        .{ .name = "std", .bytes = fake_std, .selected = false },
-    }, &.{
-        .{ .from = 0, .spelling = "pkg", .target = 1 },
-        .{ .from = 1, .spelling = "std", .target = 3 },
-        .{ .from = 1, .spelling = "sync.zig", .target = 2 },
-        .{ .from = 2, .spelling = "root.zig", .target = 1 },
-    });
-    defer f.deinit();
-    try std.testing.expectEqualSlices(Project.FileId, &.{ f.project.sources[1].id, f.project.sources[3].id }, try roots(&f.facts));
-    const rules = try of(&f.facts, f.project.sources[1].id);
-    try std.testing.expectEqual(@as(usize, 0), rules.problems.len);
-    try std.testing.expectEqual(@as(usize, 1), rules.replaces.len);
-    try std.testing.expectEqualStrings("createFileAtomic", f.name(rules.replaces[0].std.?));
-    try std.testing.expectEqualStrings("publish", f.name(rules.replaces[0].with));
-    try std.testing.expectEqualStrings("airlock's publish is durable", rules.replaces[0].why);
-    try std.testing.expectEqualStrings("old", f.name(rules.deprecated[0].decl));
-    // The root's own role, then the included one; the include back to the root reads nothing again.
-    try std.testing.expectEqual(@as(usize, 2), rules.roles.len);
-    try std.testing.expectEqualStrings("Once", f.name(rules.roles[0].type));
-    try std.testing.expectEqualStrings("Secret", f.name(rules.roles[1].type));
-    try std.testing.expectEqualStrings("secret", rules.roles[1].role);
-    try std.testing.expectEqualStrings("data", rules.roles[1].internal[0]);
-    try std.testing.expectEqualStrings("acquire", f.name(rules.pairs[0].acquire.?));
-    try std.testing.expectEqualStrings("publish", f.name(rules.pairs[0].release[0]));
-    // Read once for the run.
-    try std.testing.expectEqual(rules, try of(&f.facts, f.project.sources[1].id));
-}
-
-test "what a root's lint_rules cannot name is a problem where it is written: drift, another package's declaration, a field the vocabulary lacks, another version" {
-    var f: Fixture = undefined;
-    try f.init(&.{
-        .{ .name = "pkg/root.zig", .package = "pkg", .fingerprint = 7, .bytes =
-        \\const other = @import("other");
-        \\const Ns = struct {};
-        \\pub fn publish() void {}
-        \\pub const lint_rules = .{
-        \\    .version = 1,
-        \\    .deprecated = .{ .{ .decl = Ns.gone, .with = publish, .why = "gone" }, .{ .decl = other.thing, .with = null, .why = "not ours" } },
-        \\    .colour = .red,
-        \\};
-        },
-        .{ .name = "other/root.zig", .package = "other", .fingerprint = 9, .selected = false, .bytes = "pub fn thing() void {}\n" },
-        .{ .name = "next/root.zig", .package = "next", .fingerprint = 3, .selected = false, .bytes = "pub fn thing() void {}\npub const lint_rules = .{ .version = 3, .deprecated = .{.{ .decl = thing, .why = \"later\" }} };\n" },
-    }, &.{.{ .from = 0, .spelling = "other", .target = 1 }});
-    defer f.deinit();
-    const rules = try of(&f.facts, f.project.sources[0].id);
-    var whys: [3]Problem.Why = undefined;
-    for (rules.problems, 0..) |problem, i| whys[i] = problem.why;
-    try std.testing.expectEqualSlices(Problem.Why, &.{ .unresolved, .foreign, .unknown_field }, whys[0..rules.problems.len]);
-    try std.testing.expect(rules.deprecated[0].decl == .unresolved);
-    try std.testing.expectEqualStrings("publish", f.name(rules.deprecated[0].with.?));
-    try std.testing.expect(rules.deprecated[1].decl == .foreign);
-    try std.testing.expectEqual(null, rules.deprecated[1].with);
-    // Another version is read as no rules at all.
-    const later = try of(&f.facts, f.project.sources[2].id);
-    try std.testing.expectEqual(@as(usize, 0), later.deprecated.len);
-    try std.testing.expectEqual(Problem.Why.unknown_version, later.problems[0].why);
-    // A root that declares none has none, and no problem.
-    try std.testing.expectEqual(null, (try of(&f.facts, f.project.sources[1].id)).declared);
-}
-
-test "a replacement names a std declaration or an external symbol, one of the two: both, or neither, is malformed where it is written" {
-    var f: Fixture = undefined;
-    try f.init(&.{
-        .{ .name = "pkg/root.zig", .package = "pkg", .fingerprint = 7, .bytes =
-        \\const std = @import("std");
-        \\pub fn publish() void {}
-        \\pub const lint_rules = .{
-        \\    .version = 1,
-        \\    .replaces = .{
-        \\        .{ .symbol = "fsync", .with = publish, .why = "durable" },
-        \\        .{ .std = std.Io.Dir.createFileAtomic, .symbol = "fsync", .with = publish, .why = "both" },
-        \\        .{ .with = publish, .why = "neither" },
-        \\    },
-        \\};
-        },
-        .{ .name = "std", .bytes = fake_std, .selected = false },
-    }, &.{.{ .from = 0, .spelling = "std", .target = 1 }});
-    defer f.deinit();
-    const rules = try of(&f.facts, f.project.sources[0].id);
-    try std.testing.expectEqual(@as(usize, 1), rules.replaces.len);
-    try std.testing.expectEqualStrings("fsync", rules.replaces[0].symbol.?);
-    try std.testing.expectEqual(null, rules.replaces[0].std);
-    try std.testing.expectEqualStrings("publish", f.name(rules.replaces[0].with));
-    var whys: [4]Problem.Why = undefined;
-    for (rules.problems, 0..) |problem, i| whys[i] = problem.why;
-    try std.testing.expectEqualSlices(Problem.Why, &.{ .malformed, .malformed }, whys[0..rules.problems.len]);
-}
-
-test "a door entry names a declaration of the package: one that does not resolve or is another's is a problem where it is written, the rest read" {
-    var f: Fixture = undefined;
-    try f.init(&.{
-        .{ .name = "pkg/root.zig", .package = "pkg", .fingerprint = 7, .bytes =
-        \\const other = @import("other");
-        \\pub fn publish() void {}
-        \\pub fn flush() void {}
-        \\const Ns = struct {};
-        \\pub const lint_rules = .{
-        \\    .version = 1,
-        \\    .door = .{ flush, Ns.gone, other.thing },
-        \\};
-        },
-        .{ .name = "other/root.zig", .package = "other", .fingerprint = 8, .selected = false, .bytes = "pub fn thing() void {}\n" },
-    }, &.{.{ .from = 0, .spelling = "other", .target = 1 }});
-    defer f.deinit();
-    const rules = try of(&f.facts, f.project.sources[0].id);
-    try std.testing.expectEqual(@as(usize, 3), rules.door.len);
-    try std.testing.expectEqualStrings("flush", f.name(rules.door[0].reference));
-    var whys: [4]Problem.Why = undefined;
-    for (rules.problems, 0..) |problem, i| whys[i] = problem.why;
-    try std.testing.expectEqualSlices(Problem.Why, &.{ .unresolved, .foreign }, whys[0..rules.problems.len]);
-    for (rules.problems) |problem| try std.testing.expectEqual(Problem.Part.replaces, problem.part);
-}
-
-test "a replaced std member each target declares in a holder of its own is read in every holder that has it" {
-    var f: Fixture = undefined;
-    try f.init(&.{
-        .{ .name = "pkg/root.zig", .package = "pkg", .fingerprint = 7, .bytes =
-        \\const std = @import("std");
-        \\pub fn publish() void {}
-        \\pub const lint_rules = .{
-        \\    .version = 1,
-        \\    .replaces = .{
-        \\        .{ .std = std.F.BOTH, .with = publish, .why = "two targets" },
-        \\        .{ .std = std.F.ONE, .with = publish, .why = "one target" },
-        \\        .{ .std = std.F.NONE, .with = publish, .why = "no target" },
-        \\    },
-        \\};
-        },
-        .{ .name = "std", .selected = false, .bytes =
-        \\const native = @import("builtin").os.tag;
-        \\pub const F = switch (native) {
-        \\    .macos => struct { pub const BOTH = 1; pub const ONE = 2; },
-        \\    .linux => struct { pub const BOTH = 3; },
-        \\    else => void,
-        \\};
-        },
-    }, &.{.{ .from = 0, .spelling = "std", .target = 1 }});
-    defer f.deinit();
-    const rules = try of(&f.facts, f.project.sources[0].id);
-    try std.testing.expectEqual(@as(usize, 3), rules.replaces.len);
-    try std.testing.expectEqual(@as(usize, 2), rules.replaces[0].std.?.declarations().len);
-    try std.testing.expectEqual(@as(usize, 1), rules.replaces[1].std.?.declarations().len);
-    try std.testing.expectEqual(@as(usize, 0), rules.replaces[2].std.?.declarations().len);
-    try std.testing.expectEqual(@as(usize, 1), rules.problems.len);
-    try std.testing.expectEqual(Problem.Why.unresolved, rules.problems[0].why);
-}
-
-test "a fork's copy of a package is the package by its stated identity, wherever its tree is" {
-    var f: Fixture = undefined;
-    try f.init(&.{
-        .{ .name = "consumer", .bytes = "const parallax = @import(\"parallax\");\npub fn f() void {\n    _ = parallax;\n}\n" },
-        .{ .name = ".zig-cache/bay/forks/parallax-1a2b/src/root.zig", .package = "parallax", .fingerprint = 11, .selected = false, .bytes = "const hunks = @import(\"hunks.zig\");\npub const lint_rules = .{ .version = 1, .deprecated = .{.{ .decl = hunks.walk, .with = hunks.next, .why = \"one walk\" }} };\n" },
-        .{ .name = ".zig-cache/bay/forks/parallax-1a2b/src/hunks.zig", .package = "parallax", .fingerprint = 11, .selected = false, .bytes = "pub fn walk() void {}\npub fn next() void {}\n" },
-    }, &.{
-        .{ .from = 0, .spelling = "parallax", .target = 1 },
-        .{ .from = 1, .spelling = "hunks.zig", .target = 2 },
-    });
-    defer f.deinit();
-    const rules = try of(&f.facts, f.project.sources[1].id);
-    try std.testing.expectEqual(@as(usize, 0), rules.problems.len);
-    try std.testing.expectEqualStrings("parallax", rules.package.name);
-    try std.testing.expectEqualStrings("walk", f.name(rules.deprecated[0].decl));
-    try std.testing.expectEqualStrings("next", f.name(rules.deprecated[0].with.?));
-}
-
-/// Whether `value` is one of the `owing` types: a value of one, seen through `!` and `?`, or
-/// (`pointer`) a pointer to one; a part that does not resolve shows none. A choice is one where
-/// every part is, not where none is, and null where its parts differ.
-fn owes(value: Facts.Value, owing: []const Facts.Container, pointer: bool) ?bool {
-    var some = false;
-    var every = true;
-    for (Facts.valueParts(&value)) |part| {
-        const one: bool = switch (part) {
-            .error_union, .optional => |inner| owes(inner.*, owing, pointer) orelse return null,
-            .pointer => |inner| if (pointer) owes(inner.child.*, owing, pointer) orelse return null else false,
-            .container, .instance => |c| for (owing) |held| {
-                if (held.file == c.file and held.scope == c.scope) break true;
-            } else false,
-            .alternatives => unreachable, // unreachable: valueParts gives no choice as a part
-            else => false,
-        };
-        some = some or one;
-        every = every and one;
-    }
-    if (some != every) return null;
-    return some;
-}
-
-test "a pair of a type names its operations as its members, and where a transfer moves the obligation is read from the member's declaration" {
-    var f: Fixture = undefined;
-    try f.init(&.{.{ .name = "pkg/root.zig", .package = "pkg", .fingerprint = 7, .bytes =
-        \\pub fn Guarded(comptime T: type) type {
-        \\    return struct {
-        \\        value: T,
-        \\        pub const Guard = struct {
-        \\            pub fn deinit(g: *Guard) void { _ = g; }
-        \\            pub fn handOff(g: *Guard) Handoff { _ = g; return .{}; }
-        \\            pub fn tryHandOff(g: *Guard) ?Handoff { _ = g; return null; }
-        \\        };
-        \\        pub const Handoff = struct {
-        \\            pub fn release(h: *Handoff) void { _ = h; }
-        \\        };
-        \\    };
-        \\}
-        \\pub const Reservation = struct {
-        \\    pub fn release(r: *Reservation) void { _ = r; }
-        \\    pub fn moveInto(r: *Reservation, destination: *Reservation) void { _ = r; _ = destination; }
-        \\};
-        \\pub const lint_rules = .{
-        \\    .version = 1,
-        \\    .pairs = .{
-        \\        .{ .type = .{ .generic = Guarded, .member = .Guard }, .release = .{.deinit}, .transfer = .{ .handOff, .tryHandOff } },
-        \\        .{ .type = .{ .generic = Guarded, .member = .Handoff }, .release = .{.release} },
-        \\        .{ .type = Reservation, .release = .{.release}, .transfer = .{.moveInto} },
-        \\    },
-        \\};
-    }}, &.{});
-    defer f.deinit();
-    const rules = try of(&f.facts, f.project.sources[0].id);
-    try std.testing.expectEqual(@as(usize, 0), rules.problems.len);
-    try std.testing.expectEqualStrings("deinit", f.name(rules.pairs[0].release[0]));
-    // To the result: a `Handoff`, and through `?` one that may be null.
-    try std.testing.expect(rules.pairs[0].transfer[0].to == .result);
-    try std.testing.expect(rules.pairs[0].transfer[1].to == .result);
-    // Into the one parameter, the receiver aside, that points to an owing type.
-    try std.testing.expectEqual(@as(usize, 1), rules.pairs[2].transfer[0].to.argument);
-}
-
-test "a pair is refused as written where its operations do not settle: a transfer to nothing or to two places, a teardown with no release, a member that is not there or no function" {
-    const head =
-        \\pub const R = struct {
-        \\    pub const kind = 1;
-        \\    pub fn release(r: *R) void { _ = r; }
-        \\    pub fn deinit(r: *R) void { _ = r; }
-        \\    pub fn drop(r: *R) void { _ = r; }
-        \\    pub fn split(r: *R, a: *R, b: *R) void { _ = r; _ = a; _ = b; }
-        \\};
-        \\
-    ;
-    for ([_]struct { []const u8, Problem.Why }{
-        .{ ".{ .type = R, .release = .{.release}, .transfer = .{.drop} }", .refused },
-        .{ ".{ .type = R, .release = .{.release}, .transfer = .{.split} }", .refused },
-        .{ ".{ .type = R, .teardown = .{.deinit} }", .refused },
-        .{ ".{ .type = R, .release = .{.relase} }", .unresolved },
-        .{ ".{ .type = R, .release = .{.kind} }", .refused },
-    }) |case| {
-        const source = try std.mem.concat(std.testing.allocator, u8, &.{ head, "pub const lint_rules = .{ .version = 1, .pairs = .{", case[0], "} };\n" });
-        defer std.testing.allocator.free(source);
-        var f: Fixture = undefined;
-        try f.init(&.{.{ .name = "pkg/root.zig", .package = "pkg", .fingerprint = 7, .bytes = source }}, &.{});
-        defer f.deinit();
-        const rules = try of(&f.facts, f.project.sources[0].id);
-        try std.testing.expectEqual(@as(usize, 1), rules.problems.len);
         try std.testing.expectEqual(case[1], rules.problems[0].why);
     }
 }

@@ -1,8 +1,8 @@
-//! The danger rules' predicates (designs/aegis.md §7): the sites each finds, and the sites it
-//! leaves alone, over a std laid out as Zig 0.17's.
+//! P007 (operations Zig leaves unchecked), P008 (identifying integers of one type) and P009 (a
+//! pointer into the frame carried out): the sites each finds and the sites it leaves alone, over a
+//! std laid out as Zig 0.17's.
 const std = @import("std");
 const glint = @import("glint");
-const pack = glint.AegisPack;
 const sources = @import("aegis_sources");
 
 /// std as 0.17 lays out what the rules name, and nothing else.
@@ -307,7 +307,7 @@ fn runWith(rule: glint.Rule, program: []const u8, extra: []const sources.Extra, 
 fn runAs(rule: glint.Rule, program: []const u8, as: sources.Consumer, extra: []const sources.Extra, imports: []const sources.ExtraImport) !Run {
     var project = try sources.projectAs(std.testing.allocator, program, as, extra, imports);
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .report }} }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .report }} }, .{});
     defer report.deinit();
     var result: Run = .{ .findings = 0, .undecided = 0 };
     // A fixture std's AstGen refuses is not checked at all: it would pass any count of none.
@@ -319,22 +319,14 @@ fn runAs(rule: glint.Rule, program: []const u8, as: sources.Consumer, extra: []c
     result.countUndecided(report, rule);
     return result;
 }
-/// `expect` for a program whose public generics nothing binds, as the row means them to be:
-/// undecided only by `notes` notes at their names.
-fn expectNoted(rule: glint.Rule, program: []const u8, notes: usize, findings: usize) !void {
-    const result = try run(rule, program);
-    try std.testing.expectEqual(notes, result.undecided);
-    try std.testing.expectEqual(notes, result.unbound);
-    try std.testing.expectEqual(findings, result.findings);
-}
 fn expect(rule: glint.Rule, program: []const u8, findings: usize) !void {
     const result = try run(rule, program);
     try std.testing.expectEqual(@as(usize, 0), result.undecided); // safe: fixture counts are representable.
     try std.testing.expectEqual(findings, result.findings);
 }
 
-test "A019 finds the unchecked operations, an interface field's parent and its alignment among them, the escape covering one, never an address read" {
-    try expect(pack.unsafe_set,
+test "P007 finds the unchecked operations, an interface field's parent and its alignment among them, a suppression covering one, never an address read" {
+    try expect(.P007,
         \\extern fn write(fd: c_int) c_int;
         \\const Sink = struct { interface: u64, n: u32 };
         \\fn of(w: *u64) *Sink {
@@ -345,101 +337,52 @@ test "A019 finds the unchecked operations, an interface field's parent and its a
         \\    const q: *u8 = @constCast(p);
         \\    const r: *u32 = @ptrCast(@alignCast(q));
         \\    _ = r;
-        \\    const s: *u8 = @ptrFromInt(a); // aegis: boundary(A019): an address the kernel hands back
+        \\    const s: *u8 = @ptrFromInt(a); // glint-ignore: P007 -- an address the kernel hands back
         \\    _ = s;
         \\    return @intFromPtr(p);
         \\}
     , 7);
 }
 
-test "A014 finds a pointer into the frame carried out of the call" {
-    try expect(pack.lifetimes, "pub fn f(n: usize) []u8 { var buf: [16]u8 = undefined; buf[0] = 1; return buf[0..n]; }", 1);
-    try expect(pack.lifetimes, "pub fn f() *u32 { var x: u32 = 1; x += 1; const out = &x; return out; }", 1);
-    try expect(pack.lifetimes, "const R = struct { s: []u8 }; pub fn f(n: usize) R { var buf: [8]u8 = undefined; buf[0] = 1; return .{ .s = buf[0..n] }; }", 1);
+test "P009 finds a pointer into the frame carried out of the call" {
+    try expect(.P009, "pub fn f(n: usize) []u8 { var buf: [16]u8 = undefined; buf[0] = 1; return buf[0..n]; }", 1);
+    try expect(.P009, "pub fn f() *u32 { var x: u32 = 1; x += 1; const out = &x; return out; }", 1);
+    try expect(.P009, "const R = struct { s: []u8 }; pub fn f(n: usize) R { var buf: [8]u8 = undefined; buf[0] = 1; return .{ .s = buf[0..n] }; }", 1);
     // A const of a run-time value, a local whose type only its value gives, a var alias and an
     // alias of an alias. (Stores into another object's field or a global are no longer A014's:
     // the 0.8 cut keeps the certain return shape.)
-    try expect(pack.lifetimes, "pub fn f(x: u8) []const u8 { const buf = [_]u8{ x, 1 }; return buf[0..]; }", 1);
-    try expect(pack.lifetimes, "pub fn f(n: usize) []u8 { var buf = [_]u8{ 0, 0, 0, 0 }; buf[0] = 1; return buf[0..n]; }", 1);
-    try expect(pack.lifetimes, "pub fn f() *u32 { var x: u32 = 1; x += 1; var p: *u32 = undefined; p = &x; return p; }", 1);
-    try expect(pack.lifetimes, "pub fn f() *u32 { var x: u32 = 1; x += 1; const a = &x; const b = a; return b; }", 1);
+    try expect(.P009, "pub fn f(x: u8) []const u8 { const buf = [_]u8{ x, 1 }; return buf[0..]; }", 1);
+    try expect(.P009, "pub fn f(n: usize) []u8 { var buf = [_]u8{ 0, 0, 0, 0 }; buf[0] = 1; return buf[0..n]; }", 1);
+    try expect(.P009, "pub fn f() *u32 { var x: u32 = 1; x += 1; var p: *u32 = undefined; p = &x; return p; }", 1);
+    try expect(.P009, "pub fn f() *u32 { var x: u32 = 1; x += 1; const a = &x; const b = a; return b; }", 1);
     // Stored by a destructure into a `var` alias that is returned.
-    try expect(pack.lifetimes, "pub fn f() *u32 { var x: u32 = 1; x += 1; var p: *u32 = undefined; p, _ = .{ &x, 0 }; return p; }", 1);
+    try expect(.P009, "pub fn f() *u32 { var x: u32 = 1; x += 1; var p: *u32 = undefined; p, _ = .{ &x, 0 }; return p; }", 1);
     // A slice of a pointer local points where the pointer does: into a local array it was
     // given, and nowhere in the frame where it is made from an integer, its type unresolved (a
     // generic's `@TypeOf(slice.ptr)`, relic-b's warp c.zig:774).
-    try expect(pack.lifetimes, "pub fn f(n: u8) []u8 { var buf: [4]u8 = .{ n, n, n, n }; buf[0] = 1; const p: [*]u8 = &buf; return p[0..2]; }", 1);
-    try expectNoted(pack.lifetimes, "fn m(s: anytype, at: usize) @TypeOf(s) { const p: @TypeOf(s.ptr) = @ptrFromInt(at); return p[0..s.len]; } pub fn f(x: anytype) void { _ = m(x, 8); }", 1, 0);
-    try expectNoted(pack.lifetimes, "fn m(s: anytype, at: usize) @TypeOf(s) { const p: @TypeOf(s.ptr) = @ptrCast(@alignCast(@as(*u8, @ptrFromInt(at)))); return p[0..s.len]; } pub fn f(x: anytype) void { _ = m(x, 8); }", 1, 0);
+    try expect(.P009, "pub fn f(n: u8) []u8 { var buf: [4]u8 = .{ n, n, n, n }; buf[0] = 1; const p: [*]u8 = &buf; return p[0..2]; }", 1);
+    try expect(.P009, "fn m(s: anytype, at: usize) @TypeOf(s) { const p: @TypeOf(s.ptr) = @ptrFromInt(at); return p[0..s.len]; } pub fn f(x: anytype) void { _ = m(x, 8); }", 0);
+    try expect(.P009, "fn m(s: anytype, at: usize) @TypeOf(s) { const p: @TypeOf(s.ptr) = @ptrCast(@alignCast(@as(*u8, @ptrFromInt(at)))); return p[0..s.len]; } pub fn f(x: anytype) void { _ = m(x, 8); }", 0);
 }
 
-test "A014 leaves static storage, pointers, copies and a store a defer clears on every exit alone" {
-    try expect(pack.lifetimes, "pub fn f() []const u8 { const table = [_]u8{ 1, 2 }; return table[0..]; }", 0);
-    try expect(pack.lifetimes, "pub fn f() []const u8 { comptime { var buf: [2]u8 = .{ 1, 2 }; buf[0] = 3; const out = buf; return &out; } }", 0);
-    try expectNoted(pack.lifetimes, "pub fn Make(comptime n: usize) type { var x: [n]u8 = undefined; x[0] = 1; _ = &x; return struct {}; }", 1, 0);
-    try expect(pack.lifetimes, "const N = struct { v: u32 }; pub fn f(head: *N) *u32 { var node: *N = head; node.v += 1; return &node.v; }", 0);
-    try expect(pack.lifetimes, "pub fn f(items: []u8) []u8 { var s: []u8 = items; s = s[1..]; return s[0..1]; }", 0);
-    try expect(pack.lifetimes, "pub fn f() [4]u8 { var buf: [4]u8 = undefined; buf[0] = 1; return buf; }", 0);
-    try expect(pack.lifetimes, "const T = struct { cur: ?*u32 = null }; pub fn f(t: *T) void { var x: u32 = 1; x += 1; t.cur = &x; defer t.cur = null; }", 0);
-    try expect(pack.lifetimes, "pub fn f() u32 { var x: u32 = 1; var p: *u32 = undefined; p = &x; p.* += 1; return x; }", 0);
-    try expect(pack.lifetimes, "const T = struct { cur: ?*u32 = null }; pub fn f(t: *T) void { var x: u32 = 1; x += 1; t.cur = &x; defer { t.cur = null; } }", 0);
+test "P009 leaves static storage, pointers, copies and a store a defer clears on every exit alone" {
+    try expect(.P009, "pub fn f() []const u8 { const table = [_]u8{ 1, 2 }; return table[0..]; }", 0);
+    try expect(.P009, "pub fn f() []const u8 { comptime { var buf: [2]u8 = .{ 1, 2 }; buf[0] = 3; const out = buf; return &out; } }", 0);
+    try expect(.P009, "pub fn Make(comptime n: usize) type { var x: [n]u8 = undefined; x[0] = 1; _ = &x; return struct {}; }", 0);
+    try expect(.P009, "const N = struct { v: u32 }; pub fn f(head: *N) *u32 { var node: *N = head; node.v += 1; return &node.v; }", 0);
+    try expect(.P009, "pub fn f(items: []u8) []u8 { var s: []u8 = items; s = s[1..]; return s[0..1]; }", 0);
+    try expect(.P009, "pub fn f() [4]u8 { var buf: [4]u8 = undefined; buf[0] = 1; return buf; }", 0);
+    try expect(.P009, "const T = struct { cur: ?*u32 = null }; pub fn f(t: *T) void { var x: u32 = 1; x += 1; t.cur = &x; defer t.cur = null; }", 0);
+    try expect(.P009, "pub fn f() u32 { var x: u32 = 1; var p: *u32 = undefined; p = &x; p.* += 1; return x; }", 0);
+    try expect(.P009, "const T = struct { cur: ?*u32 = null }; pub fn f(t: *T) void { var x: u32 = 1; x += 1; t.cur = &x; defer { t.cur = null; } }", 0);
     // Twins: a destructure that stores no pointer into the frame, and the clear spelled
     // otherwise, naming the same memory.
-    try expect(pack.lifetimes, "const T = struct { p: ?*u32 = null }; pub fn f(t: *T, y: *u32) void { var x: u32 = 1; x += 1; t.p, _ = .{ y, x }; }", 0);
-    try expect(pack.lifetimes, "const T = struct { cur: ?*u32 = null }; pub fn f(t: *T) void { var x: u32 = 1; x += 1; t.cur = &x; defer (t).cur = null; }", 0);
+    try expect(.P009, "const T = struct { p: ?*u32 = null }; pub fn f(t: *T, y: *u32) void { var x: u32 = 1; x += 1; t.p, _ = .{ y, x }; }", 0);
+    try expect(.P009, "const T = struct { cur: ?*u32 = null }; pub fn f(t: *T) void { var x: u32 = 1; x += 1; t.cur = &x; defer (t).cur = null; }", 0);
 }
 
-test "the aegis escape covers the pack's findings on its line, is listed with them, and refuses glint-ignore" {
-    var project = try sources.projectWithSources(std.testing.allocator,
-        \\pub fn reg(a: usize) *u8 {
-        \\    // aegis: boundary(A019): the device register the board maps at this address
-        \\    return @ptrFromInt(a);
-        \\}
-        \\pub fn page(a: usize) *u8 {
-        \\    return @ptrFromInt(a); // aegis: internal(A019): the page the kernel hands back
-        \\}
-        \\pub fn g() void {} // aegis: design(A019): nothing here
-    , &std_files, &std_imports);
-    defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = pack.unsafe_set, .level = .gate }} }, .{ .project_rules = &pack.rules });
-    defer report.deinit();
-    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: fixture counts are representable.
-    try std.testing.expectEqual(@as(usize, 2), report.escapes.len); // safe: fixture counts are representable.
-    try std.testing.expectEqualStrings("boundary", report.escapes[0].reason);
-    try std.testing.expectEqualStrings("A019", report.escapes[0].covered[0].name);
-    try std.testing.expectEqualStrings("internal", report.escapes[1].reason);
-    try std.testing.expectEqual(@as(usize, 1), report.stale.len); // safe: fixture counts are representable.
-    try std.testing.expect(report.complete);
-    // An escape covers only the rules it names; one naming none hides nothing: its line's pack
-    // findings stay findings, recorded as what it covers for the fix to name, and the run that
-    // reads it is incomplete.
-    var other = try sources.projectWithSources(std.testing.allocator,
-        \\pub fn f(parent_id: u32, child_id: u32) *u8 { return @ptrFromInt(parent_id + child_id); } // aegis: no-danger(A016): another rule's
-        \\pub fn g(parent_id: u32, child_id: u32) *u8 { return @ptrFromInt(parent_id + child_id); } // aegis: no-danger: every rule's
-    , &std_files, &std_imports);
-    defer other.deinit();
-    var named = try glint.runConfigured(std.testing.allocator, &other, .{ .enabled = .empty, .selections = &.{ .{ .rule = pack.identity, .level = .gate }, .{ .rule = pack.unsafe_set, .level = .gate } } }, .{ .project_rules = &pack.rules });
-    defer named.deinit();
-    // f's escape covers A016 alone, so A019 stays on its line; g's covers nothing it names.
-    try std.testing.expectEqual(@as(usize, 3), named.diagnostics.len); // safe: fixture counts are representable.
-    try std.testing.expectEqual(@as(u32, 1), named.diagnostics[0].span.line);
-    try std.testing.expectEqual(@as(u32, 2), named.diagnostics[1].span.line);
-    try std.testing.expectEqual(@as(u32, 2), named.diagnostics[2].span.line);
-    try std.testing.expectEqual(@as(usize, 2), named.escapes.len); // safe: fixture counts are representable.
-    try std.testing.expectEqualStrings("A016", named.escapes[0].covered[0].name);
-    try std.testing.expectEqual(@as(usize, 2), named.escapes[1].covered.len); // safe: fixture counts are representable.
-    try std.testing.expect(!named.complete);
-    try std.testing.expectEqual(@as(usize, 1), named.malformed.len); // safe: fixture counts are representable.
-    var refused = try sources.projectWithSources(std.testing.allocator, "pub fn h(a: usize) *u8 { return @ptrFromInt(a); } // glint-ignore: A019 -- no-danger: one register\n", &std_files, &std_imports);
-    defer refused.deinit();
-    var rejected = try glint.runConfigured(std.testing.allocator, &refused, .{ .enabled = .empty, .selections = &.{.{ .rule = pack.unsafe_set, .level = .gate }} }, .{ .project_rules = &pack.rules });
-    defer rejected.deinit();
-    try std.testing.expect(!rejected.complete);
-    try std.testing.expectEqual(@as(usize, 1), rejected.malformed.len); // safe: fixture count is representable.
-}
-
-test "A016 finds identifying integers of one type meeting, not other integers" {
-    try expect(pack.identity,
+test "P008 finds identifying integers of one type meeting, not other integers" {
+    try expect(.P008,
         \\const NodeIndex = u32;
         \\pub fn link(parent_id: u32, child_id: u32) void { _ = parent_id; _ = child_id; }
         \\pub fn move(from: NodeIndex, toIndex: u32) void { _ = from; _ = toIndex; }
@@ -486,7 +429,7 @@ const interface_program =
     \\
 ;
 
-test "A019 reads a module republishing aegis beside code of its own as the program's: only aegis's own package leaves it" {
+test "P007 reads a module republishing aegis beside code of its own as the program's: only aegis's own package leaves it" {
     // `wrap` republishes all of aegis's root and names a field of what it cannot resolve as
     // `interface`: the program's code, whose use of the field leaves the conversion a finding.
     const wrap: sources.Extra = .{ .name = "wrap/root.zig", .package = "wrap", .bytes =
@@ -524,16 +467,16 @@ test "A019 reads a module republishing aegis beside code of its own as the progr
     };
     const extra = &(std_files ++ [_]sources.Extra{wrap});
     const imports = &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "wrap", .target = std_files.len }, .{ .from = std_files.len, .spelling = "aegis", .target = sources.aegis_file }, .{ .from = std_files.len, .spelling = "std", .target = 0 } });
-    const found = try runWith(pack.unsafe_set, comptime edited(interface_program, "const std = @import(\"std\");\n", "const std = @import(\"std\");\nconst wrap = @import(\"wrap\");\n"), extra, imports);
+    const found = try runWith(.P007, comptime edited(interface_program, "const std = @import(\"std\");\n", "const std = @import(\"std\");\nconst wrap = @import(\"wrap\");\n"), extra, imports);
     try std.testing.expectEqualSlices(u32, &.{ 12, 12 }, found.lines[0..found.findings]);
 }
 
-test "A019 reads every file a path import joins to the program, selected or not: a copy of an interface field there leaves the conversion a finding" {
+test "P007 reads every file a path import joins to the program, selected or not: a copy of an interface field there leaves the conversion a finding" {
     // `other.zig`, outside the selection, copies the field it is handed: 11, the conversion
     // and its alignment.
     const program = comptime edited(interface_program, "pub fn use() !usize {", "const other = @import(\"other.zig\");\npub fn use() !usize {\n    var t: Sink = .init();\n    other.keep(&t);");
     const other: sources.Extra = .{ .name = "other.zig", .bytes = "pub fn keep(s: anytype) void { const copy = s.interface; _ = copy; }" };
-    const found = try runWith(pack.unsafe_set, program, &(std_files ++ [_]sources.Extra{other}), &(std_imports ++ [_]sources.ExtraImport{.{ .spelling = "other.zig", .target = std_files.len }}));
+    const found = try runWith(.P007, program, &(std_files ++ [_]sources.Extra{other}), &(std_imports ++ [_]sources.ExtraImport{.{ .spelling = "other.zig", .target = std_files.len }}));
     try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, found.lines[0..found.findings]);
 }
 
@@ -541,7 +484,7 @@ test "A019 reads every file a path import joins to the program, selected or not:
 fn fixed(rule: glint.Rule, program: []const u8) ![]u8 {
     var project = try sources.projectWithSources(std.testing.allocator, program, &std_files, &std_imports);
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .gate }} }, .{});
     defer report.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -557,7 +500,7 @@ fn fixedBy(rules: []const glint.Rule, program: []const u8, record: []const u8) !
     defer project.deinit();
     var selections: [8]glint.Config.Selection = undefined;
     for (rules, 0..) |rule, i| selections[i] = .{ .rule = rule, .level = .gate };
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = selections[0..rules.len] }, .{ .project_rules = &pack.rules });
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = selections[0..rules.len] }, .{});
     defer report.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -567,116 +510,66 @@ fn fixedBy(rules: []const glint.Rule, program: []const u8, record: []const u8) !
     return .{ .bytes = try std.testing.allocator.dupe(u8, bytes), .stale = report.stale.len };
 }
 
-test "the fix names an escape in the older form only where a run before recorded it at that place with those words, with the rules it covered then that find something now, and keeps an escape whose rules did not run" {
-    const older =
-        \\pub fn f(parent_id: u32, child_id: u32) *u8 { return @ptrFromInt(parent_id + child_id); } // aegis: no-danger: probe
+test "one suppression names each rule it covers on its line, one site each; the aegis escape form is malformed" {
+    var project = try sources.projectWithSources(std.testing.allocator,
+        \\pub fn f(parent_id: u32, child_id: u32) *u8 { return @ptrFromInt(parent_id + child_id); } // glint-ignore: P007, P008 -- the board's two register ids
+        \\pub fn g(parent_id: u32, child_id: u32) *u8 { return @ptrFromInt(parent_id + child_id); } // glint-ignore: P007 -- only the conversion
+        \\pub fn h(a: usize) *u8 { return @ptrFromInt(a); } // aegis: boundary(A019): the old form
+    , &std_files, &std_imports);
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{ .{ .rule = .P007, .level = .gate }, .{ .rule = .P008, .level = .gate } } }, .{});
+    defer report.deinit();
+    // g's P008 stands, and h's P007 under a comment glint reads no more.
+    try std.testing.expectEqual(@as(usize, 2), report.diagnostics.len); // safe: fixture counts are representable.
+    try std.testing.expectEqual(@as(u32, 2), report.diagnostics[0].span.line);
+    try std.testing.expectEqual(@as(u32, 3), report.diagnostics[1].span.line);
+    try std.testing.expectEqual(@as(usize, 3), report.suppressed); // safe: f's two and g's one.
+    try std.testing.expectEqual(@as(usize, 1), report.malformed.len); // safe: the old escape.
+    try std.testing.expect(!report.complete);
+}
+
+test "the fix rewrites the aegis escape into glint-ignore under today's names, names an older one from a run's record, and removes one naming only a rule that went" {
+    const program =
+        \\pub fn a(p: usize) *u8 {
+        \\    return @ptrFromInt(p); // aegis: internal(A019, A014): the page the kernel hands back
+        \\}
+        \\pub fn b(p: usize) *u8 {
+        \\    return @ptrFromInt(p); // aegis: boundary: the device register
+        \\}
+        \\pub fn c(p: usize) *u8 {
+        \\    return @ptrFromInt(p); // aegis: no-danger(A010): gone with the flow engine
+        \\}
+        \\pub fn d(p: usize) *u8 {
+        \\    return @ptrFromInt(p); // aegis: design: no record names it
+        \\}
         \\
     ;
-    const both: []const glint.Rule = &.{ pack.identity, pack.unsafe_set };
-    // A016 and A019 both find something on the line; the record holds A019 only, so A016, new
-    // since, is left to the owner.
-    {
-        const out = try fixedBy(both, older, "glint: escape: consumer:1:91: no-danger: probe (A019)\nglint: 3 files\n");
-        defer std.testing.allocator.free(out.bytes);
-        try std.testing.expect(std.mem.find(u8, out.bytes, "// aegis: no-danger(A019): probe") != null);
-    }
-    {
-        const out = try fixedBy(both, older, "escape: consumer:1:91: no-danger: probe (A016 at 1:26, A019 at 1:54, A014 at 1:1)\n");
-        defer std.testing.allocator.free(out.bytes);
-        try std.testing.expect(std.mem.find(u8, out.bytes, "// aegis: no-danger(A016, A019): probe") != null);
-    }
-    // No record of the escape, or one of another line, column or words (moved or reworded
-    // since), or of rules that find nothing now, or a line in another form that names it:
-    // nothing is written, and the escape stays for its owner to name.
-    inline for (.{
-        "",
-        "glint: escape: consumer:9:91: no-danger: probe (A019)\n",
-        "glint: escape: consumer:1:89: no-danger: probe (A019)\n",
-        "glint: escape: consumer:1:91: design: probe (A019)\n",
-        "glint: escape: consumer:1:91: no-danger: probe two (A019)\n",
-        "glint: escape: consumer:1:91: no-danger: probe (A014)\n",
-        "note: escape: consumer:1:91: no-danger: probe (A019)\n",
-        "glint: A019: consumer:1:54: see escape: consumer:1:91: no-danger: probe (A019)\n",
-    }) |record| {
-        const out = try fixedBy(both, older, record);
-        defer std.testing.allocator.free(out.bytes);
-        try std.testing.expectEqualStrings(older, out.bytes);
-    }
-    // A line in the record's form that is no escape's whole record is refused, not guessed at.
-    var records = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer records.deinit();
-    inline for (.{
-        "escape: consumer:1: no-danger: probe (A019)\n",
-        "escape: consumer:1:91: no-danger probe (A019)\n",
-        "glint: escape: consumer:1:91: no-danger: probe (A019\n",
-        "escape: consumer:1:91: no-danger: probe (A019 near 4:18)\n",
-        "escape: consumer:x:32: no-danger: probe (A019)\n",
-    }) |record| try std.testing.expectError(error.InvalidEscapeRecord, glint.Fix.escapeRecord(records.allocator(), record));
-    // An escape is stale only where every rule it names ran: a run of A016 alone keeps an
-    // escape naming A019, and one naming A016 and A014.
-    inline for (.{ "no-danger(A019)", "no-danger(A016, A014)" }) |escape| {
-        const named = "pub fn f() u8 {\n    return 0; // aegis: " ++ escape ++ ": probe\n}\n";
-        const out = try fixedBy(&.{pack.identity}, named, "");
-        defer std.testing.allocator.free(out.bytes);
-        try std.testing.expectEqual(@as(usize, 0), out.stale);
-        try std.testing.expectEqualStrings(named, out.bytes);
-    }
-    // Where it ran and found nothing, it goes.
-    {
-        const named = "pub fn f() u8 {\n    return 0; // aegis: no-danger(A019): probe\n}\n";
-        const out = try fixedBy(&.{ pack.identity, pack.unsafe_set }, named, "");
-        defer std.testing.allocator.free(out.bytes);
-        try std.testing.expectEqual(@as(usize, 1), out.stale);
-        try std.testing.expectEqual(null, std.mem.find(u8, out.bytes, "aegis:"));
-    }
+    const out = try fixedBy(&.{.P007}, program, "glint: escape: consumer:5:28: boundary: the device register (A019)\n");
+    defer std.testing.allocator.free(out.bytes);
+    try std.testing.expectEqualStrings(
+        \\pub fn a(p: usize) *u8 {
+        \\    return @ptrFromInt(p); // glint-ignore: P007, P009 -- internal: the page the kernel hands back
+        \\}
+        \\pub fn b(p: usize) *u8 {
+        \\    return @ptrFromInt(p); // glint-ignore: P007 -- boundary: the device register
+        \\}
+        \\pub fn c(p: usize) *u8 {
+        \\    return @ptrFromInt(p);
+        \\}
+        \\pub fn d(p: usize) *u8 {
+        \\    return @ptrFromInt(p); // aegis: design: no record names it
+        \\}
+        \\
+    , out.bytes);
     // A record line that names an escape and is not one is refused.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     try std.testing.expectError(error.InvalidEscapeRecord, glint.Fix.escapeRecord(arena.allocator(), "glint: escape: consumer:x:1: no-danger: why (A019)\n"));
 }
 
-test "the fix makes the old pack suppression the escape, removes an escape whose rules ran and found nothing, and writes no escape a site did not have" {
-    const out = try fixed(pack.unsafe_set,
-        \\pub fn f(p: *const u8) *u8 {
-        \\    // safe: the caller passes memory it owns
-        \\    return @constCast(p);
-        \\}
-        \\pub fn g() u8 {
-        \\    // aegis: no-danger(A019): nothing here any more
-        \\    return 1; // aegis: design: nor here
-        \\}
-        \\pub fn h(p: *const u8) *u8 {
-        \\    // glint-ignore: A019 -- c-os-boundary: the kernel's handle
-        \\    return @constCast(p);
-        \\}
-        \\pub fn k(p: *const u8) *u8 {
-        \\    return @constCast(p); // aegis: boundary: the kernel's handle
-        \\}
-    );
-    defer std.testing.allocator.free(out);
-    try std.testing.expectEqualStrings(
-        \\pub fn f(p: *const u8) *u8 {
-        \\    // safe: the caller passes memory it owns
-        \\    return @constCast(p);
-        \\}
-        \\pub fn g() u8 {
-        \\    return 1; // aegis: design: nor here
-        \\}
-        \\pub fn h(p: *const u8) *u8 {
-        \\    // aegis: boundary(A019): the kernel's handle
-        \\    return @constCast(p);
-        \\}
-        \\pub fn k(p: *const u8) *u8 {
-        \\    return @constCast(p); // aegis: boundary: the kernel's handle
-        \\}
-    , out);
-    // An escape in the older form is named only from a record of a run before, and is stale
-    // only where the whole pack ran: this run is A019's alone.
-}
-
-test "A019 reads @setRuntimeSafety on the build mode in each mode: off where the build keeps the checks, undecided on anything else" {
+test "P007 reads @setRuntimeSafety on the build mode in each mode: off where the build keeps the checks, undecided on anything else" {
     // fiat-crypto's form: checked only in debug, so off in safe builds.
-    try expect(pack.unsafe_set,
+    try expect(.P007,
         \\const mode = @import("builtin").mode;
         \\pub fn f(a: u64, b: u64) u64 {
         \\    @setRuntimeSafety(mode == .debug);
@@ -684,7 +577,7 @@ test "A019 reads @setRuntimeSafety on the build mode in each mode: off where the
         \\}
     , 1);
     // Through the builtin import and a constant: off nowhere the build keeps checks.
-    try expect(pack.unsafe_set,
+    try expect(.P007,
         \\const builtin = @import("builtin");
         \\const checked = builtin.mode == .debug or builtin.mode == .safe;
         \\pub fn f(a: u64, b: u64) u64 {
@@ -697,14 +590,14 @@ test "A019 reads @setRuntimeSafety on the build mode in each mode: off where the
         \\}
     , 0);
     // Off in both checked modes, and a condition on something else.
-    try expect(pack.unsafe_set,
+    try expect(.P007,
         \\const builtin = @import("builtin");
         \\pub fn f(a: u64, b: u64) u64 {
         \\    @setRuntimeSafety(builtin.mode == .fast);
         \\    return a +% b;
         \\}
     , 1);
-    const other = try run(pack.unsafe_set,
+    const other = try run(.P007,
         \\const flags = struct { var checked: bool = true; };
         \\pub fn f(a: u64, b: u64) u64 {
         \\    @setRuntimeSafety(flags.checked);
@@ -748,11 +641,11 @@ const captured_field_program =
     \\
 ;
 
-test "A019 reads a call through a function field's captured payload as one through the field" {
+test "P007 reads a call through a function field's captured payload as one through the field" {
     // `if (o.f) |f| f(o)` hands the interface as `o.f.?(o)` does: what the field holds is judged
     // where it is installed, never left undecided at the call.
-    const captured = try run(pack.unsafe_set, captured_field_program);
-    const unwrapped = try runEdited(pack.unsafe_set, captured_field_program, "if (observer.boundary) |boundary| boundary(observer);", "observer.boundary.?(observer);");
+    const captured = try run(.P007, captured_field_program);
+    const unwrapped = try runEdited(.P007, captured_field_program, "if (observer.boundary) |boundary| boundary(observer);", "observer.boundary.?(observer);");
     try std.testing.expectEqual(@as(usize, 0), captured.undecided);
     try std.testing.expectEqual(unwrapped.undecided, captured.undecided);
     try std.testing.expectEqual(unwrapped.findings, captured.findings);

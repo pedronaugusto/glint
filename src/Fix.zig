@@ -1,10 +1,12 @@
-//! The fixes a run's findings carry, applied: each a set of edits of one file's bytes that
-//! replaces a raw site with aegis's answer where the answer follows from the site alone
-//! (designs/aegis.md §7). The pack's old suppression (`// glint-ignore: A001 -- design: why`)
-//! becomes its escape naming that rule, an escape in the older form names the rules a record of
-//! an earlier run shows it covered and that still find something there, and an escape that
-//! covers nothing goes. No fix writes an escape a site did not already have:
-//! a reason is the author's to state. A site whose answer is a design choice carries no fix.
+//! The fixes a run's findings carry, applied: each a set of edits of one file's bytes where the
+//! answer follows from the site alone. A suppression in a form glint reads no more is rewritten
+//! into the one it reads, `// glint-ignore: <rule>, ... -- <reason>`: the aegis pack's escape
+//! (`// aegis: <reason>(<rule>, ...): <why>`, its reason kept in the words), one in the escape's
+//! older form naming the rules a record of an earlier run shows it covered, and a suppression
+//! naming a rule the pack had under the name glint gives it now (A019 is P007, A016 P008, A014
+//! P009). A rule that went with the flow engine (A010, A020, and A012's input-sized work) is
+//! dropped from it; one naming none left goes. No fix writes a suppression a site did not already
+//! have: a reason is the author's to state.
 const std = @import("std");
 const aegis = @import("aegis");
 const Project = @import("Project.zig");
@@ -109,16 +111,9 @@ pub fn apply(a: std.mem.Allocator, project: *const Project, report: *const Repor
         if (!entry.found_existing) entry.value_ptr.* = .empty;
         try entry.value_ptr.appendSlice(a, d.fix);
     }
-    for (report.stale) |stale| {
-        if (!std.mem.eql(u8, stale.name, "aegis")) continue;
-        const file = project.at(stale.span.file).file;
-        const entry = try by_file.getOrPut(a, stale.span.file);
-        if (!entry.found_existing) entry.value_ptr.* = .empty;
-        try entry.value_ptr.append(a, removal(file, stale.span.start, stale.span.end) orelse return error.InvalidEdit);
-    }
     for (report.malformed) |entry| {
         const file = project.at(entry.span.file).file;
-        const edit = (try oldSuppression(a, file, entry.span.start, entry.span.end)) orelse (try unnamedEscape(a, project, report, entry.span, options.escapes_before)) orelse continue;
+        const edit = (try oldSuppression(a, file, entry.span.start, entry.span.end)) orelse (try oldEscape(a, project, entry.span, options.escapes_before)) orelse continue;
         const slot = try by_file.getOrPut(a, entry.span.file);
         if (!slot.found_existing) slot.value_ptr.* = .empty;
         try slot.value_ptr.append(a, edit);
@@ -148,68 +143,86 @@ pub fn apply(a: std.mem.Allocator, project: *const Project, report: *const Repor
     return out.items;
 }
 
-/// The escape for the pack's old suppression, `// glint-ignore: A0NN -- <category>: <why>`: its
-/// category becomes the escape's reason (`measured-boundary` is `hot-loop`,
-/// `safe-type-internals` `internal`, `c-os-boundary` `boundary`), its words kept.
+/// The name glint gives now to a rule an old suppression or escape names: the pack's own under
+/// their built-in names, the rules that went with the flow engine none.
+fn renamed(name: []const u8) ?[]const u8 {
+    const moves = [_][2][]const u8{ .{ "A019", "P007" }, .{ "A016", "P008" }, .{ "A014", "P009" } };
+    for (moves) |move| if (std.mem.eql(u8, name, move[0])) return move[1];
+    for ([_][]const u8{ "A010", "A012", "A020" }) |gone| if (std.mem.eql(u8, name, gone)) return null;
+    return name;
+}
+
+/// The rules `names` lists under today's names, sorted and each once; whether any was renamed or
+/// dropped.
+fn today(a: std.mem.Allocator, names: []const []const u8) std.mem.Allocator.Error!struct { list: []const u8, changed: bool, empty: bool } {
+    var kept: std.ArrayList([]const u8) = .empty;
+    var changed = false;
+    for (names) |name| {
+        const now = renamed(name) orelse {
+            changed = true;
+            continue;
+        };
+        if (!std.mem.eql(u8, now, name)) changed = true;
+        for (kept.items) |earlier_name| {
+            if (std.mem.eql(u8, earlier_name, now)) break;
+        } else try kept.append(a, now);
+    }
+    std.mem.sort([]const u8, kept.items, {}, lessName);
+    var list: std.ArrayList(u8) = .empty;
+    for (kept.items, 0..) |name, i| {
+        if (i != 0) try list.appendSlice(a, ", ");
+        try list.appendSlice(a, name);
+    }
+    return .{ .list = list.items, .changed = changed, .empty = kept.items.len == 0 };
+}
+
+/// A suppression naming a rule under the pack's old name (`// glint-ignore: A019 -- why`),
+/// under today's names; one naming none left goes.
 fn oldSuppression(a: std.mem.Allocator, file: *const File, start: u32, end: u32) std.mem.Allocator.Error!?Report.Edit {
     const text = spanned(file, start, end) orelse return null;
     const after = std.mem.cutPrefix(u8, text, "// glint-ignore: ") orelse return null;
-    if (!std.mem.startsWith(u8, after, "A0")) return null;
-    const named, const rest = std.mem.cut(u8, after, " -- ") orelse return null;
-    const category_name, const why = std.mem.cutScalar(u8, rest, ':') orelse return null;
-    const categories = [_][2][]const u8{ .{ "no-danger", "no-danger" }, .{ "design", "design" }, .{ "measured-boundary", "hot-loop" }, .{ "safe-type-internals", "internal" }, .{ "c-os-boundary", "boundary" } };
-    const rule = std.mem.trim(u8, named, " ");
-    for (categories) |category| if (std.mem.eql(u8, std.mem.trim(u8, category_name, " "), category[0])) {
-        return .{ .start = start, .end = end, .text = try a.print("// aegis: {s}({s}):{s}", .{ category[1], rule, why }) };
-    };
-    return null;
+    const listed, const why = std.mem.cut(u8, after, " -- ") orelse return null;
+    var names: std.ArrayList([]const u8) = .empty;
+    var each = std.mem.tokenizeAny(u8, listed, ", \t");
+    while (each.next()) |name| try names.append(a, name);
+    const now = try today(a, names.items);
+    if (!now.changed) return null;
+    if (now.empty) return removal(file, start, end);
+    return .{ .start = start, .end = end, .text = try a.print("// glint-ignore: {s} -- {s}", .{ now.list, why }) };
+}
+
+/// An escape in the aegis pack's form, as the suppression glint reads: `// aegis: <reason>(<rules>):
+/// <why>` becomes `// glint-ignore: <rules> -- <reason>: <why>` under today's names. One in the
+/// older form, naming no rules, takes those a record of a run before shows it covered, at that
+/// place with those words; one the record does not hold is left for its owner to name.
+fn oldEscape(a: std.mem.Allocator, project: *const Project, span: Report.Span, before: []const Escaped) std.mem.Allocator.Error!?Report.Edit {
+    const file = project.at(span.file).file;
+    const text = spanned(file, span.start, span.end) orelse return null;
+    const rest = std.mem.trim(u8, std.mem.cutPrefix(u8, text, "// aegis:") orelse return null, " ");
+    const head, const why_raw = std.mem.cutScalar(u8, rest, ':') orelse return null;
+    const why = std.mem.trim(u8, why_raw, " ");
+    const reason, const listed = std.mem.cutScalar(u8, head, '(') orelse .{ std.mem.trim(u8, head, " "), null };
+    var names: std.ArrayList([]const u8) = .empty;
+    if (listed) |inside| {
+        var each = std.mem.tokenizeAny(u8, std.mem.cutSuffix(u8, inside, ")") orelse return null, ", \t");
+        while (each.next()) |name| try names.append(a, name);
+    } else {
+        const recorded = for (before) |escaped| {
+            if (escaped.line != span.line or escaped.column != span.column) continue;
+            if (!std.mem.eql(u8, escaped.path, project.at(span.file).input.name)) continue;
+            if (std.mem.eql(u8, escaped.reason, reason) and std.mem.eql(u8, escaped.why, why)) break escaped;
+        } else return null;
+        try names.appendSlice(a, recorded.rules);
+    }
+    const now = try today(a, names.items);
+    if (now.empty) return removal(file, span.start, span.end);
+    return .{ .start = span.start, .end = span.end, .text = try a.print("// glint-ignore: {s} -- {s}: {s}", .{ now.list, std.mem.trim(u8, reason, " "), why }) };
 }
 
 /// A span's bytes of `file`; null for a span outside them.
 fn spanned(file: *const File, start: u32, end: u32) ?[]const u8 {
     if (start > end or end > file.source.len) return null;
     return file.source[start..end];
-}
-
-/// The rules an escape in the older form (`// aegis: <reason>: <why>`) covers, written into it
-/// (`// aegis: <reason>(A009, A010): <why>`): each one the record of a run before shows it
-/// covered and that finds something on its line now. A finding new since that run is no rule
-/// it was written for, so its owner judges it; an escape the record does not hold, or holds
-/// with none of today's rules, is left for its owner to name. One that covers nothing goes as a
-/// stale escape instead.
-fn unnamedEscape(a: std.mem.Allocator, project: *const Project, report: *const Report, span: Report.Span, before: []const Escaped) std.mem.Allocator.Error!?Report.Edit {
-    const file = project.at(span.file).file;
-    const text = spanned(file, span.start, span.end) orelse return null;
-    if (!std.mem.startsWith(u8, text, "// aegis:")) return null;
-    for (report.escapes) |escape| {
-        if (escape.span.file != span.file or escape.span.start != span.start) continue;
-        // The record's escape is this one: its place and its words.
-        const recorded = for (before) |escaped| {
-            if (escaped.line != span.line or escaped.column != span.column) continue;
-            if (!std.mem.eql(u8, escaped.path, project.at(span.file).input.name)) continue;
-            if (std.mem.eql(u8, escaped.reason, escape.reason) and std.mem.eql(u8, escaped.why, escape.why)) break escaped;
-        } else return null;
-        var names: std.ArrayList(u8) = .empty;
-        var seen: std.ArrayList([]const u8) = .empty;
-        for (escape.covered) |covered| {
-            for (recorded.rules) |rule| {
-                if (std.mem.eql(u8, rule, covered.name)) break;
-            } else continue;
-            for (seen.items) |earlier_name| {
-                if (std.mem.eql(u8, earlier_name, covered.name)) break;
-            } else try seen.append(a, covered.name);
-        }
-        if (seen.items.len == 0) return null;
-        std.mem.sort([]const u8, seen.items, {}, lessName);
-        for (seen.items, 0..) |name, i| {
-            if (i != 0) try names.appendSlice(a, ", ");
-            try names.appendSlice(a, name);
-        }
-        const reason_end = std.mem.findScalarPos(u8, text, "// aegis:".len, ':') orelse return null;
-        const reason = std.mem.trim(u8, text["// aegis:".len..reason_end], " ");
-        return .{ .start = span.start, .end = span.end, .text = try a.print("// aegis: {s}({s}):{s}", .{ reason, names.items, text[reason_end + 1 ..] }) };
-    }
-    return null;
 }
 
 fn lessName(_: void, x: []const u8, y: []const u8) bool {
@@ -238,12 +251,13 @@ fn removal(file: *const File, start: u32, end: u32) ?Report.Edit {
     return .{ .start = from, .end = end, .text = "" };
 }
 
-test "the pack's old suppression becomes the escape naming its rule, an unused escape goes" {
-    var file = try File.init(std.testing.allocator, "const a = 1; // glint-ignore: A010 -- design: one byte\nconst c = 3; // aegis: no-danger(A009): stale\n", .{});
+test "an old suppression takes today's names, and one naming only a rule that went goes" {
+    var file = try File.init(std.testing.allocator, "const a = 1; // glint-ignore: A019, A014 -- design: one cast\nconst c = 3; // glint-ignore: A010 -- design: gone\nconst d = 4; // glint-ignore: Z013 -- kept\n", .{});
     defer file.deinit();
     const a = file.arena.allocator();
-    const old = (try oldSuppression(a, &file, file.comments[0].start, file.comments[0].end)).?;
-    try std.testing.expectEqualStrings("// aegis: design(A010): one byte", old.text);
-    const gone = removal(&file, file.comments[1].start, file.comments[1].end).?;
-    try std.testing.expectEqualStrings(" // aegis: no-danger(A009): stale", file.source[gone.start..gone.end]);
+    const renamed_one = (try oldSuppression(a, &file, file.comments[0].start, file.comments[0].end)).?;
+    try std.testing.expectEqualStrings("// glint-ignore: P007, P009 -- design: one cast", renamed_one.text);
+    const gone = (try oldSuppression(a, &file, file.comments[1].start, file.comments[1].end)).?;
+    try std.testing.expectEqualStrings(" // glint-ignore: A010 -- design: gone", file.source[gone.start..gone.end]);
+    try std.testing.expectEqual(null, try oldSuppression(a, &file, file.comments[2].start, file.comments[2].end));
 }

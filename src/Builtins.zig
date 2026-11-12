@@ -36,6 +36,9 @@ const SelfRecursion = @import("SelfRecursion.zig");
 const UndefinedConst = @import("UndefinedConst.zig");
 const UndefinedReason = @import("UndefinedReason.zig");
 const UnwrapTrap = @import("UnwrapTrap.zig");
+const Unchecked = @import("Unchecked.zig");
+const SameTypeIds = @import("SameTypeIds.zig");
+const Escapes = @import("Escapes.zig");
 const RunError = Context.Error;
 
 pub fn check(context: *Context) RunError!void {
@@ -80,6 +83,9 @@ fn breadth(context: *Context) RunError!void {
     if (context.config.has(.Z054)) try BuildOption.check(context, .Z054);
     if (context.config.has(.Z055)) try PublicAnytype.check(context, .Z055);
     if (context.config.has(.Z056)) try EmptyBranch.check(context, .Z056);
+    if (context.config.has(.P007)) try Unchecked.check(context, .P007);
+    if (context.config.has(.P008)) try SameTypeIds.check(context, .P008);
+    if (context.config.has(.P009)) try Escapes.check(context, .P009);
     if (context.config.has(.P010)) try UnwrapTrap.check(context, .P010);
     if (context.config.has(.P011)) try UndefinedReason.check(context, .P011);
     if (context.config.has(.P012)) try LeftoverDebugging.check(context, .P012);

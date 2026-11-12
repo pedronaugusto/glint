@@ -1,47 +1,32 @@
-//! One real comment, one exact rule, one site and a nonempty written reason; or, for the aegis
-//! pack, the one escape `// aegis: <reason>(<rule>, ...): <why>`, which covers the findings of
-//! the pack rules it names on its site's line and names one of the five reasons a raw site may
-//! have. An escape in the older form, which names no rules, still covers every pack finding on
-//! its line, so the fix can name them, but the run that reads one is incomplete.
+//! One real comment, the rules it names, one site each and a nonempty written reason:
+//! `// glint-ignore: <rule>, ... -- <reason>`, on its site's line or the line before. Every rule
+//! takes it, glint's own and those a package declares. A comment in the aegis pack's escape form
+//! (`// aegis: ...`) is read no more: it is malformed, and `glint --fix` rewrites it.
 const std = @import("std");
 const File = @import("File.zig");
 const rules = @import("Rule.zig");
 const Suppression = @This();
 
-/// The rule a `glint-ignore` names; null for an aegis escape, which names none.
-rule: ?rules.Rule,
+/// The rules it names, in order, each with the start of the one site it suppresses.
+named: [max_named]rules.Rule = undefined,
+matched: [max_named]?u32 = @splat(null),
+named_len: u8 = 0,
 line: u32,
 comment: File.Comment,
 reason: []const u8,
-/// An aegis escape's reason; null for a `glint-ignore`.
-escape: ?Reason = null,
-/// The pack rules an escape covers, in the order it names them.
-covers: [max_covered]rules.Rule = undefined,
-covers_len: u8 = 0,
-/// An escape in the older form, naming no rules.
-unnamed: bool = false,
 used: bool = false,
-matched_start: ?u32 = null,
 
-/// Why a raw site stands where an aegis type is the answer (designs/aegis.md §7): the danger
-/// does not exist there, a design removes the class, a measured hot loop validated once at
-/// its boundary, the inside of a safe type, or a C or OS call.
-pub const Reason = enum {
-    @"no-danger",
-    design,
-    @"hot-loop",
-    internal,
-    boundary,
-};
-
-/// How many rules one escape may name.
-pub const max_covered = 8;
+/// How many rules one suppression may name.
+pub const max_named = 8;
 
 pub const ParseError = std.mem.Allocator.Error || error{ MalformedSuppression, AmbiguousSuppression, UnknownRule };
 
-/// A comment that reads as a suppression or an escape and is not one, and why: the run that
-/// meets it is incomplete, with the comment named, never a run that silently suppresses.
+/// A comment that reads as a suppression and is not one, and why: the run that meets it is
+/// incomplete, with the comment named, never a run that silently suppresses.
 pub const Malformed = struct { comment: File.Comment, why: []const u8 };
+
+/// What an escape in the aegis pack's form is told: the form it is now, and the fix that writes it.
+pub const old_escape = "an aegis escape is read no more: `// glint-ignore: <rule>, ... -- <reason>` (glint --fix rewrites it)";
 
 /// The file's suppressions; a malformed one is an error.
 pub fn parse(a: std.mem.Allocator, file: *const File) ParseError![]Suppression {
@@ -66,72 +51,51 @@ const Outcome = union(enum) { none, found: Suppression, malformed: []const u8 };
 
 fn one(file: *const File, comment: File.Comment, definitions: []const rules.Definition) Outcome {
     const raw = std.mem.trim(u8, file.source[comment.start + 2 .. comment.end], " \t\r");
-    var rule: ?rules.Rule = null;
-    var escape: ?Reason = null;
-    // Copied whole into what is found, past what it names too: every entry holds a rule.
-    var covers: [max_covered]rules.Rule = @splat(.Z001);
-    var covers_len: u8 = 0;
-    var unnamed = false;
-    var reason: []const u8 = undefined;
-    if (std.mem.startsWith(u8, raw, "aegis:")) {
-        const rest = std.mem.trim(u8, raw["aegis:".len..], " \t");
-        const before_colon, const why = std.mem.cutScalar(u8, rest, ':') orelse return .{ .malformed = "an aegis escape is `// aegis: <reason>(<rule>, ...): <why>`" };
-        const head = std.mem.trim(u8, before_colon, " \t");
-        const named_reason, const listed = std.mem.cutScalar(u8, head, '(') orelse .{ head, null };
-        escape = std.meta.stringToEnum(Reason, std.mem.trim(u8, named_reason, " \t")) orelse return .{ .malformed = "an aegis escape's reason is no-danger, design, hot-loop, internal or boundary" };
-        if (listed) |inside| {
-            const names_text = std.mem.cutSuffix(u8, inside, ")") orelse return .{ .malformed = "an aegis escape names its rules in parentheses: `// aegis: <reason>(<rule>, ...): <why>`" };
-            var names = std.mem.tokenizeAny(u8, names_text, ", \t");
-            while (names.next()) |id| {
-                const named = rules.parseConfigured(id, definitions) orelse return .{ .malformed = "an aegis escape names a rule glint does not have" };
-                if (rules.definition(named, definitions).?.exception != .aegis) return .{ .malformed = "an aegis escape names only the pack's rules" };
-                if (covers_len == max_covered) return .{ .malformed = "an aegis escape names at most eight rules" };
-                covers[covers_len] = named;
-                covers_len += 1;
-            }
-            if (covers_len == 0) return .{ .malformed = "an aegis escape names the rules it covers" };
-        } else unnamed = true;
-        reason = std.mem.trim(u8, why, " \t");
-    } else if (std.mem.startsWith(u8, raw, "glint-ignore:")) {
-        const rest = std.mem.trim(u8, raw[13..], " \t");
-        const named, const why = std.mem.cut(u8, rest, " -- ") orelse return .{ .malformed = "a suppression is `// glint-ignore: <rule> -- <reason>`" };
-        const id = std.mem.trim(u8, named, " \t");
-        rule = rules.parseConfigured(id, definitions) orelse return .{ .malformed = "a suppression names a rule glint does not have" };
-        // The pack has one escape, which says why the danger is absent: never a bare reason.
-        if (rules.definition(rule.?, definitions).?.exception == .aegis) return .{ .malformed = "an aegis rule takes `// aegis: <reason>(<rule>, ...): <why>`, never glint-ignore" };
-        reason = std.mem.trim(u8, why, " \t");
-    } else return .none;
-    if (reason.len == 0) return .{ .malformed = "a suppression or escape needs its written reason" };
+    if (std.mem.startsWith(u8, raw, "aegis:")) return .{ .malformed = old_escape };
+    if (!std.mem.startsWith(u8, raw, "glint-ignore:")) return .none;
+    const rest = std.mem.trim(u8, raw["glint-ignore:".len..], " \t");
+    const listed, const why = std.mem.cut(u8, rest, " -- ") orelse return .{ .malformed = "a suppression is `// glint-ignore: <rule>, ... -- <reason>`" };
+    var found: Suppression = .{ .line = comment.line, .comment = comment, .reason = std.mem.trim(u8, why, " \t") };
+    var listed_names = std.mem.tokenizeAny(u8, listed, ", \t");
+    while (listed_names.next()) |id| {
+        const rule = rules.parseConfigured(id, definitions) orelse return .{ .malformed = "a suppression names a rule glint does not have" };
+        if (std.mem.findScalar(rules.Rule, found.named[0..found.named_len], rule) != null) return .{ .malformed = "a suppression names each rule once" };
+        if (found.named_len == max_named) return .{ .malformed = "a suppression names at most eight rules" };
+        found.named[found.named_len] = rule;
+        found.named_len += 1;
+    }
+    if (found.named_len == 0) return .{ .malformed = "a suppression names the rules it suppresses" };
+    if (found.reason.len == 0) return .{ .malformed = "a suppression needs its written reason" };
     const before = std.mem.trim(u8, file.source[file.lines[comment.line]..comment.start], " \t\r");
-    var site = comment.line;
     if (before.len == 0) {
         var token: usize = 0;
         while (token < file.tree.tokens.len and file.tree.tokenStart(@intCast(token)) < comment.end) token += 1;
-        if (token == file.tree.tokens.len or file.tree.tokenTag(@intCast(token)) == .eof) return .{ .malformed = "a suppression or escape stands before no code" };
-        site = file.line(file.tree.tokenStart(@intCast(token)));
-        if (site > comment.line + 1) return .{ .malformed = "a suppression or escape on a line of its own stands on the line before its site" };
+        if (token == file.tree.tokens.len or file.tree.tokenTag(@intCast(token)) == .eof) return .{ .malformed = "a suppression stands before no code" };
+        found.line = file.line(file.tree.tokenStart(@intCast(token)));
+        if (found.line > comment.line + 1) return .{ .malformed = "a suppression on a line of its own stands on the line before its site" };
     }
-    return .{ .found = .{ .rule = rule, .line = site, .comment = comment, .reason = reason, .escape = escape, .covers = covers, .covers_len = covers_len, .unnamed = unnamed } };
+    return .{ .found = found };
 }
 
-/// Whether this suppresses `rule`'s finding at `start` on `line`. An escape covers the findings
-/// of the pack rules it names on its line (every pack rule's, in the older form naming none); a
-/// `glint-ignore` one site of its rule.
-pub fn matches(self: *Suppression, rule: rules.Rule, aegis: bool, line: u32, start: u32) error{AmbiguousSuppression}!bool {
-    if (!self.applies(rule, aegis, line)) return false;
-    if (self.escape == null) {
-        if (self.matched_start) |previous| if (previous != start) return error.AmbiguousSuppression;
-        self.matched_start = start;
-    }
+/// The rules it names.
+pub fn names(self: *const Suppression) []const rules.Rule {
+    return self.named[0..self.named_len];
+}
+
+/// Whether this suppresses `rule`'s finding at `start` on `line`: one site of each rule it names;
+/// a second site of the same rule on the line is ambiguous.
+pub fn matches(self: *Suppression, rule: rules.Rule, line: u32, start: u32) error{AmbiguousSuppression}!bool {
+    if (!self.applies(rule, line)) return false;
+    const at = std.mem.findScalar(rules.Rule, self.names(), rule).?;
+    if (self.matched[at]) |previous| if (previous != start) return error.AmbiguousSuppression;
+    self.matched[at] = start;
     self.used = true;
     return true;
 }
 
 /// Whether this covers a finding of `rule` on `line` (`matches`), asked without using it.
-pub fn applies(self: *const Suppression, rule: rules.Rule, aegis: bool, line: u32) bool {
-    if (self.line != line) return false;
-    if (self.escape != null) return aegis and (self.unnamed or std.mem.findScalar(rules.Rule, self.covers[0..self.covers_len], rule) != null);
-    return self.rule == rule;
+pub fn applies(self: *const Suppression, rule: rules.Rule, line: u32) bool {
+    return self.line == line and std.mem.findScalar(rules.Rule, self.names(), rule) != null;
 }
 
 test "suppression requires exact ID and reason from a real comment" {
@@ -139,8 +103,8 @@ test "suppression requires exact ID and reason from a real comment" {
     defer file.deinit();
     const parsed = try parse(file.arena.allocator(), &file);
     try std.testing.expectEqual(@as(usize, 1), parsed.len); // safe: explicit compile-time type selection; the value is representable in that type.
-    try std.testing.expect(try parsed[0].matches(.Z013, false, 1, 6));
-    try std.testing.expect(!try parsed[0].matches(.Z003, false, 1, 6));
+    try std.testing.expect(try parsed[0].matches(.Z013, 1, 6));
+    try std.testing.expect(!try parsed[0].matches(.Z003, 1, 6));
     var invalid = try File.init(std.testing.allocator, "// glint-ignore: Z013\nconst x = 1;", .{});
     defer invalid.deinit();
     try std.testing.expectError(error.MalformedSuppression, parse(invalid.arena.allocator(), &invalid));
@@ -150,21 +114,18 @@ test "suppression one reason cannot suppress distinct sites on one line" {
     var file = try File.init(std.testing.allocator, "const a = @import(\"a\"); const b = @import(\"b\"); // glint-ignore: Z013 -- one justified site\n", .{});
     defer file.deinit();
     const parsed = try parse(file.arena.allocator(), &file);
-    try std.testing.expect(try parsed[0].matches(.Z013, false, 0, 6));
-    try std.testing.expectError(error.AmbiguousSuppression, parsed[0].matches(.Z013, false, 0, 31));
+    try std.testing.expect(try parsed[0].matches(.Z013, 0, 6));
+    try std.testing.expectError(error.AmbiguousSuppression, parsed[0].matches(.Z013, 0, 31));
 }
 
-test "an aegis escape names one of five reasons and a why; one in the older form, naming no rules, covers the pack's findings on its line" {
-    var file = try File.init(std.testing.allocator, "const x = 1; // aegis: boundary: the C call takes the raw pointer\n", .{});
+test "a suppression names several rules, one site each; the aegis escape form is malformed" {
+    var file = try File.init(std.testing.allocator, "const x = 1; // glint-ignore: Z013, Z003 -- both read here\n", .{});
     defer file.deinit();
     const parsed = try parse(file.arena.allocator(), &file);
-    try std.testing.expectEqual(Reason.boundary, parsed[0].escape.?);
-    try std.testing.expect(parsed[0].unnamed);
-    try std.testing.expect(try parsed[0].matches(.Z013, true, 0, 6));
-    try std.testing.expect(try parsed[0].matches(.Z003, true, 0, 9));
-    try std.testing.expect(!try parsed[0].matches(.Z013, false, 0, 6));
-    // A rule list that is empty, unclosed, or names a rule outside the pack is malformed.
-    for ([_][]const u8{ "const x = 1; // aegis: measured: fast\n", "const x = 1; // aegis: design:\n", "const x = 1; // aegis: design\n", "const x = 1; // aegis: design(): why\n", "const x = 1; // aegis: design(Z013: why\n", "const x = 1; // aegis: design(Z013): why\n" }) |bytes| {
+    try std.testing.expect(try parsed[0].matches(.Z013, 0, 6));
+    try std.testing.expect(try parsed[0].matches(.Z003, 0, 9));
+    try std.testing.expect(!try parsed[0].matches(.Z011, 0, 6));
+    for ([_][]const u8{ "const x = 1; // aegis: boundary(Z003): the C call\n", "const x = 1; // aegis: boundary: the C call\n", "const x = 1; // glint-ignore: Z013, Z013 -- twice\n", "const x = 1; // glint-ignore: -- none\n" }) |bytes| {
         var bad = try File.init(std.testing.allocator, bytes, .{});
         defer bad.deinit();
         try std.testing.expectError(error.MalformedSuppression, parse(bad.arena.allocator(), &bad));

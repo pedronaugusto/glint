@@ -203,3 +203,19 @@ pub fn debugPrints(c: *Context) Context.Error!void {
     try Governed.sitesLeaving(c, .P005, found, &sites, &unread);
     for (sites.items) |site| try c.atDefinition(.P005, site.token, "production debug print; use the program's output or logging", site.decl);
 }
+
+/// Each declaration a package names in place of std's `debug.assert`: every `.with` of an entry,
+/// under any rule, whose target is it. Assertion metrics count calls of them (Metrics.zig).
+pub fn assertions(c: *Context) Context.Error![]const Facts.Decl {
+    _ = try entries(c, "");
+    const all = try c.facts.memo(Entries);
+    var found: std.ArrayList(Facts.Decl) = .empty;
+    for (all.all.items) |entry| {
+        const replaced = for (entry.replacement.declarations()) |decl| {
+            if (try Governed.isStd(c, decl, "debug.assert") == .yes) break true;
+        } else false;
+        if (!replaced) continue;
+        for (entry.replacement.with) |answer| if (answer.declaration()) |decl| try found.append(c.allocator, decl);
+    }
+    return found.items;
+}

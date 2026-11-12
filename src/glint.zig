@@ -56,6 +56,9 @@ pub const stdCall = @import("Governed.zig").stdCall;
 pub const RuleDefinition = @import("Rule.zig").Definition;
 /// Runs compiled project rules and per-source configuration on the same model.
 pub const runConfigured = @import("Runner.zig").runConfigured;
+/// The rules the project's packages declare in their `lint_rules`, each with the id this run gives
+/// it: what a caller resolves a package rule's name against before it configures a run.
+pub const packageRules = @import("Runner.zig").packageRules;
 /// Explicit source overrides: callers select these using their own path dialect.
 pub const FileConfig = @import("Runner.zig").FileConfig;
 
@@ -71,11 +74,7 @@ pub const Scope = @import("Model.zig").Scope;
 pub const Reference = @import("Model.zig").Reference;
 
 /// A library's published roles, found through the module a program imports it by.
-pub const Library = @import("Library.zig").Library;
-
 /// Optional configurable obligations for the published aegis contract.
-pub const AegisPack = @import("AegisPack.zig");
-
 /// Fast std-tokenizer imports, spellings and test liveness without parsing or lowering.
 pub const token = @import("Token.zig");
 /// The filesystem command-line driver a project's own linter calls with its compiled rules.

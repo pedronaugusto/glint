@@ -14,9 +14,7 @@ suppressed: usize,
 stale_suppressions: usize,
 /// Each suppression that matched no finding, at its comment.
 stale: []const Stale = &.{},
-/// Each aegis escape that covered a finding, with the findings it covered: what the review reads.
-escapes: []const Escape = &.{},
-/// Each comment that reads as a suppression or an escape and is not one; any makes the run
+/// Each comment that reads as a suppression and is not one; any makes the run
 /// incomplete.
 malformed: []const Malformed = &.{},
 complete: bool,
@@ -48,19 +46,15 @@ pub const Metrics = struct {
     pub const Kind = enum {
         /// `std.debug.assert`, checked in Debug and ReleaseSafe only.
         std_assert,
-        invariant,
-        never,
-        debug,
-        debug_check,
+        /// A declaration a package names in its place: a `.with` of a `lint_rules` entry that
+        /// replaces `std.debug.assert`.
+        replacement,
 
-        /// The declaration as a program names it.
+        /// What the count is of, as a report names it.
         pub fn label(self: Kind) []const u8 {
             return switch (self) {
                 .std_assert => "std.debug.assert",
-                .invariant => "aegis.assert.invariant",
-                .never => "aegis.assert.never",
-                .debug => "aegis.assert.debug",
-                .debug_check => "aegis.assert.debugCheck",
+                .replacement => "its replacements",
             };
         }
     };
@@ -123,13 +117,8 @@ pub const Coverage = struct {
     detail: []const u8 = "",
     pub const Reason = enum { parsed, invalid_syntax, invalid_lowering, budget_exhausted, unresolved, unsupported };
 };
-/// A suppression that suppressed nothing: the rule it names (`aegis` for an escape) and its
-/// comment's site.
+/// A suppression that suppressed nothing: a rule it names that ran, and its comment's site.
 pub const Stale = struct { name: []const u8, span: Span };
-/// An aegis escape (`// aegis: <reason>(<rule>, ...): <why>`) at its comment, and the pack's findings on its
-/// line that it covered.
-pub const Escape = struct { span: Span, reason: []const u8, why: []const u8, covered: []const Covered };
-pub const Covered = struct { name: []const u8, span: Span };
 pub const Malformed = struct { why: []const u8, span: Span };
 pub const Format = enum { text, json, sarif };
 pub const WriteError = std.Io.Writer.Error || error{InvalidProject};
@@ -153,11 +142,6 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
             };
             for (self.stale) |stale| try writer.print("suppression: {s}:{d}:{d}: {s} suppresses nothing\n", .{ project.at(stale.span.file).input.name, stale.span.line, stale.span.column, stale.name });
             for (self.malformed) |entry| try writer.print("suppression: {s}:{d}:{d}: malformed: {s}\n", .{ project.at(entry.span.file).input.name, entry.span.line, entry.span.column, entry.why });
-            for (self.escapes) |escape| {
-                try writer.print("escape: {s}:{d}:{d}: {s}: {s} (", .{ project.at(escape.span.file).input.name, escape.span.line, escape.span.column, escape.reason, escape.why });
-                for (escape.covered, 0..) |covered, i| try writer.print("{s}{s} at {d}:{d}", .{ if (i == 0) "" else ", ", covered.name, covered.span.line, covered.span.column });
-                try writer.writeAll(")\n");
-            }
             for (self.seams) |seam| {
                 try writer.print("seam: {s}: {s}: ", .{ seam.where, seam.reason });
                 for (seam.rules, 0..) |rule, i| try writer.print("{s}{s} {d}", .{ if (i == 0) "" else ", ", rule.name, rule.sites });
@@ -177,11 +161,6 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
             for (self.malformed, 0..) |entry, i| {
                 if (i != 0) try writer.writeByte(',');
                 try std.json.Stringify.value(.{ .source = project.at(entry.span.file).input.name, .line = entry.span.line, .column = entry.span.column, .why = entry.why }, .{}, writer);
-            }
-            try writer.writeAll("],\"escapes\":[");
-            for (self.escapes, 0..) |escape, i| {
-                if (i != 0) try writer.writeByte(',');
-                try jsonEscape(writer, project, escape);
             }
             try writer.writeAll("],\"diagnostics\":[");
             for (self.diagnostics, 0..) |d, i| {
@@ -254,24 +233,6 @@ fn jsonCounts(writer: *std.Io.Writer, counts: Metrics.Counts) std.Io.Writer.Erro
     try writer.print("\"functions\":{d},\"asserted\":{d},\"unresolved\":{d},\"assertions\":{{", .{ counts.functions, counts.asserted, counts.unresolved });
     for (std.meta.tags(Metrics.Kind), counts.assertions, 0..) |kind, n, i| try writer.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", kind.label(), n });
     try writer.writeByte('}');
-}
-
-fn jsonEscape(writer: *std.Io.Writer, project: *const Project, escape: Escape) std.Io.Writer.Error!void {
-    var stream: std.json.Stringify = .{ .writer = writer, .options = .{} };
-    try stream.beginObject();
-    try stream.objectField("source");
-    try stream.write(project.at(escape.span.file).input.name);
-    try stream.objectField("span");
-    try stream.write(wireSpan(escape.span));
-    try stream.objectField("reason");
-    try stream.write(escape.reason);
-    try stream.objectField("why");
-    try stream.write(escape.why);
-    try stream.objectField("covered");
-    try stream.beginArray();
-    for (escape.covered) |covered| try stream.write(.{ .rule = covered.name, .span = wireSpan(covered.span) });
-    try stream.endArray();
-    try stream.endObject();
 }
 
 fn jsonDiagnostic(writer: *std.Io.Writer, project: *const Project, d: Diagnostic) std.Io.Writer.Error!void {

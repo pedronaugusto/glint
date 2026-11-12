@@ -1,22 +1,18 @@
 //! Assertion metrics: how many functions a file declares and the assertion calls in them, each
-//! counted by the declaration its callee resolves to (std's `debug.assert`, aegis's `assert`
-//! contracts by the roles aegis declares), never by spelling. A call named like one whose callee does not resolve is counted
+//! counted by the declaration its callee resolves to (std's `debug.assert`, and each declaration a
+//! package's `lint_rules` names in its place, a `.with` of an entry replacing it), never by spelling. A call named like one whose callee does not resolve is counted
 //! apart. A report, never a proof or a gate: a count says nothing about what an assertion checks.
 const std = @import("std");
 const Context = @import("RuleContext.zig");
 const Model = @import("Model.zig");
-const Library = @import("Library.zig").Library;
 const Governed = @import("Governed.zig");
+const Replaced = @import("Replaced.zig");
+const Facts = @import("Facts.zig");
 const Report = @import("Report.zig");
 const Ast = std.zig.Ast;
 
 pub const Kind = Report.Metrics.Kind;
 pub const Counts = Report.Metrics.Counts;
-
-const Lib = Library(Kind);
-/// Aegis's assertions, by the roles its `lint_rules` gives them (`.role = .invariant`, ...).
-/// An aegis that declares none of them, or a program that imports no aegis, just counts none.
-pub const library: Lib = .{ .package = @import("AegisContract.zig").package };
 
 /// Counts the context's file.
 pub fn count(context: *Context) Context.Error!Counts {
@@ -25,6 +21,7 @@ pub fn count(context: *Context) Context.Error!Counts {
     const model = &source.model;
     var counts: Counts = .{};
     if (tree.errors.len != 0) return counts;
+    const replacements = try Replaced.assertions(context);
     const asserted = try context.allocator.alloc(bool, tree.nodes.len);
     @memset(asserted, false);
     for (tree.nodes.items(.tag), 0..) |tag, n| {
@@ -33,8 +30,8 @@ pub fn count(context: *Context) Context.Error!Counts {
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
         const value = try context.facts.resolve(context.file, call.ast.fn_expr);
-        // std's by std's contract, at its path; aegis's by the role aegis declares.
-        const kind: ?Kind = if (value != .function) null else if (try Governed.stdCall(context, node, "debug.assert") == .yes) .std_assert else try context.role(library, value);
+        // std's by std's contract, at its path; a replacement by the declaration a package names.
+        const kind: ?Kind = if (value != .function) null else if (try Governed.stdCall(context, node, "debug.assert") == .yes) .std_assert else if (among(replacements, value.function)) .replacement else null;
         if (kind) |k| {
             counts.assertions[@backingInt(k)] += 1; // safe: a kind indexes its own count table.
             if (function(tree, model, node)) |f| asserted[@backingInt(f)] = true; // safe: the checked AST indexes its own node table.
@@ -67,5 +64,10 @@ fn spelledLike(tree: *const Ast, callee: Ast.Node.Index) bool {
     };
     const name = tree.tokenSlice(token);
     for ([_][]const u8{ "assert", "invariant", "pre", "post", "never", "debugCheck" }) |spelling| if (std.mem.eql(u8, name, spelling)) return true;
+    return false;
+}
+
+fn among(decls: []const Facts.Decl, decl: Facts.Decl) bool {
+    for (decls) |each| if (std.meta.eql(each, decl)) return true;
     return false;
 }

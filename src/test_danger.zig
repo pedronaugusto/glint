@@ -1,6 +1,6 @@
-//! A test root: the danger rules' contract tests.
+//! A test root: P007, P008 and P009, over the pinned aegis sources and a std laid out as 0.17's.
 test {
-    _ = @import("Danger_test.zig");
+    _ = @import("Unchecked_test.zig");
 }
 
 // The aegis files this binary's tests share (ci/aegis_sources.zig) are as they were frozen,

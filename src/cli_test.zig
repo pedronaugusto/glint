@@ -348,7 +348,7 @@ test "publishing aegis's API turns the pack on and nothing more: a program file 
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const manifest = try a.print(".{{ .name = .aegis, .version = \"0.2.1\", .fingerprint = 0x{x}, .paths = .{{\"\"}} }}\n", .{glint.AegisPack.package.fingerprint});
+    const manifest = try a.print(".{{ .name = .aegis, .version = \"0.2.1\", .fingerprint = 0x{x}, .paths = .{{\"\"}} }}\n", .{aegis_sources.package.fingerprint});
     defer a.free(manifest);
     for ([_][]const u8{ "aegis", "old" }) |dir| {
         try tmp.dir.createDirPath(std.testing.io, dir);
@@ -412,77 +412,4 @@ test "publishing aegis's API turns the pack on and nothing more: a program file 
     const second = try runOn(a, &tmp, &.{ "--only", "A004", "--module", "aegis_old=old/src/root.zig" }, "two.zig", &status);
     defer a.free(second);
     try std.testing.expect(std.mem.find(u8, second, "A004: ") != null);
-}
-
-test "the aegis pack is on where a file's import of aegis resolves to aegis, and on whatever the files import with --aegis" {
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const cast = "pub fn f(p: *const u32) *const u8 {\n    return @ptrCast(p);\n}\n";
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "plain.zig", .data = cast });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "uses.zig", .data = "const aegis = @import(\"aegis\");\ncomptime {\n    _ = aegis;\n}\n" ++ cast });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "renamed.zig", .data = "const safety = @import(\"safety\");\ncomptime {\n    _ = safety;\n}\n" ++ cast });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "by_path.zig", .data = "const aegis = @import(\"aegis/src/root.zig\");\ncomptime {\n    _ = aegis;\n}\n" ++ cast });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fake.zig", .data = "pub const x = 1;\n" });
-    try tmp.dir.createDirPath(std.testing.io, "aegis");
-    var tree = try tmp.dir.openDir(std.testing.io, "aegis", .{});
-    defer tree.close(std.testing.io);
-    try aegis_sources.writeTree(a, std.testing.io, tree);
-    // Aegis's package, by the manifest a dependency's tree holds: its name and fingerprint.
-    const manifest = try a.print(".{{ .name = .aegis, .version = \"0.2.1\", .fingerprint = 0x{x}, .paths = .{{\"\"}} }}\n", .{glint.AegisPack.package.fingerprint});
-    defer a.free(manifest);
-    try tree.writeFile(std.testing.io, .{ .sub_path = "build.zig.zon", .data = manifest });
-    var status: u8 = undefined;
-    // No aegis: off, and no line.
-    const off = try runOn(a, &tmp, &.{}, "plain.zig", &status);
-    defer a.free(off);
-    try std.testing.expectEqual(@as(u8, 0), status); // safe: a clean exit.
-    try std.testing.expectEqual(null, std.mem.find(u8, off, "aegis pack"));
-    // --aegis: on, whatever the file imports.
-    const forced = try runOn(a, &tmp, &.{"--aegis"}, "plain.zig", &status);
-    defer a.free(forced);
-    try std.testing.expectEqual(@as(u8, 1), status); // safe: a findings exit.
-    try std.testing.expect(std.mem.startsWith(u8, forced, "aegis pack: on\n"));
-    try std.testing.expect(std.mem.find(u8, forced, "A019: ") != null);
-    // aegis imported: on, with the file that imports it.
-    const imported = try runOn(a, &tmp, &.{ "--module", "aegis=aegis/src/root.zig" }, "uses.zig", &status);
-    defer a.free(imported);
-    try std.testing.expectEqual(@as(u8, 1), status); // safe: a findings exit.
-    try std.testing.expect(std.mem.startsWith(u8, imported, "aegis pack: on (imported by "));
-    try std.testing.expect(std.mem.find(u8, imported, "A019: ") != null);
-    // aegis imported under another module name, or by its path: aegis by what it publishes, on.
-    const renamed = try runOn(a, &tmp, &.{ "--module", "safety=aegis/src/root.zig" }, "renamed.zig", &status);
-    defer a.free(renamed);
-    try std.testing.expectEqual(@as(u8, 1), status); // safe: a findings exit.
-    try std.testing.expect(std.mem.startsWith(u8, renamed, "aegis pack: on (imported by "));
-    try std.testing.expect(std.mem.find(u8, renamed, "A019: ") != null);
-    const by_path = try runOn(a, &tmp, &.{}, "by_path.zig", &status);
-    defer a.free(by_path);
-    try std.testing.expectEqual(@as(u8, 1), status); // safe: a findings exit.
-    try std.testing.expect(std.mem.startsWith(u8, by_path, "aegis pack: on (imported by "));
-    // aegis's sources vendored into another package's tree, with no manifest of their own: that
-    // package's code, not aegis (aegis is known by its package's identity alone, as a fork keeps
-    // its manifest): off, by its name or another, and the cast is the program's own finding.
-    try tmp.dir.createDirPath(std.testing.io, "app/libs");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/build.zig.zon", .data = ".{ .name = .app, .version = \"0.1.0\", .fingerprint = 0x1c0ffee5ca1ab1e, .paths = .{\"\"} }\n" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/uses.zig", .data = "const aegis = @import(\"aegis\");\ncomptime {\n    _ = aegis;\n}\n" ++ cast });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/renamed.zig", .data = "const safety = @import(\"safety\");\ncomptime {\n    _ = safety;\n}\n" ++ cast });
-    var vendored = try tmp.dir.openDir(std.testing.io, "app/libs", .{});
-    defer vendored.close(std.testing.io);
-    try aegis_sources.writeTree(a, std.testing.io, vendored);
-    for ([_][2][]const u8{ .{ "aegis=app/libs/src/root.zig", "app/uses.zig" }, .{ "safety=app/libs/src/root.zig", "app/renamed.zig" } }) |case| {
-        const in_tree = try runOn(a, &tmp, &.{ "--module", case[0] }, case[1], &status);
-        defer a.free(in_tree);
-        try std.testing.expectEqual(null, std.mem.find(u8, in_tree, "aegis pack"));
-    }
-    // A module named aegis that is not aegis: off.
-    const other = try runOn(a, &tmp, &.{ "--module", "aegis=fake.zig" }, "uses.zig", &status);
-    defer a.free(other);
-    try std.testing.expectEqual(@as(u8, 0), status); // safe: a clean exit.
-    try std.testing.expectEqual(null, std.mem.find(u8, other, "aegis pack"));
-    // --only selects the pack's rules as it selects any: no line.
-    const only = try runOn(a, &tmp, &.{ "--only", "A019", "--module", "aegis=aegis/src/root.zig" }, "uses.zig", &status);
-    defer a.free(only);
-    try std.testing.expectEqual(null, std.mem.find(u8, only, "aegis pack"));
-    try std.testing.expect(std.mem.find(u8, only, "A019: ") != null);
 }

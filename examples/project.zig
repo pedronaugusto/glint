@@ -16,10 +16,10 @@ fn check(context: *glint.RuleContext) glint.RuleContext.Error!void {
 pub fn main(init: std.process.Init) !void {
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch std.process.exit(2);
     var buffer: [4096]u8 = undefined;
-    // aegis: design(A019): read only below what it wrote; ensign's Page calls it through a function-pointer field that std's generic reflective writers may store into until glint reaches them per instantiation
+    // glint-ignore: P007 -- design: read only below what it wrote; ensign's Page calls it through a function-pointer field that std's generic reflective writers may store into until glint reaches them per instantiation
     var output = std.Io.File.stdout().writerStreaming(init.io, &buffer);
     var problems_buffer: [1024]u8 = undefined;
-    // aegis: design(A019): read only below what it wrote; ensign's Page calls it through a function-pointer field that std's generic reflective writers may store into until glint reaches them per instantiation
+    // glint-ignore: P007 -- design: read only below what it wrote; ensign's Page calls it through a function-pointer field that std's generic reflective writers may store into until glint reaches them per instantiation
     var problems = std.Io.File.stderr().writerStreaming(init.io, &problems_buffer);
     const status = cli.executeConfigured(init.gpa, init.io, args, &output.interface, &problems.interface, &rules) catch |err| switch (err) {
         // A write that failed has its cause on its file's writer: a cancel in either ends main as one.
