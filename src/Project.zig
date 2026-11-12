@@ -98,7 +98,9 @@ pub const Compilations = enum {
     }
 };
 /// A module edge selected and resolved by the caller, never by a path hash: `from` and `target`
-/// are positions in the inputs given to `init`.
+/// are positions in the inputs given to `init`. Several edges of one name from one file in one
+/// compilation are a choice: each module that compiles the file binds the name to its own
+/// target, and an import of it reads as any of them.
 pub const Import = struct {
     from: usize,
     spelling: []const u8,
@@ -237,8 +239,9 @@ pub fn init(gpa: std.mem.Allocator, inputs: []const Input, imports: []const Impo
         const in = import.compilation orelse inputs[import.from].compilations;
         if (!in.within(inputs[import.from].compilations) or !in.within(inputs[import.target].compilations)) return error.InvalidMapping;
         mapping.* = .{ .from = sources[import.from].id, .spelling = try a.dupe(u8, import.spelling), .target = sources[import.target].id, .in = in };
-        // A name has one binding in each compilation: two edges hold in one apiece.
-        for (mappings[0..index]) |earlier| if (mapping.from == earlier.from and std.mem.eql(u8, mapping.spelling, earlier.spelling) and !mapping.in.apart(earlier.in)) return error.DuplicateMapping;
+        // A name bound to several files in one compilation (each module that compiles the file
+        // binds it to its own) reaches each, a choice; the same edge twice is no binding.
+        for (mappings[0..index]) |earlier| if (mapping.from == earlier.from and mapping.target == earlier.target and std.mem.eql(u8, mapping.spelling, earlier.spelling) and !mapping.in.apart(earlier.in)) return error.DuplicateMapping;
     }
     const identity = try nextIdentity();
     return .{ .arena = arena, .sources = sources, .imports = mappings, .identity = identity, .own = own, .store = store };
@@ -292,26 +295,27 @@ pub fn source(self: *const Project, source_handle: Handle) QueryError![]const u8
     return (try self.checked(source_handle)).input.bytes;
 }
 
-/// The file an import of `spelling` in `from` reaches in the program's compilation, or in the
-/// only one that compiles `from`; null when no mapping was supplied. `importedAll` gives each.
+/// The first file an import of `spelling` in `from` reaches in the program's compilation, or in
+/// the only one that compiles `from`; null when no mapping was supplied. `importedAll` gives
+/// each.
 pub fn imported(self: *const Project, from: FileId, spelling: []const u8) ?FileId {
-    var buffer: [2]FileId = undefined;
-    const all = self.importedAll(from, spelling, &buffer);
-    for (self.imports) |mapping| if (mapping.from == from and std.mem.eql(u8, mapping.spelling, spelling) and mapping.in.inProgram()) return mapping.target;
-    return if (all.len == 0) null else all[0];
+    var first: ?FileId = null;
+    for (self.imports) |mapping| if (mapping.from == from and std.mem.eql(u8, mapping.spelling, spelling)) {
+        if (mapping.in.inProgram()) return mapping.target;
+        if (first == null) first = mapping.target;
+    };
+    return first;
 }
 
-/// The files an import of `spelling` in `from` reaches, as the caller mapped it: one, or one in
-/// each compilation where a file both compile binds the name apart; none when no mapping was
-/// supplied.
-pub fn importedAll(self: *const Project, from: FileId, spelling: []const u8, buffer: *[2]FileId) []const FileId {
-    var found: usize = 0;
+/// The files an import of `spelling` in `from` reaches, as the caller mapped it: one, one in
+/// each compilation where a file both compile binds the name apart, or each a module that
+/// compiles it binds the name to; none when no mapping was supplied.
+pub fn importedAll(self: *const Project, a: std.mem.Allocator, from: FileId, spelling: []const u8) std.mem.Allocator.Error![]const FileId {
+    var found: std.ArrayList(FileId) = .empty;
     for (self.imports) |mapping| if (mapping.from == from and std.mem.eql(u8, mapping.spelling, spelling)) {
-        buffer[found] = mapping.target;
-        found += 1;
-        if (found == buffer.len) break;
+        if (std.mem.findScalar(FileId, found.items, mapping.target) == null) try found.append(a, mapping.target);
     };
-    return buffer[0..found];
+    return found.toOwnedSlice(a);
 }
 
 /// Whether the build binds no module named `spelling` for `from` (its input's `absent`).
@@ -408,19 +412,26 @@ test "a name a file both compilations compile binds apart reaches each compilati
         .{ .from = 0, .spelling = "dep", .target = 2, .compilation = .build },
     }, .{});
     defer project.deinit();
-    var buffer: [2]FileId = undefined;
-    try std.testing.expectEqualSlices(FileId, &.{ try project.fileAt(1), try project.fileAt(2) }, project.importedAll(try project.fileAt(0), "dep", &buffer));
+    const all = try project.importedAll(std.testing.allocator, try project.fileAt(0), "dep");
+    defer std.testing.allocator.free(all);
+    try std.testing.expectEqualSlices(FileId, &.{ try project.fileAt(1), try project.fileAt(2) }, all);
     try std.testing.expectEqual(@as(?FileId, try project.fileAt(1)), project.imported(try project.fileAt(0), "dep"));
-    // Two bindings in one compilation, an edge in every compilation beside one in a single one,
-    // and an edge in a compilation that does not compile its file or its target, are refused.
+    // The same edge twice, and an edge in a compilation that does not compile its file or its
+    // target, are refused.
     try std.testing.expectError(error.DuplicateMapping, init(std.testing.allocator, &inputs, &.{
         .{ .from = 0, .spelling = "dep", .target = 1, .compilation = .program },
         .{ .from = 0, .spelling = "dep", .target = 1, .compilation = .program },
     }, .{}));
-    try std.testing.expectError(error.DuplicateMapping, init(std.testing.allocator, &inputs, &.{
+    // Two modules of one compilation that both compile the file, each binding the name to its
+    // own file: the name reaches both there.
+    var chosen = try init(std.testing.allocator, &inputs, &.{
         .{ .from = 0, .spelling = "dep", .target = 3 },
         .{ .from = 0, .spelling = "dep", .target = 2, .compilation = .build },
-    }, .{}));
+    }, .{});
+    defer chosen.deinit();
+    const both = try chosen.importedAll(std.testing.allocator, try chosen.fileAt(0), "dep");
+    defer std.testing.allocator.free(both);
+    try std.testing.expectEqualSlices(FileId, &.{ try chosen.fileAt(3), try chosen.fileAt(2) }, both);
     try std.testing.expectError(error.InvalidMapping, init(std.testing.allocator, &inputs, &.{.{ .from = 1, .spelling = "dep", .target = 2, .compilation = .build }}, .{}));
     try std.testing.expectError(error.InvalidMapping, init(std.testing.allocator, &inputs, &.{.{ .from = 0, .spelling = "dep", .target = 1, .compilation = .build }}, .{}));
 }

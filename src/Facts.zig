@@ -2815,8 +2815,7 @@ fn importValue(self: *Facts, file: Project.FileId, args: []const Ast.Node.Index)
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidLiteral => return .{ .unknown = .computed_import },
     };
-    var reached: [2]Project.FileId = undefined;
-    const targets = self.project.importedAll(file, spelling, &reached);
+    const targets = try self.project.importedAll(self.gpa, file, spelling);
     if (targets.len == 0) return .{ .unknown = if (self.project.absent(file, spelling))
         .absent
     else if (try self.zigOwn(file, spelling))
@@ -4315,8 +4314,7 @@ fn importSite(self: *Facts, sites: *Analysis.Sites, file: Project.FileId, node: 
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidLiteral => return sites.unresolved_imports.append(self.gpa, site),
     };
-    var reached: [2]Project.FileId = undefined;
-    const targets = self.project.importedAll(file, spelling, &reached);
+    const targets = try self.project.importedAll(self.gpa, file, spelling);
     if (targets.len == 0) {
         if (self.project.absent(file, spelling) or try self.zigOwn(file, spelling)) return;
         return sites.unresolved_imports.append(self.gpa, site);
@@ -4450,8 +4448,7 @@ fn reachFrom(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), fil
                     error.OutOfMemory => return error.OutOfMemory,
                     error.InvalidLiteral => return,
                 };
-                var reached: [2]Project.FileId = undefined;
-                for (self.project.importedAll(file, spelling, &reached)) |target| try self.enterFile(found, next, target);
+                for (try self.project.importedAll(self.gpa, file, spelling)) |target| try self.enterFile(found, next, target);
                 return;
             }
             if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) return;

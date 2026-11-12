@@ -519,6 +519,43 @@ fn fixedBy(rules: []const glint.Rule, program: []const u8, record: []const u8) !
     return .{ .bytes = try std.testing.allocator.dupe(u8, bytes), .stale = report.stale.len };
 }
 
+test "the fix drops from a suppression each rule that ran and met no site under it, keeping its reason, and removes one naming none left; a rule that did not run stays" {
+    const program =
+        \\pub fn a(p: usize) *u8 {
+        \\    return @ptrFromInt(p); // glint-ignore: P007, P008 -- the device register
+        \\}
+        \\pub fn b() u8 {
+        \\    return 1; // glint-ignore: P007 -- nothing here now
+        \\}
+        \\pub fn c() u8 {
+        \\    // glint-ignore: P007 -- nothing below now
+        \\    return 2;
+        \\}
+        \\pub fn d() u8 {
+        \\    return 3; // glint-ignore: Z026 -- a rule this run does not run
+        \\}
+        \\
+    ;
+    const out = try fixedBy(&.{ .P007, .P008 }, program, "");
+    defer std.testing.allocator.free(out.bytes);
+    try std.testing.expectEqual(@as(usize, 3), out.stale);
+    try std.testing.expectEqualStrings(
+        \\pub fn a(p: usize) *u8 {
+        \\    return @ptrFromInt(p); // glint-ignore: P007 -- the device register
+        \\}
+        \\pub fn b() u8 {
+        \\    return 1;
+        \\}
+        \\pub fn c() u8 {
+        \\    return 2;
+        \\}
+        \\pub fn d() u8 {
+        \\    return 3; // glint-ignore: Z026 -- a rule this run does not run
+        \\}
+        \\
+    , out.bytes);
+}
+
 test "one suppression names each rule it covers on its line, one site each; the aegis escape form is malformed" {
     var project = try sources.projectWithSources(std.testing.allocator,
         \\pub fn f(parent_id: u32, child_id: u32) *u8 { return @ptrFromInt(parent_id + child_id); } // glint-ignore: P007, P008 -- the board's two register ids

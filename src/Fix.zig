@@ -4,9 +4,10 @@
 //! (`// aegis: <reason>(<rule>, ...): <why>`, its reason kept in the words), one in the escape's
 //! older form naming the rules a record of an earlier run shows it covered, and a suppression
 //! naming a rule the pack had under the name glint gives it now (A019 is P007, A016 P008, A014
-//! P009). A rule that went with the flow engine (A010, A020, and A012's input-sized work) is
-//! dropped from it; one naming none left goes. No fix writes a suppression a site did not already
-//! have: a reason is the author's to state.
+//! P009). A rule 0.8 removed (A003, those that went with the flow engine, and A012's input-sized
+//! work) is dropped from it, and so is a rule that ran and met no site under it; one naming none
+//! left goes. No fix writes a suppression a site did not already have: a reason is the author's
+//! to state.
 const std = @import("std");
 const aegis = @import("aegis");
 const Project = @import("Project.zig");
@@ -101,8 +102,9 @@ fn ruleName(name: []const u8) bool {
     return true;
 }
 
-/// Each file a run's fixes change, with its bytes after them: every finding's fix and the
-/// removal of every escape that covered nothing. Overlapping edits keep the first; an edit two
+/// Each file a run's fixes change, with its bytes after them: every finding's fix, the rewrite of
+/// a suppression in a form glint reads no more, and each rule dropped from a suppression it met
+/// no site under (the suppression gone where none is left). Overlapping edits keep the first; an edit two
 /// findings share is made once.
 /// An edit outside its file's bytes is no edit glint makes: `InvalidEdit`.
 pub fn apply(a: std.mem.Allocator, project: *const Project, report: *const Report, options: Options) error{ OutOfMemory, InvalidEdit }![]const Changed {
@@ -122,6 +124,21 @@ pub fn apply(a: std.mem.Allocator, project: *const Project, report: *const Repor
         if (!slot.found_existing) slot.value_ptr.* = .empty;
         try slot.value_ptr.append(a, edit);
         (try sites.getOrPutValue(a, entry.span.file, 0)).value_ptr.* += 1;
+    }
+    // A suppression a rule that ran met no site under (`Report.stale`): that rule dropped from
+    // it, its reason kept, and the comment gone where it names no rule left.
+    var stale: std.array_hash_map.Auto(struct { Project.FileId, u32, u32 }, std.ArrayList([]const u8)) = .empty;
+    for (report.stale) |entry| {
+        const slot = try stale.getOrPut(a, .{ entry.span.file, entry.span.start, entry.span.end });
+        if (!slot.found_existing) slot.value_ptr.* = .empty;
+        try slot.value_ptr.append(a, entry.name);
+    }
+    for (stale.keys(), stale.values()) |at, names| {
+        const edit = (try staleSuppression(a, project.at(at[0]).file, at[1], at[2], names.items)) orelse continue;
+        const slot = try by_file.getOrPut(a, at[0]);
+        if (!slot.found_existing) slot.value_ptr.* = .empty;
+        try slot.value_ptr.append(a, edit);
+        (try sites.getOrPutValue(a, at[0], 0)).value_ptr.* += 1;
     }
     var out: std.ArrayList(Changed) = .empty;
     for (by_file.keys(), by_file.values()) |file, *edits| {
@@ -199,6 +216,26 @@ fn oldSuppression(a: std.mem.Allocator, file: *const File, start: u32, end: u32)
     if (!now.changed) return null;
     if (now.empty) return removal(file, start, end);
     return .{ .start = start, .end = end, .text = try a.print("// glint-ignore: {s} -- {s}", .{ now.list, why }) };
+}
+
+/// A suppression without the rules `stale` names, which suppress nothing under it: the rest with
+/// its reason, or its removal where none is left.
+fn staleSuppression(a: std.mem.Allocator, file: *const File, start: u32, end: u32, stale: []const []const u8) std.mem.Allocator.Error!?Report.Edit {
+    const text = spanned(file, start, end) orelse return null;
+    const after = std.mem.cutPrefix(u8, text, "// glint-ignore: ") orelse return null;
+    const listed, const why = std.mem.cut(u8, after, " -- ") orelse return null;
+    var kept: std.ArrayList(u8) = .empty;
+    var each = std.mem.tokenizeAny(u8, listed, ", \t");
+    while (each.next()) |name| {
+        const gone = for (stale) |one| {
+            if (std.mem.eql(u8, one, name)) break true;
+        } else false;
+        if (gone) continue;
+        if (kept.items.len != 0) try kept.appendSlice(a, ", ");
+        try kept.appendSlice(a, name);
+    }
+    if (kept.items.len == 0) return removal(file, start, end);
+    return .{ .start = start, .end = end, .text = try a.print("// glint-ignore: {s} -- {s}", .{ kept.items, why }) };
 }
 
 /// An escape in the aegis pack's form, as the suppression glint reads: `// aegis: <reason>(<rules>):
