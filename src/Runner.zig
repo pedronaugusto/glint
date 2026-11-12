@@ -43,7 +43,7 @@ files: []const FileConfig = &.{},
 /// The file whose rules run; set before each file's run, and read only during it.
 file: Project.FileId = undefined,
 /// The sites each seam held, by seam (its index in the base configuration) and rule.
-seam_sites: std.AutoArrayHashMapUnmanaged(struct { usize, rules.Rule }, usize) = .empty,
+seam_sites: std.AutoHashMapUnmanaged(struct { usize, rules.Rule }, usize) = .empty,
 
 pub const RunError = Suppression.ParseError || Context.Error || std.Io.Cancelable;
 pub const Options = struct {
