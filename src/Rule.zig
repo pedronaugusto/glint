@@ -415,3 +415,88 @@ pub fn parseConfigured(name: []const u8, project: []const Definition) ?Rule {
     for (project) |rule| if (std.mem.eql(u8, name, rule.name)) return rule.id;
     return null;
 }
+
+/// A rule id glint 0.7 had that 0.8 does not, and what a configuration naming it does now. A
+/// removed id is never an alias: it is refused, and the refusal says this.
+pub const Removed = struct {
+    id: []const u8,
+    now: union(enum) {
+        /// Gone with no successor: the configuration drops it.
+        removed,
+        /// Its check is the rule of this id now.
+        renamed: []const u8,
+        /// The package of this name declares a rule of the same id in its `lint_rules`: a rule
+        /// of the run wherever the program reaches that package, and of no other run.
+        declared: []const u8,
+    },
+
+    /// The refusal of `name` where no rule of the run has it, with what to write instead
+    /// where 0.8 removed it.
+    pub fn refuse(w: *std.Io.Writer, name: []const u8) std.Io.Writer.Error!void {
+        const gone = removed(name) orelse return w.print("`{s}` is not a rule glint has", .{name});
+        try gone.write(w);
+    }
+
+    /// What a configuration naming this id is told.
+    pub fn write(gone: Removed, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (gone.now) {
+            .removed => try w.print("`{s}` was removed in glint 0.8: remove it", .{gone.id}),
+            .renamed => |id| try w.print("`{s}` was removed in glint 0.8: its check is `{s}`, name that", .{ gone.id, id }),
+            .declared => |package| try w.print("`{s}` is not glint's since 0.8: {s} declares it in its `lint_rules`, a rule wherever the program reaches {s}; remove it where it does not", .{ gone.id, package, package }),
+        }
+    }
+};
+
+/// Every rule id 0.7 had that 0.8 removed, as CHANGELOG's 0.8 section lists them.
+pub const removed_rules = [_]Removed{
+    .{ .id = "A001", .now = .{ .declared = "aegis" } },
+    .{ .id = "A002", .now = .removed },
+    .{ .id = "A003", .now = .removed },
+    .{ .id = "A004", .now = .{ .declared = "aegis" } },
+    .{ .id = "A005", .now = .removed },
+    .{ .id = "A006", .now = .removed },
+    .{ .id = "A007", .now = .{ .declared = "aegis" } },
+    .{ .id = "A008", .now = .{ .declared = "aegis" } },
+    .{ .id = "A009", .now = .{ .declared = "aegis" } },
+    .{ .id = "A010", .now = .removed },
+    .{ .id = "A011", .now = .{ .declared = "aegis" } },
+    .{ .id = "A012", .now = .{ .declared = "aegis" } },
+    .{ .id = "A013", .now = .{ .declared = "aegis" } },
+    .{ .id = "A015", .now = .{ .declared = "aegis" } },
+    .{ .id = "A017", .now = .removed },
+    .{ .id = "A018", .now = .removed },
+    .{ .id = "A020", .now = .removed },
+    .{ .id = "A021", .now = .{ .declared = "aegis" } },
+};
+
+/// What 0.8 did with the rule id `name`, where it removed it.
+pub fn removed(name: []const u8) ?Removed {
+    for (removed_rules) |gone| if (std.mem.eql(u8, gone.id, name)) return gone;
+    return null;
+}
+
+test "a removed rule's refusal says it was removed in 0.8 and what to write instead" {
+    var buffer: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buffer);
+    try Removed.refuse(&w, "A002");
+    try std.testing.expectEqualStrings("`A002` was removed in glint 0.8: remove it", w.buffered());
+    w.end = 0;
+    try Removed.refuse(&w, "A007");
+    try std.testing.expectEqualStrings("`A007` is not glint's since 0.8: aegis declares it in its `lint_rules`, a rule wherever the program reaches aegis; remove it where it does not", w.buffered());
+    w.end = 0;
+    try Removed.refuse(&w, "Z008");
+    try std.testing.expectEqualStrings("`Z008` is not a rule glint has", w.buffered());
+    // A renamed id names its successor (A019's row, P007, comes with the rule that takes its check).
+    w.end = 0;
+    try (Removed{ .id = "A019", .now = .{ .renamed = "P007" } }).write(&w);
+    try std.testing.expectEqualStrings("`A019` was removed in glint 0.8: its check is `P007`, name that", w.buffered());
+    // No row names a rule glint has, nor names one twice; a successor is a rule glint has.
+    for (removed_rules, 0..) |gone, i| {
+        try std.testing.expectEqual(@as(?Rule, null), Rule.parse(gone.id));
+        for (removed_rules[0..i]) |earlier| try std.testing.expect(!std.mem.eql(u8, earlier.id, gone.id));
+        switch (gone.now) {
+            .renamed => |id| try std.testing.expect(Rule.parse(id) != null),
+            .removed, .declared => {},
+        }
+    }
+}

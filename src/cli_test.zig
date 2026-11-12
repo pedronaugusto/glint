@@ -210,6 +210,24 @@ test "completion retired rule selections are argument failures" {
     try expectOutcome(&tmp, "argument_failure");
 }
 
+test "a rule 0.8 removed is refused with what to write instead, once the packages' rules are read" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "input.zig", .data = "pub const value = 1;" });
+    const input = try resultPath(a, &tmp, "input.zig");
+    defer a.free(input);
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    var problems: std.Io.Writer.Allocating = .init(a);
+    defer problems.deinit();
+    try std.testing.expectError(error.UnknownRule, cli.execute(a, std.testing.io, &.{ "glint", "--only", "A002", input }, &output.writer, &problems.writer));
+    try std.testing.expectEqualStrings("glint: `A002` was removed in glint 0.8: remove it\n", problems.written());
+    problems.clearRetainingCapacity();
+    try std.testing.expectError(error.UnknownRule, cli.execute(a, std.testing.io, &.{ "glint", "--only", "Z033", input }, &output.writer, &problems.writer));
+    try std.testing.expectEqualStrings("glint: `Z033` is not a rule glint has\n", problems.written());
+}
+
 test "G2 completion rejects incomplete analysis despite every finding being allowed" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

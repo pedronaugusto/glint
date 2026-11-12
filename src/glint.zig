@@ -12,6 +12,11 @@ pub const Completion = @import("Completion.zig");
 pub const Rule = @import("Rule.zig").Rule;
 /// Explicit rule selection and work budgets.
 pub const Config = @import("Rule.zig").Config;
+/// A rule id 0.7 had that 0.8 removed, and what a configuration naming it writes instead:
+/// `RemovedRule.refuse(writer, name)` says so of any name no rule of the run has.
+pub const RemovedRule = @import("Rule.zig").Removed;
+/// What 0.8 did with a rule id it removed, or null.
+pub const removedRule = @import("Rule.zig").removed;
 /// Owned diagnostics and coverage, rendered as text, JSON or SARIF.
 pub const Report = @import("Report.zig");
 /// Runs the selected code checks over one frozen project.

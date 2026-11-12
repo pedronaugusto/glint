@@ -293,7 +293,7 @@ pub const Arguments = struct {
 
 /// What the arguments ask: the profile chosen, the rules named (resolved by `resolve` once the
 /// packages' rules are read), the code options and the inputs.
-fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, definitions: []const Rule.Definition) !Options {
+fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments) !Options {
     var result: Options = .{ .format = arguments.format, .zig_lib_path = arguments.zig_lib_path };
     if (arguments.config) |path| {
         const bytes = try aegis.own.readFile(io, std.Io.Dir.cwd(), path, a, .fromRaw(4 * 1024 * 1024));
@@ -321,11 +321,6 @@ fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, definitions: 
     if (arguments.only.len != 0) result.aegis = .selected;
     result.only = arguments.only;
     result.levels = .{ .{ arguments.report, .report }, .{ arguments.gate, .gate }, .{ arguments.disable, .off } };
-    // A name of glint's own form (Z, P, D) that glint and the caller do not have is unknown now:
-    // no package may declare one, so it waits for nothing the project holds.
-    for (result.settings) |setting| try knownForm(setting.id, definitions);
-    for (result.only) |id| try knownForm(id, definitions);
-    for (result.levels) |level| for (level[0]) |id| try knownForm(id, definitions);
     if (arguments.max_line_length) |n| result.config.max_line_length = n;
     if (arguments.max_function_lines) |n| result.config.max_function_lines = n;
     if (arguments.fact_budget) |n| result.config.fact_budget = n;
@@ -350,9 +345,32 @@ fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, definitions: 
     return result;
 }
 
-fn knownForm(name: []const u8, definitions: []const Rule.Definition) error{UnknownRule}!void {
-    if (name.len == 0 or std.mem.findScalar(u8, "ZPD", name[0]) == null) return;
-    if (Rule.parseConfigured(name, definitions) == null) return error.UnknownRule;
+/// The first rule `result` names that glint and `definitions` do not have. Where `own_form`,
+/// only a name of glint's own form (Z, P, D), which no package may declare: it is unknown before
+/// the project is read, where any other waits for the packages' rules.
+fn unknownRule(result: *const Options, definitions: []const Rule.Definition, own_form: bool) ?[]const u8 {
+    for (result.settings) |setting| if (unknown(setting.id, definitions, own_form)) return setting.id;
+    for (result.only) |id| if (unknown(id, definitions, own_form)) return id;
+    for (result.levels) |level| for (level[0]) |id| if (unknown(id, definitions, own_form)) return id;
+    // A seam names rules the run has.
+    if (!own_form) for (result.config.seams) |seam| for (seam.rules) |name| if (unknown(name, definitions, false)) return name;
+    return null;
+}
+
+fn unknown(name: []const u8, definitions: []const Rule.Definition, own_form: bool) bool {
+    if (own_form and (name.len == 0 or std.mem.findScalar(u8, "ZPD", name[0]) == null)) return false;
+    return Rule.parseConfigured(name, definitions) == null;
+}
+
+/// Refuses a run that names a rule it does not have (`unknownRule`), saying which and, where
+/// glint 0.8 removed it, what to write instead (`Rule.Removed`).
+fn refuseUnknown(result: *const Options, definitions: []const Rule.Definition, own_form: bool, problems: *std.Io.Writer) !void {
+    const name = unknownRule(result, definitions, own_form) orelse return;
+    try problems.writeAll("glint: ");
+    try Rule.Removed.refuse(problems, name);
+    try problems.writeByte('\n');
+    try problems.flush();
+    return error.UnknownRule;
 }
 
 /// The rules `options` asked by name, now that `definitions` holds every rule of the run (the
@@ -469,7 +487,8 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
         // outcome no parse of them gives is a refusal, not a state the program cannot reach.
         .complete => return error.InvalidArguments,
     };
-    var configured = try options(a, io, arguments, definitions);
+    var configured = try options(a, io, arguments);
+    try refuseUnknown(&configured, definitions, true, problems);
     if (configured.files.items.len == 0) return error.MissingSource;
     record.outcome = .input_failure;
     var loader: Loader = .{ .a = a, .io = io, .options = &configured };
@@ -494,6 +513,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     const declared = try Runner.packageRules(a, &project);
     const all = try std.mem.concat(a, Rule.Definition, &.{ definitions, declared });
     record.outcome = .argument_failure;
+    try refuseUnknown(&configured, all, false, problems);
     try resolve(a, &configured, all);
     record.outcome = .tool_failure;
     var config = configured.config;
@@ -583,8 +603,11 @@ test "CLI invalid selections and unknown formats fail" {
     defer arena.deinit();
     // A name of glint's own form is known or not before the project is read; any other waits
     // for the packages' rules.
-    try std.testing.expectError(error.UnknownRule, options(arena.allocator(), std.testing.io, .{ .only = &.{"Z008"} }, &.{}));
-    var asked = try options(arena.allocator(), std.testing.io, .{ .only = &.{"X008"} }, &.{});
+    const own = try options(arena.allocator(), std.testing.io, .{ .only = &.{"Z008"} });
+    try std.testing.expectEqualStrings("Z008", unknownRule(&own, &.{}, true).?);
+    var asked = try options(arena.allocator(), std.testing.io, .{ .only = &.{"X008"} });
+    try std.testing.expectEqual(@as(?[]const u8, null), unknownRule(&asked, &.{}, true));
+    try std.testing.expectEqualStrings("X008", unknownRule(&asked, &.{}, false).?);
     try std.testing.expectError(error.UnknownRule, resolve(arena.allocator(), &asked, &.{}));
     try std.testing.expectError(error.InvalidValue, ensign.parse(Arguments, arena.allocator(), &.{ "--format", "other" }, .{}));
     // A run of some rules never names an older escape from a record.
@@ -685,11 +708,11 @@ test "the packages' rules on by default run unless a profile of none or --only s
         .{ .id = @fromBackingInt(2000), .name = "X001", .group = .family_policy, .purpose = "p", .declared = .{ .package = "pkg", .kind = .ban, .reads = .replaces, .default = true } },
         .{ .id = @fromBackingInt(2001), .name = "X002", .group = .family_policy, .purpose = "q", .declared = .{ .package = "pkg", .kind = .ban, .reads = .replaces, .default = false } },
     };
-    var plain = try options(a, std.testing.io, .{}, &declared);
+    var plain = try options(a, std.testing.io, .{});
     try resolve(a, &plain, &declared);
     // The run selects the defaults (Runner); the configuration says it takes them.
     try std.testing.expect(plain.config.package_defaults);
-    var only = try options(a, std.testing.io, .{ .only = &.{"X002"} }, &declared);
+    var only = try options(a, std.testing.io, .{ .only = &.{"X002"} });
     try resolve(a, &only, &declared);
     try std.testing.expect(!only.config.package_defaults);
     try std.testing.expectEqual(Rule.Config.Level.report, only.config.level(declared[1].id));
