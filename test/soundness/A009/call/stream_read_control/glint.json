@@ -1,0 +1,1 @@
+{"seams":[{"rules":["A009"],"file":"twin.zig","reason":"the one place the program reads its input files"}]}

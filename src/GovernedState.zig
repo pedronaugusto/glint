@@ -4,11 +4,12 @@
 //! A rule that reads `.governed` is a ban on a governed type's own state: a touch of an internal
 //! field (a read, a write, a struct literal naming it, `@field` and the other field builtins), a
 //! cast that makes the type from another or reinterprets it (`@enumFromInt`, `@intFromEnum`,
-//! `@bitCast`, `@ptrCast` and the pointer casts), and reflection over it (`@typeInfo`, `@field`,
-//! `@hasField`, `@FieldType`, the offsets). `@sizeOf` and `@alignOf` read no state. A reference
-//! spelling an internal field's name that does not resolve cannot be shown to be another field: a
-//! finding. A cast or reflection whose operand does not resolve spells no governed name and is
-//! silent.
+//! `@backingInt`, `@fromBackingInt`, `@bitCast`, `@ptrCast` and the pointer casts), reflection
+//! over it (`@typeInfo`, `@field`, `@hasField`, `@FieldType`, the offsets), and a library's
+//! reflective function given it (`std.mem.zeroes`, `asBytes`, `bytesToValue`, `std.meta.fields`).
+//! `@sizeOf` and `@alignOf` read no state. A reference spelling an internal field's name that
+//! does not resolve cannot be shown to be another field: a finding. A cast or reflection whose
+//! operand does not resolve spells no governed name and is silent.
 //!
 //! A rule that reads `.exits` is hygiene: an exit's result (`raw()`) given straight to arithmetic, a
 //! comparison or a narrowing cast loses the type's checks. Only a call that resolves to an exit
@@ -101,10 +102,31 @@ pub fn check(c: *Context, definition: Rule.Definition) Context.Error!void {
         const entry = ofContainer(all, found) orelse all[0];
         try c.at(definition.id, token, try c.allocator.print("{s} over {s}: its state is {s}'s alone; use the type's own makers and API", .{ name, typeName(c, entry), entry.package.name }));
     }
+
+    // A library's reflective functions over a governed type: one that makes it from what the
+    // caller hands it (`std.mem.zeroes(T)`, `std.mem.bytesToValue(T, b)`), or reads whatever
+    // it is handed (`std.mem.asBytes(&t)`, `std.meta.fields(T)`).
+    for (tree.nodes.items(.tag), 0..) |tag, raw| {
+        switch (tag) {
+            .call, .call_comma, .call_one, .call_one_comma => {},
+            else => continue,
+        }
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(raw));
+        const token = tree.nodeMainToken(node);
+        if (c.inTest(token)) continue;
+        const callee = switch (try Governed.madeByCall(c, node, types.items)) {
+            .yes => |callee| callee,
+            .no, .unknown => try Governed.reflectedByCall(c, node, types.items),
+        } orelse continue;
+        const at = tree.firstToken(node);
+        if ((try reported.getOrPut(c.allocator, at)).found_existing) continue;
+        const named = c.project.at(callee.file).model.declarations[@backingInt(callee.index)].name;
+        try c.at(definition.id, at, try c.allocator.print("{s} reads or makes a governed type by reflection: its state is {s}'s alone; use the type's own makers and API", .{ named, all[0].package.name }));
+    }
 }
 
 /// The builtins that make a value of one type from another's bits, or reinterpret a pointer.
-const casts = [_][]const u8{ "@enumFromInt", "@intFromEnum", "@bitCast", "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@ptrFromInt", "@errorFromInt", "@intFromError" };
+const casts = [_][]const u8{ "@enumFromInt", "@intFromEnum", "@backingInt", "@fromBackingInt", "@bitCast", "@addrSpaceCast", "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@ptrFromInt", "@errorFromInt", "@intFromError" };
 /// The builtins that read a type's fields or layout by name.
 const reflection = [_][]const u8{ "@typeInfo", "@field", "@hasField", "@FieldType", "@offsetOf", "@bitOffsetOf", "@fieldParentPtr" };
 

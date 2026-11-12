@@ -407,26 +407,32 @@ pub fn madeByCall(self: *Context, node: Ast.Node.Index, types: []const Facts.Con
     return .no;
 }
 
-/// Whether the cast at `node` (`@ptrCast`, `@bitCast`) makes a value of one of `types`, or a
-/// pointer to one, from a value of another type: a reinterpretation no maker of the type sees.
-/// Unknown where its result does not resolve and its operand is of none of `types`.
-pub fn madeByCast(self: *Context, node: Ast.Node.Index, types: []const Facts.Container) Context.Error!Made {
-    if (types.len == 0) return .no;
-    const tree = &self.project.at(self.file).file.tree;
-    const builtin = Facts.builtinName(tree, node) orelse return .no;
-    if (!std.mem.eql(u8, builtin, "@ptrCast") and !std.mem.eql(u8, builtin, "@bitCast")) return .no;
-    var buffer: [2]Ast.Node.Index = undefined;
-    const args = Facts.builtinArgs(tree, node, &buffer);
-    if (args.len != 1) return .no;
-    const operand = try self.facts.resolve(self.file, args[0]);
-    const from = madeType(operand, types);
-    const result = try self.facts.castTypeIn(null, self.file, node);
-    const into = madeType(result, types) orelse {
-        if (result == .unknown and result.unknown != .generic and from == null) return .{ .unknown = result.unknown };
-        return .no;
+/// Whether the call at `node` hands one of `types`, or a value of or pointer to one, to a
+/// library function that reads whatever it is given by reflection: a callee outside the program
+/// and outside the type's package whose result is written in terms of its own parameter
+/// (`std.mem.asBytes(&t)`, `std.meta.fields(T)`, `std.mem.toBytes(t)`). A function that only
+/// holds a type it is given (`std.ArrayList(T)`, a result written as `type`) or returns nothing
+/// of it (`std.mem.swap`) is none. The callee is given.
+pub fn reflectedByCall(self: *Context, node: Ast.Node.Index, types: []const Facts.Container) Context.Error!?Facts.Decl {
+    if (types.len == 0) return null;
+    const call = (try Facts.calls.at(self.facts, self.file, node)) orelse return null;
+    const args = switch (call.args) {
+        .known => |known| known,
+        .unknown => return null,
     };
-    if (from) |same| if (same.file == into.file and same.scope == into.scope) return .no;
-    return .{ .yes = null };
+    const callees: []const Facts.Decl = switch (call.callee) {
+        .function => |function| &.{function},
+        .choice => |each| each,
+        .any => return null,
+    };
+    for (args) |arg| {
+        const handed = madeType(try self.facts.resolve(self.file, arg), types) orelse continue;
+        for (callees) |callee| {
+            if (try self.facts.program(callee.file) or try samePackage(self, callee.file, handed.file)) continue;
+            if (reflectiveResult(self, callee)) return callee;
+        }
+    }
+    return null;
 }
 
 /// The one of `types` a value is, or points at, through optionals and error unions; of a
@@ -472,8 +478,8 @@ fn reflectiveResult(self: *Context, function: Facts.Decl) bool {
 }
 
 /// Whether a type expression refers to one of `proto`'s parameters, by its declaration (`T`,
-/// `?T`, `E!*T`, `[]const T`, `@TypeOf(x)`, `Made(T)`, `T.Elem`). A form not read here refers
-/// to none.
+/// `?T`, `E!*T`, `[]const T`, `[@sizeOf(T)]u8`, `@TypeOf(x)`, `Made(T)`, `T.Elem`). A form not
+/// read here refers to none.
 pub fn refersToParameter(tree: *const Ast, model: *const Model, proto: Ast.full.FnProto, written: Ast.Node.Index) bool {
     return parameterIn(tree, model, proto, written, 0);
 }
@@ -481,7 +487,7 @@ pub fn refersToParameter(tree: *const Ast, model: *const Model, proto: Ast.full.
 fn parameterIn(tree: *const Ast, model: *const Model, proto: Ast.full.FnProto, node: Ast.Node.Index, depth: usize) bool {
     if (depth == 16) return false;
     if (tree.fullPtrType(node)) |ptr| return parameterIn(tree, model, proto, ptr.ast.child_type, depth + 1);
-    if (tree.fullArrayType(node)) |array| return parameterIn(tree, model, proto, array.ast.elem_type, depth + 1);
+    if (tree.fullArrayType(node)) |array| return parameterIn(tree, model, proto, array.ast.elem_type, depth + 1) or parameterIn(tree, model, proto, array.ast.elem_count, depth + 1);
     switch (tree.nodeTag(node)) {
         .identifier => {
             const index = (model.reference(node) orelse return false).declaration orelse return false;
