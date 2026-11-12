@@ -17,8 +17,8 @@
     },
     .dev_dependencies = .{
         .preflight = .{
-            .url = "git+https://github.com/pedronaugusto/preflight?ref=wip/vocab-6#0b8d9d11acaab6c3b081eb57c93c0335293b4fc9",
-            .hash = "preflight-0.18.6-LX1ZwiWdGABRDmPWvPCyTI_nUUzvCi411I_P4UIBmcU0",
+            .url = "git+https://github.com/pedronaugusto/preflight?ref=wip/vocab-6-2#132fb179c8d48656838f4a723464a3bf33fc86aa",
+            .hash = "preflight-0.18.6-LX1Zwl6bGAD-3NgYyKIpC39xdsNIbgYirxz21Xk0qWoY",
         },
 
         .shakedown = .{

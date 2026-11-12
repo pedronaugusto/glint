@@ -503,4 +503,3 @@ const Walk = struct {
         return false;
     }
 };
-
