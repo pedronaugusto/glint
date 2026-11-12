@@ -12,7 +12,9 @@ A rule is one of two kinds, and says which:
   declaration a reference resolves to. Every site is a finding: there is no excuse, no proof that a site is
   harmless, and no analysis to fool. A ban must never miss, and it reads nothing but its construct, so it
   cannot. A reference that does not resolve, in a file the ban applies to, is a finding ("cannot show this is
-  not X").
+  not X") where its name belongs to no other declaration the program reaches, std's included. An enum literal
+  or a struct-init label never spells a declaration, and a computed `@field` spells nothing: over a governed
+  holder it is the reflection finding, once.
 - **Hygiene.** Dead code, unused imports, naming, length, deprecations. A hygiene rule reports only what it is
   certain of and claims nothing about what it does not report. A miss harms nobody; a wrong report is the only
   defect.
@@ -20,8 +22,6 @@ A rule is one of two kinds, and says which:
 A run ends in one of three ways: findings, reports, or a run error. There is no "undecided" result and no
 partial pass: what glint cannot read is a run error that names the file and what to do (below), never a site
 counted as unknown. Soundness is relative to the claim: every claim glint makes is one it can decide.
-**Pending:** the removal of the undecided class (`RuleContext.undecided` and `unknown`, `Coverage.rule`,
-`Metrics.unresolved`) is the last part of the aegis session's push 6.
 
 ## Who defends what
 
@@ -49,7 +49,7 @@ nothing unasked. The configuration keys a rule reads are named in its row with t
 
 | ID | Kind | Claim and construct list |
 |---|---|---|
-| Z001 Z005 Z006 Z009 Z014 Z031 Z032 | hygiene | Naming over known kinds. A name whose kind does not resolve is silent. An established external ABI name is kept. |
+| Z001 Z005 Z006 Z009 Z014 Z031 Z032 | hygiene | Naming over known kinds. A name whose kind does not resolve is silent; a call of a function declared to return `type` names a type. An established external ABI name is kept. |
 | Z003 | hygiene | Input that std's parser or lowering rejects. |
 | Z024 | hygiene | A line longer than the configured byte length (`max_line_length`, default 100). |
 | Z034 | hygiene | Two binary operators the next Zig refuses to order without parentheses (a product and a remainder, two bitwise operators, arithmetic and bitwise, `and` and `or`, `orelse` or `catch` with any other), or a chained shift or remainder. The fix parenthesizes as 0.17 groups. |
@@ -62,9 +62,9 @@ nothing unasked. The configuration keys a rule reads are named in its row with t
 | Z026 | ban | A discarded error needs a written reason. An error handler (`catch`, an `if`'s or a `while`'s `else \|e\|`) whose body is empty: a block of empty statements (`{}`, a bare `break` to its own label, `_ = X` with no call), `void{}`, `@as(void, …)` of an empty one, an `if` or `switch` whose every branch is empty, `return`/`continue`/`break` with no operand. Also `catch unreachable`. A handler that returns a value, or calls anything, is not empty; this rule does not judge what it does with the error. `orelse unreachable` is not Z026's: a null is no error, and the safe build traps it. Test code is exempt. |
 | P005 | hygiene | A reference that resolves to std's `debug.print`, outside test code, on the `replaces` engine. A reference that does not resolve is silent. |
 | P006 | ban | A reference that resolves to a declaration (or an extern symbol) the project's `disallowed` list names, outside the packages the entry names as owners, on the `replaces` engine. An entry that resolves to nothing is a run error. |
-| P007 | ban | An operation Zig leaves unchecked, outside a seam, in production code: inline `asm`; `@setRuntimeSafety` off in a build that keeps the checks, or on a value the build mode does not decide; the pointer conversions no build checks (`@ptrCast`, `@alignCast`, `@constCast`, `@volatileCast`, `@ptrFromInt`, `@fieldParentPtr`); an `extern` declaration and `@extern`; `noalias`; `@setFloatMode(.optimized)`; arithmetic on or indexing of a many-item or C pointer; std's `mem.bytesAsValue` and `mem.bytesAsSlice`; and any member of `std.c`, `std.os.linux` or `std.os.windows`. A chain of casts written one inside another is one site, the outermost. What the program runs only as it compiles is not read. (Was A019.) |
+| P007 | ban | An operation Zig leaves unchecked, outside a seam, in production code: inline `asm`; `@setRuntimeSafety` off in a build that keeps the checks, or on a value the build mode does not decide; the pointer conversions no build checks (`@ptrCast`, `@alignCast`, `@constCast`, `@volatileCast`, `@ptrFromInt`, `@fieldParentPtr`); an `extern` declaration and `@extern`; `noalias`; `@setFloatMode(.optimized)`; arithmetic on or indexing of a many-item or C pointer; std's `mem.bytesAsValue` and `mem.bytesAsSlice`; and any member of `std.c`, `std.os.linux` or `std.os.windows`. A chain of casts written one inside another is one site, the outermost. Not read: the interface idiom, `@fieldParentPtr` with the `@alignCast` around it, and `@ptrCast`/`@alignCast` from `*anyopaque` to a single-item pointer; a cast to a slice or a many-item pointer stays a site. What the program runs only as it compiles is not read. (Was A019.) |
 | P008 | ban | Two or more identifying integers of one type meeting in one public signature or one public struct, where nothing keeps one from standing for the other, read from the shape alone. Two names are one integer when their types resolve to it, or are spelled alike and are an integer whatever the build chooses. A type that does not resolve, or a choice that may meet the other's, is a finding. (Was A016.) |
-| P009 | hygiene | A pointer into a function's own frame carried out by its `return`: the address or a slice of a local, in a returned literal or through a local alias. Comptime frames are not read. **Pending:** narrowing to the certain `return &local` shape. (Was A014.) |
+| P009 | hygiene | A pointer into a function's own frame carried out by its `return`: the address or a slice of a local, in a returned literal or through a local alias. Comptime frames are not read, and a `const` whose value is compiled in is static memory: a literal, `comptime x`, a comptime parameter, a file or container declaration, a local const, arithmetic on those, or an inline call with such arguments. **Pending:** narrowing to the certain `return &local` shape. (Was A014.) |
 | Z035 | hygiene | Two operands written alike: `a OP a` for `and`, `or`, `-`, `^`, `|`, `&`; for a comparison only where `a`'s declaration writes an integer or `bool` type (a float's `x != x` is its NaN test). |
 | Z036 | hygiene | An `if` / `else if` chain repeating an earlier condition token for token, or an `if` whose `else` body is written as its `then` body. |
 | Z037 | hygiene | Arithmetic done narrow and then widened: `@as(u64, a * b)`, `@as(u64, a << n)`, `const x: u64 = a * b`, where the operands' declarations write narrower integer types. |
@@ -133,7 +133,9 @@ declaration.
 - `.rules`: `.{ .id, .name, .kind = .ban | .hygiene, .reads = .governed | .exits | .replaces, .default, .purpose }`.
   The package names its own ids. A run refuses two packages that declare one id.
 - `.governed`: `.{ .type = T, .internal = .{ .field, ... }, .exits = .{ .member, ... } }`. `T` is a declaration,
-  or `.{ .generic = F, .member = .Name }` for every instance of a type function's member.
+  or `.{ .generic = F, .member = .Name }` for every instance of a type function's member. Every internal field
+  is named `<package>_<name>` (aegis's `aegis_state`), so a reference glint cannot resolve still names the field;
+  one without the prefix is a malformed entry in the declarer.
 - `.replaces`: `.{ .rule, <target>, .held = .field (optional), .with, .why }`. The target is exactly one of:
   - `.decl = D`;
   - `.members = C, .except = .{...}` (every function declared directly in `C`, so a new one is caught);
@@ -150,7 +152,9 @@ run error. In a consumer, an unresolved reference inside a banned file is a find
 
 ## Configuration, seams and suppression
 
-A project's `glint.json` (or preflight's `glint` block) holds its profile, rule levels and code options:
+A project's `glint.json` holds its seams, test inputs and code options, the one home of each: preflight passes it
+to glint unchanged, and preflight's own `glint` block holds only the rule levels (`rules`). On the command line
+`glint.json` also holds the profile and levels:
 
 ```json
 {
@@ -167,7 +171,7 @@ A project's `glint.json` (or preflight's `glint` block) holds its profile, rule 
 A **seam** names a file, a glob or a directory, the rules it holds, and a written reason; it is declared in the
 configuration, never inline. The report counts each seam's sites, so a seam cannot grow unseen, and a seam is
 stale where its rules ran and it held nothing. **`test_inputs`** names the inputs read as test code, by path
-glob or directory.
+glob or directory, for every caller: the command line and preflight alike.
 
 A single site is answered by one comment, inline or on the line before:
 
@@ -180,7 +184,8 @@ It names one or more rules (`// glint-ignore: P007, A007 -- <reason>`), each cov
 needs a non-empty reason. A malformed comment is reported where it is written, and every suppression is
 counted. There is no other form: the `// aegis: <reason>(<rule>): <why>` escape is malformed, and `--fix`
 rewrites it into a `glint-ignore` naming the rules it covers (an escape that names none takes the rules a record
-of an earlier run lists, `--escapes-before`).
+of an earlier run lists, `--escapes-before`). `--fix` also rewrites 0.7's `// unreachable: <why>` at a
+`catch unreachable` into `// glint-ignore: Z026 -- <why>`.
 
 ## Model and run
 
@@ -193,13 +198,10 @@ for a ban, silence for hygiene). Reports are text, JSON version 1, or SARIF 2.1.
 
 - a file std's parser or lowering rejects: the file and the error;
 - an import no module mapping names: the import, the file, and how to map it (`--module NAME=FILE`, or the
-  build's module graph through preflight); an import under a comptime branch the build does not take is
-  nothing;
+  build's module graph through preflight, which maps the options modules, the roots a WriteFiles step embeds and
+  the generated roots by their text); an import under a comptime branch the build does not take is nothing;
 - a configuration glint cannot read, a rule it does not have (with the removed-rule table's answer), a P003
   exception naming no function, a P006 entry resolving to nothing.
-
-**Pending:** parse failures, unmapped imports and the P003 and P006 entries become run errors with push 6;
-today each is counted as coverage.
 
 Exit 0 means a completed run with no findings, 1 a completed run with findings, and 2 a run error or an
 argument, input, tool, output or cancellation failure. A `--result` record binds an invocation id, the exit

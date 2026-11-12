@@ -19,8 +19,15 @@ closed construct list. In short, for a configuration written for 0.7:
   `--fix` rewrites it. Files and directories are answered by `seams` in the configuration, test code named by
   `test_inputs`.
 - **Profiles:** `core` (Z003, Z013), `reviewed`, `none`; `--aegis` and the `aegis` profile are gone.
+- **Reading under a ban:** an unresolved reference is a finding only where its name belongs to no other
+  declaration the program reaches; enum literals and struct-init labels spell nothing, nor does a computed
+  `@field` (over a governed holder it is the reflection finding, once). A package names its governed internal
+  fields `<package>_<name>`.
+- **One home for seams:** `glint.json` holds seams, test inputs (exempting for every caller) and options;
+  preflight passes it through and keeps only `rules` in its own `glint` block. `--fix` also rewrites 0.7's
+  `// unreachable: <why>` into `// glint-ignore: Z026 -- <why>`.
 - **Run errors** in place of undecided coverage: a file that does not parse, an unmapped import, a P003 exception
-  or P006 entry naming nothing. **Pending:** push 6.
+  or P006 entry naming nothing.
 
 ### Breaking
 
