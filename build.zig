@@ -177,16 +177,14 @@ pub fn dev(b: *std.Build, tools: type) void {
     const rule_lint = addLint(b, rule_readers, .{ .sources = rule_files, .directories = &.{p.path("src")}, .args = &.{ "--only", "RULE_READERS" } });
     rule_lint.addArg("--zig-lib-path");
     rule_lint.addDirectoryArg2(.zig_lib, .{});
-    rule_lint.addArg("--module");
-    rule_lint.addPrefixedFileArg("aegis=", aegis_dependency.path("src/root.zig"));
+    mapOwnModules(p, rule_lint, aegis_dependency, target, optimize);
     // NAME_TABLES over every source of glint's own, the shared queries' files included: a table
     // of declarations by their text is the class wherever it is made. VALUE_SWITCHES in the same
     // run: a resolved value's choice is read part by part wherever glint switches on one.
     const table_lint = addLint(b, rule_readers, .{ .sources = ownSources(b, p) catch |err| std.debug.panic("glint's src/ could not be listed for NAME_TABLES: {t}", .{err}), .directories = &.{p.path("src")}, .args = &.{ "--only", "NAME_TABLES", "--only", "VALUE_SWITCHES" } });
     table_lint.addArg("--zig-lib-path");
     table_lint.addDirectoryArg2(.zig_lib, .{});
-    table_lint.addArg("--module");
-    table_lint.addPrefixedFileArg("aegis=", aegis_dependency.path("src/root.zig"));
+    mapOwnModules(p, table_lint, aegis_dependency, target, optimize);
     const rule_readers_step = b.step("check-rule-readers", "Report where a rule reads a value, a write, a call or a type around the shared queries, where glint keys a table by text, and where it switches on a resolved value without reading its choice part by part: each report whole under zig-out/rule-readers/, their totals per rule, class and file printed");
     // Each report whole in a file, never read off the build runner's output, which it cuts.
     const reports = [_]struct { std.Build.LazyPath, []const u8 }{ .{ rule_lint.captureStdOut(.{}), "rule-readers.json" }, .{ table_lint.captureStdOut(.{}), "name-tables.json" } };
@@ -313,6 +311,21 @@ fn ownSources(b: *std.Build, p: *std.Build) ![]const std.Build.LazyPath {
     for (try ownSourcePaths(b, p)) |path| try found.append(b.allocator, p.path(path));
     return found.items;
 }
+/// The named modules glint's own sources import, for a lint of them: aegis, glint itself (main and the
+/// build gate import it), ensign and the xenoglyph ensign imports. An import no mapping names is a run error.
+fn mapOwnModules(p: *std.Build, run: *std.Build.Step.Run, aegis_dependency: *std.Build.Dependency, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) void {
+    const ensign_dependency = p.dependency("ensign", .{ .target = target, .optimize = optimize });
+    const xenoglyph_dependency = ensign_dependency.builder.dependency("xenoglyph", .{ .target = target, .optimize = optimize });
+    for ([_]struct { []const u8, std.Build.LazyPath }{
+        .{ "aegis=", aegis_dependency.path("src/root.zig") },
+        .{ "glint=", p.path("src/glint.zig") },
+        .{ "ensign=", ensign_dependency.path("src/ensign.zig") },
+        .{ "xenoglyph=", xenoglyph_dependency.path("src/xenoglyph.zig") },
+    }) |mapping| {
+        run.addArg("--module");
+        run.addPrefixedFileArg(mapping[0], mapping[1]);
+    }
+}
 /// The paths of `ownSources`, from the package root (`src/Facts.zig`).
 fn ownSourcePaths(b: *std.Build, p: *std.Build) ![]const []const u8 {
     const io = b.graph.io;
@@ -323,6 +336,9 @@ fn ownSourcePaths(b: *std.Build, p: *std.Build) ![]const []const u8 {
     var paths: std.ArrayList([]const u8) = .empty;
     while (try walker.next(io)) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".zig") or std.mem.endsWith(u8, entry.path, "_test.zig")) continue;
+        // The test root and the test helpers import the test build's own modules (aegis_sources,
+        // made from a generated tree), which no lint can map.
+        if (std.mem.eql(u8, entry.path, "tests.zig") or std.mem.startsWith(u8, std.Io.Dir.path.basename(entry.path), "test_")) continue;
         try paths.append(b.allocator, b.fmt("src/{s}", .{entry.path}));
     }
     std.mem.sort([]const u8, paths.items, {}, struct {

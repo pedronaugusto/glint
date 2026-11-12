@@ -485,7 +485,12 @@ pub fn main(init: std.process.Init) !void {
             if (problems.err) |cause| if (cause == error.Canceled) return error.Canceled;
             std.process.exit(2);
         },
-        else => std.process.exit(2),
+        // Any other failure says what it was, where a bare exit hid it.
+        else => |cause| {
+            problems.interface.print("glint-rule-readers: {t}\n", .{cause}) catch std.process.exit(2);
+            problems.interface.flush() catch std.process.exit(2);
+            std.process.exit(2);
+        },
     };
     if (status != 0) std.process.exit(status);
 }
