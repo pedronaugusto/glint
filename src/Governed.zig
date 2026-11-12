@@ -200,7 +200,7 @@ pub fn sitesLeaving(self: *Context, rule: Rule, governed: []const Governed, out:
                 }
                 // A name it ranges over or computes, or a holder only its result names
                 // (`@fieldParentPtr`): each governed name it may be.
-                try fieldSites(self, rule, governed, renamed, node, by, named, out);
+                try fieldSites(self, rule, governed, renamed, node, by, named, out, unread);
                 continue;
             },
             // A decl literal (`.fromMilliseconds(ms)`, `.zero`): a member of the type its place
@@ -211,7 +211,7 @@ pub fn sitesLeaving(self: *Context, rule: Rule, governed: []const Governed, out:
                 var buffer: [2]Ast.Node.Index = undefined;
                 if (tree.fullStructInit(&buffer, node)) |literal| for (literal.ast.fields) |value| {
                     const label = Model.initName(tree, value) orelse continue;
-                    try literalSite(self, rule, governed, renamed, node, value, label, out);
+                    try literalSite(self, rule, governed, renamed, node, value, label, out, unread);
                 };
                 continue;
             },
@@ -241,17 +241,24 @@ pub fn sitesLeaving(self: *Context, rule: Rule, governed: []const Governed, out:
     }
 }
 
+/// A reference that does not resolve: to `unread` where the caller gives one, to judge; else
+/// undecided.
+fn leave(self: *Context, rule: Rule, unread: ?*std.ArrayList(Unread), node: Ast.Node.Index, why: Facts.Unknown) Context.Error!void {
+    if (unread) |list| return list.append(self.allocator, .{ .node = node, .why = why });
+    return self.unknown(rule, node, why);
+}
+
 /// A literal field's name spelling a governed member: a site where the literal's type has it.
-fn literalSite(self: *Context, rule: Rule, governed: []const Governed, renamed: []const []const []const u8, literal: Ast.Node.Index, value: Ast.Node.Index, label: Ast.TokenIndex, out: *std.ArrayList(Site)) Context.Error!void {
+fn literalSite(self: *Context, rule: Rule, governed: []const Governed, renamed: []const []const []const u8, literal: Ast.Node.Index, value: Ast.Node.Index, label: Ast.TokenIndex, out: *std.ArrayList(Site), unread: ?*std.ArrayList(Unread)) Context.Error!void {
     const tree = &self.project.at(self.file).file.tree;
     const spelled = try Model.identifier(self.allocator, tree.tokenSlice(label));
     if (!spelledAny(self, governed, renamed, spelled, label)) return;
     switch (try self.facts.literalDeclaration(self.file, literal, spelled)) {
-        .unknown => |why| try self.unknown(rule, value, why),
+        .unknown => |why| try leave(self, rule, unread, value, why),
         .none => {},
         .decl => |decl| switch (try paired(self, decl)) {
             .pair => |pair| try append(self, governed, renamed, label, value, spelled, &pair, out),
-            .unknown => |why| try self.unknown(rule, value, why),
+            .unknown => |why| try leave(self, rule, unread, value, why),
         },
     }
 }
@@ -282,7 +289,7 @@ pub fn fieldHolder(self: *Context, node: Ast.Node.Index, by: FieldBuiltin) Conte
 /// A field builtin by a name it ranges over or computes, or by any name where only its result
 /// names its holder: each governed member its holder has that the name may be is a site; a
 /// holder that does not resolve is undecided where a governed name may be named.
-fn fieldSites(self: *Context, rule: Rule, governed: []const Governed, renamed: []const []const []const u8, node: Ast.Node.Index, by: FieldBuiltin, named: Facts.FieldName, out: *std.ArrayList(Site)) Context.Error!void {
+fn fieldSites(self: *Context, rule: Rule, governed: []const Governed, renamed: []const []const []const u8, node: Ast.Node.Index, by: FieldBuiltin, named: Facts.FieldName, out: *std.ArrayList(Site), unread: ?*std.ArrayList(Unread)) Context.Error!void {
     // A name of the fields or tags of the very type the holder is, or holds, is a field's or a
     // tag's: Zig forbids a declaration of one name with them in a container, so it reaches no
     // declaration, but it does reach a governed field among them.
@@ -299,7 +306,7 @@ fn fieldSites(self: *Context, rule: Rule, governed: []const Governed, renamed: [
         const aliases: []const []const u8 = if (own) &.{} else names;
         for ([_][]const []const u8{ &.{g.name}, aliases }) |list| for (list) |name| {
             if (!self.facts.mayName(named, name) or (self.inTest(site) and g.target.production)) continue;
-            if (value == .unknown) return self.unknown(rule, node, value.unknown);
+            if (value == .unknown) return leave(self, rule, unread, node, value.unknown);
             var options: std.ArrayList(Facts.Container) = .empty;
             try containers(self, value, &options);
             for (options.items) |container| {
@@ -307,7 +314,7 @@ fn fieldSites(self: *Context, rule: Rule, governed: []const Governed, renamed: [
                 if (named == .computed) return self.undecided(rule, tree.tokenStart(site), .unresolved, "a name @field computes may name a governed declaration");
                 switch (try paired(self, decl)) {
                     .pair => |pair| try append(self, governed, renamed, site, node, name, &pair, out),
-                    .unknown => |why| return self.unknown(rule, node, why),
+                    .unknown => |why| return leave(self, rule, unread, node, why),
                 }
             }
         };

@@ -120,6 +120,9 @@ pub const Set = std.bit_set.Array(usize, 1 << 16);
 /// Explicit rule selection. Only the two inspected inherited core rules default on.
 pub const Config = struct {
     enabled: Set = core,
+    /// Whether each rule a package declares on by default (`.default = true`) runs unless the
+    /// configuration sets it: off for a profile of none and for a run of named rules (`--only`).
+    package_defaults: bool = true,
     max_line_length: u32 = 100,
     strict_suppressions: bool = false,
     max_function_lines: u32 = 120,
@@ -141,9 +144,48 @@ pub const Config = struct {
     /// rules read hold a value at each (`usize` is as wide as the pointer). Empty reads both 32
     /// and 64 bits, for a package that does not say.
     pointer_widths: []const u16 = &.{},
+    /// Where the project declares the rules it names are not reported, with one written reason:
+    /// a file, or a directory (`module`). The report counts each one's sites per rule
+    /// (`Report.seams`), and one whose rules ran and found nothing in it is stale.
+    seams: []const Seam = &.{},
+    /// The inputs that are test code beside `test` blocks: a path glob or a directory. The caller
+    /// classifies them (`Project.Input.classification`); the report counts each one's files, and
+    /// one matching none is stale.
+    test_inputs: []const TestInput = &.{},
+    /// The directory `seams` and `test_inputs` name paths from (the configuration file's): an
+    /// input named under it is matched by its path from there.
+    paths_from: ?[]const u8 = null,
 
     pub const Level = enum { off, report, gate };
     pub const Selection = struct { rule: Rule, level: Level };
+    /// One seam: exactly one of `file` (an input's path, or a glob of them) and `module` (a
+    /// directory, every input under it), the rules it is a seam for by name, and why.
+    pub const Seam = struct { file: ?[]const u8 = null, module: ?[]const u8 = null, rules: []const []const u8, reason: []const u8 };
+    /// One test input entry: exactly one of `path` (an input's path, or a glob of them) and
+    /// `module` (a directory).
+    pub const TestInput = struct { path: ?[]const u8 = null, module: ?[]const u8 = null };
+
+    /// The first seam that holds the input named `name` for the rule named `rule`.
+    pub fn seamOf(self: Config, name: []const u8, rule: []const u8) ?usize {
+        const relative = self.fromRoot(name);
+        for (self.seams, 0..) |seam, i| {
+            if (!covers(seam.file, seam.module, relative)) continue;
+            for (seam.rules) |each| if (std.mem.eql(u8, each, rule)) return i;
+        }
+        return null;
+    }
+    /// The first test input entry that holds the input named `name`.
+    pub fn testInput(self: Config, name: []const u8) ?usize {
+        const relative = self.fromRoot(name);
+        for (self.test_inputs, 0..) |entry, i| if (covers(entry.path, entry.module, relative)) return i;
+        return null;
+    }
+    /// `name` from `paths_from` where it lies under it; else as given.
+    fn fromRoot(self: Config, name: []const u8) []const u8 {
+        const root = std.mem.trimEnd(u8, self.paths_from orelse return name, "/");
+        if (name.len > root.len and std.mem.startsWith(u8, name, root) and name[root.len] == '/') return name[root.len + 1 ..];
+        return name;
+    }
     pub const FunctionException = struct { function: []const u8, lines: u32, reason: []const u8 };
     /// A declaration a project keeps out of its code (P006), named by what a reference reaches.
     /// `source` is what `@import` takes: a `.zig` project input's name, or a module as programs
@@ -192,6 +234,12 @@ pub const Config = struct {
         }
         for (self.selections, 0..) |selection, i| for (self.selections[0..i]) |earlier| if (selection.rule == earlier.rule) return error.InvalidSelection;
         for (self.pointer_widths) |width| if (width != 16 and width != 32 and width != 64) return error.InvalidSelection;
+        for (self.seams) |seam| {
+            if ((seam.file == null) == (seam.module == null) or seam.rules.len == 0) return error.InvalidSelection;
+            if (std.mem.trim(u8, seam.reason, " \t\r\n").len == 0) return error.InvalidSelection;
+            for (seam.rules) |rule| if (rule.len == 0) return error.InvalidSelection;
+        }
+        for (self.test_inputs) |entry| if ((entry.path == null) == (entry.module == null)) return error.InvalidSelection;
         // An id below 1000 is glint's own and must be one it has; one from 1000 is a package's,
         // which the run checks against the rules the packages declare (Runner).
         var on = self.enabled.iterator(.{});
@@ -206,12 +254,13 @@ pub const Config = struct {
     }
     /// An empty selection for callers migrating explicit policy.
     pub fn none() Config {
-        return .{ .enabled = .empty };
+        return .{ .enabled = .empty, .package_defaults = false };
     }
     /// All reviewed rules for reporting but the opt-in ones. A caller decides which groups gate.
     pub fn reviewed() Config {
         var config = none();
         for (std.meta.tags(Rule)) |rule| config.set(rule, !rule.optIn());
+        config.package_defaults = true;
         return config;
     }
     /// Selects a stable rule ID.
@@ -230,6 +279,63 @@ pub const Config = struct {
         return self.enabled.isSet(@backingInt(rule));
     }
 };
+
+/// Whether an input named `name` is the `file` (a path, or a glob: `*` within a part, `**`
+/// across parts) or lies under the directory `module`.
+fn covers(file: ?[]const u8, module: ?[]const u8, name: []const u8) bool {
+    if (file) |pattern| return glob(pattern, name);
+    const dir = std.mem.trimEnd(u8, module orelse return false, "/");
+    return name.len > dir.len and std.mem.startsWith(u8, name, dir) and name[dir.len] == '/';
+}
+
+/// A path glob: `**` matches any run of characters, `*` any within one path part, `?` one
+/// character other than `/`; anything else itself.
+pub fn glob(pattern: []const u8, name: []const u8) bool {
+    if (pattern.len == 0) return name.len == 0;
+    if (std.mem.startsWith(u8, pattern, "**")) {
+        var rest = pattern[2..];
+        if (std.mem.startsWith(u8, rest, "/")) rest = rest[1..];
+        for (0..name.len + 1) |i| if (glob(rest, name[i..])) return true;
+        return false;
+    }
+    switch (pattern[0]) {
+        '*' => {
+            for (0..name.len + 1) |i| {
+                if (glob(pattern[1..], name[i..])) return true;
+                if (i < name.len and name[i] == '/') return false;
+            }
+            return false;
+        },
+        '?' => return name.len != 0 and name[0] != '/' and glob(pattern[1..], name[1..]),
+        else => return name.len != 0 and name[0] == pattern[0] and glob(pattern[1..], name[1..]),
+    }
+}
+
+test "a seam holds a file, a glob of files or a directory for the rules it names, and a test input entry a path glob or a directory" {
+    const config: Config = .{
+        .seams = &.{
+            .{ .file = "src/uring.zig", .rules = &.{ "A007", "P007" }, .reason = "kernel-shared ring words" },
+            .{ .module = "src/backend/", .rules = &.{"A007"}, .reason = "the backends are the runtime's seam" },
+        },
+        .test_inputs = &.{ .{ .path = "src/**/*_test.zig" }, .{ .module = "src/testing" } },
+    };
+    try config.validate();
+    try std.testing.expectEqual(@as(?usize, 0), config.seamOf("src/uring.zig", "P007"));
+    try std.testing.expectEqual(@as(?usize, null), config.seamOf("src/uring.zig", "A009"));
+    try std.testing.expectEqual(@as(?usize, 1), config.seamOf("src/backend/kqueue/poll.zig", "A007"));
+    try std.testing.expectEqual(@as(?usize, null), config.seamOf("src/backend.zig", "A007"));
+    try std.testing.expectEqual(@as(?usize, 0), config.testInput("src/odb/pack_test.zig"));
+    try std.testing.expectEqual(@as(?usize, 1), config.testInput("src/testing/server.zig"));
+    try std.testing.expectEqual(@as(?usize, null), config.testInput("src/odb/pack.zig"));
+    // An input named by its full path is matched by its path from the configuration's directory.
+    var rooted = config;
+    rooted.paths_from = "/work/pkg/";
+    try std.testing.expectEqual(@as(?usize, 0), rooted.seamOf("/work/pkg/src/uring.zig", "A007"));
+    try std.testing.expectEqual(@as(?usize, null), rooted.seamOf("/elsewhere/src/uring.zig", "A007"));
+    // A seam with no reason, both a file and a directory, or no rule is refused.
+    const bad = [_]Config.Seam{ .{ .file = "a.zig", .rules = &.{"A007"}, .reason = " " }, .{ .file = "a.zig", .module = "src", .rules = &.{"A007"}, .reason = "r" }, .{ .file = "a.zig", .rules = &.{}, .reason = "r" } };
+    for (bad) |seam| try std.testing.expectError(error.InvalidSelection, (Config{ .seams = &.{seam} }).validate());
+}
 
 test "review inventory excludes removed identities without compatibility aliases" {
     try std.testing.expectEqual(@as(usize, 44), std.meta.tags(Rule).len); // safe: explicit compile-time type selection; the value is representable in that type.

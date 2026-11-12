@@ -1,0 +1,8 @@
+.{
+    // X002 is the vocabulary's `replaces` kind, declared by each case's module (module/module.zig,
+    // its own package): a reference, builtin, extern symbol or held field type that resolves into
+    // an entry's target. Its cases are one hole and one twin per target form (test/vocabulary's
+    // table), so most rows hold none yet.
+    .no_hole = .{ .branch, .destructure, .capture, .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory },
+    .no_twin = .{ .branch, .destructure, .capture, .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory },
+}

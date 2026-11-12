@@ -22,6 +22,20 @@ malformed: []const Malformed = &.{},
 complete: bool,
 /// Assertion metrics, when the configuration asks for them (`Config.metrics`).
 metrics: ?Metrics = null,
+/// Each seam the configuration declares (`Config.seams`), with its sites per rule.
+seams: []const SeamCount = &.{},
+/// Each test input entry (`Config.test_inputs`), with how many files it holds.
+test_inputs: []const TestInputCount = &.{},
+/// How many files had an import no module mapping names: a partial map, on which every count
+/// depends.
+unmapped_import_files: usize = 0,
+
+/// A seam, where it is and why, the sites it held per rule, and whether it is stale: its rules
+/// all ran and it held none.
+pub const SeamCount = struct { where: []const u8, reason: []const u8, rules: []const RuleSites, stale: bool };
+pub const RuleSites = struct { name: []const u8, sites: usize };
+/// A test input entry and the files it holds; one holding none is stale.
+pub const TestInputCount = struct { pattern: []const u8, files: usize };
 
 /// Per selected file, the functions it declares and the assertion calls in them, each counted
 /// by the declaration its callee resolves to. A report, never a proof or a gate.
@@ -144,6 +158,13 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
                 for (escape.covered, 0..) |covered, i| try writer.print("{s}{s} at {d}:{d}", .{ if (i == 0) "" else ", ", covered.name, covered.span.line, covered.span.column });
                 try writer.writeAll(")\n");
             }
+            for (self.seams) |seam| {
+                try writer.print("seam: {s}: {s}: ", .{ seam.where, seam.reason });
+                for (seam.rules, 0..) |rule, i| try writer.print("{s}{s} {d}", .{ if (i == 0) "" else ", ", rule.name, rule.sites });
+                try writer.writeAll(if (seam.stale) " (stale: it holds no site)\n" else "\n");
+            }
+            for (self.test_inputs) |entry| try writer.print("test inputs: {s}: {d} files{s}\n", .{ entry.pattern, entry.files, if (entry.files == 0) " (stale)" else "" });
+            if (self.unmapped_import_files != 0) try writer.print("module map: {d} files import a module no mapping names; the counts above depend on it\n", .{self.unmapped_import_files});
             if (self.metrics) |metrics| try textMetrics(writer, metrics);
         },
         .json => {
@@ -172,7 +193,11 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
                 if (i != 0) try writer.writeByte(',');
                 try std.json.Stringify.value(.{ .source = project.at(c.file).input.name, .rule = if (c.rule == null) @as(?[]const u8, null) else c.rule_name, .start = c.start, .reason = c.reason, .detail = c.detail }, .{}, writer);
             }
-            try writer.writeByte(']');
+            try writer.writeAll("],\"seams\":");
+            try std.json.Stringify.value(self.seams, .{}, writer);
+            try writer.writeAll(",\"test_inputs\":");
+            try std.json.Stringify.value(self.test_inputs, .{}, writer);
+            try writer.print(",\"unmapped_import_files\":{d}", .{self.unmapped_import_files});
             if (self.metrics) |metrics| {
                 try writer.writeAll(",\"metrics\":{");
                 try jsonCounts(writer, metrics.total);

@@ -1066,3 +1066,64 @@ test "a rule's memory for one file is given back when the rule is done with the 
     const grown = (peakResident() orelse return error.SkipZigTest) -| before;
     try std.testing.expect(grown < 1 << 30);
 }
+
+test "a seam holds a rule's sites in its files and counts them per rule; one whose rules ran and held none is stale, one whose rule did not run is not" {
+    const P = glint.Project;
+    var project = try P.init(std.testing.allocator, &.{
+        .{ .name = "src/backend.zig", .bytes = "const lib = @import(\"lib\");\npub fn a(fd: i32) void { lib.posix.fdatasync(fd); lib.posix.fdatasync(fd); }" },
+        .{ .name = "src/program.zig", .bytes = "const lib = @import(\"lib\");\npub fn b(fd: i32) void { lib.posix.fdatasync(fd); }" },
+        .{ .name = "lib.zig", .bytes = "pub const posix = struct { pub fn fdatasync(fd: i32) void { _ = fd; } };", .selected = false },
+    }, &.{ .{ .from = 0, .spelling = "lib", .target = 2 }, .{ .from = 1, .spelling = "lib", .target = 2 } }, .{});
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.selections = &.{.{ .rule = .P006, .level = .gate }};
+    config.disallowed = durability[0..1];
+    config.seams = &.{
+        .{ .file = "src/backend.zig", .rules = &.{"P006"}, .reason = "the backend is durability's seam" },
+        .{ .module = "src/gone", .rules = &.{"P006"}, .reason = "a directory the project no longer has" },
+        .{ .file = "src/*.zig", .rules = &.{"Z011"}, .reason = "a rule this run does not select" },
+    };
+    var report = try glint.run(std.testing.allocator, &project, config);
+    defer report.deinit();
+    // The program's call stands; the backend's two are the seam's.
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: fixture sites counted by hand.
+    try std.testing.expectEqual(@as(usize, 3), report.seams.len); // safe: one count per configured seam.
+    try std.testing.expectEqualStrings("src/backend.zig", report.seams[0].where);
+    try std.testing.expectEqual(@as(usize, 2), report.seams[0].rules[0].sites); // safe: fixture sites counted by hand.
+    try std.testing.expect(!report.seams[0].stale);
+    try std.testing.expectEqual(@as(usize, 0), report.seams[1].rules[0].sites); // safe: the directory holds no input.
+    try std.testing.expect(report.seams[1].stale);
+    try std.testing.expect(!report.seams[2].stale);
+}
+
+test "a test input entry counts the inputs it holds, the first entry holding one counting it; one holding none is stale" {
+    var project = try glint.Project.init(std.testing.allocator, &.{
+        .{ .name = "src/a_test.zig", .bytes = "pub const a = 1;" },
+        .{ .name = "src/testing/fake.zig", .bytes = "pub const b = 2;" },
+        .{ .name = "src/testing/b_test.zig", .bytes = "pub const c = 3;" },
+        .{ .name = "src/main.zig", .bytes = "pub const d = 4;" },
+    }, &.{}, .{});
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.test_inputs = &.{ .{ .path = "src/**/*_test.zig" }, .{ .module = "src/testing" }, .{ .path = "test/*.zig" } };
+    var report = try glint.run(std.testing.allocator, &project, config);
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 3), report.test_inputs.len); // safe: one count per configured entry.
+    try std.testing.expectEqual(@as(usize, 2), report.test_inputs[0].files); // safe: both _test files, the testing one first matched here.
+    try std.testing.expectEqual(@as(usize, 1), report.test_inputs[1].files); // safe: fake.zig alone.
+    try std.testing.expectEqual(@as(usize, 0), report.test_inputs[2].files); // safe: no input under test/.
+}
+
+test "the report counts the files with an import no module mapping names, each file once" {
+    var project = try glint.Project.init(std.testing.allocator, &.{
+        .{ .name = "one.zig", .bytes = "const lib = @import(\"lib\"); const other = @import(\"other\"); pub fn f() void { _ = lib; _ = other; }" },
+        .{ .name = "two.zig", .bytes = "const lib = @import(\"lib\"); pub fn g() void { _ = lib; }" },
+        .{ .name = "three.zig", .bytes = "const builtin = @import(\"builtin\"); pub fn h() bool { return builtin.is_test; }" },
+    }, &.{}, .{});
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.set(.Z012, true);
+    var report = try glint.run(std.testing.allocator, &project, config);
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 2), report.unmapped_import_files); // safe: one.zig and two.zig; Zig's own builtin is no mapping's.
+}

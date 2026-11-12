@@ -13,6 +13,7 @@ const Builtins = @import("Builtins.zig");
 const Metrics = @import("Metrics.zig");
 const Contract = @import("AegisContract.zig");
 const PackageRules = @import("PackageRules.zig");
+const Replaced = @import("Replaced.zig");
 const AegisPack = @import("AegisPack.zig");
 
 a: std.mem.Allocator,
@@ -41,6 +42,8 @@ definitions: []const rules.Definition = &.{},
 files: []const FileConfig = &.{},
 /// The file whose rules run; set before each file's run, and read only during it.
 file: Project.FileId = undefined,
+/// The sites each seam held, by seam (its index in the base configuration) and rule.
+seam_sites: std.AutoHashMapUnmanaged(struct { usize, rules.Rule }, usize) = .empty,
 
 pub const RunError = Suppression.ParseError || Context.Error || std.Io.Cancelable;
 pub const Options = struct {
@@ -98,9 +101,9 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
         if (!source.input.selected or source.input.kind == .zon) continue;
         if (options.io) |io| try io.checkCancel();
         runner.file = source.id;
-        runner.config = config;
+        runner.config = try withDefaults(a, config, definitions);
         for (options.files) |setting| if (setting.file == runner.file) {
-            runner.config = setting.config;
+            runner.config = try withDefaults(a, setting.config, definitions);
         };
         // Each file's analysis has its own budget: work a scan of the program did for an
         // earlier file is kept, and charged to that file, unless that file's budget ran out.
@@ -140,6 +143,16 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
             try metrics.append(a, .{ .file = runner.file, .counts = counts });
         }
         _ = scratch.reset(.free_all);
+        // The rules packages declare, each run by the engine of what it reads.
+        if (file.status == .parsed) for (definitions) |definition| {
+            const declared_by = definition.declared orelse continue;
+            if (!runner.config.has(definition.id)) continue;
+            switch (declared_by.reads) {
+                .replaces => try Replaced.check(&context, definition),
+                .governed, .exits => {},
+            }
+            _ = scratch.reset(.free_all);
+        };
         if (file.status == .parsed) for (options.project_rules) |rule| {
             if (!runner.config.has(rule.definition.id)) continue;
             try rule.check(&context);
@@ -158,7 +171,70 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     }
     if (config.strict_suppressions and runner.stale.items.len != 0) runner.complete = false;
     std.mem.sort(Report.Diagnostic, runner.diagnostics.items, project, diagnosticLess);
-    return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .coverage = runner.coverage.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale.items.len, .stale = runner.stale.items, .escapes = runner.escapes.items, .malformed = runner.malformed.items, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null };
+    return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .coverage = runner.coverage.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale.items.len, .stale = runner.stale.items, .escapes = runner.escapes.items, .malformed = runner.malformed.items, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null, .seams = try runner.seamCounts(config), .test_inputs = try testInputCounts(a, project, config), .unmapped_import_files = unmappedImportFiles(runner.coverage.items) };
+}
+
+/// Each seam of `config` with the sites it held per rule; stale where every rule it names ran
+/// and it held none.
+fn seamCounts(runner: *const Runner, config: rules.Config) error{OutOfMemory}![]const Report.SeamCount {
+    const counts = try runner.a.alloc(Report.SeamCount, config.seams.len);
+    for (config.seams, counts, 0..) |seam, *count, i| {
+        const per_rule = try runner.a.alloc(Report.RuleSites, seam.rules.len);
+        var total: usize = 0;
+        var all_ran = true;
+        for (seam.rules, per_rule) |name, *sites| {
+            const id = rules.parseConfigured(name, runner.definitions);
+            const held = if (id) |rule| runner.seam_sites.get(.{ i, rule }) orelse 0 else 0;
+            sites.* = .{ .name = name, .sites = held };
+            total += held;
+            all_ran = all_ran and id != null and config.has(id.?);
+        }
+        count.* = .{ .where = seam.file orelse seam.module.?, .reason = seam.reason, .rules = per_rule, .stale = all_ran and total == 0 };
+    }
+    return counts;
+}
+
+/// Each test input entry of `config` with the project's inputs it holds (the first entry that
+/// holds an input counts it).
+fn testInputCounts(a: std.mem.Allocator, project: *const Project, config: rules.Config) error{OutOfMemory}![]const Report.TestInputCount {
+    const counts = try a.alloc(Report.TestInputCount, config.test_inputs.len);
+    for (config.test_inputs, counts) |entry, *count| count.* = .{ .pattern = entry.path orelse entry.module.?, .files = 0 };
+    for (project.sources) |*source| if (config.testInput(source.input.name)) |i| {
+        counts[i].files += 1;
+    };
+    return counts;
+}
+
+/// How many files reported an import no module mapping names.
+fn unmappedImportFiles(coverage: []const Report.Coverage) usize {
+    var count: usize = 0;
+    for (coverage, 0..) |entry, i| {
+        if (entry.reason != .unresolved or !std.mem.eql(u8, entry.detail, "missing_mapping")) continue;
+        const earlier = for (coverage[0..i]) |before| {
+            if (before.file == entry.file and before.reason == .unresolved and std.mem.eql(u8, before.detail, "missing_mapping")) break true;
+        } else false;
+        if (!earlier) count += 1;
+    }
+    return count;
+}
+
+/// `config` with each package rule that is on by default selected at report level, where the
+/// configuration takes package defaults (`Config.package_defaults`) and sets nothing for it.
+fn withDefaults(a: std.mem.Allocator, config: rules.Config, definitions: []const rules.Definition) error{OutOfMemory}!rules.Config {
+    if (!config.package_defaults) return config;
+    var selections: std.ArrayList(rules.Config.Selection) = .empty;
+    try selections.appendSlice(a, config.selections);
+    for (definitions) |definition| {
+        const declared_by = definition.declared orelse continue;
+        if (!declared_by.default or config.enabled.isSet(@backingInt(definition.id))) continue;
+        const named = for (config.selections) |selection| {
+            if (selection.rule == definition.id) break true;
+        } else false;
+        if (!named) try selections.append(a, .{ .rule = definition.id, .level = .report });
+    }
+    var effective = config;
+    effective.selections = selections.items;
+    return effective;
 }
 
 /// The rules the project's packages declare (`PackageRules.table`), with the ids the run gives
@@ -300,6 +376,12 @@ fn emitRelated(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: [
     const file = self.project.at(self.file).file;
     const line = file.line(start);
     const metadata = rules.definition(rule, self.definitions) orelse return error.InvalidSelection;
+    // A site in a seam the project declares for this rule is the seam's, counted, not reported.
+    if (self.config.seamOf(self.project.at(self.file).input.name, metadata.name)) |seam| {
+        const held = try self.seam_sites.getOrPut(self.a, .{ seam, rule });
+        held.value_ptr.* = if (held.found_existing) held.value_ptr.* + 1 else 1;
+        return;
+    }
     const span: Report.Span = .{ .file = self.file, .start = start, .end = end, .line = line + 1, .column = file.column(start) };
     const key = try self.a.print("{d} {d} {d} {d} {s}", .{ @backingInt(rule), @backingInt(self.file), start, end, message });
     const seen = try self.emitted.getOrPut(self.a, key);
