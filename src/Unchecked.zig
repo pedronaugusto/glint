@@ -55,9 +55,11 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
             continue;
         }
         // An address read out of a pointer (`@intFromPtr`) is never undefined behavior.
-        for ([_][]const u8{ "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@ptrFromInt", "@fieldParentPtr" }) |cast| if (std.mem.eql(u8, name, cast)) {
+        // A cast written straight inside another (`@ptrCast(@alignCast(p))`) is one conversion:
+        // the outermost is its site, so one suppression names it.
+        if (pointerCast(name) and !nestedCast(c, tree, node)) {
             try c.at(rule, token, try c.allocator.print("{s}: a pointer conversion no build checks", .{name}));
-        };
+        }
         if (std.mem.eql(u8, name, "@extern")) try c.at(rule, token, "@extern: a symbol whose definition Zig does not check; only the raw call, at the package's seam");
         if (std.mem.eql(u8, name, "@setFloatMode")) {
             var buffer: [2]Ast.Node.Index = undefined;
@@ -85,6 +87,19 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
     try lengthless(c, rule);
     try reinterpreted(c, rule);
     try rawBindings(c, rule);
+}
+
+fn pointerCast(name: []const u8) bool {
+    for ([_][]const u8{ "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@ptrFromInt", "@fieldParentPtr" }) |cast| if (std.mem.eql(u8, name, cast)) return true;
+    return false;
+}
+
+/// Whether the pointer cast at `node` is the operand of another, past parentheses.
+fn nestedCast(c: *Context, tree: *const Ast, node: Ast.Node.Index) bool {
+    const model = &c.project.at(c.file).model;
+    var parent = model.parentOf(node) orelse return false;
+    while (tree.nodeTag(parent) == .grouped_expression) parent = model.parentOf(parent) orelse return false;
+    return pointerCast(Facts.builtinName(tree, parent) orelse return false);
 }
 
 /// Arithmetic on, or an index into, a many-item or C pointer: it carries no length to check.

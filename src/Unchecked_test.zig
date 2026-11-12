@@ -325,7 +325,7 @@ fn expect(rule: glint.Rule, program: []const u8, findings: usize) !void {
     try std.testing.expectEqual(findings, result.findings);
 }
 
-test "P007 finds the unchecked operations, an interface field's parent and its alignment among them, a suppression covering one, never an address read" {
+test "P007 finds the unchecked operations, a cast nested in another once, a suppression covering one, never an address read" {
     try expect(.P007,
         \\extern fn write(fd: c_int) c_int;
         \\const Sink = struct { interface: u64, n: u32 };
@@ -341,7 +341,7 @@ test "P007 finds the unchecked operations, an interface field's parent and its a
         \\    _ = s;
         \\    return @intFromPtr(p);
         \\}
-    , 7);
+    , 5);
 }
 
 test "P009 finds a pointer into the frame carried out of the call" {
@@ -468,7 +468,7 @@ test "P007 reads a module republishing aegis beside code of its own as the progr
     const extra = &(std_files ++ [_]sources.Extra{wrap});
     const imports = &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "wrap", .target = std_files.len }, .{ .from = std_files.len, .spelling = "aegis", .target = sources.aegis_file }, .{ .from = std_files.len, .spelling = "std", .target = 0 } });
     const found = try runWith(.P007, comptime edited(interface_program, "const std = @import(\"std\");\n", "const std = @import(\"std\");\nconst wrap = @import(\"wrap\");\n"), extra, imports);
-    try std.testing.expectEqualSlices(u32, &.{ 12, 12 }, found.lines[0..found.findings]);
+    try std.testing.expectEqualSlices(u32, &.{12}, found.lines[0..found.findings]);
 }
 
 test "P007 reads every file a path import joins to the program, selected or not: a copy of an interface field there leaves the conversion a finding" {
@@ -477,7 +477,7 @@ test "P007 reads every file a path import joins to the program, selected or not:
     const program = comptime edited(interface_program, "pub fn use() !usize {", "const other = @import(\"other.zig\");\npub fn use() !usize {\n    var t: Sink = .init();\n    other.keep(&t);");
     const other: sources.Extra = .{ .name = "other.zig", .bytes = "pub fn keep(s: anytype) void { const copy = s.interface; _ = copy; }" };
     const found = try runWith(.P007, program, &(std_files ++ [_]sources.Extra{other}), &(std_imports ++ [_]sources.ExtraImport{.{ .spelling = "other.zig", .target = std_files.len }}));
-    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, found.lines[0..found.findings]);
+    try std.testing.expectEqualSlices(u32, &.{11}, found.lines[0..found.findings]);
 }
 
 /// `program` after the fixes of `rule`'s findings and its stale escapes.
