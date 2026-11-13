@@ -1,0 +1,6 @@
+.{
+    // X004 is a `governed` rule its case's module declares as hygiene: an internal field read that
+    // resolves is a finding, one that does not resolve is silent (8c).
+    .no_hole = .{ .address, .aggregate, .assignment, .branch, .call, .capture, .compile_time, .conversion, .deferred, .destructure, .inline_loop, .jump, .memory, .operator, .unwrap },
+    .no_twin = .{ .address, .aggregate, .assignment, .branch, .call, .capture, .compile_time, .conversion, .deferred, .destructure, .inline_loop, .jump, .memory, .operator, .unwrap },
+}

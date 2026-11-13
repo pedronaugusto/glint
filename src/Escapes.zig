@@ -1,22 +1,24 @@
-//! A014 (0.8 cut): a pointer into a function's own frame that a `return` carries out. Stores of
-//! one (through a parameter, into a container's variable) are no longer read: `scope` and
-//! `handle` carry those. TODO(0.8): narrow to the certain `return &local` shape.
+//! P009 (0.8): a pointer into a function's own frame that a `return` carries out, reported only
+//! where certain. Stores of one (through a parameter, into a container's variable) are no longer
+//! read: `scope` and `handle` carry those.
 //!
 //! A `var` declared in a function's body lives in the call's frame, which the return frees.
 //! Its address (`&x`, `&x.field`, `&x[i]`), or a slice of it when it is an array (`x[a..b]`),
 //! is a pointer into that frame. Zig refuses `return &x` itself ("returning address of expired
 //! local variable"); it does not refuse a slice of a local array, a pointer carried out in a
-//! returned struct literal or through a local alias (`const out = &x; return out;`), or one
-//! stored through a parameter or into a container's variable. Those are this rule's.
+//! returned struct literal or through a local alias (`const out = &x; return out;`). Those are
+//! this rule's.
 //!
-//! A heuristic (designs/glint.md §6), reported. A `var` local counts, and a `const` one but where
-//! its value is a literal or a `comptime` expression the program compiles in (static memory). A path through a field or an
-//! element counts but where the local's type, written or of its value, is a pointer, which Zig
-//! dereferences on access. Nothing inside `comptime` or in a function returning `type` counts,
-//! where frames are comptime memory. A store the function undoes does not outlive the call: a
-//! `defer` that assigns the target again (a registration cleared) on every exit. Aliases are
-//! followed within the function, through a `const`'s value and every value a `var` is given. A
-//! clean run never certifies lifetimes.
+//! Hygiene: it reports the escape it shows and nothing else. A value whose reach is not read
+//! (its address handed to a callee whose stores are not known, a value not resolved, more aliases
+//! than are followed) is none, never a report. A `var` local counts, and a `const` one but where
+//! its value is a literal or a `comptime` expression the program compiles in (static memory). A
+//! path through a field or an element counts but where the local's type, written or of its value,
+//! is a pointer, which Zig dereferences on access. Nothing inside `comptime` or in a function
+//! returning `type` counts, where frames are comptime memory. A store the function undoes does
+//! not outlive the call: a `defer` that assigns the target again (a registration cleared) on
+//! every exit. Aliases are followed within the function, through a `const`'s value and every
+//! value a `var` is given. A clean run never certifies lifetimes.
 const std = @import("std");
 const Context = @import("RuleContext.zig");
 const Model = @import("Model.zig");
@@ -50,11 +52,6 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         if (stored) |target| if (try self.restored(function, target, node)) continue;
         const local = switch (reached) {
             .none => unreachable, // unreachable: left above
-            // A ban that cannot show the pointer stays out of the frame reports it.
-            .unknown => |why| {
-                try c.at(rule, tree.nodeMainToken(operand), try c.allocator.print("cannot be shown not to point into the frame the return frees: {s}", .{why.detail}));
-                continue;
-            },
             .local => |d| d,
         };
         const name = model.declarations[@backingInt(local)].name;
@@ -66,12 +63,11 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
     }
 }
 
-/// What a pointer value reaches into: a local of the function's frame, none, or what may be one
-/// and why it is not known.
+/// What a pointer value reaches into: a local of the function's frame, or none shown. P009 is
+/// hygiene: a value whose reach is not known is none, never a report.
 const Reached = union(enum) {
     local: Model.Declaration.Id,
     none,
-    unknown: struct { detail: []const u8 },
 };
 
 const Walk = struct {
@@ -125,12 +121,12 @@ const Walk = struct {
     fn escaping(self: Walk, written: Ast.Node.Index, function: Ast.Node.Index, depth: u8) Context.Error!Reached {
         const tree = self.tree;
         const node = Facts.ungrouped(tree, written);
-        if (depth > 8) return .{ .unknown = .{ .detail = "a pointer followed through more aliases than are read may point into a local the return frees" } };
+        if (depth > 8) return .none;
         // A value carried or chosen (`.?`, `try`, both sides of `orelse` and `catch`, an `if`'s
         // or a `switch`'s results, a labeled block's `break`s, `@as`): each value it may give.
         switch (try Facts.accesses.valuesOf(self.c.facts, self.c.file, node)) {
             .leaves => |leaves| if (leaves.len != 1 or leaves[0] != node) return self.first(leaves, function, depth + 1),
-            .unknown => return .{ .unknown = .{ .detail = "a value whose possible values are not read may point into a local the return frees" } },
+            .unknown => return .none,
         }
         switch (tree.nodeTag(node)) {
             .address_of => return self.addressOf(tree.nodeData(node).node, function, depth),
@@ -144,7 +140,7 @@ const Walk = struct {
                 // a slice of itself (`s = s[1..]`), which holds no memory it did not.
                 if (try self.c.facts.holdsNoAddress(try self.typeOf(d))) return .none;
                 const given = (try self.c.facts.givenTo(.{ .file = self.c.file, .index = d }, true)) orelse
-                    return .{ .unknown = .{ .detail = "a pointer named by a local given a value no store here shows (its address taken, its bytes written) may point into a local the return frees" } };
+                    return .none;
                 var others: std.ArrayList(Facts.Key) = .empty;
                 for (given) |each| if (!try self.slicesItself(each.node, d)) try others.append(self.c.allocator, each);
                 return self.first(others.items, function, depth + 1);
@@ -168,7 +164,7 @@ const Walk = struct {
                 // A value that holds no pointer (`[4]u8` returned whole) points nowhere.
                 if (try self.c.facts.holdsNoAddress(try self.typeOf(d))) return .none;
                 const given = (try self.c.facts.givenTo(.{ .file = self.c.file, .index = d }, true)) orelse
-                    return .{ .unknown = .{ .detail = "a pointer named by a local given a value no store here shows (its address taken, its bytes written) may point into a local the return frees" } };
+                    return .none;
                 return self.first(given, function, depth + 1);
             },
             // A pointer moved by a number points into the memory it did (`p + 1`); a difference
@@ -211,28 +207,22 @@ const Walk = struct {
 
     /// The local a pointer capture (`|*v|`) points into: the memory its source points at (a
     /// slice, a pointer to an array), or the source's own where it holds what it captures (an
-    /// optional, a union, an array). Where the source's type is not known, its own memory may
-    /// be the local's only as one not known.
+    /// optional, a union, an array). A source whose type is not known shows neither: none.
     fn pointed(self: Walk, source: Ast.Node.Index, function: Ast.Node.Index, depth: u8) Context.Error!Reached {
         const typed = try self.c.facts.resolve(self.c.file, source);
         var pointer = false;
         var holder = false;
-        var unknown = false;
         for (Facts.valueParts(&typed)) |part| switch (part) {
             .pointer => pointer = true,
-            // A choice, which valueParts never gives as a part, is read as one not known.
-            .unknown, .alternatives => unknown = true,
+            .unknown, .alternatives => {},
             else => holder = true,
         };
-        var out: Reached = .none;
-        if (pointer or unknown) out = try self.escaping(source, function, depth);
-        if (out == .local) return out;
-        if (holder or unknown) switch (try self.addressOf(source, function, depth)) {
-            .local => |d| return if (holder) .{ .local = d } else .{ .unknown = .{ .detail = "a pointer capture of a local whose type is not known may point into the local the return frees" } },
-            .unknown => |why| out = .{ .unknown = why },
-            .none => {},
-        };
-        return out;
+        if (pointer) {
+            const out = try self.escaping(source, function, depth);
+            if (out == .local) return out;
+        }
+        if (holder) return self.addressOf(source, function, depth);
+        return .none;
     }
 
     /// The pointer the place `node` is reached through nearest to it, whose memory holds the
@@ -261,15 +251,13 @@ const Walk = struct {
     }
 
     /// The first local one of `values` (expressions, or `Facts.Key`s of this file) reaches
-    /// into; else what may be one, or none.
+    /// into, or none.
     fn first(self: Walk, values: anytype, function: Ast.Node.Index, depth: u8) Context.Error!Reached {
-        var out: Reached = .none;
         for (values) |each| switch (try self.escaping(if (@TypeOf(each) == Facts.Key) each.node else each, function, depth)) {
             .local => |d| return .{ .local = d },
-            .unknown => |why| out = .{ .unknown = why },
             .none => {},
         };
-        return out;
+        return .none;
     }
 
     fn reach(local: ?Model.Declaration.Id) Reached {

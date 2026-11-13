@@ -8,6 +8,15 @@
         "call/mx-callee_stores/hole.zig",
         // matrix A014: @atomicStore is no store the rule reads
         "memory/mx-atomic_store_global/hole.zig",
+        // P009 reports only what it shows (8c): a store through an alias of the local's address
+        // (`const into = &p; into.* = &x`) is no store the rule reads, so `p`'s reach is not known
+        "address/m4-alias_address_taken/hole.zig",
+        // P009 reports only what it shows (8c): what a std map's method stores through its
+        // receiver is not read, so the key slicing a local is not shown to reach the map
+        "call/glintc-std_map_method/hole.zig",
+        // P009 reports only what it shows (8c): a switch's pointer capture of the local is its
+        // address taken, whose stores are not read, so the payload's new slice is not shown
+        "capture/glintc-pointer_capture_field/hole.zig",
     },
     .no_hole = .{ .assignment, .deferred, .jump, .inline_loop, .branch },
     .no_twin = .{ .assignment, .deferred, .jump, .inline_loop, .branch },

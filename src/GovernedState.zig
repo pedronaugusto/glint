@@ -85,11 +85,13 @@ pub fn check(c: *Context, definition: Rule.Definition) Context.Error!void {
         const entry = all[site.index];
         try c.atDefinition(definition.id, site.token, try c.allocator.print("internal field '{s}' of {s}: {s}'s alone; use the type's own API", .{ declName(c.project, site.decl), typeName(c, entry), entry.package.name }), site.decl);
     }
-    for (unread.items) |missed| {
+    // Under a ban, a reference spelling an internal field that does not resolve cannot be shown
+    // not to be it: a finding. A hygiene rule reports only what it resolves.
+    if (declared.kind == .ban) for (unread.items) |missed| {
         const token = tree.firstToken(missed.node);
         if ((try reported.getOrPut(c.allocator, token)).found_existing) continue;
         try c.at(definition.id, token, try c.allocator.print("a reference spelling an internal field {s} governs does not resolve ({t}), so it cannot be shown to be another", .{ definition.name, missed.why }));
-    }
+    };
 
     // Casts and reflection over a governed type.
     for (tree.nodes.items(.tag), 0..) |_, raw| {
