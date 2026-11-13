@@ -54,7 +54,8 @@ cache.store(key, value) catch {};
 
 A whole file or directory is answered by a seam in the project's configuration (the path or glob, its rules, a
 reason), and `test_inputs` names the inputs read as test code. Every suppression and every seam is counted in
-the report. `glint --fix` (preflight's `zig build fix`) rewrites 0.7's `// aegis:` escapes into `glint-ignore`.
+the report. `glint --fix` (preflight's `zig build fix`) rewrites 0.7's `// aegis:` escapes and `// unreachable:`
+reasons into `glint-ignore`, and replaces a call a package's rule bans with the answer it names as a drop-in.
 
 ## Design
 

@@ -59,7 +59,7 @@ nothing unasked. The configuration keys a rule reads are named in its row with t
 | Z013 | hygiene | A private `const X = @import("...")` whose name the file spells nowhere else: no identifier, member token, `.X` literal, or `@field` string. A file holding a computed `@field` name reports none. |
 | Z016 | hygiene | A call resolving to std's `debug.assert` whose argument, as written (parentheses and `comptime` stripped), is `a and b`. Nothing is followed. |
 | D001 | hygiene | A private function or variable at file or container level whose name its file spells nowhere outside its own declaration. Any spelling is a use. A file holding a computed `@field` name reports none. A declaration that only dead code names is used. |
-| Z026 | ban | A discarded error needs a written reason. An error handler (`catch`, an `if`'s or a `while`'s `else \|e\|`) whose body is empty: a block of empty statements (`{}`, a bare `break` to its own label, `_ = X` with no call), `void{}`, `@as(void, …)` of an empty one, an `if` or `switch` whose every branch is empty, `return`/`continue`/`break` with no operand. Also `catch unreachable`. A handler that returns a value, or calls anything, is not empty; this rule does not judge what it does with the error. `orelse unreachable` is not Z026's: a null is no error, and the safe build traps it. Test code is exempt. |
+| Z026 | ban | A discarded error needs a written reason. An error handler (`catch`, an `if`'s or a `while`'s `else \|e\|`) whose body is empty: a block of empty statements (`{}`, a bare `break` to its own label, `_ = X` with no call), `void{}`, `@as(void, …)` of an empty one, an `if` or `switch` whose every branch is empty, `return`/`continue`/`break` with no operand. Also `catch unreachable`, and a handler that only traps: a block whose one statement is `unreachable`, a `switch` whose every prong is. A handler that returns a value, or calls anything, is not empty; this rule does not judge what it does with the error. `orelse unreachable` is not Z026's: a null is no error, and the safe build traps it. Test code is exempt. |
 | P005 | hygiene | A reference that resolves to std's `debug.print`, outside test code, on the `replaces` engine. A reference that does not resolve is silent. |
 | P006 | ban | A reference that resolves to a declaration (or an extern symbol) the project's `disallowed` list names, outside the packages the entry names as owners, on the `replaces` engine. An entry that resolves to nothing is a run error. |
 | P007 | ban | An operation Zig leaves unchecked, outside a seam, in production code: inline `asm`; `@setRuntimeSafety` off in a build that keeps the checks, or on a value the build mode does not decide; the pointer conversions no build checks (`@ptrCast`, `@alignCast`, `@constCast`, `@volatileCast`, `@ptrFromInt`, `@fieldParentPtr`); an `extern` declaration and `@extern`; `noalias`; `@setFloatMode(.optimized)`; arithmetic on or indexing of a many-item or C pointer; std's `mem.bytesAsValue` and `mem.bytesAsSlice`; and any member of `std.c`, `std.os.linux` or `std.os.windows`. A chain of casts written one inside another is one site, the outermost. Not read: the interface idiom, `@fieldParentPtr` with the `@alignCast` around it, and `@ptrCast`/`@alignCast` from `*anyopaque` to a single-item pointer; a cast to a slice or a many-item pointer stays a site. What the program runs only as it compiles is not read. (Was A019.) |
@@ -136,7 +136,7 @@ declaration.
   or `.{ .generic = F, .member = .Name }` for every instance of a type function's member. Every internal field
   is named `<package>_<name>` (aegis's `aegis_state`), so a reference glint cannot resolve still names the field;
   one without the prefix is a malformed entry in the declarer.
-- `.replaces`: `.{ .rule, <target>, .held = .field (optional), .with, .why }`. The target is exactly one of:
+- `.replaces`: `.{ .rule, <target>, .held = .field (optional), .with, .drop_in (optional), .why }`. The target is exactly one of:
   - `.decl = D`;
   - `.members = C, .except = .{...}` (every function declared directly in `C`, so a new one is caught);
   - `.field = .{ .type, .name }`;
@@ -145,6 +145,13 @@ declaration.
 
   `.held = .field` counts the target only as a struct field's type held by value. The declaring package itself
   may use what it replaces.
+
+  `.drop_in = D` names the one of `.with` that takes a call of the target one for one: its parameters are the
+  target's, each type as written, then at most one `comptime []const u8`, which `--fix` fills with the call's
+  arguments as written (`std.debug.assert(n < 9)` becomes `assert.invariant(n < 9, "n < 9")`). Each site then
+  carries a fix: the call, or a private alias of the target together with every call through it, and an import
+  of the package where the file has none, under the module name the package's other files use. Any other answer
+  is a malformed entry: no fix is made from a guess at how the answer is called.
 
 Version 1 (`.roles`, `.pairs`, `.door`, `.deprecated`, the old `.replaces`) is read no more. A part of
 `lint_rules` glint cannot read is a malformed entry where it is written, and the declaring package's run is a
@@ -184,8 +191,12 @@ It names one or more rules (`// glint-ignore: P007, A007 -- <reason>`), each cov
 needs a non-empty reason. A malformed comment is reported where it is written, and every suppression is
 counted. There is no other form: the `// aegis: <reason>(<rule>): <why>` escape is malformed, and `--fix`
 rewrites it into a `glint-ignore` naming the rules it covers (an escape that names none takes the rules a record
-of an earlier run lists, `--escapes-before`). `--fix` also rewrites 0.7's `// unreachable: <why>` at a
-`catch unreachable` into `// glint-ignore: Z026 -- <why>`.
+of an earlier run lists, `--escapes-before`; with no record it is left for its owner to name). A suppression
+naming a rule under the name 0.7 gave it takes today's (A019 is P007, A016 P008, A014 P009); a rule 0.8 removed
+(A002, A003, A005, A006, A010, A017, A018, A020, and 0.7's A012, another check than aegis's) is dropped from it,
+and one naming none left goes. `--fix` also rewrites 0.7's `// unreachable: <why>`, at a `catch unreachable` or
+alone on the line above it, into `// glint-ignore: Z026 -- <why>`, except where that line holds a second such
+site, which one suppression cannot name. No fix writes a suppression a site did not already have.
 
 ## Model and run
 

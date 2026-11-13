@@ -455,8 +455,10 @@ fn reflectsParameter(self: *Context, function: Facts.Decl, position: usize) bool
     // By its name: Zig refuses a name in the body that shadows a parameter, so an identifier
     // spelling it there is it.
     const spelled = tree.tokenSlice(name);
-    if (tree.nodeTag(record.node) != .fn_decl) return false;
-    const body = tree.nodeData(record.node).node_and_node[1];
+    // A function's record holds its prototype; the body is the declaration's around it.
+    const declaration = self.facts.scopeNode(function);
+    if (tree.nodeTag(declaration) != .fn_decl) return false;
+    const body = tree.nodeData(declaration).node_and_node[1];
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
     for (tree.nodes.items(.tag), 0..) |_, raw| {

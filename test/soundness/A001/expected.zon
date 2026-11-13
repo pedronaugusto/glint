@@ -1,8 +1,5 @@
 .{
-    .open = .{
-        // review 8 M5: std.meta.fieldNames(S) reflects on its type parameter (@typeInfo(T) in its body); Governed.reflectsParameter does not reach it yet
-        "call/std_field_names/hole.zig",
-    },
+    .open = .{},
     // A001 is a rule aegis declares (its lint_rules, read from the pinned aegis): sites it reports
     // and ones it must not, through the aegis types. Its other rows hold none.
     .no_hole = .{ .assignment, .destructure, .capture, .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .unwrap, .aggregate, .memory, .branch },
