@@ -1035,3 +1035,43 @@ test "A013's drop-in fix leaves an alias used other than by a call, and its site
     const shadowed = "const std = @import(\"std\");\npub fn f(aegis: u8) void { std.debug.assert(aegis > 1); }\n";
     try std.testing.expectEqualStrings(shadowed, try dropInFixed(arena.allocator(), shadowed, 1));
 }
+
+test "a library's reflective call read through a parenthesized result in a branch, without a crash (8e)" {
+    // Governed.returnsCast reads a std `return` through grouping, `if` branches and the calls it
+    // hands a parameter to: a grouped expression's data is its node and its parenthesis token, never a
+    // bare node (riverrun's `bay dev fix` panicked there). `bytes` returns the governed value it is
+    // handed cast to bytes, through `(@ptrCast(v))` in a branch: a finding; `same` hands back what
+    // it was given, grouped: none.
+    const P = glint.Project;
+    const program =
+        \\const gov = @import("gov");
+        \\const std = @import("std");
+        \\pub fn f(c: *const gov.Counted) *const [8]u8 { return std.mem.bytes(c); }
+        \\pub fn g(c: gov.Counted) gov.Counted { return std.mem.same(c); }
+    ;
+    const inputs = [_]P.Input{
+        .{ .name = "program.zig", .bytes = program },
+        .{ .name = "gov.zig", .bytes =
+        \\pub const Counted = struct { gov_n: u64, pub fn init(n: u64) Counted { return .{ .gov_n = n }; } };
+        \\pub const lint_rules = .{ .version = 2, .rules = .{.{ .id = .X001, .name = "governed state", .kind = .ban, .reads = .governed, .default = true, .purpose = "p" }}, .governed = .{.{ .type = Counted, .internal = .{.gov_n} }} };
+        , .selected = false, .package = "gov", .fingerprint = 7 },
+        .{ .name = "std.zig", .bytes = "pub const mem = @import(\"mem.zig\");", .selected = false },
+        .{ .name = "mem.zig", .bytes =
+        \\pub fn bytes(v: anytype) *const [8]u8 { return if (true) (@ptrCast(v)) else unreachable; }
+        \\pub fn same(v: anytype) @TypeOf(v) { return if (true) (v) else v; }
+        , .selected = false },
+    };
+    const imports = [_]P.Import{
+        .{ .from = 0, .spelling = "gov", .target = 1 },
+        .{ .from = 0, .spelling = "std", .target = 2 },
+        .{ .from = 2, .spelling = "mem.zig", .target = 3 },
+    };
+    var project = try P.init(std.testing.allocator, &inputs, &imports, .{});
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.package_defaults = true;
+    var report = try glint.run(std.testing.allocator, &project, config);
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: view's call alone
+    try std.testing.expect(std.mem.find(u8, report.diagnostics[0].message, "bytes") != null);
+}

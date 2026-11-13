@@ -498,7 +498,8 @@ fn returnsCast(self: *Context, function: Facts.Decl, node: Ast.Node.Index, posit
     if (depth > 8) return false;
     const tree = &self.project.at(function.file).file.tree;
     switch (tree.nodeTag(node)) {
-        .grouped_expression, .deref, .@"try", .address_of => return returnsCast(self, function, tree.nodeData(node).node, position, cast, depth + 1),
+        .grouped_expression => return returnsCast(self, function, tree.nodeData(node).node_and_token[0], position, cast, depth + 1),
+        .deref, .@"try", .address_of => return returnsCast(self, function, tree.nodeData(node).node, position, cast, depth + 1),
         .@"orelse", .@"catch" => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             return try returnsCast(self, function, lhs, position, cast, depth + 1) or try returnsCast(self, function, rhs, position, cast, depth + 1);
@@ -547,7 +548,8 @@ fn castWritten(self: *Context, function: Facts.Decl, arg: Ast.Node.Index) bool {
     const tree = &self.project.at(function.file).file.tree;
     var at = arg;
     while (true) switch (tree.nodeTag(at)) {
-        .grouped_expression, .address_of => at = tree.nodeData(at).node,
+        .grouped_expression => at = tree.nodeData(at).node_and_token[0],
+        .address_of => at = tree.nodeData(at).node,
         else => break,
     };
     const name = Facts.builtinName(tree, at) orelse return false;
@@ -559,7 +561,8 @@ fn handedParameter(self: *Context, function: Facts.Decl, arg: Ast.Node.Index) ?u
     const tree = &self.project.at(function.file).file.tree;
     var at = arg;
     while (true) switch (tree.nodeTag(at)) {
-        .grouped_expression, .address_of => at = tree.nodeData(at).node,
+        .grouped_expression => at = tree.nodeData(at).node_and_token[0],
+        .address_of => at = tree.nodeData(at).node,
         else => break,
     };
     if (tree.nodeTag(at) != .identifier) return null;
@@ -707,7 +710,8 @@ fn parameterIn(tree: *const Ast, model: *const Model, proto: Ast.full.FnProto, n
             while (parameters.next()) |parameter| if (parameter.name_token == record.token) return true;
             return false;
         },
-        .optional_type, .grouped_expression => return parameterIn(tree, model, proto, tree.nodeData(node).node, depth + 1),
+        .grouped_expression => return parameterIn(tree, model, proto, tree.nodeData(node).node_and_token[0], depth + 1),
+        .optional_type => return parameterIn(tree, model, proto, tree.nodeData(node).node, depth + 1),
         .error_union => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             return parameterIn(tree, model, proto, lhs, depth + 1) or parameterIn(tree, model, proto, rhs, depth + 1);
