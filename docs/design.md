@@ -55,7 +55,7 @@ nothing unasked. The configuration keys a rule reads are named in its row with t
 | Z034 | hygiene | Two binary operators the next Zig refuses to order without parentheses (a product and a remainder, two bitwise operators, arithmetic and bitwise, `and` and `or`, `orelse` or `catch` with any other), or a chained shift or remainder. The fix parenthesizes as 0.17 groups. |
 | P003 | hygiene | A function longer than the configured line count (`max_function_lines`, default 120). An exception (`function_exceptions`) names a function and its reason; one naming no function is a run error. |
 | Z011 | hygiene | A call whose callee resolves to a declaration whose doc comment begins "deprecated" or "this function is deprecated". A choice of callees counts only when every alternative is deprecated. An unresolved callee is silent. |
-| Z012 | hygiene | A type written by name in a public surface signature (parameter, return, a `pub const` annotation, a surface field) that resolves to a private container written in place with no public alias. The walk goes through parentheses, `?`, `E!`, pointers, slices, arrays, and a function prototype or container written in place. Calls, made types, comptime choices, builtins and inferred types are not read. |
+| Z012 | hygiene | A type written by name in a public surface signature (parameter, return, a `pub const` annotation, a surface field) that resolves to a private container written in place with no public alias. The walk goes through parentheses, `?`, `E!`, pointers, slices, arrays, and a function prototype or container written in place. Calls, made types, comptime choices, builtins and inferred types are not read. The public surface is what the roots of the modules the package exports reach through `pub` declarations (a public alias's target included, a private alias exporting nothing; preflight states the roots, the command line `--exported FILE`): a container a private function makes, a file reached only through a private alias or a test block, and every file-level declaration when no root is stated, say nothing. |
 | Z013 | hygiene | A private `const X = @import("...")` whose name the file spells nowhere else: no identifier, member token, `.X` literal, or `@field` string. A file holding a computed `@field` name reports none. |
 | Z016 | hygiene | A call resolving to std's `debug.assert` whose argument, as written (parentheses and `comptime` stripped), is `a and b`. Nothing is followed. |
 | D001 | hygiene | A private function or variable at file or container level whose name its file spells nowhere outside its own declaration. Any spelling is a use. A file holding a computed `@field` name reports none. A declaration that only dead code names is used. |
@@ -215,6 +215,12 @@ for a ban, silence for hygiene). Reports are text, JSON version 1, or SARIF 2.1.
   the generated roots by their text); an import under a comptime branch the build does not take is nothing;
 - a configuration glint cannot read, a rule it does not have (with the removed-rule table's answer), a P003
   exception naming no function, a P006 entry resolving to nothing.
+
+A module whose bytes the configuration holds (sources, copied files, a WriteFiles step's contents, an options
+module) is read and linted; a module whose bytes exist only after a build step runs (translate-c's output, a Run
+step's output file) is external (`Project.Input.external`, `--external NAME`): its import resolves to it, what is
+read through it is unknown, it is never linted, it is no run error, and a ban still reports a name spelling one
+of its targets as it does an unresolved reference.
 
 Exit 0 means a completed run with no findings, 1 a completed run with findings, and 2 a run error or an
 argument, input, tool, output or cancellation failure. A `--result` record binds an invocation id, the exit

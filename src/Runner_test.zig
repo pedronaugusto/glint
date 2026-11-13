@@ -9,7 +9,8 @@ fn check(rule: glint.Rule, source: []const u8, expected: usize) !void {
     defer inputs.deinit(std.testing.allocator);
     var imports: std.ArrayList(glint.Project.Import) = .empty;
     defer imports.deinit(std.testing.allocator);
-    try inputs.append(std.testing.allocator, .{ .name = "fixture", .stem = "Fixture", .bytes = source });
+    // The fixture is its own package's root: the public surface Z012 reads is what it reaches.
+    try inputs.append(std.testing.allocator, .{ .name = "fixture", .stem = "Fixture", .bytes = source, .exported = true });
     var rest = source;
     while (std.mem.find(u8, rest, "@import(\"")) |at| {
         rest = rest[at + "@import(\"".len ..];
@@ -416,7 +417,7 @@ test "Z012 reads the type a signature writes by name, through its written wrappe
 test "G2 amended policies are explicit family choices and count suppressed sites" {
     try std.testing.expect(!(@as(glint.Config, .{})).has(.Z012)); // safe: select the default configuration type for this policy assertion.
     try std.testing.expect(!(@as(glint.Config, .{})).has(.Z026)); // safe: select the default configuration type for this policy assertion.
-    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "policy", .bytes = "const Hidden = struct {};\n// glint-ignore: Z012 -- inference-only factory\npub fn create() Hidden { return .{}; }" }}, &.{}, .{});
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "policy", .bytes = "const Hidden = struct {};\n// glint-ignore: Z012 -- inference-only factory\npub fn create() Hidden { return .{}; }", .exported = true }}, &.{}, .{});
     defer project.deinit();
     var config = glint.Config.none();
     config.set(.Z012, true);
@@ -1074,4 +1075,44 @@ test "a library's reflective call read through a parenthesized result in a branc
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: view's call alone
     try std.testing.expect(std.mem.find(u8, report.diagnostics[0].message, "bytes") != null);
+}
+
+test "Z012 with no exported root stated says nothing of file-level public declarations (8f)" {
+    // Hygiene reports only what it is sure of: without a root the build exports, nothing proves a
+    // file's `pub` reaches a consumer. The same file, stated as a root, is reported.
+    const source = "const Hidden = struct {}; pub fn create() Hidden { return .{}; }";
+    for ([_]bool{ false, true }) |exported| {
+        var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "lib", .bytes = source, .exported = exported }}, &.{}, .{});
+        defer project.deinit();
+        var config = glint.Config.none();
+        config.set(.Z012, true);
+        var report = try glint.run(std.testing.allocator, &project, config);
+        defer report.deinit();
+        try std.testing.expectEqual(@as(usize, @intFromBool(exported)), report.diagnostics.len); // safe: one site, reported only from a root
+    }
+}
+
+test "an external module is read as nothing glint has: its import, its members, no run error (8f)" {
+    // translate-c's output or a Run step's file exists only after a build step: a bodiless input,
+    // never linted. Its import resolves to it, a member read through it is unknown, and the run
+    // completes; the same import with no input for it stops the run.
+    const program =
+        \\const sdl = @import("sdl");
+        \\pub fn start() c_int { return sdl.SDL_Init(sdl.SDL_INIT_VIDEO); }
+    ;
+    for ([_]bool{ true, false }) |external| {
+        const inputs = [_]glint.Project.Input{
+            .{ .name = "program.zig", .bytes = program },
+            .{ .name = "<external sdl>", .bytes = "", .selected = false, .external = true },
+        };
+        const imports = [_]glint.Project.Import{.{ .from = 0, .spelling = "sdl", .target = 1 }};
+        var project = try glint.Project.init(std.testing.allocator, if (external) &inputs else inputs[0..1], if (external) &imports else &.{}, .{});
+        defer project.deinit();
+        var config = glint.Config.reviewed();
+        config.set(.P007, true);
+        var report = try glint.run(std.testing.allocator, &project, config);
+        defer report.deinit();
+        try std.testing.expectEqual(external, report.complete);
+        if (external) try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: nothing of the module is read
+    }
 }

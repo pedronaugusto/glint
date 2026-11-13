@@ -220,9 +220,12 @@ pub const Reflected = struct { of: *const Value, at: enum { info, pointer, size,
 /// `erased_field`: a call through a field that holds a function pointer, whose stores are not
 /// all seen (`storedFunctions`: a parameter's or a cast's value stored there, a file that may
 /// share the compilation unread) or whose holder does not resolve: any function of its type.
+/// `external`: it is a module whose bytes exist only after a build step runs (translate-c's
+/// output, a Run step's output file: Project.Input.external), which no reading has: an import
+/// of it, and every member read through it.
 /// Whether something is so: yes, no, or unknown and why.
 pub const Is = union(enum) { yes, no, unknown: Unknown };
-pub const Unknown = enum { invalid_front_end, unresolved, missing_mapping, computed_import, comptime_dependent, cycle, budget, unsupported, absent, generic, zig_own, erased_field };
+pub const Unknown = enum { invalid_front_end, unresolved, missing_mapping, computed_import, comptime_dependent, cycle, budget, unsupported, absent, generic, zig_own, erased_field, external };
 /// The declaration an expression names (`definition`, `reflected`, `origin`): one known, none
 /// (no reference at all: a literal, a call, a member its holder does not declare, a primitive),
 /// or unknown and why (a holder that does not resolve, a choice of holders, a computed name, a
@@ -723,7 +726,7 @@ fn holderOutside(self: *Facts, file: Project.FileId, access: Ast.Node.Index) Res
     if (tree.nodeTag(access) != .field_access) return true;
     return switch (try self.resolve(file, tree.nodeData(access).node_and_token[0])) {
         .unknown => |why| switch (why) {
-            .invalid_front_end, .missing_mapping, .computed_import, .generic => true,
+            .invalid_front_end, .missing_mapping, .computed_import, .generic, .external => true,
             .unresolved, .comptime_dependent, .cycle, .budget, .unsupported, .absent, .zig_own, .erased_field => false,
         },
         .alternatives => false, // a choice of known values (`choose` keeps no unknown in one): each in the run
@@ -2816,6 +2819,7 @@ fn importValue(self: *Facts, file: Project.FileId, args: []const Ast.Node.Index)
         error.InvalidLiteral => return .{ .unknown = .computed_import },
     };
     const targets = try self.project.importedAll(self.gpa, file, spelling);
+    for (targets) |target| if (self.project.at(target).input.external) return .{ .unknown = .external };
     if (targets.len == 0) return .{ .unknown = if (self.project.absent(file, spelling))
         .absent
     else if (try self.zigOwn(file, spelling))
@@ -9795,6 +9799,59 @@ fn functionOfScope(model: *const Model, tree: *const Ast, node: Ast.Node.Index) 
     const proto = tree.nodeData(at).node_and_node[0];
     for (model.declarations) |decl| if (decl.kind == .function and decl.node == proto) return decl;
     return null;
+}
+
+/// Whether a declaration in `scope` of `file` is on the package's public surface for a consumer:
+/// on the surface as written (`onSurface`), and in a file the exported roots reach through
+/// `pub` declarations (`Project.Input.exported`: `pub const x = @import("x.zig")`), or in a
+/// container a public alias in one of those files holds (`pub const Recorder =
+/// tokens.Recorder`). A private alias exports nothing. With no root stated nothing is known to be
+/// a consumer's, and this answers false: hygiene reports only what it is sure of.
+pub fn exportedSurface(self: *Facts, file: Project.FileId, scope: Model.Scope.Id) ResolveError!bool {
+    if (!try self.onSurface(file, scope)) return false;
+    const exported = try self.exportedReach();
+    if (exported.files.contains(@backingInt(file))) return true;
+    const model = &self.project.at(file).model;
+    var at: ?Model.Scope.Id = scope;
+    while (at) |s| : (at = model.scopes[@backingInt(s)].parent) {
+        if (model.scopes[@backingInt(s)].kind == .container and exported.containers.contains(.{ @backingInt(file), @backingInt(s) })) return true;
+    }
+    return false;
+}
+
+const Exported = struct {
+    built: bool = false,
+    files: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    containers: std.AutoHashMapUnmanaged(struct { u32, u32 }, void) = .empty,
+};
+
+/// What the exported roots reach, found once: the files their public imports reach, and the
+/// containers of other files their public aliases hold.
+fn exportedReach(self: *Facts) ResolveError!*const Exported {
+    const exported = try self.memo(Exported);
+    if (exported.built) return exported;
+    exported.built = true;
+    var queue: std.ArrayList(Project.FileId) = .empty;
+    for (self.project.sources) |*source| if (source.input.exported) {
+        if ((try exported.files.getOrPut(self.gpa, @backingInt(source.id))).found_existing) continue;
+        try queue.append(self.gpa, source.id);
+    };
+    var next: usize = 0;
+    while (next < queue.items.len) : (next += 1) {
+        const file = queue.items[next];
+        const model = &self.project.at(file).model;
+        for (model.declarations, 0..) |decl, i| {
+            if (decl.kind != .variable or !decl.public or !model.surfaceReachable(decl.scope)) continue;
+            const named = try self.declaration(.{ .file = file, .index = @fromBackingInt(@intCast(i)) });
+            if (named != .container or named.container.symbolic) continue;
+            const held = named.container;
+            if (self.project.at(held.file).model.scopes[@backingInt(held.scope)].kind == .file) {
+                if ((try exported.files.getOrPut(self.gpa, @backingInt(held.file))).found_existing) continue;
+                try queue.append(self.gpa, held.file);
+            } else try exported.containers.put(self.gpa, .{ @backingInt(held.file), @backingInt(held.scope) }, {});
+        }
+    }
+    return exported;
 }
 
 /// Whether a public constant the surface reaches holds the container whose scope is `scope`.

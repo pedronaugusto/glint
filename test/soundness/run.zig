@@ -518,7 +518,10 @@ fn judge(gpa: std.mem.Allocator, io: std.Io, store: *glint.Project.Store, rule: 
     if (job.policy) |config| try args.appendSlice(a, &.{ "--config", config });
     if (job.before) |before| try args.append(a, before);
     const own = try moduleFiles(a, io, std.Io.Dir.path.dirname(job.absolute) orelse ".");
-    for (own) |file| if (std.mem.eql(u8, std.Io.Dir.path.basename(file), "module.zig")) try args.appendSlice(a, &.{ "--module", try std.fmt.allocPrint(a, "module={s}", .{file}) });
+    for (own) |file| if (std.mem.eql(u8, std.Io.Dir.path.basename(file), "module.zig")) try args.appendSlice(a, &.{ "--module", try std.fmt.allocPrint(a, "module={s}", .{file}), "--exported", file });
+    // A case's file is its own package's root, and a module's root its published one: the
+    // public surface a rule reading it (Z012) reads is what these reach.
+    try args.appendSlice(a, &.{ "--exported", job.absolute });
     try args.appendSlice(a, own);
     try args.append(a, job.absolute);
     // A suppression that would cover two findings stops the run, which glint's command line

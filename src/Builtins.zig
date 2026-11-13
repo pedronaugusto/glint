@@ -280,11 +280,13 @@ fn amendedPolicies(self: *Context) RunError!void {
     if (!selected(self, &.{.Z012})) return;
     const source = self.project.at(self.file);
     const tree = &source.file.tree;
-    // Z012 reads the public surface as written: a public function's signature, a public
-    // constant's or variable's written type, and a field of a container the surface reaches.
+    // Z012 reads the public surface a consumer reaches: a public function's signature, a public
+    // constant's or variable's written type, and a field of a container the surface reaches, in
+    // what the exported roots reach (Facts.exportedSurface; none stated, none).
     if (self.config.has(.Z012)) for (source.model.declarations, 0..) |decl, i| {
         if (decl.kind != .field and !decl.public and !decl.exported) continue;
-        if (!try self.facts.onSurface(self.file, decl.scope)) continue;
+        // On the surface a consumer reaches: from the roots the package exports (8f).
+        if (!try self.facts.exportedSurface(self.file, decl.scope)) continue;
         const signature: Signature = .{ .site = decl.token, .scope = decl.scope };
         switch (decl.kind) {
             .function => {
@@ -799,7 +801,8 @@ fn unmappedImports(self: *Context) RunError!void {
         const args = Facts.builtinArgs(tree, node, &b);
         if (args.len != 1 or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import")) continue;
         const value = try self.facts.resolve(self.file, node);
-        if (value != .unknown or value.unknown == .zig_own) continue;
+        // Zig's own per-build file, and a module whose bytes a build step makes (external): no gap.
+        if (value != .unknown or value.unknown == .zig_own or value.unknown == .external) continue;
         if (underBranch(tree, model, node)) continue;
         const at = tree.tokenLocation(0, tree.nodeMainToken(node));
         try self.refuse(try self.allocator.print("{d}:{d}: `@import({s})` names no module or file this run maps, so no rule read what it brings: map it (`--module NAME=FILE`, or the build graph's module preflight passes)", .{ at.line + 1, at.column + 1, tree.getNodeSource(args[0]) }));

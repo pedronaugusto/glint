@@ -89,6 +89,8 @@ closed construct list. In short, for a configuration written for 0.7:
 
 ### Added
 
+- `Project.Input.exported` (`--exported FILE`): the root of a module the package exports. Z012 reads the public surface as what these roots reach through `pub` declarations, a public alias's target included; a file reached only through a private alias or a test block, a container a private function makes, and, with no root stated, every file-level declaration are no surface, and Z012 says nothing of them (it reported a `pub` declaration in any file).
+- `Project.Input.external` (`--external NAME`): a module whose bytes exist only after a build step runs (translate-c's output, a Run step's output file). Its import resolves to it, what is read through it is unknown (`Facts.Unknown.external`), it is never linted and no run error, and a ban still reports a name spelling one of its targets.
 - `glint.stdCall` and `glint.Is`: whether a call calls std's declaration at a path (`mem.eql`), read by what its callee resolves to, for a project's own rules: yes where every function it may call is that one, no where none is, unknown and why where its callee does not resolve and may be it.
 - `zig build check-rule-readers` (development, in preflight's extra checks): RULE_READERS, a compiled rule of glint's own lint, reports where one of its rules reads a value, a write, a call or a type around the shared queries (`Facts.resolve`, `Facts.accesses`, `Facts.calls`, Governed): std's text comparisons given a name a declaration may have, and a node's syntax tag tested against one that writes a value. It reports and does not gate; it gates once its list is empty.
 

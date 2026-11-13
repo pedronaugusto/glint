@@ -17,6 +17,10 @@ const Options = struct {
     format: Report.Format = .text,
     files: std.ArrayList([]const u8) = .empty,
     modules: std.ArrayList(Module) = .empty,
+    /// The roots of the modules the package exports (`Project.Input.exported`).
+    exported: std.ArrayList([]const u8) = .empty,
+    /// Modules whose bytes a build step makes, by name (`Project.Input.external`).
+    externals: std.ArrayList([]const u8) = .empty,
     /// Directories whose files belong to a named package (`Project.Input.package`).
     packages: std.ArrayList(Module) = .empty,
     roots: std.ArrayList([]const u8) = .empty,
@@ -81,6 +85,17 @@ const Loader = struct {
         return position;
     }
 
+    /// The bodiless input of a module a build step makes, by its name: one for the run.
+    fn externalInput(self: *Loader, name: []const u8) !usize {
+        const key = try self.a.print("<external {s}>", .{name});
+        if (self.paths.get(key)) |position| return position;
+        const position = self.inputs.items.len;
+        try self.inputs.append(self.a, .{ .name = key, .stem = name, .bytes = "", .selected = false, .external = true });
+        try self.canonical_paths.append(self.a, key);
+        try self.paths.put(self.a, key, position);
+        return position;
+    }
+
     /// A file's bytes, counted against the project's source budget.
     const Source = struct { bytes: [:0]const u8 };
     fn take(self: *Loader, bytes: [:0]const u8) error{SourceBudgetExceeded}!Source {
@@ -142,8 +157,13 @@ const Loader = struct {
                 if (lexer.next().tag != .r_paren) continue;
                 // The spelling is the source's: a path it names is parsed into one inside the
                 // roots before anything opens it.
-                const target_path = (try aegis.input.Untrusted(Spelling).init(.{ .from = cursor, .text = spelling }).parse(self, Loader.importPath)) orelse continue;
-                const target = try self.load(target_path, false);
+                const external = for (self.options.externals.items) |name| {
+                    if (std.mem.eql(u8, name, spelling)) break true;
+                } else false;
+                const target = if (external) try self.externalInput(spelling) else target: {
+                    const target_path = (try aegis.input.Untrusted(Spelling).init(.{ .from = cursor, .text = spelling }).parse(self, Loader.importPath)) orelse continue;
+                    break :target try self.load(target_path, false);
+                };
                 var duplicate = false;
                 for (self.mappings.items) |m| if (m.from == from and std.mem.eql(u8, m.spelling, spelling)) {
                     duplicate = true;
@@ -247,6 +267,8 @@ pub const Arguments = struct {
     escapes_before: ?[]const u8 = null,
     zig_lib_path: ?[]const u8 = null,
     module: []const []const u8 = &.{},
+    exported: []const []const u8 = &.{},
+    external: []const []const u8 = &.{},
     root: []const []const u8 = &.{},
     package: []const []const u8 = &.{},
     files_from: []const []const u8 = &.{},
@@ -274,6 +296,8 @@ pub const Arguments = struct {
             .escapes_before = .{ .value_name = "FILE", .hint = .file, .help = "The escapes a run before reported (its text report, or preflight's escapes.txt): --fix names an escape in the older form, at that place with those words, with only the rules listed for it there that find something now, and leaves one not listed to its owner; never with --only" },
             .zig_lib_path = .{ .value_name = "DIR", .hint = .directory, .section = "Inputs", .help = "Zig's library, for std's imports" },
             .module = .{ .value_name = "NAME=FILE", .section = "Inputs", .help = "A module the files import by name, and its root file, repeated" },
+            .exported = .{ .value_name = "FILE", .hint = .file, .section = "Inputs", .help = "The root of a module the package exports, repeated: Z012 reads the public surface these reach, and none without one" },
+            .external = .{ .value_name = "NAME", .section = "Inputs", .help = "A module whose bytes a build step makes (translate-c, a Run step's output), repeated: an import of it is read as nothing glint has, never linted" },
             .root = .{ .value_name = "DIR", .hint = .directory, .section = "Inputs", .help = "A directory imports may read files from, repeated" },
             .package = .{ .value_name = "NAME=DIR", .section = "Inputs", .help = "The package whose files a directory holds, repeated" },
             .files_from = .{ .value_name = "FILE", .hint = .file, .section = "Inputs", .help = "A file naming files to check under this directory, one a line, repeated" },
@@ -327,6 +351,8 @@ fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, problems: *st
     }
     try result.roots.appendSlice(a, arguments.root);
     for (arguments.module) |mapping| try result.modules.append(a, named(mapping) orelse return error.InvalidModule);
+    try result.exported.appendSlice(a, arguments.exported);
+    try result.externals.appendSlice(a, arguments.external);
     for (arguments.package) |mapping| try result.packages.append(a, named(mapping) orelse return error.InvalidPackage);
     try result.files.appendSlice(a, arguments.files);
     for (arguments.files_from) |from| {
@@ -505,6 +531,10 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     }
     record.outcome = .traversal_failure;
     try loader.imports();
+    for (configured.exported.items) |root| {
+        const canonical = try std.Io.Dir.cwd().realPathFileAlloc(io, root, a);
+        if (loader.paths.get(canonical)) |position| loader.inputs.items[position].exported = true;
+    }
     record.outcome = .tool_failure;
     var project = try Project.init(gpa, loader.inputs.items, loader.mappings.items, .{ .io = io, .store = store });
     defer project.deinit();

@@ -73,6 +73,16 @@ pub const Input = struct {
     /// script, the program's is aegis's module. An import is read in the compilations of the
     /// file that makes it, never by its spelling in another.
     compilations: Compilations = .program,
+    /// The root of a module the package exports (`b.addModule`'s root, as the caller's build has
+    /// it): the public surface is what these roots reach through `pub` declarations. With none
+    /// stated, a hygiene rule that reads the surface (Z012) says nothing of file-level public
+    /// declarations.
+    exported: bool = false,
+    /// A module whose bytes exist only after a build step runs (translate-c's output, a Run
+    /// step's output file): bodiless, never linted. An import of it resolves to it and every
+    /// member read through it is unknown (`Facts.Unknown.external`), with no run error; a ban
+    /// still reports a name that spells one of its targets, as it does an unresolved reference.
+    external: bool = false,
 };
 /// The compilations that compile a file.
 pub const Compilations = enum {
