@@ -1,0 +1,6 @@
+.{
+    // Z005: a function that returns `type` is named in TitleCase; one that returns a value of a type,
+    // or a result type glint cannot resolve, says nothing (hygiene, 8d).
+    .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .operator, .conversion, .unwrap, .aggregate, .memory, .branch },
+    .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .operator, .conversion, .unwrap, .aggregate, .memory, .branch },
+}

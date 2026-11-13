@@ -3384,7 +3384,7 @@ fn memberValue(self: *Facts, lhs: Value, name: []const u8) ResolveError!Value {
     const container = switch (lhs) {
         .container, .instance => |c| c,
         .pointer => |p| switch (p.child.*) {
-            .instance, .container => |c| if (self.member(c, name)) |decl| return self.memberOf(c, decl) else return sequence(lhs, name),
+            .instance, .container => |c| if (self.member(c, name)) |decl| return self.heldIn(c, decl, p.child.* == .instance) else return sequence(lhs, name),
             .alternatives => return self.map(p.child.*, name, memberValue),
             else => return sequence(lhs, name),
         },
@@ -3396,8 +3396,18 @@ fn memberValue(self: *Facts, lhs: Value, name: []const u8) ResolveError!Value {
     };
     // A tag named on an enum or a union type (`Color.red`, `Shape.empty`): a value of it.
     if (lhs == .container and self.declaresTag(container, name)) return .{ .instance = container };
-    if (self.member(container, name)) |decl| return self.memberOf(container, decl);
+    if (self.member(container, name)) |decl| return self.heldIn(container, decl, lhs == .instance);
     return .{ .unknown = .unresolved };
+}
+
+/// What a member reads: `memberOf`'s answer, but for a field of a value declared `type`
+/// (`params.Fe` of `params: Params`, `Fe: type`), which holds a type its binding chooses, not
+/// the type `type`: one that depends on the binding.
+fn heldIn(self: *Facts, container: Container, decl: Decl, of_value: bool) ResolveError!Value {
+    const value = try self.memberOf(container, decl);
+    if (!of_value or self.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind != .field) return value;
+    if (value == .primitive and std.mem.eql(u8, value.primitive, "type")) return .{ .unknown = .comptime_dependent };
+    return value;
 }
 
 /// A tag of an enum or a union, by its type and its name.
