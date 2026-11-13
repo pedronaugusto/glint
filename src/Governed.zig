@@ -373,13 +373,16 @@ pub const Made = union(enum) { no, yes: ?Facts.Decl, unknown: Facts.Unknown };
 
 /// Whether the call at `node` makes a value of one of `types` (or a pointer to one, through
 /// optionals and error unions) outside its type's own code: its callee is outside the program
-/// (the program's own is judged by its body) and is a function of another package, or of the
-/// type's own package but reflective, its result written in terms of its own comptime type
-/// parameter (std's `mem.zeroInit(T, init)`, `mem.zeroes(T)`), which makes whatever type it is
-/// given from what the caller hands it. A type's makers are functions of its own package with
-/// a result of that type: never reflective. The callee is given (`yes`) for the caller to
-/// weigh its own library; a reflective callee whose result does not resolve is unknown, but
-/// for a generic's binding, judged where it is bound.
+/// (the program's own is judged by its body) and makes it from untyped data (`makesFromData`):
+/// a value or pointer of the type out of bytes the caller hands it (`mem.bytesToValue(T, b)`,
+/// `bytesAsValue`, `bytesAsSlice`), or a value built by reading the type's fields
+/// (`mem.zeroes(T)`, `zeroInit`: `@typeInfo(T)`). A typed pointer to storage the callee
+/// allocates or keeps is neither (`Allocator.alloc(T, n)`, a map's `get`): that memory is
+/// undefined until a value of the type is written to it. A type's makers are functions of its
+/// own package with a result of that type: those of its package are judged only where generic,
+/// their result written in terms of their own parameter. The callee is given (`yes`) for the
+/// caller to weigh its own library; one that makes from data whose result does not resolve is
+/// unknown, but for a generic's binding, judged where it is bound.
 pub fn madeByCall(self: *Context, node: Ast.Node.Index, types: []const Facts.Container) Context.Error!Made {
     if (types.len == 0) return .no;
     const call = (try Facts.calls.at(self.facts, self.file, node)) orelse return .no;
@@ -393,10 +396,11 @@ pub fn madeByCall(self: *Context, node: Ast.Node.Index, types: []const Facts.Con
         if (try self.facts.program(callee.file)) continue;
         if (result == null) result = try self.facts.resolve(self.file, node);
         const made = madeType(result.?, types) orelse {
-            if (result.? == .unknown and result.?.unknown != .generic and reflectiveResult(self, callee)) return .{ .unknown = result.?.unknown };
+            if (result.? == .unknown and result.?.unknown != .generic and try makesFromData(self, callee)) return .{ .unknown = result.?.unknown };
             continue;
         };
         if (!reflectiveResult(self, callee) and try samePackage(self, callee.file, made.file)) continue;
+        if (!try makesFromData(self, callee)) continue;
         // A copy of memory out of a value of the same type (`std.mem.bytesToValue(T,
         // std.mem.asBytes(&t))`, `Facts.accesses.copyAt`) makes it from its own bytes.
         if (try Facts.accesses.copyAt(self.facts, self.file, node)) |copy| if (madeType(try self.facts.resolve(self.file, copy.from.node()), types)) |from| {
@@ -408,12 +412,14 @@ pub fn madeByCall(self: *Context, node: Ast.Node.Index, types: []const Facts.Con
 }
 
 /// Whether the call at `node` hands one of `types`, or a value of or pointer to one, to a
-/// library function that reads whatever it is given by reflection: a callee outside the program
-/// and outside the type's package whose result is written in terms of its own parameter
-/// (`std.mem.asBytes(&t)`, `std.mem.toBytes(t)`), or whose body applies a reflective builtin
-/// to the parameter it is handed (`std.meta.fieldNames(T)`, `fieldInfo`, `tags`: `@typeInfo(T)`).
-/// A function that only holds a type it is given (`std.ArrayList(T)`: `@sizeOf`, `@alignOf`)
-/// or copies a value (`std.mem.swap`) is none. The callee is given.
+/// library function that reads it as untyped data: a callee outside the program and outside the
+/// type's package that returns the value it is handed cast to another type, there or through a
+/// call it hands it on to (`std.mem.asBytes(&t)`, `sliceAsBytes`, `toBytes(t)`:
+/// `castsParameter`), or whose body applies a reflective builtin to the parameter it is handed
+/// (`std.meta.fieldNames(T)`, `fieldInfo`, `tags`: `@typeInfo(T)`). A function that only holds
+/// a type it is given (`std.ArrayList(T)`: `@sizeOf`, `@alignOf`), allocates or keeps storage
+/// for it (`Allocator.alloc(T, n)`, `realloc`, whose bytes of the old memory never reach its
+/// result), or copies a value (`std.mem.swap`) is none. The callee is given.
 pub fn reflectedByCall(self: *Context, node: Ast.Node.Index, types: []const Facts.Container) Context.Error!?Facts.Decl {
     if (types.len == 0) return null;
     const call = (try Facts.calls.at(self.facts, self.file, node)) orelse return null;
@@ -430,10 +436,171 @@ pub fn reflectedByCall(self: *Context, node: Ast.Node.Index, types: []const Fact
         const handed = madeType(try self.facts.resolve(self.file, arg), types) orelse continue;
         for (callees) |callee| {
             if (try self.facts.program(callee.file) or try samePackage(self, callee.file, handed.file)) continue;
-            if (reflectiveResult(self, callee) or reflectsParameter(self, callee, position)) return callee;
+            if (try castsParameter(self, callee, position, 0) or reflectsParameter(self, callee, position)) return callee;
         }
     }
     return null;
+}
+
+/// Whether a library function makes the value it returns from untyped data: it returns a cast
+/// of bytes it is handed (`castsParameter` over any parameter that holds data), or applies a
+/// reflective builtin to one of its parameters (`@typeInfo(T)`: `mem.zeroes`, `zeroInit`).
+fn makesFromData(self: *Context, function: Facts.Decl) Context.Error!bool {
+    if (try castsParameter(self, function, null, 0)) return true;
+    const tree = &self.project.at(function.file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, self.project.at(function.file).model.declarations[@backingInt(function.index)].node) orelse return false;
+    var parameters = proto.iterate(tree);
+    var position: usize = 0;
+    while (parameters.next()) |_| : (position += 1) {
+        if (reflectsParameter(self, function, position)) return true;
+    }
+    return false;
+}
+
+/// The casts that carry a value to another type and keep its bits.
+const bit_casts = [_][]const u8{ "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@bitCast" };
+
+fn isBitCast(name: []const u8) bool {
+    for (bit_casts) |each| if (std.mem.eql(u8, each, name)) return true;
+    return false;
+}
+
+/// Whether `function` returns its parameter at `position` cast to another type, there or
+/// through a call it hands the parameter to that does (`toBytes(v)` returning
+/// `asBytes(&v).*`, `bytesToValue(T, b)` returning `bytesAsValue(T, b).*`). With no position,
+/// any parameter that holds data the caller hands it: written `anytype`, or bytes (`[]const
+/// u8`, `*[n]u8`, `[*]u8`). Its own allocation or storage it keeps (`self.metadata`) is no
+/// parameter, so a cast of either is none: what it reads is what a value of the type wrote.
+fn castsParameter(self: *Context, function: Facts.Decl, position: ?usize, depth: u8) Context.Error!bool {
+    if (depth > 4) return false;
+    const tree = &self.project.at(function.file).file.tree;
+    const declaration = self.facts.scopeNode(function);
+    if (tree.nodeTag(declaration) != .fn_decl) return false;
+    const body = tree.nodeData(declaration).node_and_node[1];
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
+    for (tree.nodes.items(.tag), 0..) |tag, raw| {
+        if (tag != .@"return") continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(raw));
+        const at = tree.nodeMainToken(node);
+        if (at < first or at > last) continue;
+        const operand = tree.nodeData(node).opt_node.unwrap() orelse continue;
+        if (try returnsCast(self, function, operand, position, false, depth)) return true;
+    }
+    return false;
+}
+
+/// Whether the returned expression `node` is the parameter at `position` (or one holding data)
+/// cast, through the forms that hand on a value: grouping, `.*`, a slice, `try`, `@as`, both
+/// results of an `if`, `orelse` and `catch`, and a call it is handed to that returns it cast.
+fn returnsCast(self: *Context, function: Facts.Decl, node: Ast.Node.Index, position: ?usize, cast: bool, depth: u8) Context.Error!bool {
+    if (depth > 8) return false;
+    const tree = &self.project.at(function.file).file.tree;
+    switch (tree.nodeTag(node)) {
+        .grouped_expression, .deref, .@"try", .address_of => return returnsCast(self, function, tree.nodeData(node).node, position, cast, depth + 1),
+        .@"orelse", .@"catch" => {
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            return try returnsCast(self, function, lhs, position, cast, depth + 1) or try returnsCast(self, function, rhs, position, cast, depth + 1);
+        },
+        .slice_open, .slice, .slice_sentinel => return returnsCast(self, function, (tree.fullSlice(node) orelse return false).ast.sliced, position, cast, depth + 1),
+        .identifier => {
+            const k = parameterAt(self, function, node) orelse return false;
+            return cast and if (position) |p| k == p else holdsData(self, function, k);
+        },
+        else => {},
+    }
+    if (tree.fullIf(node)) |branch| {
+        if (try returnsCast(self, function, branch.ast.then_expr, position, cast, depth + 1)) return true;
+        const otherwise = branch.ast.else_expr.unwrap() orelse return false;
+        return returnsCast(self, function, otherwise, position, cast, depth + 1);
+    }
+    if (Facts.builtinName(tree, node)) |name| {
+        var buffer: [2]Ast.Node.Index = undefined;
+        const args = Facts.builtinArgs(tree, node, &buffer);
+        if (std.mem.eql(u8, name, "@as") and args.len == 2) return returnsCast(self, function, args[1], position, cast, depth + 1);
+        if (isBitCast(name) and args.len >= 1) return returnsCast(self, function, args[args.len - 1], position, true, depth + 1);
+        return false;
+    }
+    // A call the parameter is handed to: the callee returns it cast, or it was cast here.
+    const call = (try Facts.calls.at(self.facts, function.file, node)) orelse return false;
+    const args = switch (call.args) {
+        .known => |known| known,
+        .unknown => return false,
+    };
+    const callees: []const Facts.Decl = switch (call.callee) {
+        .function => |one| &.{one},
+        .choice => |each| each,
+        .any => return false,
+    };
+    for (args, 0..) |arg, i| {
+        if (castWritten(self, function, arg) and try returnsCast(self, function, arg, position, false, depth + 1)) return true;
+        const k = handedParameter(self, function, arg) orelse continue;
+        if (if (position) |p| k != p else !holdsData(self, function, k)) continue;
+        for (callees) |callee| if (try castsParameter(self, callee, i, depth + 1)) return true;
+    }
+    return false;
+}
+
+/// Whether the argument `arg` is itself a cast written here, not only the parameter handed on.
+fn castWritten(self: *Context, function: Facts.Decl, arg: Ast.Node.Index) bool {
+    const tree = &self.project.at(function.file).file.tree;
+    var at = arg;
+    while (true) switch (tree.nodeTag(at)) {
+        .grouped_expression, .address_of => at = tree.nodeData(at).node,
+        else => break,
+    };
+    const name = Facts.builtinName(tree, at) orelse return false;
+    return isBitCast(name);
+}
+
+/// The position of the parameter an argument hands on as it is (`b`, `&v`, `(b)`), if any.
+fn handedParameter(self: *Context, function: Facts.Decl, arg: Ast.Node.Index) ?usize {
+    const tree = &self.project.at(function.file).file.tree;
+    var at = arg;
+    while (true) switch (tree.nodeTag(at)) {
+        .grouped_expression, .address_of => at = tree.nodeData(at).node,
+        else => break,
+    };
+    if (tree.nodeTag(at) != .identifier) return null;
+    return parameterAt(self, function, at);
+}
+
+/// The position among `function`'s parameters of the one the identifier `node` names.
+fn parameterAt(self: *Context, function: Facts.Decl, node: Ast.Node.Index) ?usize {
+    const tree = &self.project.at(function.file).file.tree;
+    const model = &self.project.at(function.file).model;
+    const index = (model.reference(node) orelse return null).declaration orelse return null;
+    const record = model.declarations[@backingInt(index)];
+    if (record.kind != .parameter) return null;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, model.declarations[@backingInt(function.index)].node) orelse return null;
+    var parameters = proto.iterate(tree);
+    var k: usize = 0;
+    while (parameters.next()) |parameter| : (k += 1) {
+        if (parameter.name_token == record.token) return k;
+    }
+    return null;
+}
+
+/// Whether `function`'s parameter at `position` holds data the caller hands it: written
+/// `anytype`, or bytes (`[]const u8`, `*[n]u8`, `[*]u8`).
+fn holdsData(self: *Context, function: Facts.Decl, position: usize) bool {
+    const tree = &self.project.at(function.file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, self.project.at(function.file).model.declarations[@backingInt(function.index)].node) orelse return false;
+    var parameters = proto.iterate(tree);
+    var k: usize = 0;
+    while (parameters.next()) |parameter| : (k += 1) {
+        if (k != position) continue;
+        if (parameter.anytype_ellipsis3) |token| return tree.tokenTag(token) == .keyword_anytype;
+        const written = parameter.type_expr orelse return false;
+        const pointer = tree.fullPtrType(written) orelse return false;
+        var child = pointer.ast.child_type;
+        if (tree.fullArrayType(child)) |array| child = array.ast.elem_type;
+        return tree.nodeTag(child) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(child)), "u8");
+    }
+    return false;
 }
 
 /// The builtins that read a type's fields, layout or tags by reflection.
