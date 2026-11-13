@@ -86,6 +86,11 @@ pub fn check(c: *Context, definition: Rule.Definition) Context.Error!void {
         // A use through an alias the run reports is no second site: the alias is, where it
         // spells the target (review 8, m8).
         if (site.through_alias) continue;
+        // The ban means a value of the target is held only through the entry's answer: the
+        // target as an argument of that answer (`Secret(T)`) is the answer, and an operand of a
+        // comparison of types (`T != U`) makes no value. Neither is a site; a parameter, field,
+        // local, result type or call naming the target is.
+        if (try answerArgument(c, entry, site.node) or try typeComparison(c, site.node)) continue;
         if (!try applies(c, entry, site.node)) continue;
         const fix = if (entry.replacement.drop_in) |drop_in| try dropInFix(c, entry, drop_in, site, sites.items) else &.{};
         try found.append(c.allocator, .{ .site = site, .entry = entry, .fix = fix });
@@ -120,6 +125,57 @@ fn applies(c: *Context, entry: Entry, node: Ast.Node.Index) Context.Error!bool {
         if (std.meta.eql(decl, holder)) return false;
     }
     return true;
+}
+
+/// Whether `node` is an argument of a call of one of `entry`'s answers (`Secret(T)`).
+fn answerArgument(c: *Context, entry: Entry, node: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    var at = node;
+    var parent = model.parentOf(at) orelse return false;
+    while (tree.nodeTag(parent) == .grouped_expression) {
+        at = parent;
+        parent = model.parentOf(at) orelse return false;
+    }
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, parent) orelse return false;
+    if (std.mem.findScalar(Ast.Node.Index, call.ast.params, at) == null) return false;
+    const callees: []const Facts.Decl = switch ((try Facts.calls.at(c.facts, c.file, parent) orelse return false).callee) {
+        .function => |one| &.{one},
+        .choice => |each| each,
+        .any => return false,
+    };
+    for (callees) |callee| if (!isAnswer(entry, callee)) return false;
+    return callees.len != 0;
+}
+
+/// Whether `decl` is one of `entry`'s answers.
+fn isAnswer(entry: Entry, decl: Facts.Decl) bool {
+    for (entry.replacement.with) |answer| for (answer.declarations()) |each| {
+        if (std.meta.eql(each, decl)) return true;
+    };
+    return false;
+}
+
+/// Whether `node`, a type, is an operand of `==` or `!=`: a comparison of types, which holds no
+/// value of either.
+fn typeComparison(c: *Context, node: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    var at = node;
+    var parent = model.parentOf(at) orelse return false;
+    while (tree.nodeTag(parent) == .grouped_expression) {
+        at = parent;
+        parent = model.parentOf(at) orelse return false;
+    }
+    switch (tree.nodeTag(parent)) {
+        .equal_equal, .bang_equal => {},
+        else => return false,
+    }
+    return switch (try c.facts.resolve(c.file, at)) {
+        .container => true,
+        else => false,
+    };
 }
 
 /// The function, or else the container-level declaration, that holds `node`.
