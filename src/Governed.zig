@@ -410,9 +410,10 @@ pub fn madeByCall(self: *Context, node: Ast.Node.Index, types: []const Facts.Con
 /// Whether the call at `node` hands one of `types`, or a value of or pointer to one, to a
 /// library function that reads whatever it is given by reflection: a callee outside the program
 /// and outside the type's package whose result is written in terms of its own parameter
-/// (`std.mem.asBytes(&t)`, `std.meta.fields(T)`, `std.mem.toBytes(t)`). A function that only
-/// holds a type it is given (`std.ArrayList(T)`, a result written as `type`) or returns nothing
-/// of it (`std.mem.swap`) is none. The callee is given.
+/// (`std.mem.asBytes(&t)`, `std.mem.toBytes(t)`), or whose body applies a reflective builtin
+/// to the parameter it is handed (`std.meta.fieldNames(T)`, `fieldInfo`, `tags`: `@typeInfo(T)`).
+/// A function that only holds a type it is given (`std.ArrayList(T)`: `@sizeOf`, `@alignOf`)
+/// or copies a value (`std.mem.swap`) is none. The callee is given.
 pub fn reflectedByCall(self: *Context, node: Ast.Node.Index, types: []const Facts.Container) Context.Error!?Facts.Decl {
     if (types.len == 0) return null;
     const call = (try Facts.calls.at(self.facts, self.file, node)) orelse return null;
@@ -425,14 +426,54 @@ pub fn reflectedByCall(self: *Context, node: Ast.Node.Index, types: []const Fact
         .choice => |each| each,
         .any => return null,
     };
-    for (args) |arg| {
+    for (args, 0..) |arg, position| {
         const handed = madeType(try self.facts.resolve(self.file, arg), types) orelse continue;
         for (callees) |callee| {
             if (try self.facts.program(callee.file) or try samePackage(self, callee.file, handed.file)) continue;
-            if (reflectiveResult(self, callee)) return callee;
+            if (reflectiveResult(self, callee) or reflectsParameter(self, callee, position)) return callee;
         }
     }
     return null;
+}
+
+/// The builtins that read a type's fields, layout or tags by reflection.
+const reflective = [_][]const u8{ "@typeInfo", "@field", "@FieldType", "@hasField", "@offsetOf", "@bitOffsetOf", "@tagName" };
+
+/// Whether `function`'s body applies a reflective builtin to its parameter at `position`, as
+/// its first operand (`@typeInfo(T)`, `@field(value, name)`).
+fn reflectsParameter(self: *Context, function: Facts.Decl, position: usize) bool {
+    const tree = &self.project.at(function.file).file.tree;
+    const model = &self.project.at(function.file).model;
+    const record = model.declarations[@backingInt(function.index)];
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, record.node) orelse return false;
+    var parameters = proto.iterate(tree);
+    var index: usize = 0;
+    const name = while (parameters.next()) |parameter| : (index += 1) {
+        if (index == position) break parameter.name_token orelse return false;
+    } else return false;
+    // By its name: Zig refuses a name in the body that shadows a parameter, so an identifier
+    // spelling it there is it.
+    const spelled = tree.tokenSlice(name);
+    if (tree.nodeTag(record.node) != .fn_decl) return false;
+    const body = tree.nodeData(record.node).node_and_node[1];
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
+    for (tree.nodes.items(.tag), 0..) |_, raw| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(raw));
+        const builtin = Facts.builtinName(tree, node) orelse continue;
+        const at = tree.nodeMainToken(node);
+        if (at < first or at > last) continue;
+        const is = for (reflective) |each| {
+            if (std.mem.eql(u8, each, builtin)) break true;
+        } else false;
+        if (!is) continue;
+        var arguments: [2]Ast.Node.Index = undefined;
+        const operands = Facts.builtinArgs(tree, node, &arguments);
+        if (operands.len == 0 or tree.nodeTag(operands[0]) != .identifier) continue;
+        if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(operands[0])), spelled)) return true;
+    }
+    return false;
 }
 
 /// The one of `types` a value is, or points at, through optionals and error unions; of a

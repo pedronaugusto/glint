@@ -303,9 +303,8 @@ fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, problems: *st
         // Its seams and test inputs name paths from its own directory.
         const real = try std.Io.Dir.cwd().realPathFileAlloc(io, path, a);
         result.config.paths_from = std.Io.Dir.path.dirname(real) orelse ".";
-        // And from the working directory, where relative input names start.
-        const here = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", a);
-        result.config.paths_from_relative = try std.Io.Dir.path.relativeAlloc(a, here, null, here, result.config.paths_from.?);
+        // Relative input names are from the working directory.
+        result.config.names_from = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", a);
         result.settings = configured.settings;
         result.package_defaults = configured.package_defaults;
     } else if (arguments.reviewed) {

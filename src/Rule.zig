@@ -154,10 +154,10 @@ pub const Config = struct {
     /// The directory `seams` and `test_inputs` name paths from (the configuration file's): an
     /// input named under it is matched by its path from there.
     paths_from: ?[]const u8 = null,
-    /// The same directory from the working directory the run's relative input names start in
-    /// (`probes/seams`, empty where it is that directory), so a relative name is matched from
-    /// it wherever glint runs.
-    paths_from_relative: ?[]const u8 = null,
+    /// The working directory a relative input name is from, absolute: such a name is resolved
+    /// against it before it is matched from `paths_from`, so a run in the configuration's
+    /// directory, above it or below it (`--config ../glint.json main.zig`) reads one path.
+    names_from: ?[]const u8 = null,
 
     pub const Level = enum { off, report, gate };
     pub const Selection = struct { rule: Rule, level: Level };
@@ -170,7 +170,8 @@ pub const Config = struct {
 
     /// The first seam that holds the input named `name` for the rule named `rule`.
     pub fn seamOf(self: Config, name: []const u8, rule: []const u8) ?usize {
-        const relative = self.fromRoot(name) orelse return null;
+        var buffer: [2 * std.fs.max_path_bytes]u8 = undefined;
+        const relative = self.fromRoot(&buffer, name) orelse return null;
         for (self.seams, 0..) |seam, i| {
             if (!covers(seam.file, seam.module, relative)) continue;
             for (seam.rules) |each| if (std.mem.eql(u8, each, rule)) return i;
@@ -179,20 +180,24 @@ pub const Config = struct {
     }
     /// The first test input entry that holds the input named `name`.
     pub fn testInput(self: Config, name: []const u8) ?usize {
-        const relative = self.fromRoot(name) orelse return null;
+        var buffer: [2 * std.fs.max_path_bytes]u8 = undefined;
+        const relative = self.fromRoot(&buffer, name) orelse return null;
         for (self.test_inputs, 0..) |entry, i| if (covers(entry.path, entry.module, relative)) return i;
         return null;
     }
-    /// `name` from `paths_from`: an absolute name by `paths_from`, a relative one by
-    /// `paths_from_relative`; null where it lies outside that directory, so no entry holds it.
-    /// With no directory, as given.
-    fn fromRoot(self: Config, name: []const u8) ?[]const u8 {
-        if (std.fs.path.isAbsolute(name)) return under(self.paths_from orelse return name, name);
+    /// `name`'s path from `paths_from`, a relative name resolved against `names_from` first,
+    /// in `buffer`; null where it lies outside that directory, so no entry holds it. With no
+    /// directory, as given (`./` aside).
+    fn fromRoot(self: Config, buffer: []u8, name: []const u8) ?[]const u8 {
         var relative = name;
         while (std.mem.startsWith(u8, relative, "./")) relative = relative[2..];
-        const from = self.paths_from_relative orelse return relative;
-        if (std.mem.trimEnd(u8, from, "/").len == 0) return relative;
-        return under(from, relative);
+        const root = self.paths_from orelse return relative;
+        if (std.fs.path.isAbsolute(name)) return under(root, name);
+        const cwd = self.names_from orelse return relative;
+        var fixed: std.heap.FixedBufferAllocator = .init(buffer);
+        // A path longer than any file system holds names no input.
+        const absolute = std.fs.path.resolveAlloc(fixed.allocator(), &.{ cwd, name }) catch return null;
+        return under(root, absolute);
     }
     /// `name`'s path from `root`, where it lies under it.
     fn under(root_raw: []const u8, name: []const u8) ?[]const u8 {
@@ -335,16 +340,24 @@ test "a seam holds a file, a glob of files or a directory for the rules it names
     rooted.paths_from = "/work/pkg/";
     try std.testing.expectEqual(@as(?usize, 0), rooted.seamOf("/work/pkg/src/uring.zig", "A007"));
     try std.testing.expectEqual(@as(?usize, null), rooted.seamOf("/elsewhere/src/uring.zig", "A007"));
-    // A relative name, from a run in another directory, by the configuration's directory from
-    // there (review 8, M11).
-    var elsewhere = rooted;
-    elsewhere.paths_from_relative = "work/pkg";
-    try std.testing.expectEqual(@as(?usize, 0), elsewhere.seamOf("work/pkg/src/uring.zig", "A007"));
-    try std.testing.expectEqual(@as(?usize, 0), elsewhere.seamOf("./work/pkg/src/uring.zig", "P007"));
-    try std.testing.expectEqual(@as(?usize, 1), elsewhere.testInput("work/pkg/src/testing/server.zig"));
-    try std.testing.expectEqual(@as(?usize, null), elsewhere.seamOf("src/uring.zig", "A007"));
-    elsewhere.paths_from_relative = "";
-    try std.testing.expectEqual(@as(?usize, 0), elsewhere.seamOf("./src/uring.zig", "A007"));
+    // A relative name, from a run in the configuration's directory, above it or below it (review 8,
+    // M11): resolved against the working directory, then matched from the configuration's.
+    var above = rooted;
+    above.names_from = "/work";
+    try std.testing.expectEqual(@as(?usize, 0), above.seamOf("pkg/src/uring.zig", "A007"));
+    try std.testing.expectEqual(@as(?usize, 0), above.seamOf("./pkg/src/uring.zig", "P007"));
+    try std.testing.expectEqual(@as(?usize, 1), above.testInput("pkg/src/testing/server.zig"));
+    try std.testing.expectEqual(@as(?usize, null), above.seamOf("src/uring.zig", "A007"));
+    var below = rooted;
+    below.names_from = "/work/pkg/src";
+    try std.testing.expectEqual(@as(?usize, 0), below.seamOf("uring.zig", "A007"));
+    try std.testing.expectEqual(@as(?usize, 1), below.seamOf("backend/kqueue/poll.zig", "A007"));
+    try std.testing.expectEqual(@as(?usize, 1), below.testInput("testing/server.zig"));
+    try std.testing.expectEqual(@as(?usize, 0), below.seamOf("../src/uring.zig", "A007"));
+    try std.testing.expectEqual(@as(?usize, null), below.seamOf("../../other/src/uring.zig", "A007"));
+    var at = rooted;
+    at.names_from = "/work/pkg";
+    try std.testing.expectEqual(@as(?usize, 0), at.seamOf("./src/uring.zig", "A007"));
     // A seam with no reason, both a file and a directory, or no rule is refused.
     const bad = [_]Config.Seam{ .{ .file = "a.zig", .rules = &.{"A007"}, .reason = " " }, .{ .file = "a.zig", .module = "src", .rules = &.{"A007"}, .reason = "r" }, .{ .file = "a.zig", .rules = &.{}, .reason = "r" } };
     for (bad) |seam| try std.testing.expectError(error.InvalidSelection, (Config{ .seams = &.{seam} }).validate());
