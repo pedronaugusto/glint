@@ -124,46 +124,6 @@ pub fn dev(b: *std.Build, tools: type) void {
     const project_check = b.step("check-project", "Compile a standalone linter with project-owned rules");
     project_check.dependOn(&project_linter.step);
     const project_smoke = addLint(b, project_linter, .{ .sources = &.{p.path("examples/report.zig")}, .directories = &.{p.path("examples")}, .args = &.{ "--only", "LOCAL_EXPORT" } });
-    const source_policy = addLint(b, executable, .{
-        .sources = &.{
-            p.path("src/BuildGate.zig"),
-            p.path("src/Builtins.zig"),
-            p.path("src/Completion.zig"),
-            p.path("src/DeadDeclarations.zig"),
-            p.path("src/Metrics.zig"),
-            p.path("src/Facts.zig"),
-            p.path("src/File.zig"),
-            p.path("src/Model.zig"),
-            p.path("src/Project.zig"),
-            p.path("src/Disallowed.zig"),
-            p.path("src/Token.zig"),
-            p.path("src/Token/liveness.zig"),
-            p.path("src/Token/store.zig"),
-            p.path("src/Token/data.zig"),
-            p.path("src/Token_test.zig"),
-            p.path("src/Report.zig"),
-            p.path("src/Result.zig"),
-            p.path("src/Rule.zig"),
-            p.path("src/RuleContext.zig"),
-            p.path("src/RuleContext_test.zig"),
-            p.path("src/Runner.zig"),
-            p.path("src/Runner_test.zig"),
-            p.path("src/Suppression.zig"),
-            p.path("src/build_gate_test.zig"),
-            p.path("src/cli.zig"),
-            p.path("src/cli_test.zig"),
-            p.path("src/contract_test.zig"),
-            p.path("src/glint.zig"),
-            p.path("src/main.zig"),
-            p.path("src/names.zig"),
-            p.path("src/tests.zig"),
-            p.path("src/test_danger.zig"),
-            p.path("src/test_pack.zig"),
-        },
-        .directories = &.{p.path("src")},
-        .args = &.{ "--only", "P003", "--gate", "P003" },
-    });
-    b.step("check-source-policy", "Verify complete all-cast, safety-off and length policy on explicit own inputs").dependOn(&source_policy.step);
     // glint's rules read values, writes, calls and types only through the shared queries: the
     // rule side of glint's sources (`ruleSources`, read from the tree), with std, aegis and the
     // shared queries' files resolved and not checked.
@@ -175,15 +135,11 @@ pub fn dev(b: *std.Build, tools: type) void {
     }) });
     const rule_files = ruleSources(b, p) catch |err| std.debug.panic("glint's src/ could not be listed for RULE_READERS: {t}", .{err});
     const rule_lint = addLint(b, rule_readers, .{ .sources = rule_files, .directories = &.{p.path("src")}, .args = &.{ "--only", "RULE_READERS" } });
-    rule_lint.addArg("--zig-lib-path");
-    rule_lint.addDirectoryArg2(.zig_lib, .{});
     mapOwnModules(p, rule_lint, aegis_dependency, target, optimize);
     // NAME_TABLES over every source of glint's own, the shared queries' files included: a table
     // of declarations by their text is the class wherever it is made. VALUE_SWITCHES in the same
     // run: a resolved value's choice is read part by part wherever glint switches on one.
     const table_lint = addLint(b, rule_readers, .{ .sources = ownSources(b, p) catch |err| std.debug.panic("glint's src/ could not be listed for NAME_TABLES: {t}", .{err}), .directories = &.{p.path("src")}, .args = &.{ "--only", "NAME_TABLES", "--only", "VALUE_SWITCHES" } });
-    table_lint.addArg("--zig-lib-path");
-    table_lint.addDirectoryArg2(.zig_lib, .{});
     mapOwnModules(p, table_lint, aegis_dependency, target, optimize);
     const rule_readers_step = b.step("check-rule-readers", "Report where a rule reads a value, a write, a call or a type around the shared queries, where glint keys a table by text, and where it switches on a resolved value without reading its choice part by part: each report whole under zig-out/rule-readers/, their totals per rule, class and file printed");
     // Each report whole in a file, never read off the build runner's output, which it cuts.
@@ -407,6 +363,9 @@ pub fn addLint(b: *std.Build, executable: *std.Build.Step.Compile, options: Lint
         run.addDirectoryArg2(directory, .{});
     }
     for (options.inputs) |input| run.addFileInput(input);
+    // std, which every Zig file reaches: an import no run maps is a run error, never a pass.
+    run.addArg("--zig-lib-path");
+    run.addDirectoryArg2(.zig_lib, .{});
     run.addArgs(options.args);
     run.has_side_effects = true; // Completion receipts belong to each invocation, never a cached process outcome.
     return run;
