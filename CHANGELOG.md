@@ -25,6 +25,12 @@ closed construct list. In short, for a configuration written for 0.7:
   declaration the program reaches; enum literals and struct-init labels spell nothing, nor does a computed
   `@field` (over a governed holder it is the reflection finding, once). A package names its governed internal
   fields `<package>_<name>`.
+- **Hygiene reports only what it shows:** P008 is hygiene, no longer a ban. P008 reports two ids only where
+  their types resolve to one integer in every build, and P009 only an escape it follows to a local; a type that
+  does not resolve, a choice that meets the other's in some build, or a pointer whose reach is not read is
+  silent, where each was reported ("may be one integer", "cannot be shown not to point into the frame"). A rule
+  a package declares as hygiene over `.governed` is silent on a reference it cannot resolve, as one over
+  `.replaces` already was.
 - **One home for seams:** `glint.json` holds seams, test inputs (exempting for every caller) and options;
   preflight passes it through and keeps only `rules` in its own `glint` block. `--fix` also rewrites 0.7's
   `// unreachable: <why>` into `// glint-ignore: Z026 -- <why>`.
