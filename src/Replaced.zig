@@ -127,12 +127,18 @@ fn applies(c: *Context, entry: Entry, node: Ast.Node.Index) Context.Error!bool {
     return true;
 }
 
-/// Whether `node` is an argument of a call of one of `entry`'s answers (`Secret(T)`).
+/// Whether `node` is an argument of a call of one of `entry`'s answers (`Secret(T)`), or names
+/// a member of the target that is one (`owner.makeOrError(T.generate, args)`: the target's maker,
+/// handed to the answer that makes it in place).
 fn answerArgument(c: *Context, entry: Entry, node: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
     var at = node;
     var parent = model.parentOf(at) orelse return false;
+    if (tree.nodeTag(parent) == .field_access and tree.nodeData(parent).node_and_token[0] == at) {
+        at = parent;
+        parent = model.parentOf(at) orelse return false;
+    }
     while (tree.nodeTag(parent) == .grouped_expression) {
         at = parent;
         parent = model.parentOf(at) orelse return false;
