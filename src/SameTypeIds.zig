@@ -15,8 +15,8 @@ const Ast = std.zig.Ast;
 /// declaration uses (`pub const Link = Edge;`), a public signature's (an anonymous struct
 /// parameter) or what a reached type function returns. Two names are one integer when their
 /// types resolve to it, or are spelled the same and are an integer whatever a build chooses
-/// (`const Id = if (wide) u64 else u32`); a type that does not resolve, or a choice that may
-/// meet the other's, is a finding: it cannot be shown to be another.
+/// (`const Id = if (wide) u64 else u32`). P008 is hygiene: a type that does not resolve, or a
+/// choice that meets the other's only in some build, is not shown to be one, and is silent.
 pub fn check(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
@@ -51,10 +51,6 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
             try kinds.append(c.allocator, kind);
         }
         const pair = meet(names.items, kinds.items) orelse continue;
-        if (pair.same == .maybe) {
-            try c.at(rule, pair.second, try c.allocator.print("fields '{s}' and '{s}' identify, and their types may be one integer: one may be stored for the other", .{ tree.tokenSlice(pair.first), tree.tokenSlice(pair.second) }));
-            continue;
-        }
         try c.at(rule, pair.second, try c.allocator.print("fields '{s}' and '{s}' are both {s} that identify: one may be stored for the other; a distinct type for each (an enum, or a package's id type) keeps them apart", .{ tree.tokenSlice(pair.first), tree.tokenSlice(pair.second), pair.kind }));
     }
 }
@@ -74,7 +70,6 @@ fn signature(c: *Context, rule: Rule, tree: *const Ast, proto: Ast.full.FnProto,
         try kinds.append(c.allocator, kind);
     }
     const pair = meet(names.items, kinds.items) orelse return;
-    if (pair.same == .maybe) return c.at(rule, at, try c.allocator.print("'{s}' and '{s}' identify, and their types may be one integer: one may be passed for the other", .{ tree.tokenSlice(pair.first), tree.tokenSlice(pair.second) }));
     try c.at(rule, at, try c.allocator.print("'{s}' and '{s}' are both {s} that identify: one may be passed for the other; a distinct type for each (an enum, or a package's id type) keeps them apart", .{ tree.tokenSlice(pair.first), tree.tokenSlice(pair.second), pair.kind }));
 }
 
@@ -115,29 +110,20 @@ fn kindOf(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!?Ki
     }
 }
 
-/// The first two names that are one integer, or else the first two that may be (`.maybe`).
-fn meet(names: []const Ast.TokenIndex, kinds: []const Kind) ?struct { first: Ast.TokenIndex, second: Ast.TokenIndex, kind: []const u8, same: enum { yes, maybe } } {
-    var maybe: ?[2]usize = null;
-    for (kinds, 0..) |kind, i| for (kinds[0..i], 0..) |earlier, j| switch (oneInteger(earlier, kind)) {
-        .yes => return .{ .first = names[j], .second = names[i], .kind = if (kind.integers.len == 1) kind.integers[0] else kind.spelled, .same = .yes },
-        .maybe => if (maybe == null) {
-            maybe = .{ j, i };
-        },
-        .no => {},
+/// The first two names that are one integer in every build.
+fn meet(names: []const Ast.TokenIndex, kinds: []const Kind) ?struct { first: Ast.TokenIndex, second: Ast.TokenIndex, kind: []const u8 } {
+    for (kinds, 0..) |kind, i| for (kinds[0..i], 0..) |earlier, j| {
+        if (oneInteger(earlier, kind)) return .{ .first = names[j], .second = names[i], .kind = if (kind.integers.len == 1) kind.integers[0] else kind.spelled };
     };
-    const pair = maybe orelse return null;
-    return .{ .first = names[pair[0]], .second = names[pair[1]], .kind = kinds[pair[1]].spelled, .same = .maybe };
+    return null;
 }
 
-/// Whether two types are one integer in every build, may be in some, or never are.
-fn oneInteger(a: Kind, b: Kind) enum { yes, maybe, no } {
-    if (a.all and b.all) {
-        if (std.mem.eql(u8, a.spelled, b.spelled)) return .yes;
-        if (a.integers.len == 1 and b.integers.len == 1 and std.mem.eql(u8, a.integers[0], b.integers[0])) return .yes;
-    }
-    if (a.unknown or b.unknown) return .maybe;
-    for (a.integers) |x| for (b.integers) |y| if (std.mem.eql(u8, x, y)) return .maybe;
-    return .no;
+/// Whether two types are one integer in every build: spelled alike and an integer whatever a
+/// build chooses, or each the one same integer.
+fn oneInteger(a: Kind, b: Kind) bool {
+    if (!a.all or !b.all) return false;
+    if (std.mem.eql(u8, a.spelled, b.spelled)) return true;
+    return a.integers.len == 1 and b.integers.len == 1 and std.mem.eql(u8, a.integers[0], b.integers[0]);
 }
 
 /// Which of a file's declarations at container level code outside the file may reach (by

@@ -5,5 +5,22 @@
         // a type is comptime-only: no builtin moves one through memory
         .memory,
     },
-    .open = .{},
+    .open = .{
+        // P008 is hygiene, reporting only pairs one integer in every build (8c): an id whose
+        // integer a build chooses meets the other only in the build that picks it
+        "branch/r8-a16-choice_meets/hole.zig",
+        // P008 reports only what resolves (8c): an `if` capture of a configured optional type is
+        // not resolved, so the ids' integer is not shown
+        "capture/mx-configured_type/hole.zig",
+        // P008 reports only what resolves (8c): a comptime type parameter is an integer only at
+        // the calls that give one
+        "compile_time/mx-generic_ids/hole.zig",
+        // P008 reports only what resolves (8c): an `anytype` id is whatever a caller gives
+        "compile_time/r8-a16-anytype_ids/hole.zig",
+        // P008 reports only what resolves (8c): an `@Int` width an operator computes is not read
+        "operator/mx-width_product/hole.zig",
+        // P008 reports only what resolves (8c): a configured optional type's `orelse` and `.?` are
+        // not resolved, so the ids' integer is not shown
+        "unwrap/mx-optional_type/hole.zig",
+    },
 }
