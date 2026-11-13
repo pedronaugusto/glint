@@ -372,7 +372,7 @@ const Reader = struct {
 
     /// `.{ .type = T, .internal = .{ .field, ... }, .exits = .{ .member, ... } }`, both lists
     /// optional (a type alone is governed for the cast and reflection ban): each name a member of
-    /// every container `T` is, never a spelling at a use site.
+    /// at least one container `T` is, governed on each that has it; never a spelling at a use site.
     fn governedType(r: *Reader, file: Project.FileId, node: Ast.Node.Index) Error!void {
         const t = r.tree(file);
         var buffer: [2]Ast.Node.Index = undefined;
@@ -402,8 +402,10 @@ const Reader = struct {
         try r.governance.append(r.facts.gpa, entry);
     }
 
-    /// Each enum literal of the list at `node` as a member of every one of `containers`, of the
-    /// kind asked: a name one lacks is unresolved, one of another kind malformed.
+    /// Each enum literal of the list at `node` as a member of each of `containers` that has it, of
+    /// the kind asked: a type function's forms differ (SlotPool's keyed form holds fields its
+    /// indexed one does not), so a name is governed on every form that has it, unresolved where
+    /// none does, and malformed where one has it as another kind.
     fn namedMembers(r: *Reader, file: Project.FileId, node: ?Ast.Node.Index, containers: []const Facts.Container, kind: enum { field, function }) Error![]const Facts.Decl {
         var found: std.ArrayList(Facts.Decl) = .empty;
         for (try r.list(file, node orelse return &.{}) orelse return &.{}) |each| {
@@ -417,22 +419,23 @@ const Reader = struct {
                 try r.problem(file, each, .internal_name);
                 continue;
             }
+            // A type that resolved to no container is its own problem, reported where it is written.
+            if (containers.len == 0) continue;
+            const before = found.items.len;
             for (containers) |container| {
-                const decl = r.facts.member(container, name) orelse {
-                    try r.problem(file, each, .unresolved);
-                    break;
-                };
+                const decl = r.facts.member(container, name) orelse continue;
                 const record = r.facts.project.at(decl.file).model.declarations[@backingInt(decl.index)];
                 const fits = switch (kind) {
                     .field => record.kind == .field,
                     .function => record.kind == .function,
                 };
                 if (!fits) {
+                    found.shrinkRetainingCapacity(before);
                     try r.problem(file, each, .malformed);
                     break;
                 }
                 try found.append(r.facts.gpa, decl);
-            }
+            } else if (found.items.len == before) try r.problem(file, each, .unresolved);
         }
         return found.toOwnedSlice(r.facts.gpa);
     }
@@ -1118,6 +1121,46 @@ test "what a version 2 root cannot name is a problem where it is written, one ea
             return err;
         };
         try std.testing.expectEqual(case[1], rules.problems[0].why);
+    }
+}
+
+test "a type function's governed name is one at least one of its forms has, governed on each that has it; a name on none is unresolved, one of another kind on any form malformed" {
+    const head =
+        \\fn Keyed(comptime T: type) type {
+        \\    return struct { pkg_value: T, pkg_key: u32, pkg_mixed: u8 };
+        \\}
+        \\fn Indexed(comptime T: type) type {
+        \\    return struct {
+        \\        pkg_value: T,
+        \\        pub fn pkg_mixed() void {}
+        \\    };
+        \\}
+        \\pub fn Pool(comptime T: type, comptime keyed: bool) type {
+        \\    return if (keyed) Keyed(T) else Indexed(T);
+        \\}
+        \\
+    ;
+    for ([_]struct { []const u8, ?Problem.Why, usize }{
+        // pkg_value on both forms, pkg_key's field on the keyed one alone.
+        .{ ".internal = .{ .pkg_value, .pkg_key }", null, 3 },
+        .{ ".internal = .{ .pkg_value, .pkg_none }", .unresolved, 2 },
+        // A field where a function is asked, on the one form that has it.
+        .{ ".exits = .{.pkg_key}", .malformed, 0 },
+        // A field on the keyed form, a function on the indexed one: another kind on a form that has it.
+        .{ ".internal = .{.pkg_mixed}", .malformed, 0 },
+    }) |case| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ head, "pub const lint_rules = .{ .version = 2, .governed = .{.{ .type = Pool, ", case[0], " }} };\n" });
+        defer std.testing.allocator.free(source);
+        var f: Fixture = undefined;
+        try f.init(&.{.{ .name = "pkg/root.zig", .package = "pkg", .fingerprint = 7, .bytes = source }}, &.{});
+        defer f.deinit();
+        const rules = try of(&f.facts, f.project.sources[0].id);
+        errdefer std.debug.print("case: {s}\n", .{case[0]});
+        try std.testing.expectEqual(@as(usize, if (case[1] == null) 0 else 1), rules.problems.len);
+        if (case[1]) |why| try std.testing.expectEqual(why, rules.problems[0].why);
+        try std.testing.expectEqual(@as(usize, 1), rules.governance.len);
+        try std.testing.expectEqual(@as(usize, 2), rules.governance[0].containers.len);
+        try std.testing.expectEqual(case[2], rules.governance[0].internal.len + rules.governance[0].exits.len);
     }
 }
 

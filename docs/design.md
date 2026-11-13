@@ -135,7 +135,9 @@ declaration.
 - `.governed`: `.{ .type = T, .internal = .{ .field, ... }, .exits = .{ .member, ... } }`. `T` is a declaration,
   or `.{ .generic = F, .member = .Name }` for every instance of a type function's member. Every internal field
   is named `<package>_<name>` (aegis's `aegis_state`), so a reference glint cannot resolve still names the field;
-  one without the prefix is a malformed entry in the declarer.
+  one without the prefix is a malformed entry in the declarer. A type function's forms may differ (one returns
+  `Keyed` or `Indexed` by an option): each name is a member of at least one form and is governed on every form
+  that has it; a name on no form is unresolved, and one some form holds as another kind is malformed.
 - `.replaces`: `.{ .rule, <target>, .held = .field (optional), .with, .drop_in (optional), .why }`. The target is exactly one of:
   - `.decl = D`;
   - `.members = C, .except = .{...}` (every function declared directly in `C`, so a new one is caught);
