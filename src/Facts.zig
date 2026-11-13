@@ -9763,15 +9763,38 @@ pub fn typeFunctionOf(self: *Facts, function: Decl) ResolveError!?Decl {
 /// methods are the alias's.
 pub fn onSurface(self: *Facts, file: Project.FileId, scope: Model.Scope.Id) ResolveError!bool {
     const model = &self.project.at(file).model;
+    const tree = &self.project.at(file).file.tree;
+    // The innermost container around `scope`: what a public constant would have to hold.
+    var inner: ?Model.Scope.Id = null;
     var at: ?Model.Scope.Id = scope;
-    while (at) |s| : (at = model.scopes[@backingInt(s)].parent) {
-        if (model.scopes[@backingInt(s)].kind != .container) continue;
-        const holder = model.containerHolder(model.scopes[@backingInt(s)].node) orelse continue;
-        const decl = model.declarations[@backingInt(holder)];
-        if (decl.public or decl.exported) continue;
-        return self.aliasedOnSurface(file, s);
-    }
+    while (at) |s| : (at = model.scopes[@backingInt(s)].parent) switch (model.scopes[@backingInt(s)].kind) {
+        .container => {
+            if (inner == null) inner = s;
+            const holder = model.containerHolder(model.scopes[@backingInt(s)].node) orelse continue;
+            const decl = model.declarations[@backingInt(holder)];
+            if (decl.public or decl.exported) continue;
+            return self.aliasedOnSurface(file, s);
+        },
+        // A container a function makes (a type function's `return struct { ... }`) is the
+        // function's: off the surface where the function is private, but where a public constant
+        // holds it.
+        .function => {
+            const decl = functionOfScope(model, tree, model.scopes[@backingInt(s)].node) orelse continue;
+            if (decl.public or decl.exported) continue;
+            return if (inner) |container| self.aliasedOnSurface(file, container) else false;
+        },
+        else => {},
+    };
     return true;
+}
+
+/// The function declaration whose body is the function scope at `node`, by its prototype.
+fn functionOfScope(model: *const Model, tree: *const Ast, node: Ast.Node.Index) ?Model.Declaration {
+    var at = node;
+    while (tree.nodeTag(at) != .fn_decl) at = model.parentOf(at) orelse return null;
+    const proto = tree.nodeData(at).node_and_node[0];
+    for (model.declarations) |decl| if (decl.kind == .function and decl.node == proto) return decl;
+    return null;
 }
 
 /// Whether a public constant the surface reaches holds the container whose scope is `scope`.

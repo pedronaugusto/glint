@@ -6,7 +6,6 @@
         // The rule reads a type written by name in the signature.
         .branch,
         .call,
-        .compile_time,
         .conversion,
         .field,
         .jump,
