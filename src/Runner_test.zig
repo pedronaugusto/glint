@@ -974,7 +974,7 @@ fn dropInFixed(a: std.mem.Allocator, program: []const u8, findings: usize) ![]co
     return program;
 }
 
-test "A013's drop-in fix writes each call with the answer and its condition as written, an alias with every call through it, and the import the file lacks" {
+test "A013's drop-in fix writes each call with the answer and its condition as written, an alias with every call through it, and the import the file lacks, dropping the one whose last use it rewrote" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const program =
@@ -992,9 +992,9 @@ test "A013's drop-in fix writes each call with the answer and its condition as w
         \\    3); return x; }
         \\
     ;
+    // std's every use is a call the fix rewrites: its import goes with them.
     const fixed =
         \\//! doc
-        \\const std = @import("std");
         \\const aegis = @import("aegis");
         \\const assert = aegis.assert.invariant;
         \\pub fn a(x: u8) u8 {
@@ -1013,11 +1013,16 @@ test "A013's drop-in fix writes each call with the answer and its condition as w
     try std.testing.expectEqualStrings(fixed, try dropInFixed(arena.allocator(), program, 2));
 }
 
-test "A013's drop-in fix spells the answer through the file's own import of the package, under its name" {
+test "A013's drop-in fix spells the answer through the file's own import of the package, under its name; an import still used elsewhere stays" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const program = "const std = @import(\"std\");\nconst contract = @import(\"aegis\");\npub fn f(x: u8) void { std.debug.assert(x > 1); }\n";
-    try std.testing.expectEqualStrings("const std = @import(\"std\");\nconst contract = @import(\"aegis\");\npub fn f(x: u8) void { contract.assert.invariant(x > 1, \"x > 1\"); }\n", try dropInFixed(arena.allocator(), program, 1));
+    try std.testing.expectEqualStrings("const contract = @import(\"aegis\");\npub fn f(x: u8) void { contract.assert.invariant(x > 1, \"x > 1\"); }\n", try dropInFixed(arena.allocator(), program, 1));
+    // std's other use keeps it; a public import is the file's surface, kept whatever the fix rewrote.
+    const used = "const std = @import(\"std\");\nconst contract = @import(\"aegis\");\npub fn f(x: u8) void { std.debug.assert(x > 1); }\npub const D = std.debug;\n";
+    try std.testing.expectEqualStrings("const std = @import(\"std\");\nconst contract = @import(\"aegis\");\npub fn f(x: u8) void { contract.assert.invariant(x > 1, \"x > 1\"); }\npub const D = std.debug;\n", try dropInFixed(arena.allocator(), used, 1));
+    const public = "pub const std = @import(\"std\");\nconst contract = @import(\"aegis\");\npub fn f(x: u8) void { std.debug.assert(x > 1); }\n";
+    try std.testing.expectEqualStrings("pub const std = @import(\"std\");\nconst contract = @import(\"aegis\");\npub fn f(x: u8) void { contract.assert.invariant(x > 1, \"x > 1\"); }\n", try dropInFixed(arena.allocator(), public, 1));
 }
 
 test "A013's drop-in fix leaves an alias used other than by a call, and its sites, as they are; a name the file declares keeps the import out" {

@@ -79,6 +79,8 @@ pub fn check(c: *Context, definition: Rule.Definition) Context.Error!void {
     var sites: std.ArrayList(Governed.Site) = .empty;
     var unread: std.ArrayList(Governed.Unread) = .empty;
     try Governed.sitesLeaving(c, governed.items, &sites, &unread);
+    const Found = struct { site: Governed.Site, entry: Entry, fix: []const Report.Edit };
+    var found: std.ArrayList(Found) = .empty;
     for (sites.items) |site| {
         const entry = all[site.index];
         // A use through an alias the run reports is no second site: the alias is, where it
@@ -86,7 +88,15 @@ pub fn check(c: *Context, definition: Rule.Definition) Context.Error!void {
         if (site.through_alias) continue;
         if (!try applies(c, entry, site.node)) continue;
         const fix = if (entry.replacement.drop_in) |drop_in| try dropInFix(c, entry, drop_in, site, sites.items) else &.{};
-        try c.atDefinitionFixed(definition.id, site.token, try message(c, entry), site.decl, fix);
+        try found.append(c.allocator, .{ .site = site, .entry = entry, .fix = fix });
+    }
+    // An import whose every use the fixes rewrite goes with them, made once however many carry it.
+    var rewritten: std.ArrayList(Report.Edit) = .empty;
+    for (found.items) |each| try rewritten.appendSlice(c.allocator, each.fix);
+    const unused = try importsLeftUnused(c, rewritten.items);
+    for (found.items) |each| {
+        const fix = if (each.fix.len == 0 or unused.len == 0) each.fix else try std.mem.concat(c.allocator, Report.Edit, &.{ each.fix, unused });
+        try c.atDefinitionFixed(definition.id, each.site.token, try message(c, each.entry), each.site.decl, fix);
     }
     // Under a ban, a reference spelling a target's name that does not resolve cannot be shown
     // not to be it: a finding. A hygiene rule reports only what it resolves.
@@ -226,6 +236,52 @@ fn dropInFix(c: *Context, entry: Entry, drop_in: PackageRules.Replacement.DropIn
     try edits.append(c.allocator, replacing(tree, site.node, spelled.path));
     if (drop_in.message) try edits.append(c.allocator, (try messageArgument(c, tree, call)) orelse return &.{});
     return edits.items;
+}
+
+/// The removal of each private container-level `@import` declaration of the checked file that
+/// is used, and only inside what `edits` replace: the fixes rewrite its last use, and Zig refuses
+/// an unused one. Its whole line goes where it holds the declaration alone.
+fn importsLeftUnused(c: *Context, edits: []const Report.Edit) Context.Error![]const Report.Edit {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    const root = c.facts.rootOf(c.file);
+    var out: std.ArrayList(Report.Edit) = .empty;
+    for (model.declarations, 0..) |record, i| {
+        if (record.kind != .variable or record.scope != root.scope or record.public) continue;
+        if (importSpelling(c, tree, record.node) == null) continue;
+        const id: Model.Declaration.Id = @fromBackingInt(@intCast(i));
+        var used = false;
+        const kept = for (model.references) |reference| {
+            if (reference.declaration != id or reference.node == record.node) continue;
+            used = true;
+            const at = tree.tokenToSpan(tree.firstToken(reference.node)).start;
+            const inside = for (edits) |edit| {
+                if (edit.start < edit.end and edit.start <= at and at < edit.end) break true;
+            } else false;
+            if (!inside) break true;
+        } else false;
+        if (kept or !used) continue;
+        try out.append(c.allocator, wholeLine(tree, record.node));
+    }
+    return out.items;
+}
+
+/// The edit removing a container-level declaration: its line, newline included, where the line
+/// holds nothing else; else the declaration's own tokens.
+fn wholeLine(tree: *const Ast, node: Ast.Node.Index) Report.Edit {
+    const bytes = tree.source;
+    var start = tree.tokenToSpan(tree.firstToken(node)).start;
+    // The `;` after a variable declaration is its last token's next.
+    var end = tree.tokenToSpan(tree.lastToken(node) + 1).end;
+    var line_start = start;
+    while (line_start > 0 and (bytes[line_start - 1] == ' ' or bytes[line_start - 1] == '\t')) line_start -= 1;
+    var line_end = end;
+    while (line_end < bytes.len and (bytes[line_end] == ' ' or bytes[line_end] == '\t')) line_end += 1;
+    if ((line_start == 0 or bytes[line_start - 1] == '\n') and (line_end == bytes.len or bytes[line_end] == '\n')) {
+        start = line_start;
+        end = if (line_end < bytes.len) line_end + 1 else line_end;
+    }
+    return .{ .start = start, .end = end, .text = "" };
 }
 
 /// How the checked file spells an answer: a path from an import of the declaring package, and
