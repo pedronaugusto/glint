@@ -4,6 +4,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Breaking
+
 0.8.0. glint reports two kinds of rule, bans and hygiene, and proves nothing: a run ends in findings, reports
 or a run error that says what glint could not read. The proof engines are gone, and with them the "undecided"
 result and the compiled aegis pack; aegis declares its own rules. docs/design.md lists every rule's claim and
@@ -28,8 +30,6 @@ closed construct list. In short, for a configuration written for 0.7:
   `// unreachable: <why>` into `// glint-ignore: Z026 -- <why>`.
 - **Run errors** in place of undecided coverage: a file that does not parse, an unmapped import, a P003 exception
   or P006 entry naming nothing.
-
-### Breaking
 
 - The rules a package declares in `lint_rules` version 2 run on generic engines, and glint names no package's rule: one that reads `.replaces` reports a reference, builtin, extern symbol or held field type resolving into an entry's target; one that reads `.governed` a touch of an internal field (read, write, literal, field builtin) and any cast or reflection over a governed type; one that reads `.exits` (hygiene) an exit's result given straight to arithmetic, a comparison or `@intCast`/`@truncate`. Outside the declaring package and outside a seam; under a ban a reference spelling a target's name that does not resolve is a finding.
 - The compiled aegis pack is gone, and glint names no package: aegis declares A001, A004, A007-A009, A011-A013, A015 and A021 itself; A010, A012 (input-sized work) and A020 went with the flow engine; A014, A016 and A019 are glint's own P009 (a pointer into the frame carried out of the call), P008 (identifying integers of one type) and P007 (operations Zig leaves unchecked). P007 also bans std's raw OS and C bindings (`std.c`, `std.os.linux`, `std.os.windows`), `@extern`, `noalias`, `@setFloatMode(.optimized)`, arithmetic on and indexing of many-item and C pointers, and `std.mem.bytesAsValue`/`bytesAsSlice`. The old suite columns are retired; each rule aegis declares has one reported site and one it must not report against the pinned aegis.
@@ -79,7 +79,7 @@ closed construct list. In short, for a configuration written for 0.7:
 
 - A table's own id is read by its structure, never its name: a non-exhaustive `enum(Repr) { _ }` declared directly in a container whose values a table of that container's values is indexed by (`t[@backingInt(id)]`). Such an index is within the table only where every make of that id in the program (`@fromBackingInt`, `@enumFromInt`) counts the table's entries; where one does not, or one is made by `@bitCast` or `@ptrCast` or by a conversion whose type does not resolve, the position is undecided, neither cleared nor a finding by the id's shape. An id of a container no table of which it indexes is no table's: making it from an integer is no A009 site.
 - `zig build check-rule-readers` (development) reads every rule-side source, from the tree: all of `src/` but the test roots, the files the layer table puts in the layers that hold no rules, and the shared query `Governed` (ci/layer_files.zig, which layers.zig reads too), so a new file is counted unless it is placed outside the rules. Each report is installed whole under `zig-out/rule-readers/` and their totals per rule, class and file are printed: the build runner cut the report it printed, so counts read off it were short.
-- aegis pinned at 688eb2b, its line with `lint_rules` version 2 (its rules declared, governed internal fields named `aegis_<name>`), and preflight (development) at `wip/vocab-6-2` 132fb17, which reads `glint.json` and passes it through.
+- aegis pinned at 688eb2b, its line with `lint_rules` version 2 (its rules declared, governed internal fields named `aegis_<name>`), and preflight (development) at `wip/vocab-8-2` 19a952ac, which reads `glint.json` and passes it through and binds an import each module that compiles the file binds, generated modules included.
 
 ### Fixed
 - Z012 reads a type function's value argument (a function, a constant) by its type, never by its declaration's name, which no signature a user writes names: `pub const File = OwnedIo(Io.File, closeFile)` with a private `closeFile` of a public function type is no site; a private constant whose type is a private struct still is, as it comes back through the result's API. A type argument is read as before (`List(Entry)` with a private `Entry` is a site).
