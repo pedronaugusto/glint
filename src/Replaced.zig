@@ -139,7 +139,9 @@ fn answerArgument(c: *Context, entry: Entry, node: Ast.Node.Index) Context.Error
         at = parent;
         parent = model.parentOf(at) orelse return false;
     }
-    while (tree.nodeTag(parent) == .grouped_expression) {
+    // A branch of a choice the argument is (`Secret(if (seeded) [n]u8 else T)`): the type handed
+    // to the answer either way.
+    while (tree.nodeTag(parent) == .grouped_expression or isBranchOf(tree, parent, at)) {
         at = parent;
         parent = model.parentOf(at) orelse return false;
     }
@@ -163,6 +165,12 @@ fn isAnswer(entry: Entry, decl: Facts.Decl) bool {
     return false;
 }
 
+/// Whether `child` is the then or else result of the `if` at `parent`, never its condition.
+fn isBranchOf(tree: *const Ast, parent: Ast.Node.Index, child: Ast.Node.Index) bool {
+    const branch = tree.fullIf(parent) orelse return false;
+    return branch.ast.then_expr == child or branch.ast.else_expr.unwrap() == child;
+}
+
 /// Whether `node`, a type, is an operand of `==` or `!=`: a comparison of types, which holds no
 /// value of either.
 fn typeComparison(c: *Context, node: Ast.Node.Index) Context.Error!bool {
@@ -178,10 +186,14 @@ fn typeComparison(c: *Context, node: Ast.Node.Index) Context.Error!bool {
         .equal_equal, .bang_equal => {},
         else => return false,
     }
-    return switch (try c.facts.resolve(c.file, at)) {
-        .container => true,
-        else => false,
+    // Zig compares a type only with a type: one operand that is one makes the comparison one of
+    // types, the other a type too, where it does not resolve (`K.SecretKey` of a comptime `K`).
+    const lhs, const rhs = tree.nodeData(parent).node_and_node;
+    for ([_]Ast.Node.Index{ lhs, rhs }) |operand| switch (try c.facts.resolve(c.file, operand)) {
+        .container => return true,
+        else => {},
     };
+    return false;
 }
 
 /// The function, or else the container-level declaration, that holds `node`.
