@@ -379,7 +379,7 @@ fn oldReason(self: *Context, token: Ast.TokenIndex) RunError!?[]const Report.Edi
 /// Whether a handler is written empty, parentheses aside: a block (labeled or not) whose every
 /// statement is empty by this list or is `_ = X` of a `quiet` X; `@as(void, h)` of an empty `h`
 /// (Zig 0.17 refuses `void{}`); an `if` (a missing `else` empty) or a `switch` whose condition is `quiet` and
-/// every branch or prong empty; `return`, `break` or `continue` with no operand.
+/// every branch or prong empty, one prong at least; `return`, `break` or `continue` with no operand.
 fn emptyHandler(tree: *const Ast, written: Ast.Node.Index) bool {
     const node = ungrouped(tree, written);
     var buffer: [2]Ast.Node.Index = undefined;
@@ -410,6 +410,10 @@ fn emptyHandler(tree: *const Ast, written: Ast.Node.Index) bool {
         },
         .@"switch", .switch_comma => {
             const choice = tree.fullSwitch(node).?; // unreachable: the node is a switch
+            // A switch with no prongs compiles only over a type with no values: no error reaches
+            // it, so it drops none (`catch |err| switch (err) {}` over `error{}`, the compiler's
+            // proof that nothing fails).
+            if (choice.ast.cases.len == 0) return false;
             if (!quiet(tree, choice.ast.condition)) return false;
             for (choice.ast.cases) |case| if (!emptyHandler(tree, tree.fullSwitchCase(case).?.ast.target_expr)) return false; // unreachable: a switch's cases are prongs
             return true;

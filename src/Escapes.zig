@@ -280,8 +280,8 @@ const Walk = struct {
     /// Whether a value of `file` is one the program compiles in, so a `const` holding it is
     /// static memory: a literal (a number, a character, a string, an enum literal, an array or
     /// struct literal of such values, a concatenation of them), `comptime x`, `true`, `false`,
-    /// `null`, a comptime parameter, a declaration of a file or container, a local `const` of
-    /// such a value, arithmetic and negation of such values, and a call of an `inline fn` given
+    /// `null`, a comptime parameter, a `comptime` variable, a declaration of a file or container,
+    /// a local `const` of such a value, arithmetic and negation of such values, and a call of an `inline fn` given
     /// only such values (`std.math.inf(T)`, which Zig evaluates as it compiles).
     fn compiledIn(self: Walk, file: Project.FileId, written: Ast.Node.Index, depth: u8) Context.Error!bool {
         if (depth == 8) return false;
@@ -345,6 +345,9 @@ const Walk = struct {
             .function, .field, .capture => return false,
         }
         const holder = tree.fullVarDecl(record.node) orelse return false;
+        // A `comptime var` or `comptime const` lives as the program compiles: what it holds is
+        // compiled in, and a const copied from it is too (lookout's `sep`, 8i).
+        if (holder.comptime_token != null) return true;
         if (tree.tokenTag(holder.ast.mut_token) != .keyword_const) return false;
         switch (model.scopes[@backingInt(record.scope)].kind) {
             .file, .container => return true,
