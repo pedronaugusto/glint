@@ -94,6 +94,10 @@ pub fn check(c: *Context, definition: Rule.Definition) Context.Error!void {
         // A field's name as a union's tag tested (`op == .net_read`, a prong `.net_read =>`)
         // asks what the union holds and makes no value of the field: not a site.
         if (entry.replacement.target == .field and tagTest(c, site.node)) continue;
+        // std's assert evaluated as the program compiles (a `comptime` block, or a `comptime`
+        // call) fails as a compile error, never as undefined behaviour in a fast build: what
+        // A013 replaces it for. Not a site (visor's layout checks, 8i).
+        if (try replacesAssert(c, entry) and atComptime(c, site.node)) continue;
         if (!try applies(c, entry, site.node)) continue;
         const fix = if (entry.replacement.drop_in) |drop_in| try dropInFix(c, entry, drop_in, site, sites.items) else &.{};
         try found.append(c.allocator, .{ .site = site, .entry = entry, .fix = fix });
@@ -218,6 +222,26 @@ fn tagTest(c: *Context, node: Ast.Node.Index) bool {
         } else false,
         else => false,
     };
+}
+
+/// Whether `entry` replaces std's `debug.assert`.
+fn replacesAssert(c: *Context, entry: Entry) Context.Error!bool {
+    for (entry.replacement.declarations()) |decl| if (try Governed.isStd(c, decl, "debug.assert") == .yes) return true;
+    return false;
+}
+
+/// Whether `node` is evaluated only as the program compiles: inside a `comptime` block or
+/// expression, within its function if it has one.
+fn atComptime(c: *Context, node: Ast.Node.Index) bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    var up = model.parentOf(node);
+    while (up) |parent| : (up = model.parentOf(parent)) switch (tree.nodeTag(parent)) {
+        .@"comptime" => return true,
+        .fn_decl => return false,
+        else => {},
+    };
+    return false;
 }
 
 /// The function, or else the container-level declaration, that holds `node`.
