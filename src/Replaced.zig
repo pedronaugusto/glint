@@ -91,6 +91,9 @@ pub fn check(c: *Context, definition: Rule.Definition) Context.Error!void {
         // comparison of types (`T != U`) makes no value. Neither is a site; a parameter, field,
         // local, result type or call naming the target is.
         if (try answerArgument(c, entry, site.node) or try typeComparison(c, site.node)) continue;
+        // A field's name as a union's tag tested (`op == .net_read`, a prong `.net_read =>`)
+        // asks what the union holds and makes no value of the field: not a site.
+        if (entry.replacement.target == .field and tagTest(c, site.node)) continue;
         if (!try applies(c, entry, site.node)) continue;
         const fix = if (entry.replacement.drop_in) |drop_in| try dropInFix(c, entry, drop_in, site, sites.items) else &.{};
         try found.append(c.allocator, .{ .site = site, .entry = entry, .fix = fix });
@@ -194,6 +197,27 @@ fn typeComparison(c: *Context, node: Ast.Node.Index) Context.Error!bool {
         else => {},
     };
     return false;
+}
+
+/// Whether `node`, an enum literal, is a tag tested: an operand of `==` or `!=`, or an item of a
+/// switch prong.
+fn tagTest(c: *Context, node: Ast.Node.Index) bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    if (tree.nodeTag(node) != .enum_literal) return false;
+    var at = node;
+    var parent = model.parentOf(at) orelse return false;
+    while (tree.nodeTag(parent) == .grouped_expression) {
+        at = parent;
+        parent = model.parentOf(at) orelse return false;
+    }
+    return switch (tree.nodeTag(parent)) {
+        .equal_equal, .bang_equal => true,
+        .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline => for (tree.fullSwitchCase(parent).?.ast.values) |item| {
+            if (item == at) break true;
+        } else false,
+        else => false,
+    };
 }
 
 /// The function, or else the container-level declaration, that holds `node`.

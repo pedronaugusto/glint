@@ -367,34 +367,28 @@ const Walk = struct {
     }
 
     /// Whether a local's fields and elements live in it: its type, written or of its value, is
-    /// no pointer Zig would dereference. A type the reading does not know may be a value.
+    /// known, and no pointer Zig would dereference. A type the reading does not know may be a
+    /// pointer (a slice an allocator made, through a generic context): not shown, so none.
     fn value(self: Walk, d: Model.Declaration.Id) Context.Error!bool {
-        // A value where any build's type is one, or one not known.
+        // A value where any build's type is one known to be.
         const typed = try self.typeOf(d);
         var each: Facts.Join = .{};
         for (Facts.valueParts(&typed)) |part| each.add(part, switch (part) {
             .pointer => false,
-            .alternatives => null, // a choice, never a part (valueParts): not known
+            .unknown, .alternatives => null, // not known (a choice is never a part: valueParts)
             else => true,
         });
-        return each.any() orelse true;
+        return each.any() orelse false;
     }
 
     /// Whether a local is an array a slice of which is its frame's memory: its type, written
-    /// or of its value, is an array, or one the reading does not know but for a local its value
-    /// makes a pointer (`Facts.makesPointer`).
+    /// or of its value, is one. A type the reading does not know may be a slice (what an
+    /// allocator made, through a generic context): not shown, so none.
     fn array(self: Walk, d: Model.Declaration.Id) Context.Error!bool {
-        // Made a pointer (`@ptrFromInt`, a pointer cast), it is one whatever its type spells.
-        const unknown = if (self.tree.fullVarDecl(self.model.declarations[@backingInt(d)].node)) |decl|
-            !(if (decl.ast.init_node.unwrap()) |init| self.c.facts.makesPointer(self.c.file, init) else false)
-        else
-            true;
         // An array where any build's type is one.
         const typed = try self.typeOf(d);
         for (Facts.valueParts(&typed)) |part| switch (part) {
             .array => return true,
-            // A choice, which valueParts never gives as a part, is read as one not known.
-            .unknown, .alternatives => if (unknown) return true,
             else => {},
         };
         return false;
