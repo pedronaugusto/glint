@@ -49,11 +49,25 @@ fn execute(init: std.process.Init, gate: Gate) !u8 {
     init.io.random(&random);
     const nonce = std.fmt.bytesToHex(&random, .lower);
     const receipt_path = try std.Io.Dir.path.join(a, &.{ gate.scratch, &nonce });
-    defer std.Io.Dir.cwd().deleteFile(init.io, receipt_path) catch {}; // glint-ignore: Z026 -- scratch receipt removal is best effort after its verified consumption
+    // The record goes whatever the run gave. Where both fail, the run's failure is the one told.
+    const verdict = judge(init, gate, receipt_path, &nonce);
+    const removal = std.Io.Dir.cwd().deleteFile(init.io, receipt_path);
+    const status = try verdict;
+    removal catch |err| switch (err) {
+        // A linter that ends before it writes its record leaves none; the verdict says so.
+        error.FileNotFound => {},
+        else => return err,
+    };
+    return status;
+}
+/// The linter's run under `gate`, its record written to `receipt_path` under `nonce`, and the
+/// verdict on it: 0 accepted, 1 findings, 2 the tool's failure.
+fn judge(init: std.process.Init, gate: Gate, receipt_path: []const u8, nonce: []const u8) !u8 {
+    const a = init.arena.allocator();
     // The record is asked for first, so a line the linter refuses still leaves one; the
     // report is JSON whatever the arguments ask, as the check reads it.
     var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(a, &.{ gate.linter, "--result", receipt_path, "--run-id", &nonce });
+    try argv.appendSlice(a, &.{ gate.linter, "--result", receipt_path, "--run-id", nonce });
     try argv.appendSlice(a, gate.arguments);
     try argv.appendSlice(a, &.{ "--format", "json" });
     const result = try std.process.run(a, init.io, .{ .argv = argv.items, .stdout_limit = .limited(128 * 1024 * 1024), .stderr_limit = .limited(1024 * 1024) });
@@ -71,5 +85,5 @@ fn execute(init: std.process.Init, gate: Gate) !u8 {
     var errors = std.Io.File.stderr().writerStreaming(init.io, &stderr_buffer);
     errors.interface.writeAll(result.stderr) catch return errors.err orelse error.WriteFailed;
     errors.interface.flush() catch return errors.err orelse error.WriteFailed;
-    return if (try accepted(a, receipt, &nonce, status, result.stdout)) 0 else if (status >= 2) 2 else 1;
+    return if (try accepted(a, receipt, nonce, status, result.stdout)) 0 else if (status >= 2) 2 else 1;
 }
