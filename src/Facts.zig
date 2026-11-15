@@ -7911,6 +7911,13 @@ pub fn lengthOfValue(self: *Facts, value: Value, name: []const u8) ResolveError!
     }
 }
 
+/// The width an integer type's name spells (`u8`, `i0`, `u65535`); null for any other name,
+/// `usize` and `isize` among them, whose width the build chooses.
+fn intBits(name: []const u8) ?u16 {
+    if (name.len < 2 or (name[0] != 'u' and name[0] != 'i')) return null;
+    return std.fmt.parseInt(u16, name[1..], 10) catch null;
+}
+
 /// Whether a value of `value`'s type takes room: a known primitive wider than zero bits, a
 /// pointer to such, an optional, an error, or a container with a field (two for an enum)
 /// that takes room. What does not resolve may take none.
@@ -7918,7 +7925,7 @@ fn sized(self: *Facts, value: Value, depth: usize) ResolveError!bool {
     if (depth > 4) return false;
     switch (value) {
         .primitive => |p| {
-            if (p.len > 1 and (p[0] == 'u' or p[0] == 'i')) if (std.fmt.parseInt(u16, p[1..], 10)) |bits| return bits > 0 else |_| {}; // glint-ignore: Z026 -- no integer type's name (usize, isize): the names below decide it
+            if (intBits(p)) |bits| return bits > 0;
             for ([_][]const u8{ "bool", "usize", "isize", "f16", "f32", "f64", "f80", "f128", "c_char", "c_short", "c_ushort", "c_int", "c_uint", "c_long", "c_ulong", "c_longlong", "c_ulonglong", "c_longdouble", "anyerror" }) |one| if (std.mem.eql(u8, p, one)) return true;
             return false;
         },
