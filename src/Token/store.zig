@@ -1,8 +1,8 @@
 //! Private standard-token identities and decoded source slices.
 const std = @import("std");
 pub const Token = struct {
-    ptr: [*]const u8,
-    length: u32,
+    /// The token's spelling: a string's contents, an escaped name decoded, else its source bytes.
+    spelling: []const u8,
     offset: u32,
     tag: std.zig.Token.Tag,
     link: u32 = 0,
@@ -16,8 +16,7 @@ pub const Token = struct {
         };
     }
     pub inline fn text(t: Token) []const u8 {
-        // glint-ignore: P007 -- a token holds its text as a pointer and a 32-bit length, half a slice's width; both come from one byte slice where it is made (`init`)
-        return t.ptr[0..t.length];
+        return t.spelling;
     }
     pub inline fn partner(t: Token) u32 {
         return t.link;
@@ -41,7 +40,7 @@ pub const Token = struct {
         return lexer.next().tag;
     }
     pub inline fn init(tag: std.zig.Token.Tag, bytes: []const u8, start: usize, finish: usize) Token {
-        return .{ .ptr = bytes.ptr, .length = @intCast(bytes.len), .offset = @intCast(start), .link = @intCast(finish - start), .tag = tag };
+        return .{ .spelling = bytes, .offset = @intCast(start), .link = @intCast(finish - start), .tag = tag };
     }
     pub inline fn initEscaped(bytes: []const u8, start: usize, finish: usize) Token {
         return init(.identifier, bytes, start, finish);
