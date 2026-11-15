@@ -1,5 +1,7 @@
 const std = @import("std");
 const glint = @import("glint");
+/// What a suppression's comment opens with, the rules it names following it.
+const ignore = "// " ++ glint.suppression_keyword ++ ": ";
 const own: glint.Rule = @fromBackingInt(1000); // safe: this project owns its validated extension identity.
 const rule: glint.ProjectRule = .{ .definition = .{ .id = own, .name = "CUSTOM_API", .group = .family_policy, .purpose = "project requires a declared contract", .version = 7 }, .check = check };
 fn check(context: *glint.RuleContext) glint.RuleContext.Error!void {
@@ -18,7 +20,7 @@ fn configuration(level: glint.Config.Level) glint.Config {
     } };
 }
 test "G2 compiled project rules share metadata rendering and written site suppression" {
-    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "pub const bad = 1;\n// glint-ignore: CUSTOM_API -- boundary exports this intentional constant\npub const allowed = 2;" }}, &.{}, .{});
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "pub const bad = 1;\n" ++ ignore ++ "CUSTOM_API -- boundary exports this intentional constant\npub const allowed = 2;" }}, &.{}, .{});
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, configuration(.report), .{ .project_rules = &.{rule} });
     defer report.deinit();
@@ -62,7 +64,7 @@ fn repeating(context: *glint.RuleContext) glint.RuleContext.Error!void {
     };
 }
 test "G2 a finding is one per rule, site and cause, however many times its rule reaches it, with the related places of each" {
-    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "pub const bad = 1;\n// glint-ignore: CUSTOM_API -- boundary exports this intentional constant\npub const allowed = 2;" }}, &.{}, .{});
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "pub const bad = 1;\n" ++ ignore ++ "CUSTOM_API -- boundary exports this intentional constant\npub const allowed = 2;" }}, &.{}, .{});
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, configuration(.report), .{ .project_rules = &.{.{ .definition = rule.definition, .check = repeating }} });
     defer report.deinit();
@@ -77,7 +79,7 @@ test "G2 a finding is one per rule, site and cause, however many times its rule 
     try std.testing.expect(repeated.related[0].start != repeated.related[1].start);
 }
 test "G2 a project rule's run error leaves the run incomplete with every finding allowed" {
-    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "// glint-ignore: CUSTOM_API -- intentionally exported test contract\npub const allowed = 2;" }}, &.{}, .{});
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = ignore ++ "CUSTOM_API -- intentionally exported test contract\npub const allowed = 2;" }}, &.{}, .{});
     defer project.deinit();
     var modified = rule;
     modified.check = uncertain;
@@ -98,14 +100,14 @@ test "G2 a project rule's run error leaves the run incomplete with every finding
 }
 test "a project linter skips a suppression for a rule glint has that its run does not enable; a rule glint does not have is malformed, and an enabled rule's unused suppression is stale" {
     // P007 and Z013 are off: neither suppression is judged.
-    var inactive = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "pub fn f(buffer: []u8) void {\n    // glint-ignore: P007 -- read only below what it wrote\n    _ = buffer;\n    // glint-ignore: Z013 -- the deprecated name is kept for one release\n    _ = buffer;\n}\n" }}, &.{}, .{});
+    var inactive = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "pub fn f(buffer: []u8) void {\n    " ++ ignore ++ "P007 -- read only below what it wrote\n    _ = buffer;\n    " ++ ignore ++ "Z013 -- the deprecated name is kept for one release\n    _ = buffer;\n}\n" }}, &.{}, .{});
     defer inactive.deinit();
     var skipped = try glint.runConfigured(std.testing.allocator, &inactive, configuration(.report), .{ .project_rules = &.{rule} });
     defer skipped.deinit();
     try std.testing.expectEqual(@as(usize, 0), skipped.malformed.len); // safe: no malformed comment.
     try std.testing.expectEqual(@as(usize, 0), skipped.stale_suppressions); // safe: a rule that does not run judges nothing.
     // A rule no core, pack or project has: malformed, as before.
-    var unknown = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "pub fn f(buffer: []u8) void {\n    // glint-ignore: A999 -- read only below what it wrote\n    _ = buffer;\n}\n" }}, &.{}, .{});
+    var unknown = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "pub fn f(buffer: []u8) void {\n    " ++ ignore ++ "A999 -- read only below what it wrote\n    _ = buffer;\n}\n" }}, &.{}, .{});
     defer unknown.deinit();
     var refused = try glint.runConfigured(std.testing.allocator, &unknown, configuration(.report), .{ .project_rules = &.{rule} });
     defer refused.deinit();
@@ -113,7 +115,7 @@ test "a project linter skips a suppression for a rule glint has that its run doe
     try std.testing.expectEqualStrings("a suppression names a rule glint does not have", refused.malformed[0].why);
     try std.testing.expect(!refused.complete);
     // The project's own rule runs: its suppression that suppresses nothing is stale.
-    var enabled = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "// glint-ignore: CUSTOM_API -- the boundary exports this constant\nconst kept = 2;\npub fn f() u32 {\n    return kept;\n}\n" }}, &.{}, .{});
+    var enabled = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = ignore ++ "CUSTOM_API -- the boundary exports this constant\nconst kept = 2;\npub fn f() u32 {\n    return kept;\n}\n" }}, &.{}, .{});
     defer enabled.deinit();
     var stale = try glint.runConfigured(std.testing.allocator, &enabled, configuration(.report), .{ .project_rules = &.{rule} });
     defer stale.deinit();

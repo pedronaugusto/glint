@@ -1,6 +1,8 @@
 //! Public contracts: allocation failures, arbitrary parser input and rendering.
 const std = @import("std");
 const glint = @import("glint");
+/// What a suppression's comment opens with, the rules it names following it.
+const ignore = "// " ++ glint.suppression_keyword ++ ": ";
 const shakedown = @import("shakedown");
 
 test "contract allocation failures release project and report owners" {
@@ -57,7 +59,7 @@ test "contract a float std's lowering cannot read is refused, not lowered" {
 }
 
 test "contract JSON and SARIF preserve stable IDs and reasoned suppressions" {
-    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "fixture", .bytes = "const one = @import(\"one\");\n// glint-ignore: Z013 -- test-only retained declaration\nconst two = @import(\"two\");" }}, &.{}, .{});
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "fixture", .bytes = "const one = @import(\"one\");\n" ++ ignore ++ "Z013 -- test-only retained declaration\nconst two = @import(\"two\");" }}, &.{}, .{});
     defer project.deinit();
     var report = try glint.run(std.testing.allocator, &project, .{});
     defer report.deinit();

@@ -5,6 +5,21 @@ const std = @import("std");
 const glint = @import("glint");
 const sources = @import("aegis_sources");
 
+/// `text` with each `@ignore` written as the word a suppression opens with
+/// (`glint.suppression_keyword`), so a fixture reads as the file it stands for. Called at
+/// compile time.
+fn suppressed(comptime text: []const u8) []const u8 {
+    @setEvalBranchQuota(64 * text.len + 1000);
+    const placeholder = "@ignore";
+    var out: []const u8 = "";
+    var rest = text;
+    while (std.mem.find(u8, rest, placeholder)) |at| {
+        out = out ++ rest[0..at] ++ glint.suppression_keyword;
+        rest = rest[at + placeholder.len ..];
+    }
+    return out ++ rest;
+}
+
 /// std as 0.17 lays out what the rules name, and nothing else.
 const std_files = [_]sources.Extra{
     .{ .name = "std/std.zig", .bytes =
@@ -314,7 +329,7 @@ fn expect(rule: glint.Rule, program: []const u8, findings: usize) !void {
 }
 
 test "P007 finds the unchecked operations, a cast nested in another once, a suppression covering one, never an address read or the interface-recovery idiom" {
-    try expect(.P007,
+    try expect(.P007, comptime suppressed(
         \\extern fn write(fd: c_int) c_int;
         \\const Sink = struct { interface: u64, n: u32 };
         \\fn of(w: *u64) *Sink {
@@ -325,11 +340,11 @@ test "P007 finds the unchecked operations, a cast nested in another once, a supp
         \\    const q: *u8 = @constCast(p);
         \\    const r: *u32 = @ptrCast(@alignCast(q));
         \\    _ = r;
-        \\    const s: *u8 = @ptrFromInt(a); // glint-ignore: P007 -- an address the kernel hands back
+        \\    const s: *u8 = @ptrFromInt(a); // @ignore: P007 -- an address the kernel hands back
         \\    _ = s;
         \\    return @intFromPtr(p);
         \\}
-    , 4);
+    ), 4);
 }
 
 test "Z006 leaves a type std's type function gives alone; a labeled block's value is a value" {
@@ -520,28 +535,28 @@ fn fixedBy(rules: []const glint.Rule, program: []const u8, record: []const u8) !
 }
 
 test "the fix drops from a suppression each rule that ran and met no site under it, keeping its reason, and removes one naming none left; a rule that did not run stays" {
-    const program =
+    const program = comptime suppressed(
         \\pub fn a(p: usize) *u8 {
-        \\    return @ptrFromInt(p); // glint-ignore: P007, P008 -- the device register
+        \\    return @ptrFromInt(p); // @ignore: P007, P008 -- the device register
         \\}
         \\pub fn b() u8 {
-        \\    return 1; // glint-ignore: P007 -- nothing here now
+        \\    return 1; // @ignore: P007 -- nothing here now
         \\}
         \\pub fn c() u8 {
-        \\    // glint-ignore: P007 -- nothing below now
+        \\    // @ignore: P007 -- nothing below now
         \\    return 2;
         \\}
         \\pub fn d() u8 {
-        \\    return 3; // glint-ignore: Z026 -- a rule this run does not run
+        \\    return 3; // @ignore: Z026 -- a rule this run does not run
         \\}
         \\
-    ;
+    );
     const out = try fixedBy(&.{ .P007, .P008 }, program, "");
     defer std.testing.allocator.free(out.bytes);
     try std.testing.expectEqual(@as(usize, 3), out.stale);
-    try std.testing.expectEqualStrings(
+    try std.testing.expectEqualStrings(comptime suppressed(
         \\pub fn a(p: usize) *u8 {
-        \\    return @ptrFromInt(p); // glint-ignore: P007 -- the device register
+        \\    return @ptrFromInt(p); // @ignore: P007 -- the device register
         \\}
         \\pub fn b() u8 {
         \\    return 1;
@@ -550,18 +565,18 @@ test "the fix drops from a suppression each rule that ran and met no site under 
         \\    return 2;
         \\}
         \\pub fn d() u8 {
-        \\    return 3; // glint-ignore: Z026 -- a rule this run does not run
+        \\    return 3; // @ignore: Z026 -- a rule this run does not run
         \\}
         \\
-    , out.bytes);
+    ), out.bytes);
 }
 
 test "one suppression names each rule it covers on its line, one site each; the aegis escape form is malformed" {
-    var project = try sources.projectWithSources(std.testing.allocator,
-        \\pub fn f(parent_id: u32, child_id: u32) *u8 { return @ptrFromInt(parent_id + child_id); } // glint-ignore: P007, P008 -- the board's two register ids
-        \\pub fn g(parent_id: u32, child_id: u32) *u8 { return @ptrFromInt(parent_id + child_id); } // glint-ignore: P007 -- only the conversion
+    var project = try sources.projectWithSources(std.testing.allocator, comptime suppressed(
+        \\pub fn f(parent_id: u32, child_id: u32) *u8 { return @ptrFromInt(parent_id + child_id); } // @ignore: P007, P008 -- the board's two register ids
+        \\pub fn g(parent_id: u32, child_id: u32) *u8 { return @ptrFromInt(parent_id + child_id); } // @ignore: P007 -- only the conversion
         \\pub fn h(a: usize) *u8 { return @ptrFromInt(a); } // aegis: boundary(A019): the old form
-    , &std_files, &std_imports);
+    ), &std_files, &std_imports);
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{ .{ .rule = .P007, .level = .gate }, .{ .rule = .P008, .level = .gate } } }, .{});
     defer report.deinit();
@@ -574,7 +589,7 @@ test "one suppression names each rule it covers on its line, one site each; the 
     try std.testing.expect(!report.complete);
 }
 
-test "the fix rewrites the aegis escape into glint-ignore under today's names, names an older one from a run's record and leaves one no record names, and removes one naming only a rule that went" {
+test "the fix rewrites the aegis escape into a suppression under today's names, names an older one from a run's record and leaves one no record names, and removes one naming only a rule that went" {
     const program =
         \\pub fn a(p: usize) *u8 {
         \\    return @ptrFromInt(p); // aegis: internal(A019, A014): the page the kernel hands back
@@ -598,12 +613,12 @@ test "the fix rewrites the aegis escape into glint-ignore under today's names, n
     ;
     const out = try fixedBy(&.{.P007}, program, "glint: escape: consumer:5:28: boundary: the device register (A019)\n");
     defer std.testing.allocator.free(out.bytes);
-    try std.testing.expectEqualStrings(
+    try std.testing.expectEqualStrings(comptime suppressed(
         \\pub fn a(p: usize) *u8 {
-        \\    return @ptrFromInt(p); // glint-ignore: P007, P009 -- internal: the page the kernel hands back
+        \\    return @ptrFromInt(p); // @ignore: P007, P009 -- internal: the page the kernel hands back
         \\}
         \\pub fn b(p: usize) *u8 {
-        \\    return @ptrFromInt(p); // glint-ignore: P007 -- boundary: the device register
+        \\    return @ptrFromInt(p); // @ignore: P007 -- boundary: the device register
         \\}
         \\pub fn c(p: usize) *u8 {
         \\    return @ptrFromInt(p);
@@ -615,10 +630,10 @@ test "the fix rewrites the aegis escape into glint-ignore under today's names, n
         \\    return @ptrFromInt(p);
         \\}
         \\pub fn g(p: usize) *u8 {
-        \\    return @ptrFromInt(p); // glint-ignore: P007 -- design: one removed, one renamed
+        \\    return @ptrFromInt(p); // @ignore: P007 -- design: one removed, one renamed
         \\}
         \\
-    , out.bytes);
+    ), out.bytes);
     // A record line that names an escape and is not one is refused.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -670,10 +685,10 @@ test "the fix writes 0.7's reason on a catch unreachable as Z026's suppression; 
     ;
     const out = try fixedBy(&.{.Z026}, program, "");
     defer std.testing.allocator.free(out.bytes);
-    try std.testing.expectEqualStrings(
+    try std.testing.expectEqualStrings(comptime suppressed(
         \\fn g() !void {}
         \\pub fn a() void {
-        \\    g() catch unreachable; // glint-ignore: Z026 -- g fails on nothing here
+        \\    g() catch unreachable; // @ignore: Z026 -- g fails on nothing here
         \\}
         \\pub fn b() void {
         \\    g() catch unreachable;
@@ -682,11 +697,11 @@ test "the fix writes 0.7's reason on a catch unreachable as Z026's suppression; 
         \\    g() catch unreachable; g() catch unreachable; // unreachable: both checked by the caller
         \\}
         \\pub fn d() void {
-        \\    // glint-ignore: Z026 -- the reason on the line before, 0.7's other form
+        \\    // @ignore: Z026 -- the reason on the line before, 0.7's other form
         \\    g() catch unreachable;
         \\}
         \\
-    , out.bytes);
+    ), out.bytes);
 }
 
 test "P007 reads @setRuntimeSafety on the build mode in each mode: off where the build keeps the checks, a finding on anything it cannot decide" {

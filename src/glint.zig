@@ -23,6 +23,9 @@ pub const Report = @import("Report.zig");
 pub const run = @import("Runner.zig").run;
 /// A run's fixes applied: each file's bytes after them.
 pub const Fix = @import("Fix.zig");
+/// The word a suppression opens with: `// <suppression_keyword>: <rule>, ... -- <reason>`, on its
+/// site's line or the line before.
+pub const suppression_keyword = @import("Suppression.zig").keyword;
 test {
     _ = @import("File.zig");
     _ = @import("Model.zig");

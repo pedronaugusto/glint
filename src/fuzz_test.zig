@@ -31,10 +31,10 @@ test "fuzz: suppression and escape comments" {
         }
     };
     try std.testing.fuzz({}, Target.one, .{ .corpus = &.{
-        "// glint-ignore: Z026 -- the reason\nfn f() void {}\n",
-        "pub fn f() void {} // glint-ignore: Z026, P006 -- two rules\n",
+        Suppression.opening ++ "Z026 -- the reason\nfn f() void {}\n",
+        "pub fn f() void {} " ++ Suppression.opening ++ "Z026, P006 -- two rules\n",
         "// aegis: design(A019): a reason\nconst x = 1;\n",
-        "// glint-ignore\n// glint-ignore: -- \n// aegis:\n",
+        "// " ++ Suppression.keyword ++ "\n" ++ Suppression.opening ++ "-- \n// aegis:\n",
     } });
 }
 

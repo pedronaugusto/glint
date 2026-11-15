@@ -8,6 +8,7 @@ const names = @import("names.zig");
 const Ast = std.zig.Ast;
 const Context = @import("RuleContext.zig");
 const Report = @import("Report.zig");
+const Suppression = @import("Suppression.zig");
 const DeadDeclarations = @import("DeadDeclarations.zig");
 const Disallowed = @import("Disallowed.zig");
 const Governed = @import("Governed.zig");
@@ -354,9 +355,9 @@ fn traps(tree: *const Ast, written: Ast.Node.Index, depth: u8) bool {
 }
 
 /// The edit that rewrites a `// unreachable: <why>` comment, 0.7's reason for a `catch
-/// unreachable`, on `token`'s line or alone on the line before it (0.7's two forms), as `//
-/// glint-ignore: Z026 -- <why>`; none where the site's line holds another such site, which one
-/// suppression cannot name, so the reason is its owner's to place.
+/// unreachable`, on `token`'s line or alone on the line before it (0.7's two forms), as Z026's
+/// suppression with `<why>` its reason; none where the site's line holds another such site, which
+/// one suppression cannot name, so the reason is its owner's to place.
 fn oldReason(self: *Context, token: Ast.TokenIndex) RunError!?[]const Report.Edit {
     const file = self.project.at(self.file).file;
     const line = file.line(file.tree.tokenStart(token));
@@ -374,7 +375,7 @@ fn oldReason(self: *Context, token: Ast.TokenIndex) RunError!?[]const Report.Edi
         const why = std.mem.trim(u8, std.mem.cutPrefix(u8, text, "// unreachable:") orelse continue, " \t");
         if (why.len == 0) return null;
         const fix = try self.allocator.alloc(Report.Edit, 1);
-        fix[0] = .{ .start = comment.start, .end = comment.end, .text = try self.allocator.print("// glint-ignore: Z026 -- {s}", .{why}) };
+        fix[0] = .{ .start = comment.start, .end = comment.end, .text = try self.allocator.print(Suppression.opening ++ "Z026 -- {s}", .{why}) };
         return fix;
     }
     return null;

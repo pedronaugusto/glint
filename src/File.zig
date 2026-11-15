@@ -222,7 +222,7 @@ test "front end invalid syntax and lowering are distinct" {
 }
 
 test "comment parser rejects string lookalikes" {
-    var file = try init(std.testing.allocator, "const s = \"// glint-ignore: Z013 -- fake\"; // real\n// next\n", .{});
+    var file = try init(std.testing.allocator, "const s = \"// fake: a comment in a string\"; // real\n// next\n", .{});
     defer file.deinit();
     try std.testing.expectEqual(@as(usize, 2), file.comments.len); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expectEqualStrings("// real", file.source[file.comments[0].start..file.comments[0].end]);

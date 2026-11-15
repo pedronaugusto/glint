@@ -1,6 +1,8 @@
 //! Compatibility contracts use complete contrasting source inputs and stable IDs.
 const std = @import("std");
 const glint = @import("glint");
+/// What a suppression's comment opens with, the rules it names following it.
+const ignore = "// " ++ glint.suppression_keyword ++ ": ";
 
 fn check(rule: glint.Rule, source: []const u8, expected: usize) !void {
     // Each module the fixture imports by name is an empty file of the run: an import no mapping
@@ -107,7 +109,7 @@ test "compatibility Z024 reports bytes exceeding the configured boundary" {
 }
 
 test "compatibility strict stale suppressions and exhausted facts are incomplete" {
-    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "// glint-ignore: Z013 -- stale regression site\npub const x = 1;" }}, &.{}, .{});
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = ignore ++ "Z013 -- stale regression site\npub const x = 1;" }}, &.{}, .{});
     defer project.deinit();
     var config: glint.Config = .{ .strict_suppressions = true };
     var report = try glint.run(std.testing.allocator, &project, config);
@@ -153,7 +155,7 @@ test "each file's analysis has its own fact budget" {
 }
 
 test "a suppression that meets a second site of its rule on its line is malformed there, and hides neither site" {
-    var project = try glint.Project.init(std.testing.allocator, &.{ .{ .name = "root", .bytes = "const a = @import(\"a\"); const b = @import(\"b\"); // glint-ignore: Z013 -- one site only\n" }, .{ .name = "a", .bytes = "", .selected = false }, .{ .name = "b", .bytes = "", .selected = false } }, &.{ .{ .from = 0, .spelling = "a", .target = 1 }, .{ .from = 0, .spelling = "b", .target = 2 } }, .{});
+    var project = try glint.Project.init(std.testing.allocator, &.{ .{ .name = "root", .bytes = "const a = @import(\"a\"); const b = @import(\"b\"); " ++ ignore ++ "Z013 -- one site only\n" }, .{ .name = "a", .bytes = "", .selected = false }, .{ .name = "b", .bytes = "", .selected = false } }, &.{ .{ .from = 0, .spelling = "a", .target = 1 }, .{ .from = 0, .spelling = "b", .target = 2 } }, .{});
     defer project.deinit();
     var report = try glint.run(std.testing.allocator, &project, .{});
     defer report.deinit();
@@ -305,9 +307,9 @@ test "Z026 a test block is exempt by where it is written; a function or file onl
 
 test "G2 Z026 family reason policy includes cleanup" {
     try check(.Z026, "fn fallible() error{Failure}!void {} pub fn f() void { fallible() catch {}; defer fallible() catch {}; errdefer fallible() catch {}; }", 3);
-    try check(.Z026, "fn fallible() error{Failure}!void {}\npub fn f() void { fallible() catch unreachable; } // glint-ignore: Z026 -- the input is checked above\n", 0);
-    try check(.Z026, "fn fallible() error{Failure}!void {}\npub fn f() void { fallible() catch {}; } // glint-ignore: Z026 -- best-effort cleanup; no recovery available\n", 0);
-    try check(.Z026, "const text = \"catch {} // glint-ignore: Z026 -- fake\"; pub fn f() void { _ = text; }", 0);
+    try check(.Z026, "fn fallible() error{Failure}!void {}\npub fn f() void { fallible() catch unreachable; } " ++ ignore ++ "Z026 -- the input is checked above\n", 0);
+    try check(.Z026, "fn fallible() error{Failure}!void {}\npub fn f() void { fallible() catch {}; } " ++ ignore ++ "Z026 -- best-effort cleanup; no recovery available\n", 0);
+    try check(.Z026, "const text = \"catch {} " ++ ignore ++ "Z026 -- fake\"; pub fn f() void { _ = text; }", 0);
     // A discarded error is a result nobody read: a correctness finding.
     try std.testing.expectEqual(.correctness, glint.Rule.Z026.group());
 }
@@ -390,7 +392,7 @@ test "G2 Z012 family API report respects public aliases receivers and suppressio
     try check(.Z012, "const Hidden = struct {}; const Sink = struct { pub fn complete(s: *Sink, h: *Hidden) void { _ = s; _ = h; } };", 0);
     try check(.Z012, "const Hidden = struct {}; pub const Api = struct { const Sink = struct { pub fn take() Hidden { return .{}; } }; };", 0);
     try check(.Z012, "const Hidden = struct {}; pub const Api = struct { pub fn take() Hidden { return .{}; } };", 1);
-    try check(.Z012, "const Hidden = struct {};\n// glint-ignore: Z012 -- inference-only factory intentionally hides representation\npub fn create() Hidden { return .{}; }", 0);
+    try check(.Z012, "const Hidden = struct {};\n" ++ ignore ++ "Z012 -- inference-only factory intentionally hides representation\npub fn create() Hidden { return .{}; }", 0);
 }
 
 test "Z012 reads the type a signature writes by name, through its written wrappers" {
@@ -417,7 +419,7 @@ test "Z012 reads the type a signature writes by name, through its written wrappe
 test "G2 amended policies are explicit family choices and count suppressed sites" {
     try std.testing.expect(!(@as(glint.Config, .{})).has(.Z012)); // safe: select the default configuration type for this policy assertion.
     try std.testing.expect(!(@as(glint.Config, .{})).has(.Z026)); // safe: select the default configuration type for this policy assertion.
-    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "policy", .bytes = "const Hidden = struct {};\n// glint-ignore: Z012 -- inference-only factory\npub fn create() Hidden { return .{}; }", .exported = true }}, &.{}, .{});
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "policy", .bytes = "const Hidden = struct {};\n" ++ ignore ++ "Z012 -- inference-only factory\npub fn create() Hidden { return .{}; }", .exported = true }}, &.{}, .{});
     defer project.deinit();
     var config = glint.Config.none();
     config.set(.Z012, true);
@@ -431,7 +433,7 @@ test "D001 counts every spelling of a private name in its file as a use" {
     try check(.D001, "fn unused() void {} pub fn live() void {}", 1);
     try check(.D001, "const S = struct { fn read(self: S) u8 { _ = self; return 1; } }; pub fn live(s: S) u8 { return s.read(); }", 0);
     try check(.D001, "const S = struct { const needed = 1; }; pub fn live() void { _ = @field(S, \"needed\"); }", 0);
-    try check(.D001, "fn retained() void {}\n// glint-ignore: D001 -- deliberate fixture declaration tests unused-name reporting\nfn unused() void {}\npub fn live() void { retained(); }", 0);
+    try check(.D001, "fn retained() void {}\n" ++ ignore ++ "D001 -- deliberate fixture declaration tests unused-name reporting\nfn unused() void {}\npub fn live() void { retained(); }", 0);
     // A declaration literal names the declaration through its result type.
     try check(.D001, "const S = struct { x: u8, const empty: S = .{ .x = 0 }; }; pub fn live() u8 { const s: S = .empty; return s.x; }", 0);
     // A use only tests make is a use.

@@ -6,6 +6,7 @@ const Report = @import("Report.zig");
 const RuleContext = @import("RuleContext.zig");
 const Runner = @import("Runner.zig");
 const Fix = @import("Fix.zig");
+const Suppression = @import("Suppression.zig");
 const Result = @import("Result.zig");
 const aegis = @import("aegis");
 const ensign = @import("ensign");
@@ -277,7 +278,7 @@ pub const Arguments = struct {
         .name = "glint",
         .version = release.version,
         .about = "A linter for Zig on Zig's own parser and semantic form",
-        .description = "Explicit files only: no path patterns, no build.zig execution. The rules start from Z003 and Z013, or from --only, --reviewed or --config (--only beside --config runs only its rules under the configuration's policy); --report, --gate and --disable then set a rule's level. The rules a package the files import declares in its lint_rules join the run, each on by its own default. A caller that wants the run's record names it first: --result FILE --run-id ID. Suppress one site with // glint-ignore: Z013 -- written reason. Exit: 0 complete and clean; 1 findings; 2 input, tool or incomplete analysis.",
+        .description = "Explicit files only: no path patterns, no build.zig execution. The rules start from Z003 and Z013, or from --only, --reviewed or --config (--only beside --config runs only its rules under the configuration's policy); --report, --gate and --disable then set a rule's level. The rules a package the files import declares in its lint_rules join the run, each on by its own default. A caller that wants the run's record names it first: --result FILE --run-id ID. Suppress one site with " ++ Suppression.opening ++ "Z013 -- written reason. Exit: 0 complete and clean; 1 findings; 2 input, tool or incomplete analysis.",
         .options = .{
             .files = .{ .positional = true, .value_name = "FILE", .hint = .file, .help = "A file to check" },
             .only = .{ .value_name = "ID", .section = "Rules", .help = "Check only this rule, repeated, at report level" },

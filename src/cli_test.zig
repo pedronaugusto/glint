@@ -1,6 +1,8 @@
 //! Completed-run evidence is separate from analysis coverage and process status.
 const std = @import("std");
 const glint = @import("glint");
+/// What a suppression's comment opens with, the rules it names following it.
+const ignore = "// " ++ glint.suppression_keyword ++ ": ";
 const cli = glint.cli;
 const aegis_sources = @import("aegis_sources");
 
@@ -234,7 +236,7 @@ test "G2 completion rejects incomplete analysis despite every finding being allo
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const a = std.testing.allocator;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "input.zig", .data = "// glint-ignore: Z012 -- intentionally inference-only factory\npub fn make() Unknown { return .{}; }" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "input.zig", .data = ignore ++ "Z012 -- intentionally inference-only factory\npub fn make() Unknown { return .{}; }" });
     const input = try tmp.dir.realPathFileAlloc(std.testing.io, "input.zig", a);
     defer a.free(input);
     const result = try std.Io.Dir.path.join(a, &.{ input[0 .. input.len - 9], "result.json" });
