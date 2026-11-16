@@ -29,6 +29,7 @@ const NanComparison = @import("NanComparison.zig");
 const NarrowCounter = @import("NarrowCounter.zig");
 const NarrowWidened = @import("NarrowWidened.zig");
 const NeverLoops = @import("NeverLoops.zig");
+const PositionalStream = @import("PositionalStream.zig");
 const PublicAnytype = @import("PublicAnytype.zig");
 const RepeatedCondition = @import("RepeatedCondition.zig");
 const SameOperands = @import("SameOperands.zig");
@@ -90,6 +91,7 @@ fn breadth(context: *Context) RunError!void {
     if (context.config.has(.P011)) try UndefinedReason.check(context, .P011);
     if (context.config.has(.P012)) try LeftoverDebugging.check(context, .P012);
     if (context.config.has(.P013)) try FunctionShape.check(context, .P013);
+    if (context.config.has(.P014)) try PositionalStream.check(context, .P014);
 }
 
 fn parser(self: *Context) RunError!void {

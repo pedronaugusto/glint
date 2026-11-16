@@ -35,6 +35,7 @@ pub const BuildOption = @import("BuildOption.zig");
 pub const PublicAnytype = @import("PublicAnytype.zig");
 pub const FunctionShape = @import("FunctionShape.zig");
 pub const EmptyBranch = @import("EmptyBranch.zig");
+pub const PositionalStream = @import("PositionalStream.zig");
 
 /// A rule's check, as each breadth rule exports it.
 pub const Check = fn (*Context, Rule) Context.Error!void;
@@ -83,6 +84,13 @@ pub const fixture_std =
     \\        seek: usize = 0,
     \\        pub fn readSliceShort(r: *Reader, buffer: []u8) !usize { _ = r; return buffer.len; }
     \\        pub fn readSliceAll(r: *Reader, buffer: []u8) !void { _ = r; _ = buffer; }
+    \\    };
+    \\    pub const File = struct {
+    \\        handle: i32,
+    \\        pub fn stdout() File { return .{ .handle = 1 }; }
+    \\        pub fn stderr() File { return .{ .handle = 2 }; }
+    \\        pub fn writer(file: File, io: Io, buffer: []u8) Writer { _ = file; _ = io; _ = buffer; return .{}; }
+    \\        pub fn writerStreaming(file: File, io: Io, buffer: []u8) Writer { _ = file; _ = io; _ = buffer; return .{}; }
     \\    };
     \\};
 ;
@@ -231,4 +239,5 @@ test {
     _ = PublicAnytype;
     _ = FunctionShape;
     _ = EmptyBranch;
+    _ = PositionalStream;
 }

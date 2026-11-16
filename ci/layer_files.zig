@@ -38,6 +38,7 @@ pub const layers = [_]Layer{
         "src/PublicAnytype.zig",
         "src/FunctionShape.zig",
         "src/EmptyBranch.zig",
+        "src/PositionalStream.zig",
         "src/DeadDeclarations.zig",
         "src/Disallowed.zig",
         "src/Governed.zig",

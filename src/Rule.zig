@@ -51,6 +51,7 @@ pub const Rule = enum(u16) {
     P011 = 211,
     P012 = 212,
     P013 = 213,
+    P014 = 214,
     _,
 
     pub fn group(self: Rule) Group {
@@ -58,7 +59,7 @@ pub const Rule = enum(u16) {
             .Z003, .Z011, .Z013, .Z026, .Z034, .D001 => .correctness,
             .Z035, .Z036, .Z037, .Z038, .Z039, .Z041, .Z043, .Z044, .Z047, .Z048, .Z049, .Z051, .Z052, .Z053, .Z054 => .correctness,
             .Z012, .Z016, .P003, .P005, .P006 => .family_policy,
-            .P007, .P008, .P009, .P010, .P011, .P012, .P013 => .family_policy,
+            .P007, .P008, .P009, .P010, .P011, .P012, .P013, .P014 => .family_policy,
             else => .zig_style,
         };
     }
@@ -103,6 +104,7 @@ pub const Rule = enum(u16) {
             .P011 => "undefined outside a test",
             .P012 => "debugging left in the code",
             .P013 => "function over the configured parameter or nesting limit",
+            .P014 => "standard output or error written through a positional writer",
             else => "Zig style naming or readability (no runtime bug claimed)",
         };
     }
@@ -364,7 +366,7 @@ test "a seam holds a file, a glob of files or a directory for the rules it names
 }
 
 test "review inventory excludes removed identities without compatibility aliases" {
-    try std.testing.expectEqual(@as(usize, 47), std.meta.tags(Rule).len); // safe: explicit compile-time type selection; the value is representable in that type.
+    try std.testing.expectEqual(@as(usize, 48), std.meta.tags(Rule).len); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expectEqual(null, Rule.parse("Z008"));
     // Folded into P007, P009 and Z026, never aliased.
     for ([_][]const u8{ "P001", "P002", "P004", "E001" }) |id| try std.testing.expectEqual(null, Rule.parse(id));

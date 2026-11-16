@@ -67,8 +67,9 @@ table, the package vocabulary, the configuration, run errors, and what glint doe
 - **Bans**: discarded errors (Z026), project-declared bans (P006), operations Zig leaves unchecked (P007:
   unsafe builtins and casts, `extern`, `asm`, many-item pointer arithmetic, `std.c`, `std.os.linux`,
   `std.os.windows`), and every rule a package declares as a ban (aegis's A001, A007, A008, A009, A011, A013,
-  A015, and A012 and A021 where selected).
-  Off by default: an unwrap that can trap (P010), `undefined` outside a test (P011), leftover debugging (P012).
+  A015, and A012 and A021 where selected), and standard output or error written through a positional writer
+  (P014). Off by default: an unwrap that can trap (P010), `undefined` outside a test (P011), leftover
+  debugging (P012).
 - **Hygiene**: naming, syntax the next Zig refuses (Z003, Z034), line and function length, deprecated calls,
   private types in public signatures, unused imports, dead declarations, an assertion of `a and b`, debug
   prints, identifying integers of one type that may stand for one another (P008), a pointer into the frame

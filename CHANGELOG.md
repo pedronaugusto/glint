@@ -16,7 +16,10 @@ closed construct list. In short, for a configuration written for 0.7:
 - **Rules renamed:** A019 is P007, A016 is P008, A014 is P009, glint's own. Write the new id in `--only`,
   `--report`, `--gate`, `--disable`, a configuration's `rules`, seams and every `glint-ignore`.
 - **New rules:** Z035-Z056 hygiene (Z045, Z046, Z054, Z055, Z056 off by default; Z050 not built), P010-P012 bans
-  and P013 a metric, all four off by default.
+  and P013 a metric, all four off by default. P014, a ban on by default: standard output or standard error
+  written through std's positional `Io.File.writer`, which writes at an offset from 0, over a file the output is
+  redirected to (`>>` among them); `writerStreaming` (or ensign's streaming stdout and stderr) writes where the
+  stream is. Found by riverrun, whose output appended to a file lost bytes.
 - **One suppression form**, `// glint-ignore: <rule>, ... -- <reason>`; the `// aegis:` escape is malformed and
   `--fix` rewrites it. Files and directories are answered by `seams` in the configuration, test code named by
   `test_inputs`.
