@@ -44,6 +44,7 @@ pub const Rule = enum(u16) {
     Z054 = 154,
     Z055 = 155,
     Z056 = 156,
+    Z057 = 157,
     P007 = 207,
     P008 = 208,
     P009 = 209,
@@ -57,7 +58,7 @@ pub const Rule = enum(u16) {
     pub fn group(self: Rule) Group {
         return switch (self) {
             .Z003, .Z011, .Z013, .Z026, .Z034, .D001 => .correctness,
-            .Z035, .Z036, .Z037, .Z038, .Z039, .Z041, .Z043, .Z044, .Z047, .Z048, .Z049, .Z051, .Z052, .Z053, .Z054 => .correctness,
+            .Z035, .Z036, .Z037, .Z038, .Z039, .Z041, .Z043, .Z044, .Z047, .Z048, .Z049, .Z051, .Z052, .Z053, .Z054, .Z057 => .correctness,
             .Z012, .Z016, .P003, .P005, .P006 => .family_policy,
             .P007, .P008, .P009, .P010, .P011, .P012, .P013, .P014 => .family_policy,
             else => .zig_style,
@@ -97,6 +98,7 @@ pub const Rule = enum(u16) {
             .Z054 => "build module that ignores -Doptimize or -Dtarget",
             .Z055 => "public function taking anytype",
             .Z056 => "empty if or else body with no comment",
+            .Z057 => "compound assignment whose right side's call is handed the place it updates",
             .P007 => "operation Zig leaves unchecked, outside a seam",
             .P008 => "identifying integers of one type that one may pass for another",
             .P009 => "pointer into the frame carried out of the call",

@@ -11,6 +11,7 @@ const Report = @import("Report.zig");
 const rules = @import("Rule.zig");
 
 pub const SameOperands = @import("SameOperands.zig");
+pub const LostUpdate = @import("LostUpdate.zig");
 pub const RepeatedCondition = @import("RepeatedCondition.zig");
 pub const NarrowWidened = @import("NarrowWidened.zig");
 pub const LargeStackArray = @import("LargeStackArray.zig");
@@ -215,6 +216,7 @@ pub fn expectFixes(comptime check: Check, source: []const u8, expected: usize, f
 
 test {
     _ = SameOperands;
+    _ = LostUpdate;
     _ = RepeatedCondition;
     _ = NarrowWidened;
     _ = LargeStackArray;
