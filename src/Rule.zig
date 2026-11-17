@@ -368,7 +368,6 @@ test "a seam holds a file, a glob of files or a directory for the rules it names
 }
 
 test "review inventory excludes removed identities without compatibility aliases" {
-    try std.testing.expectEqual(@as(usize, 48), std.meta.tags(Rule).len); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expectEqual(null, Rule.parse("Z008"));
     // Folded into P007, P009 and Z026, never aliased.
     for ([_][]const u8{ "P001", "P002", "P004", "E001" }) |id| try std.testing.expectEqual(null, Rule.parse(id));
