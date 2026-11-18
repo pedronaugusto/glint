@@ -38,7 +38,22 @@ test "contract seeded arbitrary bytes parse with bounded public ownership" {
             }
         }
     };
-    try shakedown.check(std.testing.allocator, {}, Property.run, .{ .cases = 64 });
+    try shakedown.check(std.testing.allocator, {}, Property.run, .{
+        .cases = 64,
+        // `fQ:0x.p1`: a hex float with no digit, which std's lowering unwrapped (release run 44210310859).
+        .regressions = &.{"8:66:51:3a:30:78:2e:70:31"},
+    });
+}
+
+// std.zig.parseNumberLiteral calls `0x.p1` a float and std.fmt.parseFloat refuses it, which
+// AstGen and ZonGen unwrap: such a file is refused before lowering, as Zig and as ZON.
+test "contract a float std's lowering cannot read is refused, not lowered" {
+    var code = try glint.Project.init(std.testing.allocator, &.{.{ .name = "float", .bytes = "const x = 0x.p1;" }}, &.{}, .{});
+    defer code.deinit();
+    try std.testing.expectEqual(.invalid_lowering, code.sources[0].file.status);
+    var data = try glint.Project.init(std.testing.allocator, &.{.{ .name = "float", .bytes = ".{ .x = 0x.p1 }", .kind = .zon }}, &.{}, .{});
+    defer data.deinit();
+    try std.testing.expectEqual(.invalid_syntax, data.sources[0].file.status);
 }
 
 test "contract JSON and SARIF preserve stable IDs and reasoned suppressions" {

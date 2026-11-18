@@ -110,7 +110,9 @@ pub fn main(init: std.process.Init) !void {
             };
             if (row == .none) try w.print("{s}/none/: a case that moves no value\n", .{rule});
             for (try sortedEntries(a, io, rule_dir, row_name, .directory)) |case| {
-                const case_path = try std.Io.Dir.path.join(a, &.{ row_name, case });
+                // Joined with `/` on every OS: it is the key of expected.zon's open list, and
+                // Windows opens a path written with `/`.
+                const case_path = try std.fmt.allocPrint(a, "{s}/{s}", .{ row_name, case });
                 const policy = try caseFile(a, io, rule_dir, suite_path, rule, case_path, "glint.json");
                 const before = try caseFile(a, io, rule_dir, suite_path, rule, case_path, "before.zig");
                 var any = false;
@@ -446,20 +448,33 @@ fn isError(line: []const u8) bool {
 }
 
 /// The case a line names, by the first path in it under the suite (`<suite>/<rule>/<row>/<case>/`).
+/// The compiler writes a path with the OS's separator (`\` on Windows), read here as the `/` of
+/// the cases' keys.
 fn caseIn(line: []const u8, suite_name: []const u8, by_case: *const std.StringHashMapUnmanaged(usize)) ?usize {
     var rest = line;
+    var key: [std.fs.max_path_bytes]u8 = undefined;
     while (std.mem.find(u8, rest, suite_name)) |at| {
         const after = rest[at + suite_name.len ..];
         rest = after;
-        if (after.len == 0 or after[0] != '/') continue;
-        var parts = std.mem.splitScalar(u8, after[1..], '/');
+        if (after.len == 0 or !separator(after[0])) continue;
         var length: usize = 0;
-        for (0..3) |_| {
-            const part = parts.next() orelse break;
-            length += part.len + 1;
-        } else if (by_case.get(after[1..length])) |index| return index;
+        var parts: usize = 0;
+        for (after[1..]) |c| {
+            if (separator(c)) {
+                parts += 1;
+                if (parts == 3) break;
+            }
+            if (length == key.len) break;
+            key[length] = if (separator(c)) '/' else c;
+            length += 1;
+        } else continue;
+        if (parts == 3) if (by_case.get(key[0..length])) |index| return index;
     }
     return null;
+}
+
+fn separator(c: u8) bool {
+    return c == '/' or (builtin.os.tag == .windows and c == '\\');
 }
 
 /// The cases a run judges, shared by its workers: each takes the next case not yet taken and

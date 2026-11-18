@@ -1,3 +1,8 @@
+# Everything this repository holds is LF on every platform: a Windows checkout would otherwise
+# turn every line ending into CRLF, and the tests read docs and cases byte for byte (the
+# design table's header, each case's columns).
+* text=auto eol=lf
+
 # Two changes that add lines under one group of CHANGELOG.md both keep them, with no
 # conflict to resolve; `bay release` orders the section.
 CHANGELOG.md merge=union

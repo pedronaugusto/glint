@@ -45,7 +45,7 @@ pub fn initWithLowering(gpa: std.mem.Allocator, bytes: []const u8, limits: Limit
     var zir: ?std.zig.Zir = null;
     if (bytes.len > limits.bytes or tree.nodes.len > limits.nodes) {
         status = .budget_exhausted;
-    } else if (status == .parsed and !safeCharacters(&tree)) {
+    } else if (status == .parsed and !safeLiterals(&tree)) {
         // ZON is never lowered: such a literal is a file std's ZON reader rejects.
         status = if (kind == .zon) .invalid_syntax else .invalid_lowering;
     } else if (status == .parsed and kind == .zon) {
@@ -84,15 +84,24 @@ fn parseSource(reading: Reading, source: [:0]const u8) InitError!Front {
     return .{ .tree = tree, .lines = try lines.toOwnedSlice(reading.a), .comments = comments, .end = end };
 }
 
-// std's char-literal lowering assumes a complete UTF8 sequence. Check its
-// exact token operands before calling AstGen, including parser-accepted cut bytes.
-fn safeCharacters(tree: *const std.zig.Ast) bool {
-    for (tree.tokens.items(.tag), 0..) |tag, i| {
-        if (tag != .char_literal) continue;
-        const raw = tree.tokenSlice(@intCast(i));
-        if (raw.len < 3 or raw[0] != '\'' or raw[raw.len - 1] != '\'') return false;
-        if (raw[1] != '\\' and !std.unicode.utf8ValidateSlice(raw[1 .. raw.len - 1])) return false;
-    }
+// Literals std's lowering (AstGen, ZonGen) reads with an unwrap it assumes the parser already
+// checked. Check their exact tokens before lowering, including what the parser accepts:
+// - a char literal's lowering assumes a complete UTF-8 sequence, and the parser takes cut bytes;
+// - a float's lowering unwraps std.fmt.parseFloat, and std.zig.parseNumberLiteral calls a hex
+//   float with no digit before its exponent (`0x.p1`) a float that parseFloat refuses.
+fn safeLiterals(tree: *const std.zig.Ast) bool {
+    for (tree.tokens.items(.tag), 0..) |tag, i| switch (tag) {
+        .char_literal => {
+            const raw = tree.tokenSlice(@intCast(i));
+            if (raw.len < 3 or raw[0] != '\'' or raw[raw.len - 1] != '\'') return false;
+            if (raw[1] != '\\' and !std.unicode.utf8ValidateSlice(raw[1 .. raw.len - 1])) return false;
+        },
+        .number_literal => {
+            const raw = tree.tokenSlice(@intCast(i));
+            if (std.zig.parseNumberLiteral(raw) == .float) _ = std.fmt.parseFloat(f128, raw) catch return false;
+        },
+        else => {},
+    };
     return true;
 }
 
