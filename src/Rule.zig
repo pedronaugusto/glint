@@ -1,6 +1,7 @@
 //! Reviewed rules. Removed identities are rejected, never aliased or silently enabled.
 pub const Group = enum { correctness, zig_style, family_policy };
 const std = @import("std");
+const native_os = @import("builtin").os.tag;
 pub const Rule = enum(u16) {
     Z001 = 1,
     Z003 = 3,
@@ -174,7 +175,7 @@ pub const Config = struct {
 
     /// The first seam that holds the input named `name` for the rule named `rule`.
     pub fn seamOf(self: Config, name: []const u8, rule: []const u8) ?usize {
-        var buffer: [2 * std.fs.max_path_bytes]u8 = undefined;
+        var buffer: [5 * std.fs.max_path_bytes]u8 = undefined;
         const relative = self.fromRoot(&buffer, name) orelse return null;
         for (self.seams, 0..) |seam, i| {
             if (!covers(seam.file, seam.module, relative)) continue;
@@ -184,24 +185,37 @@ pub const Config = struct {
     }
     /// The first test input entry that holds the input named `name`.
     pub fn testInput(self: Config, name: []const u8) ?usize {
-        var buffer: [2 * std.fs.max_path_bytes]u8 = undefined;
+        var buffer: [5 * std.fs.max_path_bytes]u8 = undefined;
         const relative = self.fromRoot(&buffer, name) orelse return null;
         for (self.test_inputs, 0..) |entry, i| if (covers(entry.path, entry.module, relative)) return i;
         return null;
     }
     /// `name`'s path from `paths_from`, a relative name resolved against `names_from` first,
     /// in `buffer`; null where it lies outside that directory, so no entry holds it. With no
-    /// directory, as given (`./` aside).
+    /// directory, as given (`./` aside). Every path is read with `/` between its parts, as the
+    /// entries are written: on Windows a `\` is one too (`D:\a\pkg` is `D:/a/pkg`).
     fn fromRoot(self: Config, buffer: []u8, name: []const u8) ?[]const u8 {
-        var relative = name;
-        while (std.mem.startsWith(u8, relative, "./")) relative = relative[2..];
-        const root = self.paths_from orelse return relative;
-        if (std.fs.path.isAbsolute(name)) return under(root, name);
-        const cwd = self.names_from orelse return relative;
         var fixed: std.heap.FixedBufferAllocator = .init(buffer);
+        const a = fixed.allocator();
         // A path longer than any file system holds names no input.
-        const absolute = std.fs.path.resolveAlloc(fixed.allocator(), &.{ cwd, name }) catch return null;
-        return under(root, absolute);
+        var relative = slashed(a, name) orelse return null;
+        while (std.mem.startsWith(u8, relative, "./")) relative = relative[2..];
+        const root = slashed(a, self.paths_from orelse return relative) orelse return null;
+        if (absolute(relative)) return under(root, relative);
+        const cwd = slashed(a, self.names_from orelse return relative) orelse return null;
+        const resolved = std.fs.path.resolveAllocPosix(a, &.{ cwd, relative }) catch return null;
+        return under(root, resolved);
+    }
+    /// `path` on `a`, a Windows `\` between parts written `/`.
+    fn slashed(a: std.mem.Allocator, path: []const u8) ?[]u8 {
+        const copy = a.dupe(u8, path) catch return null;
+        if (native_os == .windows) std.mem.replaceScalar(u8, copy, '\\', '/');
+        return copy;
+    }
+    /// Whether `path`, `/` between its parts, starts at a root: `/`, or a drive (`D:/`).
+    fn absolute(path: []const u8) bool {
+        if (std.mem.startsWith(u8, path, "/")) return true;
+        return path.len >= 3 and std.ascii.isAlphabetic(path[0]) and path[1] == ':' and path[2] == '/';
     }
     /// `name`'s path from `root`, where it lies under it.
     fn under(root_raw: []const u8, name: []const u8) ?[]const u8 {
@@ -362,6 +376,21 @@ test "a seam holds a file, a glob of files or a directory for the rules it names
     var at = rooted;
     at.names_from = "/work/pkg";
     try std.testing.expectEqual(@as(?usize, 0), at.seamOf("./src/uring.zig", "A007"));
+    // A Windows path: a drive, and on Windows `\` between its parts as well as `/` (release run
+    // 44177284014: every seam missed on Windows, its paths read as relative and unslashed).
+    var drive = config;
+    drive.paths_from = "D:/work/pkg/";
+    drive.names_from = "D:/work/pkg/src";
+    try std.testing.expectEqual(@as(?usize, 0), drive.seamOf("D:/work/pkg/src/uring.zig", "A007"));
+    try std.testing.expectEqual(@as(?usize, 1), drive.seamOf("backend/kqueue/poll.zig", "A007"));
+    try std.testing.expectEqual(@as(?usize, null), drive.seamOf("E:/work/pkg/src/uring.zig", "A007"));
+    if (native_os == .windows) {
+        drive.paths_from = "D:\\work\\pkg";
+        drive.names_from = "D:\\work\\pkg\\src";
+        try std.testing.expectEqual(@as(?usize, 0), drive.seamOf("D:\\work\\pkg\\src\\uring.zig", "A007"));
+        try std.testing.expectEqual(@as(?usize, 1), drive.seamOf("backend\\kqueue\\poll.zig", "A007"));
+        try std.testing.expectEqual(@as(?usize, 1), drive.testInput("..\\src\\testing\\server.zig"));
+    }
     // A seam with no reason, both a file and a directory, or no rule is refused.
     const bad = [_]Config.Seam{ .{ .file = "a.zig", .rules = &.{"A007"}, .reason = " " }, .{ .file = "a.zig", .module = "src", .rules = &.{"A007"}, .reason = "r" }, .{ .file = "a.zig", .rules = &.{}, .reason = "r" } };
     for (bad) |seam| try std.testing.expectError(error.InvalidSelection, (Config{ .seams = &.{seam} }).validate());

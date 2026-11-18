@@ -34,6 +34,12 @@ test "glint >> f keeps what f held and appends each run" {
 }
 
 test "{ echo A; glint; echo B; } > f keeps that order" {
+    // A shell's `> f` gives every command one file object and so one offset. std's spawn on
+    // Windows opens the file again for the child (Io/Threaded.zig, `.file` reopened by
+    // `OpenFile` from its handle): another file object, its offset at 0, so the run writes
+    // over "A" whatever glint does (release run 44177284014). glint writes through a
+    // streaming writer, which moves the offset it shares (PositionalStream holds it to that).
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
