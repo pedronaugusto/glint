@@ -228,6 +228,42 @@ Exit 0 means a completed run with no findings, 1 a completed run with findings, 
 argument, input, tool, output or cancellation failure. A `--result` record binds an invocation id, the exit
 class and the exact flushed output (`Completion.verify`).
 
+**Front end.** Every Zig file goes through the installed Zig's std.zig.Ast and AstGen, the lowering
+`zig ast-check` uses, and glint's model is built over the ZIR with the AST's spans and comments kept. A file std
+cannot lower is a run error, and so is one whose lowering std would crash on: a float literal
+`std.zig.parseNumberLiteral` accepts and `std.fmt.parseFloat` refuses (`0x.p1`) is refused before AstGen sees it.
+A `.zon` input (`Project.Input.kind`, set by the CLI from the extension and by preflight from the module graph)
+is parsed as ZON and never lowered: it is data, no rule runs on it, and an `@import` of it resolves to its root
+expression, read by the readers an untyped `.{ ... }` literal written in place goes through. A declared type
+gives it its type (`const k: K = @import("k.zon")` is a `K`).
+
+**Test code** is lexical: inside a `test` block, or an input `test_inputs` names. A file or helper reached only
+from tests is production code.
+
+**Fixes.** `--fix` applies only a fix that follows from the site alone: Z034's parentheses, a package
+replacement's `.drop_in` call, and the rewrite of 0.7's suppression forms. No fix proves anything.
+
+**Speed.** No numeric target: `bench/` is compiled by CI and run by hand, and no timing is gated.
+
+## Who owns what
+
+| Concern | Owner |
+|---|---|
+| Parsing, scopes, import and call resolution, test context; code rules (bans, hygiene, a package's declared rules); assertion and function metrics | glint |
+| Dependency, layer, ownership and cycle graphs, the path dialect, other languages | gantry, over glint's references |
+| File selection, family rule levels, running the tools, the hardened jobs, the gate | preflight, through gantry's path dialect |
+
+The production edges are glint → aegis → std, gantry → glint (lazy, its Zig front end), and preflight → gantry
+and glint. glint has no edge to gantry or preflight, its CLI runs without either, and it names no package: a
+package declares its rules in `lint_rules` and glint reads them. preflight fails a run on the bans a project
+selects; hygiene reports, and a project may gate it. There are no blanket warnings-as-errors.
+
+**Prior art.** From TigerStyle and its tidy: dead private declarations (D001, with Z013 the import case),
+disallowed declarations as one rule with a reason and a replacement (P006), split compound assertions (Z016),
+function length (P003); not its bans on recursion, `usize` or allocation after startup, assertion counts as a
+gate, or unit suffixes (aegis's units carry the unit in the type). From Clippy: confidence apart from severity,
+which is the two kinds. From zlint: scopes, references and node links over the AST.
+
 ## What glint does not claim
 
 - That a program is safe, cannot panic, or keeps any property at run time. ReleaseSafe, aegis's types, the
@@ -244,6 +280,9 @@ class and the exact flushed output (`Completion.verify`).
 
 The proof engines left in 0.8.0: Taint, Range, Bounds, Proof, DangerFlow, the release walks, Escapes beyond
 P009's shape, Undefined's flow, ParentPointer's proofs, Summary, and the compiled-facts reader and exporter.
-So did the compiled aegis pack and the rules only the engines served (the table above). All of it is on the
+So did the compiled aegis pack and the rules only the engines served (the table above). Each engine was an
+excuse analysis, a proof that a site is harmless, and the next spelling could fool each excuse: seven review
+rounds did not converge (review 7 found 33 holes in 13 rules, its second pass 15 more, seven of them repeats).
+A ban that reads only its construct cannot be fooled that way. All of it is on the
 `strict-1029b` branch, unchanged, as the 0.7 line left it. Per-instance compiler facts, if ever wanted again,
 are their own project.
