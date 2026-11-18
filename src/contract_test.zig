@@ -10,7 +10,7 @@ test "contract allocation failures release project and report owners" {
         fn run(a: std.mem.Allocator) !void {
             var project = try glint.Project.init(a, &.{.{ .name = "fixture", .bytes = "const d = @import(\"dep\"); pub fn f() void {}" }}, &.{}, .{});
             defer project.deinit();
-            var report = try glint.run(a, &project, glint.Config.reviewed());
+            var report = try glint.run(a, &project, .{ .config = glint.Config.reviewed() });
             defer report.deinit();
             var output: std.Io.Writer.Allocating = .init(a);
             defer output.deinit();
@@ -108,7 +108,7 @@ test "contract deprecation diagnostic carries its resolved declaration span" {
     defer project.deinit();
     var config = glint.Config.none();
     config.set(.Z011, true);
-    var report = try glint.run(std.testing.allocator, &project, config);
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: expected single fixture diagnostic fits usize.
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics[0].related.len); // safe: expected single declaration span fits usize.
@@ -138,7 +138,7 @@ test "contract G2 allocation failures release dead-private owners" {
             defer project.deinit();
             var config = glint.Config.none();
             config.set(.D001, true);
-            var report = try glint.run(a, &project, config);
+            var report = try glint.run(a, &project, .{ .config = config });
             defer report.deinit();
             try std.testing.expect(report.complete);
             try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: known private unused fixture function.

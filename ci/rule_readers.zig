@@ -478,7 +478,7 @@ pub fn main(init: std.process.Init) !void {
     var output = std.Io.File.stdout().writerStreaming(init.io, &buffer);
     var problems_buffer: [1024]u8 = @splat(0);
     var problems = std.Io.File.stderr().writerStreaming(init.io, &problems_buffer);
-    const status = cli.executeConfigured(init.gpa, init.io, args, &output.interface, &problems.interface, &rules) catch |err| switch (err) {
+    const status = cli.execute(init.gpa, init.io, args, &output.interface, &problems.interface, .{ .project_rules = &rules }) catch |err| switch (err) {
         // A write that failed has its cause on its file's writer: a cancel in either ends main as one.
         error.WriteFailed => {
             if (output.err) |cause| if (cause == error.Canceled) return error.Canceled;
@@ -543,7 +543,7 @@ fn judge(root: []const u8, rule: glint.Rule, with: []const glint.ProjectRule) !s
     }, &.{.{ .from = 0, .target = 1, .spelling = "std" }}, .{}); // safe: fixture constants fit the asserted integer widths.
     defer project.deinit();
     const config: glint.Config = .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .report }} };
-    var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = with });
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config, .project_rules = with });
     defer report.deinit();
     return .{ report.diagnostics.len, report.errors.len };
 }
@@ -673,7 +673,7 @@ fn switchesAllowing(root: []const u8, comptime list: []const Allowed) !struct { 
     }, &.{.{ .from = 0, .target = 1, .spelling = "Facts.zig" }}, .{}); // safe: fixture constants fit the asserted integer widths.
     defer project.deinit();
     const config: glint.Config = .{ .enabled = .empty, .selections = &.{.{ .rule = value_switches, .level = .report }} };
-    var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = &switched(list) });
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config, .project_rules = &switched(list) });
     defer report.deinit();
     return .{ report.diagnostics.len, report.errors.len };
 }

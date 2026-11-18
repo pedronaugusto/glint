@@ -8,7 +8,7 @@ pub fn main(init: std.process.Init) !void {
     var output = std.Io.File.stdout().writerStreaming(init.io, &buffer);
     var error_buffer: [4096]u8 = undefined;
     var errors = std.Io.File.stderr().writerStreaming(init.io, &error_buffer);
-    const status = cli.execute(init.gpa, init.io, args, &output.interface, &errors.interface) catch |err| switch (err) {
+    const status = cli.execute(init.gpa, init.io, args, &output.interface, &errors.interface, .{}) catch |err| switch (err) {
         // A write that failed has its cause on its file's writer: a cancel in either ends main as one.
         error.WriteFailed => {
             if (output.err) |cause| if (cause == error.Canceled) return error.Canceled;

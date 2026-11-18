@@ -19,8 +19,10 @@ pub const RemovedRule = @import("Rule.zig").Removed;
 pub const removedRule = @import("Rule.zig").removed;
 /// Owned diagnostics and coverage, rendered as text, JSON or SARIF.
 pub const Report = @import("Report.zig");
-/// Runs the selected code checks over one frozen project.
+/// Runs the selected code checks over one frozen project, as its `RunOptions` say.
 pub const run = @import("Runner.zig").run;
+/// What a run checks: the rules and levels, compiled project rules, per-file settings, the `Io`.
+pub const RunOptions = @import("Runner.zig").Options;
 /// A run's fixes applied: each file's bytes after them.
 pub const Fix = @import("Fix.zig");
 /// The word a suppression opens with: `// <suppression_keyword>: <rule>, ... -- <reason>`, on its
@@ -57,8 +59,6 @@ pub const Is = @import("Governed.zig").Is;
 pub const stdCall = @import("Governed.zig").stdCall;
 /// Rule metadata for custom IDs, versions and bug/policy classes.
 pub const RuleDefinition = @import("Rule.zig").Definition;
-/// Runs compiled project rules and per-source configuration on the same model.
-pub const runConfigured = @import("Runner.zig").runConfigured;
 /// The rules the project's packages declare in their `lint_rules`, each with the id this run gives
 /// it: what a caller resolves a package rule's name against before it configures a run.
 pub const packageRules = @import("Runner.zig").packageRules;

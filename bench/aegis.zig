@@ -17,7 +17,7 @@ pub fn main(init: std.process.Init) !void {
     const start = std.Io.Clock.awake.now(init.io);
     var findings: usize = 0;
     for (0..rounds) |_| {
-        var report = try glint.runConfigured(init.gpa, &project, if (core) glint.Config.none() else config, .{});
+        var report = try glint.run(init.gpa, &project, .{ .config = if (core) glint.Config.none() else config });
         defer report.deinit();
         if (!report.complete or report.diagnostics.len != (if (core) @as(usize, 0) else n)) return error.UnexpectedPackResult;
         findings = report.diagnostics.len;

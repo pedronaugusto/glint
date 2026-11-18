@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
         const rules_start = now(init.io, small);
         var findings: usize = 0;
         for (0..rounds) |_| {
-            var report = try glint.run(init.gpa, &project, if (all) glint.Config.reviewed() else .{});
+            var report = try glint.run(init.gpa, &project, .{ .config = if (all) glint.Config.reviewed() else .{} });
             defer report.deinit();
             findings = report.diagnostics.len;
             if (!all and (!report.complete or findings != 0)) return error.UnexpectedCoreResult;
@@ -63,7 +63,7 @@ pub fn main(init: std.process.Init) !void {
     const matched = now(init.io, small);
     var matched_findings: usize = 0;
     for (0..rounds) |_| {
-        var report = try glint.run(init.gpa, &project, old);
+        var report = try glint.run(init.gpa, &project, .{ .config = old });
         defer report.deinit();
         if (!report.complete) return error.IncompleteMatchedScan;
         matched_findings = report.diagnostics.len;
@@ -106,7 +106,7 @@ fn semanticRows(gpa: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, roun
     for (0..rounds) |_| {
         var project = try glint.Project.init(gpa, inputs, imports, .{});
         defer project.deinit();
-        var report = try glint.run(gpa, &project, config);
+        var report = try glint.run(gpa, &project, .{ .config = config });
         defer report.deinit();
         if (!report.complete or report.diagnostics.len != 1 or report.diagnostics[0].rule != .Z011) return error.UnexpectedCrossModuleResult;
     }
@@ -115,7 +115,7 @@ fn semanticRows(gpa: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, roun
     defer project.deinit();
     const warm = now(io, small);
     for (0..rounds) |_| {
-        var report = try glint.run(gpa, &project, config);
+        var report = try glint.run(gpa, &project, .{ .config = config });
         defer report.deinit();
         if (!report.complete or report.diagnostics.len != 1) return error.UnexpectedCrossModuleResult;
     }
@@ -148,14 +148,14 @@ fn g2Rows(gpa: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, project: *
     config.selections = &.{.{ .rule = id, .level = .report }};
     const start = now(io, small);
     for (0..rounds) |_| {
-        var report = try glint.runConfigured(gpa, project, config, .{ .project_rules = &rules });
+        var report = try glint.run(gpa, project, .{ .config = config, .project_rules = &rules });
         defer report.deinit();
         if (!report.complete or report.diagnostics.len != 0) return error.UnexpectedProjectRuleResult;
     }
     try row(writer, "warm_project_rule", elapsed(io, start, small), rounds, 1);
     const reviewed_start = now(io, small);
     for (0..rounds) |_| {
-        var report = try glint.run(gpa, project, glint.Config.reviewed());
+        var report = try glint.run(gpa, project, .{ .config = glint.Config.reviewed() });
         defer report.deinit();
         if (!report.complete) return error.IncompleteReviewedScan;
     }

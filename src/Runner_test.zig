@@ -29,7 +29,7 @@ fn check(rule: glint.Rule, source: []const u8, expected: usize) !void {
     defer project.deinit();
     var config = glint.Config.none();
     config.set(rule, true);
-    var report = try glint.run(std.testing.allocator, &project, config);
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer report.deinit();
     try std.testing.expectEqual(expected, report.diagnostics.len);
     try std.testing.expect(report.complete);
@@ -54,7 +54,7 @@ test "compatibility Z011 finds deprecated calls at every expression position" {
     defer project.deinit();
     var config = glint.Config.none();
     config.set(.Z011, true);
-    var report = try glint.run(std.testing.allocator, &project, config);
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 7), report.diagnostics.len); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expect(report.complete);
@@ -67,7 +67,7 @@ test "compatibility byte line length counts CRLF content and file-struct stem" {
     config.set(.Z024, true);
     config.set(.Z009, true);
     config.max_line_length = 10;
-    var report = try glint.run(std.testing.allocator, &project, config);
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expectEqual(glint.Rule.Z009, report.diagnostics[0].rule);
@@ -83,7 +83,7 @@ test "compatibility Z016 splits only conjunction of the mapped standard assertio
     defer project.deinit();
     var config = glint.Config.none();
     config.set(.Z016, true);
-    var report = try glint.run(std.testing.allocator, &project, config);
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expect(report.complete);
@@ -102,7 +102,7 @@ test "compatibility Z024 reports bytes exceeding the configured boundary" {
     var config = glint.Config.none();
     config.set(.Z024, true);
     config.max_line_length = 10;
-    var report = try glint.run(std.testing.allocator, &project, config);
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expectEqual(@as(u32, 10), report.diagnostics[0].span.start); // safe: explicit compile-time type selection; the value is representable in that type.
@@ -112,19 +112,19 @@ test "compatibility strict stale suppressions and exhausted facts are incomplete
     var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = ignore ++ "Z013 -- stale regression site\npub const x = 1;" }}, &.{}, .{});
     defer project.deinit();
     var config: glint.Config = .{ .strict_suppressions = true };
-    var report = try glint.run(std.testing.allocator, &project, config);
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer report.deinit();
     try std.testing.expect(!report.complete);
     try std.testing.expectEqual(@as(usize, 1), report.stale_suppressions); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expectEqualStrings("Z013", report.stale[0].name);
     try std.testing.expectEqual(@as(u32, 1), report.stale[0].span.line); // safe: explicit compile-time type selection; the value is representable in that type.
     // A rule that does not run shows nothing about its suppressions.
-    var unjudged = try glint.run(std.testing.allocator, &project, .{ .strict_suppressions = true, .enabled = .empty });
+    var unjudged = try glint.run(std.testing.allocator, &project, .{ .config = .{ .strict_suppressions = true, .enabled = .empty } });
     defer unjudged.deinit();
     try std.testing.expectEqual(@as(usize, 0), unjudged.stale_suppressions); // safe: explicit compile-time type selection; the value is representable in that type.
     config.strict_suppressions = false;
     config.fact_budget = 0;
-    var exhausted = try glint.run(std.testing.allocator, &project, config);
+    var exhausted = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer exhausted.deinit();
     try std.testing.expect(!exhausted.complete);
 }
@@ -139,7 +139,7 @@ test "each file's analysis has its own fact budget" {
     var config = selected;
     config.fact_budget = 1;
     while (config.fact_budget < 100_000) : (config.fact_budget += 1) {
-        var report = try glint.runConfigured(std.testing.allocator, &one, config, .{});
+        var report = try glint.run(std.testing.allocator, &one, .{ .config = config });
         defer report.deinit();
         if (report.complete) break;
     }
@@ -149,7 +149,7 @@ test "each file's analysis has its own fact budget" {
     // leave nothing for them; each has its own and completes in it.
     var three = try glint.Project.init(std.testing.allocator, &.{ .{ .name = "one", .bytes = source }, .{ .name = "two", .bytes = source }, .{ .name = "three", .bytes = source } }, &.{}, .{});
     defer three.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &three, config, .{});
+    var report = try glint.run(std.testing.allocator, &three, .{ .config = config });
     defer report.deinit();
     for (report.errors) |item| try std.testing.expectEqual(three.sources[0].id, item.file.?);
 }
@@ -299,7 +299,7 @@ test "Z026 a test block is exempt by where it is written; a function or file onl
     defer project.deinit();
     var config = glint.Config.none();
     config.set(.Z026, true);
-    var report = try glint.run(std.testing.allocator, &project, config);
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len);
     try std.testing.expect(report.complete);
@@ -323,7 +323,7 @@ fn withStd(rule: glint.Rule, root: []const u8) !glint.Report {
     defer project.deinit();
     var config = glint.Config.none();
     config.set(rule, true);
-    return glint.run(std.testing.allocator, &project, config);
+    return glint.run(std.testing.allocator, &project, .{ .config = config });
 }
 
 test "Z016 reads std's assert by meaning: a choice of callees one of which is it; a callee not known is silent" {
@@ -350,7 +350,7 @@ test "an import of Zig's own builtin is no file glint lacks; a missing one is" {
         defer project.deinit();
         var config = glint.Config.none();
         config.set(.Z012, true);
-        var report = try glint.run(std.testing.allocator, &project, config);
+        var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
         defer report.deinit();
         try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: expected count fits usize.
         // An import that does not resolve stops the run.
@@ -423,7 +423,7 @@ test "G2 amended policies are explicit family choices and count suppressed sites
     defer project.deinit();
     var config = glint.Config.none();
     config.set(.Z012, true);
-    var report = try glint.run(std.testing.allocator, &project, config);
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), report.suppressed); // safe: expected count fits usize.
     try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: expected count fits usize.
@@ -462,7 +462,7 @@ test "D001 withholds a file with a computed @field name, and writes no coverage"
     defer project.deinit();
     var config = glint.Config.none();
     config.set(.D001, true);
-    var report = try glint.run(std.testing.allocator, &project, config);
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: the computed name withholds the file.
 }
@@ -473,11 +473,11 @@ test "G2 function length follows configured code policy" {
     var config = glint.Config.none();
     config.set(.P003, true);
     config.max_function_lines = 3;
-    var report = try glint.run(std.testing.allocator, &project, config);
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: single overlong function.
     config.function_exceptions = &.{.{ .function = "f", .lines = 4, .reason = "audited dispatch" }};
-    var allowed = try glint.run(std.testing.allocator, &project, config);
+    var allowed = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer allowed.deinit();
     try std.testing.expectEqual(@as(usize, 0), allowed.diagnostics.len); // safe: exception matches exact body budget.
 }
@@ -489,7 +489,7 @@ test "G2 function-length type constructors subtract returned container bodies" {
     var config = glint.Config.none();
     config.set(.P003, true);
     config.max_function_lines = 4;
-    var report = try glint.run(std.testing.allocator, &project, config);
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: constructor and method each fit the limit.
 }
@@ -500,14 +500,14 @@ test "G2 disallowed policy follows qualified declaration identity and aliases" {
     var config = glint.Config.none();
     config.set(.P006, true);
     config.disallowed = &.{.{ .source = "policy.zig", .declaration = "A.raw", .reason = "this project requires the guarded API", .replacement = "checked" }};
-    var report = try glint.run(std.testing.allocator, &project, config);
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer report.deinit();
     // The alias is made where it spells A.raw; its call and B.raw reach no governed declaration.
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: exact fixture identity uses.
     try std.testing.expect(report.complete);
     config.disallowed = &.{.{ .source = "missing.zig", .declaration = "A.raw", .reason = "requires guarded API", .replacement = "checked" }};
     config.selections = &.{.{ .rule = .P006, .level = .gate }};
-    var missing = try glint.run(std.testing.allocator, &project, config);
+    var missing = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer missing.deinit();
     try std.testing.expect(!missing.complete);
     try std.testing.expectEqual(@as(usize, 0), missing.diagnostics.len); // safe: no invented missing declaration.
@@ -530,7 +530,7 @@ test "a disallowed declaration is the program's module's, never a build script's
         var config = glint.Config.none();
         config.selections = &.{.{ .rule = .P006, .level = .gate }};
         config.disallowed = &.{.{ .source = "lib", .declaration = "sync", .reason = "durability belongs to airlock", .replacement = "airlock.syncFile" }};
-        var report = try glint.run(std.testing.allocator, &project, config);
+        var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
         defer report.deinit();
         try std.testing.expect(report.complete);
         try std.testing.expectEqual(case[1], report.diagnostics.len);
@@ -568,7 +568,7 @@ test "a file both compilations compile reads a name each binds apart as both: a 
         var config = glint.Config.none();
         config.selections = &.{.{ .rule = .P006, .level = .gate }};
         config.disallowed = &.{.{ .source = "lib", .declaration = "sync", .reason = "durability belongs to airlock", .replacement = "airlock.syncFile" }};
-        var report = try glint.run(std.testing.allocator, &project, config);
+        var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
         defer report.deinit();
         try std.testing.expect(report.complete);
         try std.testing.expectEqual(case[2], report.diagnostics.len);
@@ -606,7 +606,7 @@ fn ownershipRunIn(program: []const u8, package: []const u8, disallowed: []const 
     var config = glint.Config.none();
     config.selections = &.{.{ .rule = .P006, .level = .gate }};
     config.disallowed = disallowed;
-    return glint.run(std.testing.allocator, &project, config);
+    return glint.run(std.testing.allocator, &project, .{ .config = config });
 }
 
 const durability = [_]glint.Config.Disallowed{
@@ -710,7 +710,7 @@ test "G2 policy configuration rejects blank reasons empty qualifiers and stale e
     config.function_exceptions = &.{.{ .function = "missing", .lines = 120, .reason = "old reviewed boundary" }};
     var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "policy", .bytes = "pub fn live() void {}" }}, &.{}, .{});
     defer project.deinit();
-    var report = try glint.run(std.testing.allocator, &project, config);
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer report.deinit();
     try std.testing.expect(!report.complete);
     try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: incomplete policy has no invented finding.
@@ -728,7 +728,7 @@ test "Z013 withholds a file's reports where a @field name is computed, and stays
     const bytes = "const Self = @This(); const dep = @import(\"dep\"); pub fn run(comptime name: []const u8) void { _ = @field(Self, name); }";
     var project = try glint.Project.init(std.testing.allocator, &.{ .{ .name = "root", .bytes = bytes }, .{ .name = "dep", .bytes = "", .selected = false } }, &.{.{ .from = 0, .spelling = "dep", .target = 1 }}, .{});
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = .Z013, .level = .gate }} }, .{});
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = .{ .enabled = .empty, .selections = &.{.{ .rule = .Z013, .level = .gate }} } });
     defer report.deinit();
     try std.testing.expect(report.complete);
     try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: a computed name may be the import's.
@@ -766,7 +766,7 @@ test "metrics count assertion calls by the declaration their callee resolves to"
     defer project.deinit();
     var config = glint.Config.none();
     config.metrics = true;
-    var report = try glint.run(std.testing.allocator, &project, config);
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer report.deinit();
     const metrics = report.metrics.?;
     try std.testing.expectEqual(@as(usize, 1), metrics.files.len); // safe: one selected file.
@@ -802,7 +802,7 @@ test "review Z006 accepts a name a generic reads on its type parameter that an o
         defer project.deinit();
         var config = glint.Config.none();
         config.set(.Z006, true);
-        var report = try glint.run(std.testing.allocator, &project, config);
+        var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
         defer report.deinit();
         // `otherName` no outside type declares; `basePoint` only where a generic reads it.
         try std.testing.expectEqual(@as(usize, if (generic) 1 else 2), report.diagnostics.len); // safe: fixture counts are representable.
@@ -825,8 +825,8 @@ test "a canceled analysis ends at the next file, building the project or running
     var project = try glint.Project.init(std.testing.allocator, &sources, &.{}, .{});
     defer project.deinit();
     const config: glint.Config = .{};
-    try std.testing.expectError(error.Canceled, glint.runConfigured(std.testing.allocator, &project, config, .{ .io = canceled.io() }));
-    var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .io = std.testing.io });
+    try std.testing.expectError(error.Canceled, glint.run(std.testing.allocator, &project, .{ .config = config, .io = canceled.io() }));
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config, .io = std.testing.io });
     defer report.deinit();
 }
 
@@ -860,7 +860,7 @@ test "a rule's memory for one file is given back when the rule is done with the 
     defer project.deinit();
     const rule: glint.ProjectRule = .{ .definition = .{ .id = touching, .name = "TOUCHES_MEMORY", .group = .family_policy, .purpose = "fills memory of its own in each file", .version = 1 }, .check = touch };
     const config: glint.Config = .{ .enabled = .empty, .selections = &.{.{ .rule = touching, .level = .report }} };
-    var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = &.{rule} });
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config, .project_rules = &.{rule} });
     defer report.deinit();
     const grown = (peakResident() orelse return error.SkipZigTest) -| before;
     try std.testing.expect(grown < 1 << 30);
@@ -882,7 +882,7 @@ test "a seam holds a rule's sites in its files and counts them per rule; one who
         .{ .module = "src/gone", .rules = &.{"P006"}, .reason = "a directory the project no longer has" },
         .{ .file = "src/*.zig", .rules = &.{"Z011"}, .reason = "a rule this run does not select" },
     };
-    var report = try glint.run(std.testing.allocator, &project, config);
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer report.deinit();
     // The program's call stands; the backend's two are the seam's.
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: fixture sites counted by hand.
@@ -905,7 +905,7 @@ test "a test input entry counts the inputs it holds, the first entry holding one
     defer project.deinit();
     var config = glint.Config.none();
     config.test_inputs = &.{ .{ .path = "src/**/*_test.zig" }, .{ .module = "src/testing" }, .{ .path = "test/*.zig" } };
-    var report = try glint.run(std.testing.allocator, &project, config);
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 3), report.test_inputs.len); // safe: one count per configured entry.
     try std.testing.expectEqual(@as(usize, 2), report.test_inputs[0].files); // safe: both _test files, the testing one first matched here.
@@ -922,7 +922,7 @@ test "a test input is test code to every rule, whatever the caller classified" {
     var config = glint.Config.none();
     config.selections = &.{.{ .rule = .Z026, .level = .gate }};
     config.test_inputs = &.{.{ .module = "bench" }};
-    var report = try glint.run(std.testing.allocator, &project, config);
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: src/main.zig's alone.
 }
@@ -936,7 +936,7 @@ test "an import no mapping names stops the run, named at its file; Zig's own bui
     defer project.deinit();
     var config = glint.Config.none();
     config.set(.Z012, true);
-    var report = try glint.run(std.testing.allocator, &project, config);
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer report.deinit();
     // Each import no mapping names stops the run, at its file: one.zig's two and two.zig's one;
     // Zig's own builtin is no file glint lacks.
@@ -968,7 +968,7 @@ fn dropInFixed(a: std.mem.Allocator, program: []const u8, findings: usize) ![]co
     var project = try P.init(std.testing.allocator, &inputs, &imports, .{});
     defer project.deinit();
     const declared = try glint.packageRules(a, &project);
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = declared[0].id, .level = .report }} }, .{});
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = .{ .enabled = .empty, .selections = &.{.{ .rule = declared[0].id, .level = .report }} } });
     defer report.deinit();
     try std.testing.expect(report.complete);
     try std.testing.expectEqual(findings, report.diagnostics.len);
@@ -1073,7 +1073,7 @@ test "a library's reflective call read through a parenthesized result in a branc
     defer project.deinit();
     var config = glint.Config.none();
     config.package_defaults = true;
-    var report = try glint.run(std.testing.allocator, &project, config);
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: view's call alone
     try std.testing.expect(std.mem.find(u8, report.diagnostics[0].message, "bytes") != null);
@@ -1088,7 +1088,7 @@ test "Z012 with no exported root stated says nothing of file-level public declar
         defer project.deinit();
         var config = glint.Config.none();
         config.set(.Z012, true);
-        var report = try glint.run(std.testing.allocator, &project, config);
+        var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
         defer report.deinit();
         try std.testing.expectEqual(@as(usize, @intFromBool(exported)), report.diagnostics.len); // safe: one site, reported only from a root
     }
@@ -1112,7 +1112,7 @@ test "an external module is read as nothing glint has: its import, its members, 
         defer project.deinit();
         var config = glint.Config.reviewed();
         config.set(.P007, true);
-        var report = try glint.run(std.testing.allocator, &project, config);
+        var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
         defer report.deinit();
         try std.testing.expectEqual(external, report.complete);
         if (external) try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: nothing of the module is read

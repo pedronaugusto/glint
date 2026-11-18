@@ -76,7 +76,7 @@ test "fuzz: a file linted by the built-in rules" {
                 else => return,
             };
             defer project.deinit();
-            var report = Runner.run(gpa, &project, Rule.Config.reviewed()) catch |err| switch (err) {
+            var report = Runner.run(gpa, &project, .{ .config = Rule.Config.reviewed() }) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 // A file whose comments read as a suppression of two findings stops the run, as
                 // the CLI ends it.

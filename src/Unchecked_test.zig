@@ -312,7 +312,7 @@ fn runWith(rule: glint.Rule, program: []const u8, extra: []const sources.Extra, 
 fn runAs(rule: glint.Rule, program: []const u8, as: sources.Consumer, extra: []const sources.Extra, imports: []const sources.ExtraImport) !Run {
     var project = try sources.projectAs(std.testing.allocator, program, as, extra, imports);
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .report }} }, .{});
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .report }} } });
     defer report.deinit();
     var result: Run = .{ .findings = 0 };
     // A fixture std's AstGen refuses stops the run: it would pass any count of none.
@@ -508,7 +508,7 @@ test "P007 leaves the interface-recovery idiom alone where a file a path import 
 fn fixed(rule: glint.Rule, program: []const u8) ![]u8 {
     var project = try sources.projectWithSources(std.testing.allocator, program, &std_files, &std_imports);
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .gate }} }, .{});
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .gate }} } });
     defer report.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -524,7 +524,7 @@ fn fixedBy(rules: []const glint.Rule, program: []const u8, record: []const u8) !
     defer project.deinit();
     var selections: [8]glint.Config.Selection = undefined;
     for (rules, 0..) |rule, i| selections[i] = .{ .rule = rule, .level = .gate };
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = selections[0..rules.len] }, .{});
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = .{ .enabled = .empty, .selections = selections[0..rules.len] } });
     defer report.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -578,7 +578,7 @@ test "one suppression names each rule it covers on its line, one site each; the 
         \\pub fn h(a: usize) *u8 { return @ptrFromInt(a); } // aegis: boundary(A019): the old form
     ), &std_files, &std_imports);
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{ .{ .rule = .P007, .level = .gate }, .{ .rule = .P008, .level = .gate } } }, .{});
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = .{ .enabled = .empty, .selections = &.{ .{ .rule = .P007, .level = .gate }, .{ .rule = .P008, .level = .gate } } } });
     defer report.deinit();
     // g's P008 stands, and h's P007 under a comment glint reads no more.
     try std.testing.expectEqual(@as(usize, 2), report.diagnostics.len); // safe: fixture counts are representable.

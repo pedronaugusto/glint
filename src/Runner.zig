@@ -47,6 +47,8 @@ seam_sites: std.AutoHashMapUnmanaged(struct { usize, rules.Rule }, usize) = .emp
 
 pub const RunError = Suppression.ParseError || Context.Error || std.Io.Cancelable;
 pub const Options = struct {
+    /// The rules and levels of every file `files` gives no setting of its own.
+    config: rules.Config = .{},
     project_rules: []const Context.Rule = &.{},
     files: []const FileConfig = &.{},
     /// The caller's `Io`, asked for a cancel before each file's rules run:
@@ -56,11 +58,10 @@ pub const Options = struct {
 };
 pub const FileConfig = struct { file: Project.FileId, config: rules.Config };
 
-pub fn run(gpa: std.mem.Allocator, project: *const Project, config: rules.Config) RunError!Report {
-    return runConfigured(gpa, project, config, .{});
-}
-
-pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: rules.Config, options: Options) RunError!Report {
+/// Runs the checks `options` selects over one frozen project: its rules and levels, the compiled
+/// project rules, per-file settings and the caller's `Io` to ask for a cancel.
+pub fn run(gpa: std.mem.Allocator, project: *const Project, options: Options) RunError!Report {
+    const config = options.config;
     try config.validate();
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
@@ -448,10 +449,10 @@ test "the rules a package declares join the run's rules: selectable by id, and a
     try std.testing.expectEqual(@as(usize, 1), declared.len);
     try std.testing.expectEqualStrings("X001", declared[0].name);
     try std.testing.expect(rules.parseConfigured("X001", declared).? == declared[0].id);
-    var report = try runConfigured(std.testing.allocator, &project, .{ .enabled = .empty, .selections = &.{.{ .rule = declared[0].id, .level = .report }} }, .{});
+    var report = try run(std.testing.allocator, &project, .{ .config = .{ .enabled = .empty, .selections = &.{.{ .rule = declared[0].id, .level = .report }} } });
     defer report.deinit();
     try std.testing.expect(report.complete);
     var config: rules.Config = .{ .enabled = .empty };
     config.set(@fromBackingInt(2005), true);
-    try std.testing.expectError(error.InvalidSelection, runConfigured(std.testing.allocator, &project, config, .{}));
+    try std.testing.expectError(error.InvalidSelection, run(std.testing.allocator, &project, .{ .config = config }));
 }

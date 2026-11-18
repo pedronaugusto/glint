@@ -13,7 +13,7 @@ const ensign = @import("ensign");
 const release = @import("version.zig");
 
 const Module = struct { name: []const u8, path: []const u8 };
-const Options = struct {
+const Parsed = struct {
     config: Rule.Config = .{},
     format: Report.Format = .text,
     files: std.ArrayList([]const u8) = .empty,
@@ -42,7 +42,7 @@ const Options = struct {
 const Loader = struct {
     a: std.mem.Allocator,
     io: std.Io,
-    options: *const Options,
+    options: *const Parsed,
     inputs: std.ArrayList(Project.Input) = .empty,
     mappings: std.ArrayList(Project.Import) = .empty,
     /// Each loaded file's position in `inputs`, by its canonical path.
@@ -311,8 +311,8 @@ pub const Arguments = struct {
 
 /// What the arguments ask: the profile chosen, the rules named (resolved by `resolve` once the
 /// packages' rules are read), the code options and the inputs.
-fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, problems: *std.Io.Writer) !Options {
-    var result: Options = .{ .format = arguments.format, .zig_lib_path = arguments.zig_lib_path };
+fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, problems: *std.Io.Writer) !Parsed {
+    var result: Parsed = .{ .format = arguments.format, .zig_lib_path = arguments.zig_lib_path };
     if (arguments.config) |path| {
         const bytes = try aegis.own.readFile(io, std.Io.Dir.cwd(), path, a, .fromRaw(4 * 1024 * 1024));
         // A configuration file is the checked repository's content: input until parsed.
@@ -368,7 +368,7 @@ fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, problems: *st
 /// The first rule `result` names that glint and `definitions` do not have. Where `own_form`,
 /// only a name of glint's own form (Z, P, D), which no package may declare: it is unknown before
 /// the project is read, where any other waits for the packages' rules.
-fn unknownRule(result: *const Options, definitions: []const Rule.Definition, own_form: bool) ?[]const u8 {
+fn unknownRule(result: *const Parsed, definitions: []const Rule.Definition, own_form: bool) ?[]const u8 {
     for (result.settings) |setting| if (unknown(setting.id, definitions, own_form)) return setting.id;
     for (result.only) |id| if (unknown(id, definitions, own_form)) return id;
     for (result.levels) |level| for (level[0]) |id| if (unknown(id, definitions, own_form)) return id;
@@ -392,7 +392,7 @@ fn refuseProfile(w: *std.Io.Writer, name: []const u8) std.Io.Writer.Error!void {
 
 /// Refuses a run that names a rule it does not have (`unknownRule`), saying which and, where
 /// glint 0.8 removed it, what to write instead (`Rule.Removed`).
-fn refuseUnknown(result: *const Options, definitions: []const Rule.Definition, own_form: bool, problems: *std.Io.Writer) !void {
+fn refuseUnknown(result: *const Parsed, definitions: []const Rule.Definition, own_form: bool, problems: *std.Io.Writer) !void {
     const name = unknownRule(result, definitions, own_form) orelse return;
     try problems.writeAll("glint: ");
     try Rule.Removed.refuse(problems, name);
@@ -404,7 +404,7 @@ fn refuseUnknown(result: *const Options, definitions: []const Rule.Definition, o
 /// The rules `options` asked by name, now that `definitions` holds every rule of the run (the
 /// caller's and the packages'): each package rule that is on unasked and nothing set, the configuration's settings, `--only` (which starts from none), then each
 /// level's names. A name no rule has is `UnknownRule`.
-fn resolve(a: std.mem.Allocator, result: *Options, definitions: []const Rule.Definition) !void {
+fn resolve(a: std.mem.Allocator, result: *Parsed, definitions: []const Rule.Definition) !void {
     result.config.package_defaults = result.package_defaults;
     for (result.settings, 0..) |setting, i| {
         for (result.settings[0..i]) |earlier| if (std.mem.eql(u8, setting.id, earlier.id)) return error.InvalidSelection;
@@ -445,21 +445,109 @@ fn named(mapping: []const u8) ?Module {
     return .{ .name = mapping[0..equals], .path = mapping[equals + 1 ..] };
 }
 
+/// What a command line runs with beside its arguments.
+pub const Options = struct {
+    /// Compiled project rules, run beside glint's own: a standalone command line for them.
+    project_rules: []const RuleContext.Rule = &.{},
+    /// Where each file is read: runs sharing a store read a file they share once, std's among
+    /// them (glint's soundness suite, a run per case). Null: each run reads its own.
+    store: ?*Project.Store = null,
+};
+
+/// What `execute` fails with, beside the exit status it answers: a writer's failure, a cancel, the
+/// file system's errors reading sources, configuration and records and writing results and fixes,
+/// a refused command line or configuration, and the project's and the run's own.
+pub const ExecuteError = error{
+    WriteFailed,
+    Canceled,
+    InputOutput,
+    SystemResources,
+    IsDir,
+    ConnectionResetByPeer,
+    NotOpenForReading,
+    SocketUnconnected,
+    WouldBlock,
+    AccessDenied,
+    LockViolation,
+    Unexpected,
+    DiskQuota,
+    FileTooBig,
+    NoSpaceLeft,
+    DeviceBusy,
+    PermissionDenied,
+    BrokenPipe,
+    NotOpenForWriting,
+    NoDevice,
+    FileBusy,
+    ProcessFdQuotaExceeded,
+    SystemFdQuotaExceeded,
+    PathAlreadyExists,
+    SymLinkLoop,
+    LinkQuotaExceeded,
+    FileNotFound,
+    NotDir,
+    ReadOnlyFileSystem,
+    NetworkNotFound,
+    NameTooLong,
+    BadPathName,
+    PipeBusy,
+    AntivirusInterference,
+    FileLocksUnsupported,
+    Streaming,
+    OperationUnsupported,
+    FileSystem,
+    UnrecognizedVolume,
+    DirNotEmpty,
+    CrossDevice,
+    HardwareFailure,
+    OutOfMemory,
+    StreamTooLong,
+    Overflow,
+    InvalidCharacter,
+    InvalidIdentifier,
+    InvalidHandle,
+    AmbiguousSuppression,
+    InvalidSelection,
+    InvalidArguments,
+    InvalidResultRequest,
+    UnexpectedToken,
+    InvalidNumber,
+    InvalidEnumTag,
+    DuplicateField,
+    UnknownField,
+    MissingField,
+    LengthMismatch,
+    SyntaxError,
+    UnexpectedEndOfInput,
+    BufferUnderrun,
+    ValueTooLong,
+    UnknownProfile,
+    InvalidEscapeRecord,
+    InvalidModule,
+    InvalidPackage,
+    FileListPathOutside,
+    UnknownRule,
+    MissingSource,
+    FileBudgetExceeded,
+    ImportOutsideRoots,
+    SourceBudgetExceeded,
+    InvalidLiteral,
+    SourceTooLarge,
+    SourceTooComplex,
+    InvalidMapping,
+    DuplicateMapping,
+    ProjectBudgetExceeded,
+    SnapshotLimit,
+    MalformedSuppression,
+    InvalidProject,
+    InvalidEdit,
+};
+
 /// Runs glint on `args`, the program's name first: the report, help or version to `writer`,
 /// a mistake in the arguments to `problems`.
-pub fn execute(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer, problems: *std.Io.Writer) !u8 {
-    return executeConfigured(gpa, io, args, writer, problems, &.{});
-}
-/// Standalone CLI for compiled project rules. Same completion and output contract.
-pub fn executeConfigured(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer, problems: *std.Io.Writer, project_rules: []const RuleContext.Rule) !u8 {
-    return executeWith(gpa, io, args, writer, problems, project_rules, null);
-}
-/// Runs glint on `args` as `execute` does, each file read through `store`: runs sharing it
-/// read a file they share once, std's among them (glint's soundness suite, a run per case).
-pub fn executeStored(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer, problems: *std.Io.Writer, store: *Project.Store) !u8 {
-    return executeWith(gpa, io, args, writer, problems, &.{}, store);
-}
-fn executeWith(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer, problems: *std.Io.Writer, project_rules: []const RuleContext.Rule, store: ?*Project.Store) !u8 {
+pub fn execute(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer, problems: *std.Io.Writer, setup: Options) ExecuteError!u8 {
+    const project_rules = setup.project_rules;
+    const store = setup.store;
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -547,7 +635,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     try resolve(a, &configured, all);
     record.outcome = .tool_failure;
     const config = configured.config;
-    var report = try Runner.runConfigured(gpa, &project, config, .{ .project_rules = project_rules, .io = io });
+    var report = try Runner.run(gpa, &project, .{ .config = config, .project_rules = project_rules, .io = io });
     defer report.deinit();
     record.outcome = .output_failure;
     var rendered: std.Io.Writer.Allocating = .init(a);
@@ -598,7 +686,7 @@ fn refused(err: ensign.Error, diagnostic: ensign.Diagnostic, problems: *std.Io.W
 }
 
 /// `options` in a test, its problems written nowhere.
-fn testOptions(a: std.mem.Allocator, arguments: Arguments) !Options {
+fn testOptions(a: std.mem.Allocator, arguments: Arguments) !Parsed {
     var buffer: [256]u8 = undefined;
     var problems: std.Io.Writer = .fixed(&buffer);
     return options(a, std.testing.io, arguments, &problems);

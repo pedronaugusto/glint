@@ -22,7 +22,7 @@ fn configuration(level: glint.Config.Level) glint.Config {
 test "G2 compiled project rules share metadata rendering and written site suppression" {
     var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "pub const bad = 1;\n" ++ ignore ++ "CUSTOM_API -- boundary exports this intentional constant\npub const allowed = 2;" }}, &.{}, .{});
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, configuration(.report), .{ .project_rules = &.{rule} });
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = configuration(.report), .project_rules = &.{rule} });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: expected single fixture diagnostic.
     try std.testing.expectEqual(@as(usize, 1), report.suppressed); // safe: expected single reasoned exception.
@@ -41,7 +41,7 @@ test "G2 compiled project rules share metadata rendering and written site suppre
             try std.testing.expectEqual(@as(i64, 7), properties.object.get("ruleVersion").?.integer); // safe: exact custom metadata version.
         }
     }
-    var gated = try glint.runConfigured(std.testing.allocator, &project, configuration(.gate), .{ .project_rules = &.{rule} });
+    var gated = try glint.run(std.testing.allocator, &project, .{ .config = configuration(.gate), .project_rules = &.{rule} });
     defer gated.deinit();
     try std.testing.expect(gated.complete);
     // One gate finding, separate from one reasoned site; a report's findings do not gate.
@@ -66,7 +66,7 @@ fn repeating(context: *glint.RuleContext) glint.RuleContext.Error!void {
 test "G2 a finding is one per rule, site and cause, however many times its rule reaches it, with the related places of each" {
     var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "pub const bad = 1;\n" ++ ignore ++ "CUSTOM_API -- boundary exports this intentional constant\npub const allowed = 2;" }}, &.{}, .{});
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, configuration(.report), .{ .project_rules = &.{.{ .definition = rule.definition, .check = repeating }} });
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = configuration(.report), .project_rules = &.{.{ .definition = rule.definition, .check = repeating }} });
     defer report.deinit();
     // Each cause at `bad` once; the escaped site's two causes each taken once.
     try std.testing.expectEqual(@as(usize, 2), report.diagnostics.len); // safe: two causes at one site.
@@ -83,7 +83,7 @@ test "G2 a project rule's run error leaves the run incomplete with every finding
     defer project.deinit();
     var modified = rule;
     modified.check = uncertain;
-    var report = try glint.runConfigured(std.testing.allocator, &project, configuration(.gate), .{ .project_rules = &.{modified} });
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = configuration(.gate), .project_rules = &.{modified} });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: no unsuppressed findings.
     try std.testing.expectEqual(@as(usize, 1), report.suppressed); // safe: expected site exception.
@@ -102,14 +102,14 @@ test "a project linter skips a suppression for a rule glint has that its run doe
     // P007 and Z013 are off: neither suppression is judged.
     var inactive = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "pub fn f(buffer: []u8) void {\n    " ++ ignore ++ "P007 -- read only below what it wrote\n    _ = buffer;\n    " ++ ignore ++ "Z013 -- the deprecated name is kept for one release\n    _ = buffer;\n}\n" }}, &.{}, .{});
     defer inactive.deinit();
-    var skipped = try glint.runConfigured(std.testing.allocator, &inactive, configuration(.report), .{ .project_rules = &.{rule} });
+    var skipped = try glint.run(std.testing.allocator, &inactive, .{ .config = configuration(.report), .project_rules = &.{rule} });
     defer skipped.deinit();
     try std.testing.expectEqual(@as(usize, 0), skipped.malformed.len); // safe: no malformed comment.
     try std.testing.expectEqual(@as(usize, 0), skipped.stale_suppressions); // safe: a rule that does not run judges nothing.
     // A rule no core, pack or project has: malformed, as before.
     var unknown = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "pub fn f(buffer: []u8) void {\n    " ++ ignore ++ "A999 -- read only below what it wrote\n    _ = buffer;\n}\n" }}, &.{}, .{});
     defer unknown.deinit();
-    var refused = try glint.runConfigured(std.testing.allocator, &unknown, configuration(.report), .{ .project_rules = &.{rule} });
+    var refused = try glint.run(std.testing.allocator, &unknown, .{ .config = configuration(.report), .project_rules = &.{rule} });
     defer refused.deinit();
     try std.testing.expectEqual(@as(usize, 1), refused.malformed.len); // safe: the one unknown name.
     try std.testing.expectEqualStrings("a suppression names a rule glint does not have", refused.malformed[0].why);
@@ -117,7 +117,7 @@ test "a project linter skips a suppression for a rule glint has that its run doe
     // The project's own rule runs: its suppression that suppresses nothing is stale.
     var enabled = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = ignore ++ "CUSTOM_API -- the boundary exports this constant\nconst kept = 2;\npub fn f() u32 {\n    return kept;\n}\n" }}, &.{}, .{});
     defer enabled.deinit();
-    var stale = try glint.runConfigured(std.testing.allocator, &enabled, configuration(.report), .{ .project_rules = &.{rule} });
+    var stale = try glint.run(std.testing.allocator, &enabled, .{ .config = configuration(.report), .project_rules = &.{rule} });
     defer stale.deinit();
     try std.testing.expectEqual(@as(usize, 1), stale.stale_suppressions); // safe: the one unused suppression.
     try std.testing.expectEqualStrings("CUSTOM_API", stale.stale[0].name);
@@ -125,8 +125,8 @@ test "a project linter skips a suppression for a rule glint has that its run doe
 test "G2 compiled rules reject missing definitions collisions and invalid spans" {
     var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "pub const x = 1;" }}, &.{}, .{});
     defer project.deinit();
-    try std.testing.expectError(error.InvalidSelection, glint.runConfigured(std.testing.allocator, &project, configuration(.report), .{}));
-    try std.testing.expectError(error.InvalidSelection, glint.runConfigured(std.testing.allocator, &project, configuration(.report), .{ .project_rules = &.{ rule, rule } }));
+    try std.testing.expectError(error.InvalidSelection, glint.run(std.testing.allocator, &project, .{ .config = configuration(.report) }));
+    try std.testing.expectError(error.InvalidSelection, glint.run(std.testing.allocator, &project, .{ .config = configuration(.report), .project_rules = &.{ rule, rule } }));
     const Invalid = struct {
         fn run(context: *glint.RuleContext) glint.RuleContext.Error!void {
             try context.emit(own, 0, 100, "outside source");
@@ -134,19 +134,19 @@ test "G2 compiled rules reject missing definitions collisions and invalid spans"
     };
     var bad = rule;
     bad.check = Invalid.run;
-    try std.testing.expectError(error.InvalidHandle, glint.runConfigured(std.testing.allocator, &project, configuration(.report), .{ .project_rules = &.{bad} }));
+    try std.testing.expectError(error.InvalidHandle, glint.run(std.testing.allocator, &project, .{ .config = configuration(.report), .project_rules = &.{bad} }));
     const InvalidNode = struct {
         fn run(context: *glint.RuleContext) glint.RuleContext.Error!void {
             try context.at(own, 1_000_000, "outside source"); // safe: deliberately invalid token for boundary rejection.
         }
     };
     bad.check = InvalidNode.run;
-    try std.testing.expectError(error.InvalidHandle, glint.runConfigured(std.testing.allocator, &project, configuration(.report), .{ .project_rules = &.{bad} }));
+    try std.testing.expectError(error.InvalidHandle, glint.run(std.testing.allocator, &project, .{ .config = configuration(.report), .project_rules = &.{bad} }));
 }
 test "G2 caller selects per-file rule levels without importing a path dialect" {
     var project = try glint.Project.init(std.testing.allocator, &.{ .{ .name = "chosen", .bytes = "pub const x = 1;" }, .{ .name = "excluded", .bytes = "pub const y = 2;" } }, &.{}, .{});
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, configuration(.off), .{ .project_rules = &.{rule}, .files = &.{.{ .file = project.sources[0].id, .config = configuration(.report) }} });
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = configuration(.off), .project_rules = &.{rule}, .files = &.{.{ .file = project.sources[0].id, .config = configuration(.report) }} });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: only selected source reports.
     try std.testing.expect(report.diagnostics[0].span.file == project.sources[0].id);
@@ -190,7 +190,7 @@ test "a call given a type made by a type function or a type builtin is no functi
     var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = source }}, &.{}, .{});
     defer project.deinit();
     const checking: glint.ProjectRule = .{ .definition = rule.definition, .check = refusedCalls };
-    var report = try glint.runConfigured(std.testing.allocator, &project, configuration(.report), .{ .project_rules = &.{checking} });
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = configuration(.report), .project_rules = &.{checking} });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 2), report.diagnostics.len); // safe: the two type arguments are refused, the value accepted.
 }
@@ -226,7 +226,7 @@ test "test code is a test block or an input classified test, never what only tes
     }, &.{.{ .from = 0, .spelling = "support.zig", .target = 1 }}, .{});
     defer project.deinit();
     const checking: glint.ProjectRule = .{ .definition = rule.definition, .check = productionFunctions };
-    var report = try glint.runConfigured(std.testing.allocator, &project, configuration(.report), .{ .project_rules = &.{checking} });
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = configuration(.report), .project_rules = &.{checking} });
     defer report.deinit();
     // The private helper only the test calls and the file only the test imports are production;
     // the function inside the test block and the input classified test are not.
