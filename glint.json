@@ -8,6 +8,13 @@
       "reason": "the command line's input: the sources, configurations, manifests, file lists and escape records it is given are read here, each parsed as input before use"
     },
     {
+      "file": "src/Assembly.zig",
+      "rules": [
+        "A009"
+      ],
+      "reason": "a project file's input: the sources and manifests it names are read here, each parsed as input before use (Project.init, Manifest.parse)"
+    },
+    {
       "file": "src/BuildGate.zig",
       "rules": [
         "A009"
