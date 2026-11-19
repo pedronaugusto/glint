@@ -40,6 +40,34 @@ pub const Configuration = struct {
     pub const Setting = struct { id: []const u8, level: Config.Level };
 };
 
+/// A configuration in glint's schema as it was written: each field it sets, and null for each it
+/// leaves out, so the caller's value holds where it is silent. A field the schema does not have
+/// is refused, as `Configuration` refuses it.
+pub const Written = struct {
+    profile: ?[]const u8 = null,
+    rules: ?[]const Configuration.Setting = null,
+    max_line_length: ?u32 = null,
+    max_function_lines: ?u32 = null,
+    max_parameters: ?u32 = null,
+    max_nesting: ?u32 = null,
+    max_stack_array: ?u64 = null,
+    function_exceptions: ?[]const Config.FunctionException = null,
+    disallowed: ?[]const Config.Disallowed = null,
+    strict_suppressions: ?bool = null,
+    metrics: ?bool = null,
+    fact_budget: ?usize = null,
+    seams: ?[]const Config.Seam = null,
+    test_inputs: ?[]const Config.TestInput = null,
+
+    comptime {
+        // One schema: a field `Configuration` gains is a field a written one may set.
+        const ours = @typeInfo(Written).@"struct".field_names;
+        const theirs = @typeInfo(Configuration).@"struct".field_names;
+        if (ours.len != theirs.len) @compileError("Written and Configuration differ");
+        for (ours, theirs) |mine, other| if (!std.mem.eql(u8, mine, other)) @compileError("Written and Configuration differ at " ++ other);
+    }
+};
+
 /// A project file, version 1: what a caller that runs glint as a program hands it. Paths are
 /// relative to `root`. The caller owns its configuration and the build graph; glint owns what is
 /// read from them (docs/design.md, "The program contract").
@@ -90,10 +118,14 @@ pub const ProjectFile = struct {
         shipped_bans: []const []const u8,
         disallowed: []const Disallowed = &.{},
         fact_budget: usize,
-        /// The in-repo configuration in glint's own schema (glint.json's): its rules amend
-        /// `levels`, its code options apply.
-        config: ?Configuration = null,
-        /// The repository's glint.json, or null.
+        /// A suppression that suppresses nothing leaves the run incomplete.
+        strict_suppressions: bool = false,
+        /// Each selected file's functions and assertion calls are counted into the report.
+        metrics: bool = false,
+        /// The in-repo configuration in glint's own schema (glint.json's), as written: its rules
+        /// amend `levels`, the code options it writes apply.
+        config: ?Written = null,
+        /// The repository's glint.json, by its path from `root`, or null.
         repo_options: ?[]const u8 = null,
     };
     /// The rules and weights no in-repo configuration may lower; whether each package's declared

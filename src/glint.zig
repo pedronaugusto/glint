@@ -42,6 +42,7 @@ test {
     _ = @import("PackageRules.zig");
     _ = @import("Contract.zig");
     _ = @import("Assembly.zig");
+    _ = @import("Policy.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("breadth_test.zig");
     _ = @import("accesses_test.zig");

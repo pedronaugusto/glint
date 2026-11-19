@@ -52,7 +52,7 @@ pub const layers = [_]Layer{
         "src/Program.zig",
     } },
     .{ .name = "rules", .patterns = &.{"src/Runner.zig"} },
-    .{ .name = "filesystem CLI", .patterns = &.{ "src/cli.zig", "src/Result.zig", "src/Contract.zig", "src/Assembly.zig" } },
+    .{ .name = "filesystem CLI", .patterns = &.{ "src/cli.zig", "src/Result.zig", "src/Contract.zig", "src/Assembly.zig", "src/Policy.zig" } },
     .{ .name = "public", .patterns = &.{"src/glint.zig"} },
     .{ .name = "entry", .patterns = &.{ "src/main.zig", "src/BuildGate.zig" } },
 };
