@@ -150,7 +150,8 @@ pub fn main(init: std.process.Init) !void {
 
     const verdicts = try a.alloc(anyerror!Verdict, jobs.items.len);
     var pool: Pool = .{ .jobs = jobs.items, .columns = columns.items, .verdicts = verdicts, .lib = lib, .aegis = aegis };
-    const workers = @min(if (jobs_asked != 0) jobs_asked else std.Thread.getCpuCount() catch 1, @max(jobs.items.len, 1));
+    const memory: ?u64 = std.process.totalSystemMemory() catch null;
+    const workers = fitted(jobs_asked, std.Thread.getCpuCount() catch 1, jobs.items.len, memory);
     var group: std.Io.Group = .init;
     defer group.cancel(io);
     for (0..workers) |_| try group.concurrent(io, Pool.work, .{ &pool, init.gpa, io });
@@ -232,6 +233,31 @@ pub fn main(init: std.process.Init) !void {
 /// fifths more a worker.
 const worker_ceiling: usize = 1024 << 20;
 const held_ceiling: usize = 512 << 20;
+/// What one worker holds at its peak, its store holding std's models: about 460 MiB, near 610 at
+/// its most (Zig 0.17, measured cold). The pool is fitted to it.
+const worker_resident: u64 = 640 << 20;
+
+/// The workers a run judges its cases on: those asked, else one per CPU, never more than the
+/// cases, and, unasked, no more than the machine's memory holds beside what the run keeps. A
+/// machine of 2 GiB (preflight's riscv64 and FreeBSD guests) runs two, where four ran it out of
+/// memory and its kernel killed the suite (release run 44562800622).
+fn fitted(asked: usize, cpus: usize, cases: usize, memory: ?u64) usize {
+    var workers = @min(if (asked != 0) asked else cpus, @max(cases, 1));
+    if (asked == 0) if (memory) |total| {
+        const room = total -| held_ceiling;
+        workers = @min(workers, @max(1, std.math.cast(usize, room / worker_resident) orelse workers));
+    };
+    return @max(workers, 1);
+}
+
+test "the pool is fitted to the machine's memory unless the workers are asked" {
+    try std.testing.expectEqual(@as(usize, 2), fitted(0, 4, 629, 2 << 30));
+    try std.testing.expectEqual(@as(usize, 4), fitted(0, 4, 629, 64 << 30));
+    try std.testing.expectEqual(@as(usize, 4), fitted(0, 4, 629, null));
+    try std.testing.expectEqual(@as(usize, 1), fitted(0, 4, 629, 600 << 20));
+    try std.testing.expectEqual(@as(usize, 4), fitted(4, 8, 629, 2 << 30));
+    try std.testing.expectEqual(@as(usize, 3), fitted(0, 8, 3, 64 << 30));
+}
 
 /// This process's peak resident memory in bytes, null where its system does not say.
 fn peakResident() ?usize {
