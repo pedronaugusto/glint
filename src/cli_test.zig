@@ -131,6 +131,40 @@ test "--project runs a project file under its policy: a finding's verdict is in 
     try std.testing.expectError(error.InvalidArguments, cli.execute(a, std.testing.io, &.{ "glint", "--project", project, "--gate", "Z013" }, &output.writer, &quiet.writer, .{}));
 }
 
+test "--project with --fix makes each finding's fix in the file under the root, counts it in the report it writes first, and the verdicts are the run before the fix" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/a.zig", .data = "pub fn half(a: u32, b: u32) u32 {\n    return a -% b >> 1;\n}\n" });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var file: std.Io.Writer.Allocating = .init(a);
+    defer file.deinit();
+    try file.writer.writeAll("{\"version\": 1, \"root\": ");
+    try std.json.Stringify.value(root, .{}, &file.writer);
+    try file.writer.writeAll(
+        \\, "files": [{"path": "src/a.zig", "kind": "production", "ships": true, "max_function_lines": 120}],
+        \\ "policy": {"levels": [{"rule": "Z034", "weight": "gate"}], "shipped_bans": [], "fact_budget": 100000}}
+    );
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project.json", .data = file.written() });
+    const project = try resultPath(a, &tmp, "project.json");
+    defer a.free(project);
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    // The report is the run before the fix: Z034 gates, and its finding fails.
+    try std.testing.expectEqual(@as(u8, 1), try cli.execute(a, std.testing.io, &.{ "glint", "--project", project, "--format", "json", "--fix" }, &output.writer, &quiet.writer, .{}));
+    try std.testing.expect(std.mem.find(u8, output.written(), "\"rule\":\"Z034\"") != null);
+    try std.testing.expect(std.mem.find(u8, output.written(), "\"fixed\":{\"sites\":1,\"files\":1}") != null);
+    const after = try tmp.dir.readFileAlloc(std.testing.io, "src/a.zig", a, .limited(65536));
+    defer a.free(after);
+    try std.testing.expectEqualStrings("pub fn half(a: u32, b: u32) u32 {\n    return (a -% b) >> 1;\n}\n", after);
+    // Fixed, the next run is clean, and fixes nothing.
+    output.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 0), try cli.execute(a, std.testing.io, &.{ "glint", "--project", project, "--format", "json", "--fix" }, &output.writer, &quiet.writer, .{}));
+    try std.testing.expect(std.mem.find(u8, output.written(), "\"fixed\":{\"sites\":0,\"files\":0}") != null);
+}
+
 test "surface: glint surface writes a project file's surface alone, and --surface beside a run writes the same lines" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
