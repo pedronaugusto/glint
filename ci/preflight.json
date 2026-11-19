@@ -24,7 +24,8 @@
       "configure",
       "parseConfigured",
       "initWithLowering",
-      "settleRules"
+      "settleRules",
+      "readProject"
     ]
   },
   "sources": [

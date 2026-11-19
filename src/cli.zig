@@ -789,26 +789,9 @@ test "a configuration's limits reach the rules that read them: P013's parameters
     try std.testing.expect(configured.config.has(.Z035) and !configured.config.has(.P013));
 }
 
-/// Strict JSON policy, containing code options only. Callers own file selection.
-pub const Configuration = struct {
-    /// `core`, `none` or `reviewed`; 0.7's `aegis` and `family` are refused with what to
-    /// write instead.
-    profile: []const u8 = "core",
-    rules: []const Setting = &.{},
-    max_line_length: u32 = 100,
-    max_function_lines: u32 = 120,
-    max_parameters: u32 = 7,
-    max_nesting: u32 = 5,
-    max_stack_array: u64 = 64 * 1024,
-    function_exceptions: []const Rule.Config.FunctionException = &.{},
-    disallowed: []const Rule.Config.Disallowed = &.{},
-    strict_suppressions: bool = false,
-    metrics: bool = false,
-    fact_budget: usize = 100_000,
-    seams: []const Rule.Config.Seam = &.{},
-    test_inputs: []const Rule.Config.TestInput = &.{},
-    pub const Setting = struct { id: []const u8, level: Rule.Config.Level };
-};
+/// Strict JSON policy, containing code options only (glint.json's schema): the contract's
+/// (`Contract.Configuration`), named here as well for callers that link glint's CLI.
+pub const Configuration = Contract.Configuration;
 fn select(a: std.mem.Allocator, config: *Rule.Config, id: Rule.Rule, level: Rule.Config.Level) !void {
     const selections = try a.alloc(Rule.Config.Selection, config.selections.len + 1);
     @memcpy(selections[0..config.selections.len], config.selections);

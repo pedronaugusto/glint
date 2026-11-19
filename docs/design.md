@@ -265,8 +265,8 @@ any of them it is an argument failure. `glint --contract` prints exactly `glint-
 
 **The project file** is JSON, `"version": 1`, its paths relative to its `root`. The caller owns its own
 configuration and the build graph; glint owns import discovery, compilation membership, rule names and their
-resolution, the packages' rules, per-file levels, fixes and each finding's verdict. glint holds no family
-knowledge: the family's tables arrive as data.
+resolution, the packages' rules, per-file levels, fixes and each finding's verdict. glint knows nothing of its
+caller: levels, a floor and P006's entries arrive as data, and its messages name only them.
 
 - `zig_lib`; `release` (shipped bans fail, the release tier; nothing else).
 - `modules`: the build's modules, each `root` (or null), `contents` (a generated root's text), `script` (the
@@ -279,13 +279,23 @@ knowledge: the family's tables arrive as data.
   `build.zig.zon` ships: the shipped bans and the packages' bans hold it), `max_function_lines` (null: P003 off),
   `function_exceptions`, and `vendored` (`{upstream, verification}` for a file the caller verified as its
   upstream's copy: the upstream-text rules are off and a danger site there is carried, never failing).
-- `policy`: `levels` (the default table, glint's own ids at gate, finding, report or off), `floor` (an amendment
-  may only raise a rule; without it any level, and each below its default is a note), `shipped_bans`,
-  `disallowed` (P006's entries), `fact_budget`, `amendments` (the caller's `glint` object verbatim: glint refuses
-  its retired and unknown keys, a folded, removed or doubled rule, and a name neither glint nor a package of the
-  run has) and `options` (the repository's glint.json, or null: its code options are read, its function-length
-  keys refused, its profile and rules noted as unread). A package's declared rule joins at its own default (a
-  ban a finding, hygiene a report) and holds shipped files only.
+- `policy`: glint is told a floor, never whose it is.
+  - `levels`: the caller's default table, glint's own ids at gate, finding, report or off.
+  - `floor`: null (any level; each set below its default is a note), or `rules` (the rules and weights no
+    in-repo configuration may lower), `package_defaults` (each package's declared rule is held at its own
+    default) and `refuse_repo_options` (a repository's glint.json is refused). A refusal names the floor: "Z026
+    is held at gate by the caller's floor; a configuration may only raise it, not set it to report".
+  - `shipped_bans`, `disallowed` (P006's entries), `fact_budget`.
+  - `config`: the in-repo configuration in glint's own schema, the one glint.json uses ("Configuration, seams
+    and suppression"), mapped by the caller from wherever it keeps it. Its `rules` amend `levels` and its code options apply. Refused
+    there: `profile` (the defaults are `levels`), `max_function_lines` and `function_exceptions` (per file, in
+    `files`), an unknown field, a removed, folded or doubled rule, and a name neither glint nor a package of the
+    run has.
+  - `repo_options`: the repository's glint.json, or null. Unless the floor refuses it, its code options are read,
+    its function-length keys refused, and its profile and rules noted as not read.
+
+  A package's declared rule joins at its own default (a ban a finding, hygiene a report) and holds shipped files
+  only.
 
 **Outputs.** The JSON report, version 1, gains: each diagnostic's `fails`, `shipped_ban` and `carried` (the
 upstream whose verification carries the site); `notes`; and with `--fix`, `fixed` (`sites` and the `files`
