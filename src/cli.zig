@@ -14,6 +14,7 @@ const release = @import("version.zig");
 const Contract = @import("Contract.zig");
 const Assembly = @import("Assembly.zig");
 const Policy = @import("Policy.zig");
+const Surface = @import("Surface.zig");
 
 const Module = struct { name: []const u8, path: []const u8 };
 const Parsed = struct {
@@ -301,6 +302,7 @@ pub const Arguments = struct {
     input_directory: []const []const u8 = &.{},
     contract: bool = false,
     project: ?[]const u8 = null,
+    surface: ?[]const u8 = null,
     pub const spec: ensign.Spec(@This()) = .{
         .name = "glint",
         .version = release.version,
@@ -332,6 +334,7 @@ pub const Arguments = struct {
             .input_directory = .{ .value_name = "DIR", .hint = .directory, .hidden = true, .help = "A directory the caller's build reads; never a selection of files" },
             .contract = .{ .negatable = false, .help = "Print the project-file versions this glint reads (`glint-contract 1`) and check nothing" },
             .project = .{ .value_name = "FILE", .hint = .file, .section = "Inputs", .help = "A project file (the program contract, docs/design.md): the build's modules, the files and the policy in one document, beside which no input or rule option is read" },
+            .surface = .{ .value_name = "FILE", .hint = .file, .help = "With --project, write the package's public surface here: `glint-surface 1`, then a line per declaration a consumer reaches through its exported modules" },
         },
         // A run of some rules sees only what they cover: it never names an older escape.
         .conflicts = &.{ &.{ .only, .reviewed }, &.{ .only, .escapes_before } },
@@ -619,6 +622,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     const definitions = try a.alloc(Rule.Definition, project_rules.len);
     for (project_rules, 0..) |rule, i| definitions[i] = rule.definition;
     var diagnostic: ensign.Diagnostic = .{};
+    if (args.len != 0 and std.mem.eql(u8, args[0], "surface")) return executeSurface(gpa, result_a, io, args[1..], writer, problems, record, store);
     const outcome = ensign.parse(Arguments, a, args, .{ .diagnostic = &diagnostic }) catch |err| return refused(err, diagnostic, problems);
     const arguments = switch (outcome) {
         .parsed => |parsed| parsed,
@@ -640,6 +644,11 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
         record.outcome = .output_failure;
         try Contract.writeVersions(writer);
         return told(writer, record);
+    }
+    if (arguments.surface != null and arguments.project == null) {
+        try problems.writeAll("glint: --surface is written from a project file: name it with --project\n");
+        try problems.flush();
+        return error.InvalidArguments;
     }
     if (arguments.project) |path| return executeProject(gpa, result_a, io, arguments, path, writer, problems, record, project_rules, store);
     var configured = try options(a, io, arguments, problems);
@@ -778,6 +787,11 @@ fn executeProject(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.I
     record.output_bytes = output.len;
     record.output_sha256 = try result_a.dupe(u8, &std.fmt.bytesToHex(&digest, .lower));
     for (changed) |file| try root.writeFile(io, .{ .sub_path = project.at(file.file).input.name, .data = file.bytes });
+    if (arguments.surface) |surface_path| {
+        var surface: std.Io.Writer.Allocating = .init(a);
+        try Surface.write(&surface.writer, try Surface.lines(a, &project, project_file.exported));
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = surface_path, .data = surface.written() });
+    }
     for (assembled.inputs) |input| if (input.selected) {
         record.sources += 1;
     };
@@ -786,6 +800,74 @@ fn executeProject(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.I
     record.completed = report.complete;
     record.outcome = if (!report.complete) .analysis_incomplete else if (fails) .findings else .clean;
     return if (!report.complete) 2 else if (fails) 1 else 0;
+}
+
+/// `glint surface --project FILE`'s line: the project file alone.
+const SurfaceArguments = struct {
+    project: ?[]const u8 = null,
+    pub const spec: ensign.Spec(@This()) = .{
+        .name = "glint surface",
+        .version = release.version,
+        .about = "Write a package's public surface from a project file, and check nothing",
+        .description = "The lines `--surface` writes beside a run, for a tree no run reads (a release's tag): `glint-surface 1`, then one line per declaration a consumer reaches through the package's exported modules, sorted.",
+        .options = .{
+            .project = .{ .value_name = "FILE", .hint = .file, .help = "The project file (the program contract, docs/design.md)" },
+        },
+    };
+};
+
+/// The surface of a project file's package, alone: its files read as its build binds them, with
+/// no lowering, no policy and no rule run.
+fn executeSurface(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer, problems: *std.Io.Writer, record: *Result.Record, store: ?*Project.Store) !u8 {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diagnostic: ensign.Diagnostic = .{};
+    const outcome = ensign.parse(SurfaceArguments, a, args, .{ .diagnostic = &diagnostic }) catch |err| return refused(err, diagnostic, problems);
+    const arguments = switch (outcome) {
+        .parsed => |parsed| parsed,
+        .help => |page| {
+            record.outcome = .output_failure;
+            try page.write(writer, width);
+            return told(writer, record);
+        },
+        .version => |version| {
+            record.outcome = .output_failure;
+            try version.write(writer);
+            return told(writer, record);
+        },
+        .complete => return error.InvalidArguments,
+    };
+    const path = arguments.project orelse {
+        try problems.writeAll("glint surface: name the project file with --project\n");
+        try problems.flush();
+        return error.InvalidArguments;
+    };
+    const bytes = try aegis.own.readFile(io, std.Io.Dir.cwd(), path, a, .fromRaw(64 * 1024 * 1024));
+    // The project file is the caller's writing: input until read.
+    const reading: Reading = .{ .a = a, .problems = problems };
+    const project_file = aegis.input.Untrusted([]const u8).init(bytes).parse(reading, projectFile) catch |err| return flushed(problems, err);
+    record.outcome = .input_failure;
+    var root = try std.Io.Dir.cwd().openDir(io, project_file.root, .{});
+    defer root.close(io);
+    const assembled = Assembly.assemble(a, gpa, io, root, project_file, problems) catch |err| return flushed(problems, err);
+    record.outcome = .tool_failure;
+    var project = try Project.init(gpa, assembled.inputs, assembled.imports, .{ .io = io, .store = store, .lowering = false });
+    defer project.deinit();
+    const listed = try Surface.lines(a, &project, project_file.exported);
+    record.outcome = .output_failure;
+    var rendered: std.Io.Writer.Allocating = .init(a);
+    try Surface.write(&rendered.writer, listed);
+    const output = rendered.written();
+    try writer.writeAll(output);
+    try writer.flush();
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(output, &digest, .{});
+    record.output_bytes = output.len;
+    record.output_sha256 = try result_a.dupe(u8, &std.fmt.bytesToHex(&digest, .lower));
+    record.completed = true;
+    record.outcome = .clean;
+    return 0;
 }
 
 /// What reading a project file writes its problems to.
@@ -806,7 +888,7 @@ fn flushed(problems: *std.Io.Writer, err: anytype) (@TypeOf(err) || std.Io.Write
 /// a run before reported are the run's own.
 fn onlyBeside(arguments: Arguments, problems: *std.Io.Writer) !void {
     inline for (@typeInfo(Arguments).@"struct".field_names) |name| {
-        const own = comptime for ([_][]const u8{ "project", "format", "fix", "escapes_before", "contract" }) |allowed| {
+        const own = comptime for ([_][]const u8{ "project", "format", "fix", "escapes_before", "contract", "surface" }) |allowed| {
             if (std.mem.eql(u8, name, allowed)) break true;
         } else false;
         if (own) continue;

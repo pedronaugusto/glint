@@ -131,6 +131,42 @@ test "--project runs a project file under its policy: a finding's verdict is in 
     try std.testing.expectError(error.InvalidArguments, cli.execute(a, std.testing.io, &.{ "glint", "--project", project, "--gate", "Z013" }, &output.writer, &quiet.writer, .{}));
 }
 
+test "surface: glint surface writes a project file's surface alone, and --surface beside a run writes the same lines" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/a.zig", .data = "pub const limit: u32 = 8;\npub fn run(n: u32) void {\n    _ = n;\n}\n" });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var file: std.Io.Writer.Allocating = .init(a);
+    defer file.deinit();
+    try file.writer.writeAll("{\"version\": 1, \"root\": ");
+    try std.json.Stringify.value(root, .{}, &file.writer);
+    try file.writer.writeAll(
+        \\, "exported": [{"name": "pkg", "root": "src/a.zig"}],
+        \\ "files": [{"path": "src/a.zig", "kind": "production", "ships": true, "max_function_lines": 120}],
+        \\ "policy": {"levels": [], "shipped_bans": [], "fact_budget": 100000}}
+    );
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project.json", .data = file.written() });
+    const project = try resultPath(a, &tmp, "project.json");
+    defer a.free(project);
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    try std.testing.expectEqual(@as(u8, 0), try cli.execute(a, std.testing.io, &.{ "glint", "surface", "--project", project }, &output.writer, &quiet.writer, .{}));
+    try std.testing.expectEqualStrings("glint-surface 1\npkg.limit const: u32\npkg.limit value = 8\npkg.run fn ( u32 ) void\n", output.written());
+    const surface = try resultPath(a, &tmp, "surface.txt");
+    defer a.free(surface);
+    var report: std.Io.Writer.Allocating = .init(a);
+    defer report.deinit();
+    try std.testing.expectEqual(@as(u8, 0), try cli.execute(a, std.testing.io, &.{ "glint", "--project", project, "--surface", surface }, &report.writer, &quiet.writer, .{}));
+    const written = try tmp.dir.readFileAlloc(std.testing.io, "surface.txt", a, .limited(65536));
+    defer a.free(written);
+    try std.testing.expectEqualStrings(output.written(), written);
+    // A surface is written from a project file.
+    try std.testing.expectError(error.InvalidArguments, cli.execute(a, std.testing.io, &.{ "glint", "--surface", surface, "x.zig" }, &report.writer, &quiet.writer, .{}));
+}
+
 test "completion missing input and bad arguments never certify clean" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
