@@ -44,6 +44,8 @@ const Loader = struct {
     a: std.mem.Allocator,
     io: std.Io,
     options: *const Parsed,
+    /// Where an import the run cannot follow is named (`unread`).
+    problems: *std.Io.Writer,
     inputs: std.ArrayList(Project.Input) = .empty,
     mappings: std.ArrayList(Project.Import) = .empty,
     /// The compilation each mapping's name is bound in (`compile`).
@@ -181,8 +183,15 @@ const Loader = struct {
                     try self.map(from, spelling, try self.load(module.path, false), .program);
                 };
                 if (by_module) continue;
-                const target_path = (try aegis.input.Untrusted(Spelling).init(.{ .from = cursor, .text = spelling }).parse(self, Loader.importPath)) orelse continue;
-                try self.map(from, spelling, try self.load(target_path, false), .every);
+                const target_path = (aegis.input.Untrusted(Spelling).init(.{ .from = cursor, .text = spelling }).parse(self, Loader.importPath) catch |err| switch (err) {
+                    error.ImportOutsideRoots => return self.unread(from, token.loc.start, spelling, err),
+                    else => return err,
+                }) orelse continue;
+                const target = self.load(target_path, false) catch |err| switch (err) {
+                    error.FileNotFound, error.NotDir, error.ImportOutsideRoots => return self.unread(from, token.loc.start, spelling, err),
+                    else => return err,
+                };
+                try self.map(from, spelling, target, .every);
             }
         }
     }
@@ -256,6 +265,20 @@ const Loader = struct {
     fn buildScript(self: *Loader, canonical: []const u8) !bool {
         if (!std.mem.eql(u8, std.Io.Dir.path.basename(canonical), "build.zig")) return false;
         return try self.manifest(std.Io.Dir.path.dirname(canonical) orelse return false) != null;
+    }
+
+    /// Names the `@import` the run could not follow, where it is written, and how to map it,
+    /// then fails the run with `err` (`traversal_failure`): a module name spelled like a file
+    /// (`@import("gantry.zig")`) that no `--module` maps is read as a relative path, as Zig does.
+    fn unread(self: *Loader, from: usize, offset: usize, spelling: []const u8, err: anytype) (@TypeOf(err) || std.Io.Writer.Error) {
+        const input = self.inputs.items[from];
+        const at = std.zig.findLineColumn(input.bytes, offset);
+        const why = switch (err) {
+            error.ImportOutsideRoots => "is a path outside the run's roots",
+            else => "names no module this run maps and no file",
+        };
+        try self.problems.print("{s}:{d}:{d}: `@import(\"{f}\")` {s}: map the module (`--module {f}=FILE`), or give the file\n", .{ input.name, at.line + 1, at.column + 1, std.zig.fmtString(spelling), why, std.zig.fmtString(spelling) });
+        return err;
     }
 
     /// An `@import` a loaded file spells, and the file it is written in.
@@ -699,7 +722,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     try refuseUnknown(&configured, definitions, true, problems);
     if (configured.files.items.len == 0) return error.MissingSource;
     record.outcome = .input_failure;
-    var loader: Loader = .{ .a = a, .io = io, .options = &configured };
+    var loader: Loader = .{ .a = a, .io = io, .options = &configured, .problems = problems };
     for (configured.packages.items) |package| try loader.packages.append(a, .{ .name = package.name, .path = try std.Io.Dir.cwd().realPathFileAlloc(io, package.path, a) });
     for (configured.roots.items) |root| try loader.roots.append(a, try std.Io.Dir.cwd().realPathFileAlloc(io, root, a));
     for (configured.files.items) |path| {
