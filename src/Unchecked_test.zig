@@ -328,6 +328,33 @@ fn expect(rule: glint.Rule, program: []const u8, findings: usize) !void {
     try std.testing.expectEqual(findings, result.findings);
 }
 
+/// `files` named as Windows names them where the run finds std under `D:\zig\lib`: `\`
+/// between the parts. Called at compile time.
+fn windowsNamed(comptime files: []const sources.Extra) [files.len]sources.Extra {
+    var out: [files.len]sources.Extra = undefined;
+    for (files, &out) |file, *renamed| {
+        var name: []const u8 = "D:\\zig\\lib\\";
+        for (file.name) |ch| name = name ++ &[_]u8{if (ch == '/') '\\' else ch};
+        renamed.* = file;
+        renamed.name = name;
+    }
+    return out;
+}
+
+test "P007 finds a member of std's raw bindings whether std's files are named with / or with \\ (Windows)" {
+    const program =
+        \\const std = @import("std");
+        \\pub fn f(a: *std.c.posix_spawnattr_t) c_int {
+        \\    return std.c.posix_spawnattr_init(a);
+        \\}
+    ;
+    const slashed = try run(.P007, program);
+    const windows_files = comptime windowsNamed(&std_files);
+    const windows = try runWith(.P007, program, &windows_files, &std_imports);
+    try std.testing.expect(slashed.findings != 0);
+    try std.testing.expectEqual(slashed.findings, windows.findings);
+}
+
 test "P007 finds the unchecked operations, a cast nested in another once, a suppression covering one, never an address read or the interface-recovery idiom" {
     try expect(.P007, comptime suppressed(
         \\extern fn write(fd: c_int) c_int;

@@ -241,7 +241,10 @@ fn namespaceBinding(c: *Context, value: Facts.Value) Context.Error!?[]const u8 {
 /// Which raw binding a std file is, if one: `c`, `os.linux` or `os.windows`, or a file of theirs.
 fn bindingOf(c: *Context, file: Project.FileId) Context.Error!?[]const u8 {
     if (!try c.facts.standard(file)) return null;
-    const name = c.project.at(file).input.name;
+    // std's files are named as the run found them: on Windows with `\` between their parts,
+    // matched here as `/`, on every host alike.
+    const name = try c.allocator.dupe(u8, c.project.at(file).input.name);
+    std.mem.replaceScalar(u8, name, '\\', '/');
     for ([_]struct { []const u8, []const u8 }{ .{ "std/c.zig", "c" }, .{ "std/os/linux.zig", "os.linux" }, .{ "std/os/windows.zig", "os.windows" } }) |each| {
         if (std.mem.endsWith(u8, name, each[0])) return each[1];
         // A file of the binding's own directory (`std/os/linux/io_uring.zig`).
