@@ -111,6 +111,26 @@ test "completion unread required import is a traversal failure" {
     try expectOutcome(&tmp, "traversal_failure");
 }
 
+test "a module named like a file that no --module maps is named where it is imported, with how to map it" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "input.zig", .data = "pub const x = 1;\npub const gantry = @import(\"gantry.zig\");" });
+    const input = try resultPath(a, &tmp, "input.zig");
+    defer a.free(input);
+    const result = try resultPath(a, &tmp, "result.json");
+    defer a.free(result);
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    var problems: std.Io.Writer.Allocating = .init(a);
+    defer problems.deinit();
+    try std.testing.expectError(error.FileNotFound, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "unmapped", input }, &output.writer, &problems.writer, .{}));
+    try expectOutcome(&tmp, "traversal_failure");
+    const said = try a.print("{s}:2:20: `@import(\"gantry.zig\")` names no module this run maps and no file: map the module (`--module gantry.zig=FILE`), or give the file\n", .{input});
+    defer a.free(said);
+    try std.testing.expectEqualStrings(said, problems.written());
+}
+
 test "a --files-from list names files under the directory glint runs in: an absolute path or a `..` part is refused before anything opens" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

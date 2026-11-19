@@ -43,6 +43,8 @@ const Loader = struct {
     a: std.mem.Allocator,
     io: std.Io,
     options: *const Parsed,
+    /// Where an import the run cannot follow is named (`unread`).
+    problems: *std.Io.Writer,
     inputs: std.ArrayList(Project.Input) = .empty,
     mappings: std.ArrayList(Project.Import) = .empty,
     /// Each loaded file's position in `inputs`, by its canonical path.
@@ -162,8 +164,14 @@ const Loader = struct {
                     if (std.mem.eql(u8, name, spelling)) break true;
                 } else false;
                 const target = if (external) try self.externalInput(spelling) else target: {
-                    const target_path = (try aegis.input.Untrusted(Spelling).init(.{ .from = cursor, .text = spelling }).parse(self, Loader.importPath)) orelse continue;
-                    break :target try self.load(target_path, false);
+                    const target_path = (aegis.input.Untrusted(Spelling).init(.{ .from = cursor, .text = spelling }).parse(self, Loader.importPath) catch |err| switch (err) {
+                        error.ImportOutsideRoots => return self.unread(from, token.loc.start, spelling, err),
+                        else => return err,
+                    }) orelse continue;
+                    break :target self.load(target_path, false) catch |err| switch (err) {
+                        error.FileNotFound, error.NotDir, error.ImportOutsideRoots => return self.unread(from, token.loc.start, spelling, err),
+                        else => return err,
+                    };
                 };
                 var duplicate = false;
                 for (self.mappings.items) |m| if (m.from == from and std.mem.eql(u8, m.spelling, spelling)) {
@@ -173,6 +181,20 @@ const Loader = struct {
                 if (!duplicate) try self.mappings.append(self.a, .{ .from = from, .spelling = spelling, .target = target });
             }
         }
+    }
+
+    /// Names the `@import` the run could not follow, where it is written, and how to map it,
+    /// then fails the run with `err` (`traversal_failure`): a module name spelled like a file
+    /// (`@import("gantry.zig")`) that no `--module` maps is read as a relative path, as Zig does.
+    fn unread(self: *Loader, from: usize, offset: usize, spelling: []const u8, err: anytype) (@TypeOf(err) || std.Io.Writer.Error) {
+        const input = self.inputs.items[from];
+        const at = std.zig.findLineColumn(input.bytes, offset);
+        const why = switch (err) {
+            error.ImportOutsideRoots => "is a path outside the run's roots",
+            else => "names no module this run maps and no file",
+        };
+        try self.problems.print("{s}:{d}:{d}: `@import(\"{f}\")` {s}: map the module (`--module {f}=FILE`), or give the file\n", .{ input.name, at.line + 1, at.column + 1, std.zig.fmtString(spelling), why, std.zig.fmtString(spelling) });
+        return err;
     }
 
     /// An `@import` a loaded file spells, and the file it is written in.
@@ -605,7 +627,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     try refuseUnknown(&configured, definitions, true, problems);
     if (configured.files.items.len == 0) return error.MissingSource;
     record.outcome = .input_failure;
-    var loader: Loader = .{ .a = a, .io = io, .options = &configured };
+    var loader: Loader = .{ .a = a, .io = io, .options = &configured, .problems = problems };
     for (configured.packages.items) |package| try loader.packages.append(a, .{ .name = package.name, .path = try std.Io.Dir.cwd().realPathFileAlloc(io, package.path, a) });
     for (configured.roots.items) |root| try loader.roots.append(a, try std.Io.Dir.cwd().realPathFileAlloc(io, root, a));
     for (configured.files.items) |path| {
