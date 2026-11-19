@@ -1,5 +1,5 @@
 .{
     // The rule reads the left side's syntax, the call's arguments and a name's written pointer type; other rows carry no case of it.
-    .no_hole = .{ .assignment, .destructure, .capture, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .branch },
-    .no_twin = .{ .assignment, .destructure, .capture, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .branch },
+    .no_hole = .{ .assignment, .destructure, .capture, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .unwrap, .aggregate, .branch },
+    .no_twin = .{ .assignment, .destructure, .capture, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .unwrap, .aggregate, .branch },
 }

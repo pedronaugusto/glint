@@ -21,6 +21,7 @@ const Context = @import("RuleContext.zig");
 const Governed = @import("Governed.zig");
 const PackageRules = @import("PackageRules.zig");
 const Facts = @import("Facts.zig");
+const Model = @import("Model.zig");
 const Project = @import("Project.zig");
 const Rule = @import("Rule.zig");
 
@@ -172,8 +173,10 @@ fn madeType(value: Facts.Value, types: []const Facts.Container) ?Facts.Container
     return null;
 }
 
-/// A rule that reads `.exits`: an exit's result given straight to arithmetic, a comparison or a
-/// narrowing cast.
+/// A rule that reads `.exits`: an exit's result given to arithmetic, a comparison or a narrowing
+/// cast, straight or through a const local it initializes (and the const locals that alias it), at
+/// each use of the local that is one. A var takes the value out of this reading, as a call's
+/// argument does: what it is given to is no longer this function's expression.
 pub fn exits(c: *Context, definition: Rule.Definition) Context.Error!void {
     const declared = definition.declared orelse return;
     const all = try entries(c, declared.package);
@@ -198,30 +201,81 @@ pub fn exits(c: *Context, definition: Rule.Definition) Context.Error!void {
             .choice, .any => continue,
         };
         const entry = ofExit(all, callee) orelse continue;
-        // The place the result is given to, past parentheses.
-        var child = node;
-        var parent = model.parentOf(node) orelse continue;
-        while (tree.nodeTag(parent) == .grouped_expression) {
-            child = parent;
-            parent = model.parentOf(parent) orelse break;
+        if (try bareUse(c, tree, model, node)) |shape| {
+            try reportBare(c, definition, entry, token, shape);
+            continue;
         }
-        const shape: []const u8 = switch (tree.nodeTag(parent)) {
-            .add, .sub, .mul, .div, .mod, .shl, .shr, .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .shl_sat, .bit_and, .bit_or, .bit_xor, .negation, .negation_wrap, .bit_not => "arithmetic",
-            .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat, .assign_bit_and, .assign_bit_or, .assign_bit_xor => "arithmetic",
-            .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => "a comparison",
-            else => blk: {
-                const builtin = Facts.builtinName(tree, parent) orelse continue;
-                if (!std.mem.eql(u8, builtin, "@intCast") and !std.mem.eql(u8, builtin, "@truncate")) continue;
-                // Only a cast into a type that cannot hold every value of the exit's: a widening
-                // loses nothing, and a width either side's build decides is not read (hygiene).
-                const from = intType(try c.facts.resolve(c.file, node)) orelse continue;
-                const into = intType(try c.facts.castTypeIn(null, c.file, parent)) orelse continue;
-                if (holdsAll(into, from)) continue;
-                break :blk "a narrowing cast";
-            },
-        };
-        try c.at(definition.id, token, try c.allocator.print("{s}'s bare value given to {s} loses its checks: use the type's own operation", .{ typeName(c, entry), shape }));
+        // The const local the result initializes, then each const local that aliases one.
+        var held: [16]Model.Declaration.Id = undefined;
+        var count: usize = 0;
+        if (constLocal(tree, model, node)) |local| {
+            held[0] = local;
+            count = 1;
+        }
+        var next: usize = 0;
+        while (next < count) : (next += 1) {
+            for (model.references) |reference| {
+                const declaration = reference.declaration orelse continue;
+                if (declaration != held[next]) continue;
+                if (try bareUse(c, tree, model, reference.node)) |shape| {
+                    try reportBare(c, definition, entry, reference.token, shape);
+                } else if (constLocal(tree, model, reference.node)) |alias| {
+                    if (count < held.len and std.mem.findScalar(Model.Declaration.Id, held[0..count], alias) == null) {
+                        held[count] = alias;
+                        count += 1;
+                    }
+                }
+            }
+        }
     }
+}
+
+fn reportBare(c: *Context, definition: Rule.Definition, entry: Entry, token: Ast.TokenIndex, shape: []const u8) Context.Error!void {
+    try c.at(definition.id, token, try c.allocator.print("{s}'s bare value given to {s} loses its checks: use the type's own operation", .{ typeName(c, entry), shape }));
+}
+
+/// What `value`, an exit's bare result, is given to past parentheses, where that loses its checks:
+/// arithmetic, a comparison or a narrowing cast; null for anything else.
+fn bareUse(c: *Context, tree: *const Ast, model: *const Model, value: Ast.Node.Index) Context.Error!?[]const u8 {
+    var parent = model.parentOf(value) orelse return null;
+    while (tree.nodeTag(parent) == .grouped_expression) parent = model.parentOf(parent) orelse return null;
+    return switch (tree.nodeTag(parent)) {
+        .add, .sub, .mul, .div, .mod, .shl, .shr, .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .shl_sat, .bit_and, .bit_or, .bit_xor, .negation, .negation_wrap, .bit_not => "arithmetic",
+        .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat, .assign_bit_and, .assign_bit_or, .assign_bit_xor => "arithmetic",
+        .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => "a comparison",
+        else => {
+            const builtin = Facts.builtinName(tree, parent) orelse return null;
+            if (!std.mem.eql(u8, builtin, "@intCast") and !std.mem.eql(u8, builtin, "@truncate")) return null;
+            // Only a cast into a type that cannot hold every value of the exit's: a widening
+            // loses nothing, and a width either side's build decides is not read (hygiene).
+            const from = intType(try c.facts.resolve(c.file, value)) orelse return null;
+            const into = intType(try c.facts.castTypeIn(null, c.file, parent)) orelse return null;
+            if (holdsAll(into, from)) return null;
+            return "a narrowing cast";
+        },
+    };
+}
+
+/// The const local of a function `value` initializes, past parentheses (`const x = value;`); null
+/// for a var, a container's declaration, a destructure or any other place.
+fn constLocal(tree: *const Ast, model: *const Model, value: Ast.Node.Index) ?Model.Declaration.Id {
+    var child = value;
+    var parent = model.parentOf(value) orelse return null;
+    while (tree.nodeTag(parent) == .grouped_expression) {
+        child = parent;
+        parent = model.parentOf(parent) orelse return null;
+    }
+    const declaration = tree.fullVarDecl(parent) orelse return null;
+    if (tree.tokenTag(declaration.ast.mut_token) != .keyword_const) return null;
+    if (declaration.ast.init_node.unwrap() != child) return null;
+    for (model.declarations, 0..) |each, index| {
+        if (each.kind != .variable or each.node != parent) continue;
+        return switch (model.scopes[@backingInt(each.scope)].kind) {
+            .file, .container => null,
+            else => @fromBackingInt(@intCast(index)),
+        };
+    }
+    return null;
 }
 
 /// An integer type of a width every build gives it (`u32`, `i7`), as a value's type names it.

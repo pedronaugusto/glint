@@ -43,8 +43,78 @@ test "contract seeded arbitrary bytes parse with bounded public ownership" {
     try shakedown.check(std.testing.allocator, {}, Property.run, .{
         .cases = 64,
         // `fQ:0x.p1`: a hex float with no digit, which std's lowering unwrapped (release run 44210310859).
-        .regressions = &.{"8:66:51:3a:30:78:2e:70:31"},
+        // `0.0_000E94`: a decimal float whose underscores std's slow path misreads into an i32
+        // overflow, inside the check that guards lowering (release run 44602405148).
+        .regressions = &.{ "8:66:51:3a:30:78:2e:70:31", "a:30:2e:30:5f:30:30:30:45:39:34" },
     });
+}
+
+// std.fmt.parseFloat's slow path misreads a decimal float's underscores (Zig 0.17): it records
+// zeros it means to skip and trims trailing zeros at an index that leaves the underscores out.
+// AstGen hands it the token as written, so such a literal is refused before anything reads it;
+// one std reads as its digits alone is lowered.
+test "contract a decimal float std misreads by its underscores is refused; one it reads is lowered" {
+    const refused = [_][]const u8{ "0.0_000E94", "0.0_05e94", "0.0_0e-94", "0.000_000_1e-50", "1.0_05e94" };
+    for (refused) |literal| {
+        var source: [64]u8 = undefined;
+        const code_text = try std.mem.print(&source, "const x = {s};", .{literal});
+        var code = try glint.Project.init(std.testing.allocator, &.{.{ .name = "float", .bytes = code_text }}, &.{}, .{});
+        defer code.deinit();
+        std.testing.expectEqual(.invalid_lowering, code.sources[0].file.status) catch |err| {
+            std.debug.print("lowered: {s}\n", .{literal});
+            return err;
+        };
+        const data_text = try std.mem.print(&source, ".{{ .x = {s} }}", .{literal});
+        var data = try glint.Project.init(std.testing.allocator, &.{.{ .name = "float", .bytes = data_text, .kind = .zon }}, &.{}, .{});
+        defer data.deinit();
+        try std.testing.expectEqual(.invalid_syntax, data.sources[0].file.status);
+    }
+    const lowered = [_][]const u8{ "0.000_001", "0.000_000_1", "1_000.5", "1_000e100", "3.141_592_653_589_793_238_462_643", "1.797_693_134_862_315_7e308", "6.022_140_76e23", "0x1_0.8p1", "0.00_1E94" };
+    for (lowered) |literal| {
+        var source: [64]u8 = undefined;
+        const text = try std.mem.print(&source, "const x = {s};", .{literal});
+        var code = try glint.Project.init(std.testing.allocator, &.{.{ .name = "float", .bytes = text }}, &.{}, .{});
+        defer code.deinit();
+        std.testing.expectEqual(.parsed, code.sources[0].file.status) catch |err| {
+            std.debug.print("refused: {s}\n", .{literal});
+            return err;
+        };
+    }
+}
+
+// Any decimal float with underscores between its digits is lowered or refused, never a trap: a
+// literal the check passes reaches AstGen, which reads it with parseFloat as written.
+test "contract seeded decimal floats with underscores never trap the lowering" {
+    const Property = struct {
+        fn digits(case: *shakedown.Case, text: *std.ArrayList(u8), zeros: bool) !void {
+            const count = shakedown.gen.intRange(case.source, usize, 1, 40);
+            for (0..count) |i| {
+                if (i != 0 and shakedown.gen.intRange(case.source, u8, 0, 3) == 0) try text.append(case.gpa, '_');
+                const digit: u8 = if (zeros and shakedown.gen.boolean(case.source)) 0 else shakedown.gen.intRange(case.source, u8, 0, 9);
+                try text.append(case.gpa, '0' + digit);
+            }
+        }
+        fn run(_: void, case: *shakedown.Case) !void {
+            var text: std.ArrayList(u8) = .empty;
+            defer text.deinit(case.gpa);
+            try text.appendSlice(case.gpa, "const x = ");
+            const zeros = shakedown.gen.boolean(case.source);
+            if (shakedown.gen.boolean(case.source)) try text.append(case.gpa, '0') else try digits(case, &text, zeros);
+            try text.append(case.gpa, '.');
+            try digits(case, &text, zeros);
+            if (shakedown.gen.boolean(case.source)) {
+                const exponent = shakedown.gen.intRange(case.source, i32, -6000, 6000);
+                try text.print(case.gpa, "e{d}", .{exponent});
+            }
+            try text.appendSlice(case.gpa, ";");
+            case.note("{s}", .{text.items});
+            var project = try glint.Project.init(case.gpa, &.{.{ .name = "float", .bytes = text.items }}, &.{}, .{});
+            defer project.deinit();
+            const status = project.sources[0].file.status;
+            try std.testing.expect(status == .parsed or status == .invalid_lowering);
+        }
+    };
+    try shakedown.check(std.testing.allocator, {}, Property.run, .{ .cases = 2048 });
 }
 
 // std.zig.parseNumberLiteral calls `0x.p1` a float and std.fmt.parseFloat refuses it, which

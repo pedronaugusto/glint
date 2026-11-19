@@ -383,8 +383,10 @@ fn oldReason(self: *Context, token: Ast.TokenIndex) RunError!?[]const Report.Edi
 
 /// Whether a handler is written empty, parentheses aside: a block (labeled or not) whose every
 /// statement is empty by this list or is `_ = X` of a `quiet` X; `@as(void, h)` of an empty `h`
-/// (Zig 0.17 refuses `void{}`); an `if` (a missing `else` empty) or a `switch` whose condition is `quiet` and
-/// every branch or prong empty, one prong at least; `return`, `break` or `continue` with no operand.
+/// (Zig 0.17 refuses `void{}`); a `comptime`, `defer` or `errdefer` of an empty body; an `if` (a missing `else` empty)
+/// or a `switch` whose condition is `quiet` and every branch or prong empty, one prong at least, a
+/// prong that only traps counting as empty beside the others; `return`, `break` or `continue` with
+/// no operand.
 fn emptyHandler(tree: *const Ast, written: Ast.Node.Index) bool {
     const node = ungrouped(tree, written);
     var buffer: [2]Ast.Node.Index = undefined;
@@ -402,6 +404,8 @@ fn emptyHandler(tree: *const Ast, written: Ast.Node.Index) bool {
         return true;
     }
     switch (tree.nodeTag(node)) {
+        .@"comptime", .@"defer" => return emptyHandler(tree, tree.nodeData(node).node),
+        .@"errdefer" => return emptyHandler(tree, tree.nodeData(node).opt_token_and_node[1]),
         .@"return" => return tree.nodeData(node).opt_node == .none,
         .@"break", .@"continue" => return tree.nodeData(node).opt_token_and_opt_node[1] == .none,
         .builtin_call_two, .builtin_call_two_comma => {
@@ -420,7 +424,11 @@ fn emptyHandler(tree: *const Ast, written: Ast.Node.Index) bool {
             // proof that nothing fails).
             if (choice.ast.cases.len == 0) return false;
             if (!quiet(tree, choice.ast.condition)) return false;
-            for (choice.ast.cases) |case| if (!emptyHandler(tree, tree.fullSwitchCase(case).?.ast.target_expr)) return false; // unreachable: a switch's cases are prongs
+            // A prong that only traps drops its error too: `error.A => {}, error.B => unreachable`.
+            for (choice.ast.cases) |case| {
+                const prong = tree.fullSwitchCase(case).?.ast.target_expr; // unreachable: a switch's cases are prongs
+                if (!emptyHandler(tree, prong) and !traps(tree, prong, 0)) return false;
+            }
             return true;
         },
         else => return false,

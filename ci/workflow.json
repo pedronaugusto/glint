@@ -1,5 +1,6 @@
 {
   "compile_step": "check",
+  "hardened": true,
   "targets": [
     "x86_64-linux-gnu",
     "aarch64-linux-gnu",

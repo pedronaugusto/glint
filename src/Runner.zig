@@ -347,25 +347,25 @@ fn emitRelated(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: [
 }
 
 fn sinkDiagnostic(sink: *Context.Sink, rule: rules.Rule, start: u32, end: u32, message: []const u8, related: []const Report.Span, fix: []const Report.Edit) Context.Error!void {
-    const runner: *Runner = @fieldParentPtr("sink", sink);
+    const runner: *Runner = @alignCast(@fieldParentPtr("sink", sink));
     try runner.emitRelated(rule, start, end, message, related, fix);
 }
 fn sinkConfig(sink: *Context.Sink, file: Project.FileId) rules.Config {
-    const runner: *Runner = @fieldParentPtr("sink", sink);
+    const runner: *Runner = @alignCast(@fieldParentPtr("sink", sink));
     for (runner.files) |setting| if (setting.file == file) return setting.config;
     return runner.base;
 }
 /// Whether a finding of `rule` at `start` of the current file would be suppressed: a
 /// suppression naming it on its line.
 fn sinkSuppresses(sink: *Context.Sink, rule: rules.Rule, start: u32) bool {
-    const runner: *Runner = @fieldParentPtr("sink", sink);
+    const runner: *Runner = @alignCast(@fieldParentPtr("sink", sink));
     if (!runner.config.has(rule)) return false;
     const line = runner.project.at(runner.file).file.line(start);
     for (runner.suppressions) |suppression| if (suppression.applies(rule, line)) return true;
     return false;
 }
 fn sinkRefuse(sink: *Context.Sink, why: []const u8) Context.Error!void {
-    const runner: *Runner = @fieldParentPtr("sink", sink);
+    const runner: *Runner = @alignCast(@fieldParentPtr("sink", sink));
     try runner.runError(why);
 }
 /// A run error of the current file, once for its words: the run is incomplete.

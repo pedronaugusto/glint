@@ -3,14 +3,17 @@
 //! build checks (`@ptrCast`, `@alignCast`, `@constCast`, `@volatileCast`, `@addrSpaceCast`,
 //! `@ptrFromInt`); an `extern` declaration and `@extern`; `noalias`; `@setFloatMode(.optimized)`;
 //! C variadic arguments (`@cVaStart`, `@cVaArg`, `@cVaCopy`, `@cVaEnd`); arithmetic on, indexing
-//! or slicing of a many-item or C pointer, which carries no length; std's `mem.bytesAsValue` and
+//! or slicing of a many-item or C pointer, which carries no length (a slice's `.ptr` is one);
+//! std's `mem.bytesAsValue` and
 //! `mem.bytesAsSlice`, a reinterpretation by another name; and any member of std's raw OS and C
 //! bindings (`std.c`, `std.os.linux`, `std.os.windows`, and `std.posix.system`, one of them by
 //! target), which the program reaches past std's checked layer. Production code only; an
 //! operation the program runs only as it compiles has none of these dangers, but for assembly,
 //! `@extern` and `@ptrFromInt`, whose symbol or address the program uses where it runs. Zig's two
-//! interface idioms are not read, as neither has an alternative: `@fieldParentPtr`, and the
-//! `@alignCast` whose operand it is (`@alignCast(@fieldParentPtr("f", p))`, std.Io's own); and a
+//! interface idioms are not read, as neither has an alternative: `@fieldParentPtr` as the operand
+//! of an `@alignCast` (`@alignCast(@fieldParentPtr("f", p))`, std.Io's own), the two read as one;
+//! a bare `@fieldParentPtr`, a parent pointer no build checks the field pointer was taken from, is
+//! a finding; and a
 //! `@ptrCast`, with or without the `@alignCast` inside it, from a `*anyopaque` to a pointer to one
 //! item, how std.mem.Allocator's `ptr`, std.Io's `userdata` and every hand-written vtable recover
 //! their owner. A `@ptrCast` from `*anyopaque` to a slice or a many-item pointer stays a finding.
@@ -18,6 +21,7 @@ const std = @import("std");
 const Context = @import("RuleContext.zig");
 const Governed = @import("Governed.zig");
 const Facts = @import("Facts.zig");
+const Written = @import("Written.zig");
 const Model = @import("Model.zig");
 const Project = @import("Project.zig");
 const Rule = @import("Rule.zig").Rule;
@@ -89,6 +93,9 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         if (pointerCast(name) and !nestedCast(c, tree, node) and !recovery(tree, node, name) and !try ownerRecovery(c, tree, node, name)) {
             try c.at(rule, token, try c.allocator.print("{s}: a pointer conversion no build checks", .{name}));
         }
+        if (std.mem.eql(u8, name, "@fieldParentPtr") and !recovered(c, tree, node)) {
+            try c.at(rule, token, "@fieldParentPtr: a parent pointer no build checks the field pointer was taken from; only as @alignCast(@fieldParentPtr(...)), the interface idiom, or at the package's seam");
+        }
         if (std.mem.startsWith(u8, name, "@cVa")) try c.at(rule, token, try c.allocator.print("{s}: C variadic arguments read as whatever type the program names, which no build checks", .{name}));
         if (std.mem.eql(u8, name, "@setFloatMode")) {
             var buffer: [2]Ast.Node.Index = undefined;
@@ -158,6 +165,14 @@ fn recovery(tree: *const Ast, node: Ast.Node.Index, name: []const u8) bool {
     return std.mem.eql(u8, Facts.builtinName(tree, operand) orelse return false, "@fieldParentPtr");
 }
 
+/// Whether the `@fieldParentPtr` at `node` is the operand of an `@alignCast`, past parentheses.
+fn recovered(c: *Context, tree: *const Ast, node: Ast.Node.Index) bool {
+    const model = &c.project.at(c.file).model;
+    var parent = model.parentOf(node) orelse return false;
+    while (tree.nodeTag(parent) == .grouped_expression) parent = model.parentOf(parent) orelse return false;
+    return std.mem.eql(u8, Facts.builtinName(tree, parent) orelse return false, "@alignCast");
+}
+
 /// Whether the pointer cast at `node` is the operand of another, past parentheses.
 fn nestedCast(c: *Context, tree: *const Ast, node: Ast.Node.Index) bool {
     const model = &c.project.at(c.file).model;
@@ -181,13 +196,29 @@ fn lengthless(c: *Context, rule: Rule) Context.Error!void {
         const token = tree.nodeMainToken(node);
         if (c.inTest(token) or !try atRuntime(c, node)) continue;
         const value = try c.facts.resolve(c.file, operand);
-        const size = switch (value) {
+        const size: Facts.Size = if (try slicePointer(c, tree, operand)) .many else switch (value) {
             .pointer => |pointer| pointer.size orelse continue,
             else => continue,
         };
         if (size != .many and size != .c) continue;
         try c.at(rule, token, try c.allocator.print("{s} a {s} pointer, which carries no length to check", .{ what, if (size == .many) "many-item" else "C" }));
     }
+}
+
+/// Whether `node` is a slice's `.ptr`, its many-item pointer (`b.ptr + 1`), past parentheses.
+fn slicePointer(c: *Context, tree: *const Ast, written: Ast.Node.Index) Context.Error!bool {
+    var node = written;
+    while (tree.nodeTag(node) == .grouped_expression) node = tree.nodeData(node).node_and_token[0];
+    if (tree.nodeTag(node) != .field_access) return false;
+    const object, const field = tree.nodeData(node).node_and_token;
+    if (!std.mem.eql(u8, tree.tokenSlice(field), "ptr")) return false;
+    var value = try c.facts.resolve(c.file, object);
+    if (value == .pointer and value.pointer.size == .one) value = value.pointer.child.*;
+    if (value == .pointer and value.pointer.size == .slice) return true;
+    // A name whose declaration writes a slice type (`b: []const u8`), where the value is not read.
+    const declared = Written.typeOf(tree, &c.project.at(c.file).model, object) orelse return false;
+    const pointer = tree.fullPtrType(declared) orelse return false;
+    return pointer.size == .slice;
 }
 
 /// std's reinterpretations by name: `mem.bytesAsValue` and `mem.bytesAsSlice`. A reference spelling

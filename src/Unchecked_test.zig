@@ -374,6 +374,21 @@ test "P007 finds the unchecked operations, a cast nested in another once, a supp
     ), 4);
 }
 
+test "P007 reads a slice's .ptr as the many-item pointer it is, and a bare @fieldParentPtr; the idiom stays unread" {
+    try expect(.P007,
+        \\pub fn f(b: []const u8) usize {
+        \\    return @intFromPtr(b.ptr + 1);
+        \\}
+        \\const Node = struct { value: u32, link: u32 };
+        \\pub fn bare(link: *u32) *Node {
+        \\    return @fieldParentPtr("link", link);
+        \\}
+        \\pub fn idiom(link: *u32) *Node {
+        \\    return @alignCast(@fieldParentPtr("link", link));
+        \\}
+    , 2);
+}
+
 test "Z006 leaves a type std's type function gives alone; a labeled block's value is a value" {
     try expect(.Z006,
         \\const std = @import("std");

@@ -88,7 +88,9 @@ fn parseSource(reading: Reading, source: [:0]const u8) InitError!Front {
 // checked. Check their exact tokens before lowering, including what the parser accepts:
 // - a char literal's lowering assumes a complete UTF-8 sequence, and the parser takes cut bytes;
 // - a float's lowering unwraps std.fmt.parseFloat, and std.zig.parseNumberLiteral calls a hex
-//   float with no digit before its exponent (`0x.p1`) a float that parseFloat refuses.
+//   float with no digit before its exponent (`0x.p1`) a float that parseFloat refuses;
+// - parseFloat itself misreads a decimal float's underscores on its slow path (`0.0_05e94`
+//   overflows an i32 in it), so such a literal is refused before parseFloat runs at all.
 fn safeLiterals(tree: *const std.zig.Ast) bool {
     for (tree.tokens.items(.tag), 0..) |tag, i| switch (tag) {
         .char_literal => {
@@ -98,11 +100,199 @@ fn safeLiterals(tree: *const std.zig.Ast) bool {
         },
         .number_literal => {
             const raw = tree.tokenSlice(@intCast(i));
-            if (std.zig.parseNumberLiteral(raw) == .float) _ = std.fmt.parseFloat(f128, raw) catch return false;
+            if (std.zig.parseNumberLiteral(raw) != .float) continue;
+            if (!underscoresReadAsDigits(raw)) return false;
+            _ = std.fmt.parseFloat(f128, raw) catch return false;
         },
         else => {},
     };
     return true;
+}
+
+/// Whether std's `parseFloat(f128, raw)`, given the token with its underscores as AstGen gives it,
+/// reads the decimal float `raw` as it reads the same digits without them. Zig 0.17's slow path
+/// (`Decimal.parse`) does not always: past an underscore it records zeros it means to skip, and it
+/// trims trailing zeros by an index that leaves the underscores out, so `0.0_05e94` becomes a decimal
+/// of zero digits whose shift loop never ends (an i32 overflow), and `1.0_05e94` is read as 1.00e94.
+/// Its fast path reads underscores right, so only a literal the fast path declines is compared: the
+/// value of the decimal std builds from the token against the one it builds from the digits alone.
+/// Where they differ the literal is refused, even where the f128 happens to round the same (seen
+/// only past 34 significant digits or a decimal exponent of 400). A hex float never reaches
+/// `Decimal.parse`; a literal over 1024 bytes on the slow path is refused unread.
+fn underscoresReadAsDigits(raw: []const u8) bool {
+    if (std.mem.findScalar(u8, raw, '_') == null) return true;
+    if (raw.len >= 2 and raw[0] == '0' and (raw[1] | 0x20) == 'x') return true;
+    if (fastF128(raw)) return true;
+    var buffer: [1024]u8 = undefined;
+    if (raw.len > buffer.len) return false;
+    var len: usize = 0;
+    for (raw) |c| if (c != '_') {
+        buffer[len] = c;
+        len += 1;
+    };
+    const with = decimalValue(raw, decimalShape(raw) orelse return false) orelse return false;
+    const without = decimalValue(raw, decimalShape(buffer[0..len]) orelse return false) orelse return false;
+    return std.meta.eql(with, without);
+}
+
+/// The value a decimal shape of `raw`'s digits holds, by its first and last nonzero digit (counted
+/// among the digits before the exponent) and the point measured from the first; zeros at either end
+/// of the kept digits change nothing. null where it keeps digits that are all zeros: std's slow path
+/// tells zero by a count of no digits, and shifts such a decimal forever.
+const DecimalValue = struct { first: usize, last: usize, point: i64, truncated: bool };
+
+fn decimalValue(raw: []const u8, shape: DecimalShape) ?DecimalValue {
+    if (shape.digits == 0) return .{ .first = 0, .last = 0, .point = 0, .truncated = shape.truncated };
+    var first: ?usize = null;
+    var last: usize = 0;
+    var index: usize = 0;
+    for (raw) |c| switch (c) {
+        '0'...'9' => {
+            if (index >= shape.skipped + shape.digits) break;
+            if (index >= shape.skipped and c != '0') {
+                if (first == null) first = index;
+                last = index;
+            }
+            index += 1;
+        },
+        '_', '.' => {},
+        else => break,
+    };
+    const start = first orelse return null;
+    return .{ .first = start, .last = last, .point = shape.point - @as(i64, @intCast(start - shape.skipped)), .truncated = shape.truncated };
+}
+
+/// Whether std's parseFloat reads the decimal float `raw` into an f128 on its fast path
+/// (parse.zig's `parseNumber`, convert_fast.zig's `convertFast`): at most 38 significant digits,
+/// a decimal exponent from -48 to 48, or to 82 where the mantissa times the excess power of ten
+/// still has no more than 114 bits. Underscores pass, as std's digit scan passes them.
+fn fastF128(raw: []const u8) bool {
+    const max_mantissa_digits = 38;
+    const max_mantissa: u128 = 2 << 112;
+    var mantissa: u128 = 0;
+    var count: usize = 0;
+    var fraction: i64 = 0;
+    var point = false;
+    var i: usize = 0;
+    while (i < raw.len) : (i += 1) switch (raw[i]) {
+        '0'...'9' => |c| {
+            mantissa = mantissa *% 10 +% (c - '0');
+            count += 1;
+            if (point) fraction += 1;
+        },
+        '_' => {},
+        '.' => point = true,
+        else => break,
+    };
+    var exponent: i64 = -fraction;
+    if (i < raw.len and (raw[i] | 0x20) == 'e') {
+        i += 1;
+        var negative = false;
+        if (i < raw.len and (raw[i] == '-' or raw[i] == '+')) {
+            negative = raw[i] == '-';
+            i += 1;
+        }
+        var written: i64 = 0;
+        while (i < raw.len) : (i += 1) switch (raw[i]) {
+            '0'...'9' => |c| if (written < 0x1000_0000) {
+                written = 10 * written + (c - '0');
+            },
+            '_' => {},
+            else => break,
+        };
+        exponent += if (negative) -written else written;
+    }
+    if (count > max_mantissa_digits) {
+        // std recounts the excess past the leading zeros (the bytes `0`, `.` and `_` before any other).
+        var excess = count - max_mantissa_digits;
+        for (raw) |c| switch (c) {
+            '0' => excess -|= 1,
+            '.', '_' => {},
+            else => break,
+        };
+        if (excess > 0) return false;
+    }
+    if (exponent < -48 or exponent > 82 or mantissa > max_mantissa) return false;
+    if (exponent <= 48) return true;
+    const scaled = std.math.mul(u128, mantissa, std.math.powi(u128, 10, @intCast(exponent - 48)) catch return false) catch return false;
+    return scaled <= max_mantissa;
+}
+
+/// The decimal std 0.17's `Decimal.parse` builds from `s`, by what decides it: how many leading digits
+/// it skips, how many it keeps, where its point is, and whether it truncated. null where `parse`
+/// itself traps (a count trimmed below zero, an index run past the start).
+const DecimalShape = struct { skipped: usize, digits: usize, point: i64, truncated: bool };
+
+fn decimalShape(s: []const u8) ?DecimalShape {
+    const max_digits = 11564;
+    if (s.len > std.math.maxInt(i32)) return null;
+    var offset: usize = 0;
+    var underscores: usize = 0;
+    var skipped: usize = 0;
+    // `skipChars("0_")` passes underscores without counting them, unlike the digit scan.
+    while (offset < s.len and (s[offset] == '0' or s[offset] == '_')) : (offset += 1) {
+        if (s[offset] == '0') skipped += 1;
+    }
+    var digits: usize = 0;
+    scanDigits(s, &offset, &underscores, &digits);
+    var point: i64 = 0;
+    if (offset < s.len and s[offset] == '.') {
+        offset += 1;
+        const marker = offset - underscores;
+        if (digits == 0) while (offset < s.len and s[offset] == '0') : (offset += 1) {
+            skipped += 1;
+        };
+        scanDigits(s, &offset, &underscores, &digits);
+        point = @as(i64, @intCast(marker)) - @as(i64, @intCast(offset - underscores));
+    }
+    var truncated = false;
+    if (digits != 0) {
+        // Trailing zeros, read at the offset that leaves the underscores out, as std reads them.
+        var trailing: usize = 0;
+        var i = offset - underscores - 1;
+        while (true) {
+            if (s[i] == '0') {
+                trailing += 1;
+            } else if (s[i] != '.') break;
+            if (i == 0) return null;
+            i -= 1;
+            if (i == 0) break;
+        }
+        point += @intCast(trailing);
+        digits = std.math.sub(usize, digits, trailing) catch return null;
+        point += @intCast(digits);
+        if (digits > max_digits) {
+            truncated = true;
+            digits = max_digits;
+        }
+    }
+    if (offset < s.len and (s[offset] | 0x20) == 'e') {
+        offset += 1;
+        var negative = false;
+        if (offset < s.len and (s[offset] == '-' or s[offset] == '+')) {
+            negative = s[offset] == '-';
+            offset += 1;
+        }
+        var written: i64 = 0;
+        while (offset < s.len) : (offset += 1) switch (s[offset]) {
+            '0'...'9' => |c| if (written < 0x10000) {
+                written = 10 * written + (c - '0');
+            },
+            '_' => {},
+            else => break,
+        };
+        point += if (negative) -written else written;
+    }
+    return .{ .skipped = skipped, .digits = digits, .point = point, .truncated = truncated };
+}
+
+/// std's digit scan: digits counted, underscores passed and counted.
+fn scanDigits(s: []const u8, offset: *usize, underscores: *usize, digits: *usize) void {
+    while (offset.* < s.len) : (offset.* += 1) switch (s[offset.*]) {
+        '0'...'9' => digits.* += 1,
+        '_' => underscores.* += 1,
+        else => return,
+    };
 }
 
 fn sourceComplexity(source: [:0]const u8, limits: Limits) InitError!void {

@@ -59,13 +59,15 @@ fn exact(text: []const u8, bits: u8) ?bool {
             '0'...'9' => {
                 mantissa = std.math.mul(u128, mantissa, 10) catch return null;
                 mantissa += ch - '0';
-                if (seen_point) exponent -= 1;
+                if (seen_point) exponent = std.math.sub(i32, exponent, 1) catch return null;
             },
             '_' => {},
             '.' => seen_point = true,
             'e', 'E' => {
+                // A written exponent near i32's ends (`1.0e-2147483648`) is a literal std reads
+                // (as zero or infinity) and this sum cannot hold: not read here.
                 const written = std.fmt.parseInt(i32, text[index + 1 ..], 10) catch return null;
-                exponent += written;
+                exponent = std.math.add(i32, exponent, written) catch return null;
                 break;
             },
             else => return null,
@@ -96,4 +98,6 @@ test "breadth: inexact float: 0.1 and 1e-3 against a float reported; 0.5, 0, 1e3
     try breadth.expectFindings(check, "pub fn f(x: f64) bool { return x == 16777217.0; }", 0);
     try breadth.expectFindings(check, "pub fn f(x: anytype) bool { return x == 0.1; }", 0);
     try breadth.expectFindings(check, "pub fn f(x: f64) bool { return x < 0.1; }", 0);
+    // An exponent the sum cannot hold is not read (it overflowed an i32 here before).
+    try breadth.expectFindings(check, "pub fn f(x: f64) bool { return x == 10.0e-2147483648; }", 0);
 }

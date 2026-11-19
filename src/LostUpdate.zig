@@ -3,7 +3,8 @@
 //! is lost: `at.* += (try f(bytes, at)).bytes` adds to the `at.*` from before `f` ran.
 //! The left side is read when it is a name followed by field accesses, dereferences and indexes
 //! whose index runs no code (`x`, `x.f`, `p.*`, `p.f`, `a[i].f`). A call anywhere on the right is
-//! handed the place when one of its arguments is:
+//! handed the place when one of its arguments, past casts that keep the address (`@as`,
+//! `@ptrCast`, `@alignCast`, `@constCast`, `@volatileCast`: `x += f(@as(*u32, &x))`), is:
 //! - `&q`, for `q` the left side or a place it is written through (`x += f(&x)`,
 //!   `x.a.b += f(&x.a)`);
 //! - a pointer the left side dereferences (`p.* += f(p)`, `p.*.f += f(p)`);
@@ -11,8 +12,9 @@
 //!   the left side reaches through it (`p: *S` and `p.n += f(p)`, `s: []u32` and
 //!   `s[i] += f(s)`).
 //! A ban: a call handed the place is reported whether or not it writes there. An alias the
-//! syntax does not show (a pointer copied into another name, one held in a field, a method's
-//! receiver) is not read.
+//! syntax does not show is not read: a pointer copied into another name, a method's receiver, and
+//! an address held in a field of an argument (`x += f(.{ .p = &x })`, excluded: an aggregate's
+//! fields are not searched).
 const std = @import("std");
 const Ast = std.zig.Ast;
 const Context = @import("RuleContext.zig");
@@ -107,7 +109,7 @@ fn read(tree: *const Ast, target: Ast.Node.Index) ?Place {
 /// Whether `argument` hands a call the place `place` names, in one of the forms the file's
 /// comment lists.
 fn hands(tree: *const Ast, model: *const Model, place: *const Place, argument: Ast.Node.Index) bool {
-    const handed = Written.ungrouped(tree, argument);
+    const handed = uncast(tree, argument);
     if (tree.nodeTag(handed) == .address_of) {
         const operand = Written.ungrouped(tree, tree.nodeData(handed).node);
         for (place.steps[0..place.step_count]) |step| {
@@ -124,6 +126,31 @@ fn hands(tree: *const Ast, model: *const Model, place: *const Place, argument: A
     return tree.fullPtrType(written) != null;
 }
 
+/// `argument` past parentheses and the casts that keep an address: `@as(T, a)`'s `a`, and the one
+/// operand of `@ptrCast`, `@alignCast`, `@constCast` and `@volatileCast`.
+fn uncast(tree: *const Ast, argument: Ast.Node.Index) Ast.Node.Index {
+    var node = Written.ungrouped(tree, argument);
+    for (0..max_steps) |_| {
+        switch (tree.nodeTag(node)) {
+            .builtin_call_two, .builtin_call_two_comma => {},
+            else => return node,
+        }
+        const name = tree.tokenSlice(tree.nodeMainToken(node));
+        var buffer: [2]Ast.Node.Index = undefined;
+        const args = tree.builtinCallParams(&buffer, node) orelse return node;
+        if (std.mem.eql(u8, name, "@as") and args.len == 2) {
+            node = Written.ungrouped(tree, args[1]);
+            continue;
+        }
+        const keeps = for ([_][]const u8{ "@ptrCast", "@alignCast", "@constCast", "@volatileCast" }) |each| {
+            if (std.mem.eql(u8, name, each)) break true;
+        } else false;
+        if (!keeps or args.len != 1) return node;
+        node = Written.ungrouped(tree, args[0]);
+    }
+    return node;
+}
+
 const breadth = @import("breadth_test.zig");
 
 test "breadth: lost update: a call on the right handed the place the left side updates" {
@@ -137,6 +164,8 @@ test "breadth: lost update: a call on the right handed the place the left side u
     try breadth.expectFindings(check, "const S = struct { n: u32 }; fn f(s: *S) u32 { s.n = 0; return 1; } pub fn g(s: *S) void { s.n += f(s); }", 1);
     try breadth.expectFindings(check, "fn f(s: []u32) u32 { s[0] = 0; return 1; } pub fn g(s: []u32) void { s[0] |= f(s); }", 1);
     try breadth.expectFindings(check, "const S = struct { n: u32 }; fn f(p: *S) u32 { _ = p; return 1; } pub fn g(p: *S) void { p.*.n *= f(p); }", 1);
+    // The address behind a cast that keeps it.
+    try breadth.expectFindings(check, "fn f(x: *u32) u32 { x.* = 0; return 1; } pub fn g() u32 { var x: u32 = 1; x += f(@as(*u32, &x)); return x; }", 1);
 }
 
 test "breadth: lost update: what the syntax does not show is not read" {
@@ -150,6 +179,8 @@ test "breadth: lost update: what the syntax does not show is not read" {
     try breadth.expectFindings(check, "fn f(p: *u32) u32 { p.* = 0; return 1; } pub fn g(x: *u32) void { const q = x; q.* += f(x); }", 0);
     try breadth.expectFindings(check, "const S = struct { n: u32, fn f(s: *S) u32 { s.n = 0; return 1; } }; pub fn g(s: *S) void { s.n += s.f(); }", 0);
     try breadth.expectFindings(check, "fn f(at: *usize) usize { at.* += 1; return 1; } pub fn g(at: *usize) void { at.* = at.* + f(at); }", 0);
+    // An address held in a field of an argument: excluded, an aggregate's fields are not searched.
+    try breadth.expectFindings(check, "const W = struct { p: *u32 }; fn fw(w: W) u32 { w.p.* = 0; return 1; } pub fn g() u32 { var x: u32 = 1; x += fw(.{ .p = &x }); return x; }", 0);
     // An index that runs code is not read.
     try breadth.expectFindings(check, "fn i() usize { return 0; } fn f(s: []u32) u32 { _ = s; return 1; } pub fn g(s: []u32) void { s[i()] += f(s); }", 0);
 }
