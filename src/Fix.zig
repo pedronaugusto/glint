@@ -258,7 +258,7 @@ fn oldEscape(a: std.mem.Allocator, project: *const Project, span: Report.Span, b
     } else {
         const recorded = for (before) |escaped| {
             if (escaped.line != span.line or escaped.column != span.column) continue;
-            if (!std.mem.eql(u8, escaped.path, project.at(span.file).input.name)) continue;
+            if (!Rule.samePath(escaped.path, project.at(span.file).input.name)) continue;
             if (std.mem.eql(u8, escaped.reason, reason) and std.mem.eql(u8, escaped.why, why)) break escaped;
         } else null;
         // An escape no record names is its owner's to rewrite: no fix writes rules in that a

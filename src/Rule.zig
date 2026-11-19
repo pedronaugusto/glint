@@ -1,7 +1,34 @@
 //! Reviewed rules. Removed identities are rejected, never aliased or silently enabled.
 pub const Group = enum { correctness, zig_style, family_policy };
 const std = @import("std");
-const native_os = @import("builtin").os.tag;
+
+/// `path` with `/` between its parts: a Windows `\` read as `/`, on every host alike. The one form
+/// glint compares a path in, a file's name against what names it (a configuration's seams, test
+/// inputs and P006 sources, an escape record, std's own files), however the run was handed it.
+pub fn slashed(a: std.mem.Allocator, path: []const u8) error{OutOfMemory}![]u8 {
+    const copy = try a.dupe(u8, path);
+    std.mem.replaceScalar(u8, copy, '\\', '/');
+    return copy;
+}
+
+/// Whether two paths are one once both are `slashed`: `slashed` compared without a copy.
+pub fn samePath(x: []const u8, y: []const u8) bool {
+    if (x.len != y.len) return false;
+    for (x, y) |p, q| if (p != q and !(isSeparator(p) and isSeparator(q))) return false;
+    return true;
+}
+fn isSeparator(byte: u8) bool {
+    return byte == '/' or byte == '\\';
+}
+
+test "a path is compared with / between its parts on every host" {
+    var buffer: [64]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&buffer);
+    try std.testing.expectEqualStrings("D:/zig/lib/std/c.zig", try slashed(fixed.allocator(), "D:\\zig\\lib\\std\\c.zig"));
+    try std.testing.expect(samePath("src\\a.zig", "src/a.zig"));
+    try std.testing.expect(!samePath("src/a.zig", "src/b.zig"));
+    try std.testing.expect(!samePath("src/a.zig", "src/a.zigx"));
+}
 pub const Rule = enum(u16) {
     Z001 = 1,
     Z003 = 3,
@@ -198,19 +225,13 @@ pub const Config = struct {
         var fixed: std.heap.FixedBufferAllocator = .init(buffer);
         const a = fixed.allocator();
         // A path longer than any file system holds names no input.
-        var relative = slashed(a, name) orelse return null;
+        var relative = slashed(a, name) catch return null;
         while (std.mem.startsWith(u8, relative, "./")) relative = relative[2..];
-        const root = slashed(a, self.paths_from orelse return relative) orelse return null;
+        const root = slashed(a, self.paths_from orelse return relative) catch return null;
         if (absolute(relative)) return under(root, relative);
-        const cwd = slashed(a, self.names_from orelse return relative) orelse return null;
+        const cwd = slashed(a, self.names_from orelse return relative) catch return null;
         const resolved = std.fs.path.resolveAllocPosix(a, &.{ cwd, relative }) catch return null;
         return under(root, resolved);
-    }
-    /// `path` on `a`, a Windows `\` between parts written `/`.
-    fn slashed(a: std.mem.Allocator, path: []const u8) ?[]u8 {
-        const copy = a.dupe(u8, path) catch return null;
-        if (native_os == .windows) std.mem.replaceScalar(u8, copy, '\\', '/');
-        return copy;
     }
     /// Whether `path`, `/` between its parts, starts at a root: `/`, or a drive (`D:/`).
     fn absolute(path: []const u8) bool {
@@ -384,13 +405,12 @@ test "a seam holds a file, a glob of files or a directory for the rules it names
     try std.testing.expectEqual(@as(?usize, 0), drive.seamOf("D:/work/pkg/src/uring.zig", "A007"));
     try std.testing.expectEqual(@as(?usize, 1), drive.seamOf("backend/kqueue/poll.zig", "A007"));
     try std.testing.expectEqual(@as(?usize, null), drive.seamOf("E:/work/pkg/src/uring.zig", "A007"));
-    if (native_os == .windows) {
-        drive.paths_from = "D:\\work\\pkg";
-        drive.names_from = "D:\\work\\pkg\\src";
-        try std.testing.expectEqual(@as(?usize, 0), drive.seamOf("D:\\work\\pkg\\src\\uring.zig", "A007"));
-        try std.testing.expectEqual(@as(?usize, 1), drive.seamOf("backend\\kqueue\\poll.zig", "A007"));
-        try std.testing.expectEqual(@as(?usize, 1), drive.testInput("..\\src\\testing\\server.zig"));
-    }
+    // Read alike on every host: a name written with `\\` is the same path.
+    drive.paths_from = "D:\\work\\pkg";
+    drive.names_from = "D:\\work\\pkg\\src";
+    try std.testing.expectEqual(@as(?usize, 0), drive.seamOf("D:\\work\\pkg\\src\\uring.zig", "A007"));
+    try std.testing.expectEqual(@as(?usize, 1), drive.seamOf("backend\\kqueue\\poll.zig", "A007"));
+    try std.testing.expectEqual(@as(?usize, 1), drive.testInput("..\\src\\testing\\server.zig"));
     // A seam with no reason, both a file and a directory, or no rule is refused.
     const bad = [_]Config.Seam{ .{ .file = "a.zig", .rules = &.{"A007"}, .reason = " " }, .{ .file = "a.zig", .module = "src", .rules = &.{"A007"}, .reason = "r" }, .{ .file = "a.zig", .rules = &.{}, .reason = "r" } };
     for (bad) |seam| try std.testing.expectError(error.InvalidSelection, (Config{ .seams = &.{seam} }).validate());

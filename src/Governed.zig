@@ -12,6 +12,7 @@ const Facts = @import("Facts.zig");
 const Model = @import("Model.zig");
 const Project = @import("Project.zig");
 const Rule = @import("Rule.zig").Rule;
+const samePath = @import("Rule.zig").samePath;
 const Ast = std.zig.Ast;
 
 /// A declaration as a rule names it. Null `source` names an external function by its symbol:
@@ -65,7 +66,7 @@ pub fn resolve(self: *Context, rule: Rule, targets: []const Target, indexes: []c
         const module = !std.mem.endsWith(u8, source, ".zig");
         var roots: std.ArrayList(Project.FileId) = .empty;
         if (module) try roots.appendSlice(self.allocator, try moduleRoots(self, source));
-        if (!module) for (self.project.sources) |*each| if (std.mem.eql(u8, each.input.name, source)) {
+        if (!module) for (self.project.sources) |*each| if (samePath(each.input.name, source)) {
             try roots.append(self.allocator, each.id);
         };
         if (roots.items.len == 0) {

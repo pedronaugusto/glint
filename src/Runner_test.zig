@@ -494,6 +494,20 @@ test "G2 function-length type constructors subtract returned container bodies" {
     try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: constructor and method each fit the limit.
 }
 
+test "a P006 entry's source written with / names its input whether the run named it with / or \\ (Windows)" {
+    for ([_][]const u8{ "src/policy.zig", "src\\policy.zig" }) |name| {
+        var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = name, .bytes = "const A = struct { fn raw() void {} }; pub fn run() void { A.raw(); }" }}, &.{}, .{});
+        defer project.deinit();
+        var config = glint.Config.none();
+        config.set(.P006, true);
+        config.disallowed = &.{.{ .source = "src/policy.zig", .declaration = "A.raw", .reason = "this project requires the guarded API", .replacement = "checked" }};
+        var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
+        defer report.deinit();
+        try std.testing.expect(report.complete);
+        try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: one call of the governed declaration.
+    }
+}
+
 test "G2 disallowed policy follows qualified declaration identity and aliases" {
     var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "policy.zig", .bytes = "const A = struct { fn raw() void {} }; const B = struct { fn raw() void {} }; const alias = A.raw; pub fn run() void { alias(); B.raw(); }" }}, &.{}, .{});
     defer project.deinit();
