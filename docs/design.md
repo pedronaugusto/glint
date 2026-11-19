@@ -245,6 +245,62 @@ replacement's `.drop_in` call, and the rewrite of 0.7's suppression forms. No fi
 
 **Speed.** No numeric target: `bench/` is compiled by CI and run by hand, and no timing is gated.
 
+## The program contract (version 1)
+
+**Pending** (glint 0.9.0; preflight 0.20.0 writes it). preflight runs glint as a program, not as a library, so
+a change to glint's Zig API never waits on preflight and glint's own CI lints glint with the glint it builds
+(`addCi(.{ .glint = exe })`). Every other package lints with the glint preflight pins, built in preflight's
+`toolchain` step beside its checks. gantry keeps its library edge to glint's token tier; preflight and gantry pin
+one glint tag, which preflight's `pin` check asserts.
+
+```
+glint --project FILE --format json [--result FILE --run-id ID] [--fix] [--escapes-before FILE] [--surface FILE]
+glint surface --project FILE
+glint --contract
+```
+
+`--project` replaces the file, module, root, package, external, exported, setting and level flags; given with
+any of them it is an argument failure. `glint --contract` prints exactly `glint-contract 1` (or `glint-contract 1
+2` inside a version window) and exits 0; an older glint exits with its usage, which preflight names as too old.
+
+**The project file** is JSON, `"version": 1`, its paths relative to its `root`. The caller owns its own
+configuration and the build graph; glint owns import discovery, compilation membership, rule names and their
+resolution, the packages' rules, per-file levels, fixes and each finding's verdict. glint holds no family
+knowledge: the family's tables arrive as data.
+
+- `zig_lib`; `release` (shipped bans fail, the release tier; nothing else).
+- `modules`: the build's modules, each `root` (or null), `contents` (a generated root's text), `script` (the
+  build runner compiles it) and `imports` (`{name, module}` by index). glint follows imports from the selected
+  files and the build scripts' roots, binds each name per compilation (the program's, the build runner's), and
+  marks each file's compilations; a module with no root and no contents is external.
+- `exported`: `{name, root}` per exported module. A root need not be among `modules`' roots: one only exported
+  reads with no imports bound.
+- `files`: the selected files, each `path`, `kind` (production, test, support), `ships` (in what
+  `build.zig.zon` ships: the shipped bans and the packages' bans hold it), `max_function_lines` (null: P003 off),
+  `function_exceptions`, and `vendored` (`{upstream, verification}` for a file the caller verified as its
+  upstream's copy: the upstream-text rules are off and a danger site there is carried, never failing).
+- `policy`: `levels` (the default table, glint's own ids at gate, finding, report or off), `floor` (an amendment
+  may only raise a rule; without it any level, and each below its default is a note), `shipped_bans`,
+  `disallowed` (P006's entries), `fact_budget`, `amendments` (the caller's `glint` object verbatim: glint refuses
+  its retired and unknown keys, a folded, removed or doubled rule, and a name neither glint nor a package of the
+  run has) and `options` (the repository's glint.json, or null: its code options are read, its function-length
+  keys refused, its profile and rules noted as unread). A package's declared rule joins at its own default (a
+  ban a finding, hygiene a report) and holds shipped files only.
+
+**Outputs.** The JSON report, version 1, gains: each diagnostic's `fails`, `shipped_ban` and `carried` (the
+upstream whose verification carries the site); `notes`; and with `--fix`, `fixed` (`sites` and the `files`
+written). A fixed file glint cannot write fails the run (`output_failure`, the path on stderr). The result record
+is unchanged; a policy refusal is `argument_failure` with glint's message. The surface (`--surface FILE`, or
+`glint surface` alone for the tag side of a release's comparison) is `glint-surface 1`, then one line per
+declaration a consumer reaches, sorted, without repeats: `<module>.<declaration path> <description>`, the
+description a tag, `field: <type>`, a signature (with a `<path>()` line for the type a function makes),
+`requires:`, `exhaustive:`, `non-exhaustive`, `tagged:`, `const:`/`var:`, `value =` or `const either X or Y`, its
+type names canonical through aliases and facades. The caller compares whole lines.
+
+**Versions.** A change is additive where it can be and keeps version 1. A breaking one bumps the version; glint
+reads old and new for exactly one release, and the next deletes the old reader, named in both CHANGELOGs. There
+is no standing multi-version reader.
+
 ## Who owns what
 
 | Concern | Owner |
@@ -254,7 +310,7 @@ replacement's `.drop_in` call, and the rewrite of 0.7's suppression forms. No fi
 | File selection, family rule levels, running the tools, the hardened jobs, the gate | preflight, through gantry's path dialect |
 
 The production edges are glint → aegis → std, gantry → glint (lazy, its Zig front end), and preflight → gantry
-and glint. glint has no edge to gantry or preflight, its CLI runs without either, and it names no package: a
+and glint (from 0.9.0, glint runs as a program: the contract above). glint has no edge to gantry or preflight, its CLI runs without either, and it names no package: a
 package declares its rules in `lint_rules` and glint reads them. preflight fails a run on the bans a project
 selects; hygiene reports, and a project may gate it. There are no blanket warnings-as-errors.
 
