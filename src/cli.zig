@@ -11,6 +11,7 @@ const Result = @import("Result.zig");
 const aegis = @import("aegis");
 const ensign = @import("ensign");
 const release = @import("version.zig");
+const Contract = @import("Contract.zig");
 
 const Module = struct { name: []const u8, path: []const u8 };
 const Parsed = struct {
@@ -296,6 +297,7 @@ pub const Arguments = struct {
     package: []const []const u8 = &.{},
     files_from: []const []const u8 = &.{},
     input_directory: []const []const u8 = &.{},
+    contract: bool = false,
     pub const spec: ensign.Spec(@This()) = .{
         .name = "glint",
         .version = release.version,
@@ -325,6 +327,7 @@ pub const Arguments = struct {
             .package = .{ .value_name = "NAME=DIR", .section = "Inputs", .help = "The package whose files a directory holds, repeated" },
             .files_from = .{ .value_name = "FILE", .hint = .file, .section = "Inputs", .help = "A file naming files to check under this directory, one a line, repeated" },
             .input_directory = .{ .value_name = "DIR", .hint = .directory, .hidden = true, .help = "A directory the caller's build reads; never a selection of files" },
+            .contract = .{ .negatable = false, .help = "Print the project-file versions this glint reads (`glint-contract 1`) and check nothing" },
         },
         // A run of some rules sees only what they cover: it never names an older escape.
         .conflicts = &.{ &.{ .only, .reviewed }, &.{ .only, .escapes_before } },
@@ -623,6 +626,11 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
         // outcome no parse of them gives is a refusal, not a state the program cannot reach.
         .complete => return error.InvalidArguments,
     };
+    if (arguments.contract) {
+        record.outcome = .output_failure;
+        try Contract.writeVersions(writer);
+        return told(writer, record);
+    }
     var configured = try options(a, io, arguments, problems);
     try refuseUnknown(&configured, definitions, true, problems);
     if (configured.files.items.len == 0) return error.MissingSource;
@@ -692,7 +700,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
 /// The width help and messages wrap to.
 const width = 100;
 
-/// Help or the version, written: the run answered and checked nothing.
+/// Help, the version or the contract's versions, written: the run answered and checked nothing.
 fn told(writer: *std.Io.Writer, record: *Result.Record) !u8 {
     try writer.flush();
     record.outcome = .help;

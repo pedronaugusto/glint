@@ -80,6 +80,14 @@ fn expectOutcome(tmp: *std.testing.TmpDir, outcome: []const u8) !void {
     try std.testing.expectEqualStrings(outcome, json.value.object.get("outcome").?.string);
 }
 
+test "--contract answers the project-file versions on one line, exits 0 and checks nothing" {
+    const a = std.testing.allocator;
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    try std.testing.expectEqual(@as(u8, 0), try cli.execute(a, std.testing.io, &.{ "glint", "--contract" }, &output.writer, &quiet.writer, .{}));
+    try std.testing.expectEqualStrings("glint-contract 1\n", output.written());
+}
+
 test "completion missing input and bad arguments never certify clean" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
