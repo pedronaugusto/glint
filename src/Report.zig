@@ -27,6 +27,16 @@ metrics: ?Metrics = null,
 seams: []const SeamCount = &.{},
 /// Each test input entry (`Config.test_inputs`), with how many files it holds.
 test_inputs: []const TestInputCount = &.{},
+/// What a project file's policy allowed and says (`Policy.notes`): one line each.
+notes: []const []const u8 = &.{},
+/// What `--fix` made under a project file: the report is the run before it.
+fixed: ?Fixed = null,
+
+/// The sites `--fix` changed and the files they are in.
+pub const Fixed = struct { sites: usize, files: usize };
+/// What a project file's policy makes of a finding (`Policy.verdict`): whether it fails the run,
+/// whether a ban that holds what the package ships made it, and whether it is carried.
+pub const Verdict = struct { fails: bool, shipped_ban: bool, carried: bool };
 
 /// A seam, where it is and why, the sites it held per rule, and whether it is stale: its rules
 /// all ran and it held none.
@@ -93,6 +103,8 @@ pub const Diagnostic = struct {
     related: []const Span = &.{},
     /// The finding's deterministic fix, when it has one: edits of its file's bytes.
     fix: []const Edit = &.{},
+    /// Under a project file, its policy's verdict; null in a run of the command line's flags.
+    verdict: ?Verdict = null,
 };
 /// One replacement of a file's bytes from `start` to `end` with `text`.
 pub const Edit = struct {
@@ -139,6 +151,8 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
                 try writer.writeAll(if (seam.stale) " (stale: it holds no site)\n" else "\n");
             }
             for (self.test_inputs) |entry| try writer.print("test inputs: {s}: {d} files{s}\n", .{ entry.pattern, entry.files, if (entry.files == 0) " (stale)" else "" });
+            for (self.notes) |note| try writer.print("note: {s}\n", .{note});
+            if (self.fixed) |fixed| try writer.print("fixed: {d} sites in {d} files\n", .{ fixed.sites, fixed.files });
             if (self.metrics) |metrics| try textMetrics(writer, metrics);
         },
         .json => {
@@ -166,6 +180,15 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
             try std.json.Stringify.value(self.seams, .{}, writer);
             try writer.writeAll(",\"test_inputs\":");
             try std.json.Stringify.value(self.test_inputs, .{}, writer);
+            // A project file's additions (contract v1), only where a run under one has them.
+            if (self.notes.len != 0) {
+                try writer.writeAll(",\"notes\":");
+                try std.json.Stringify.value(self.notes, .{}, writer);
+            }
+            if (self.fixed) |fixed| {
+                try writer.writeAll(",\"fixed\":");
+                try std.json.Stringify.value(fixed, .{}, writer);
+            }
             if (self.metrics) |metrics| {
                 try writer.writeAll(",\"metrics\":{");
                 try jsonCounts(writer, metrics.total);
@@ -233,6 +256,10 @@ fn jsonDiagnostic(writer: *std.Io.Writer, project: *const Project, d: Diagnostic
     }
     try stream.objectField("related");
     try relatedLocations(&stream, project, d.related, false);
+    if (d.verdict) |verdict| inline for (@typeInfo(Verdict).@"struct".field_names) |name| {
+        try stream.objectField(name);
+        try stream.write(@field(verdict, name));
+    };
     try stream.endObject();
 }
 

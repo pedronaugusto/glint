@@ -12,6 +12,8 @@ const aegis = @import("aegis");
 const ensign = @import("ensign");
 const release = @import("version.zig");
 const Contract = @import("Contract.zig");
+const Assembly = @import("Assembly.zig");
+const Policy = @import("Policy.zig");
 
 const Module = struct { name: []const u8, path: []const u8 };
 const Parsed = struct {
@@ -298,6 +300,7 @@ pub const Arguments = struct {
     files_from: []const []const u8 = &.{},
     input_directory: []const []const u8 = &.{},
     contract: bool = false,
+    project: ?[]const u8 = null,
     pub const spec: ensign.Spec(@This()) = .{
         .name = "glint",
         .version = release.version,
@@ -328,6 +331,7 @@ pub const Arguments = struct {
             .files_from = .{ .value_name = "FILE", .hint = .file, .section = "Inputs", .help = "A file naming files to check under this directory, one a line, repeated" },
             .input_directory = .{ .value_name = "DIR", .hint = .directory, .hidden = true, .help = "A directory the caller's build reads; never a selection of files" },
             .contract = .{ .negatable = false, .help = "Print the project-file versions this glint reads (`glint-contract 1`) and check nothing" },
+            .project = .{ .value_name = "FILE", .hint = .file, .section = "Inputs", .help = "A project file (the program contract, docs/design.md): the build's modules, the files and the policy in one document, beside which no input or rule option is read" },
         },
         // A run of some rules sees only what they cover: it never names an older escape.
         .conflicts = &.{ &.{ .only, .reviewed }, &.{ .only, .escapes_before } },
@@ -566,6 +570,12 @@ pub const ExecuteError = error{
     MalformedSuppression,
     InvalidProject,
     InvalidEdit,
+    UnsupportedVersion,
+    InvalidProjectFile,
+    Refused,
+    InputNotFound,
+    InputNotCompiled,
+    InputUnreadable,
 };
 
 /// Runs glint on `args`, the program's name first: the report, help or version to `writer`,
@@ -631,6 +641,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
         try Contract.writeVersions(writer);
         return told(writer, record);
     }
+    if (arguments.project) |path| return executeProject(gpa, result_a, io, arguments, path, writer, problems, record, project_rules, store);
     var configured = try options(a, io, arguments, problems);
     try refuseUnknown(&configured, definitions, true, problems);
     if (configured.files.items.len == 0) return error.MissingSource;
@@ -699,6 +710,166 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
 
 /// The width help and messages wrap to.
 const width = 100;
+
+/// A run over a project file (contract v1): its files and what their imports reach, as its
+/// build binds them (`Assembly`), under its policy (`Policy`): each file's configuration from it,
+/// each finding's verdict in the report. Exit 1 where a finding fails, whatever its level.
+fn executeProject(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io, arguments: Arguments, path: []const u8, writer: *std.Io.Writer, problems: *std.Io.Writer, record: *Result.Record, project_rules: []const RuleContext.Rule, store: ?*Project.Store) !u8 {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    record.outcome = .argument_failure;
+    try onlyBeside(arguments, problems);
+    const bytes = try aegis.own.readFile(io, std.Io.Dir.cwd(), path, a, .fromRaw(64 * 1024 * 1024));
+    // The project file is the caller's writing: input until read.
+    const reading: Reading = .{ .a = a, .problems = problems };
+    const project_file = aegis.input.Untrusted([]const u8).init(bytes).parse(reading, projectFile) catch |err| return flushed(problems, err);
+    const by_path = try selectedFiles(a, project_file, problems);
+    const escapes_before = if (arguments.escapes_before) |before| try escapeRecord(a, io, before) else &.{};
+    record.outcome = .input_failure;
+    var root = try std.Io.Dir.cwd().openDir(io, project_file.root, .{});
+    defer root.close(io);
+    const repo_options = try repoOptions(a, io, root, project_file.policy, problems);
+    const assembled = Assembly.assemble(a, gpa, io, root, project_file, problems) catch |err| return flushed(problems, err);
+    record.outcome = .tool_failure;
+    var project = try Project.init(gpa, assembled.inputs, assembled.imports, .{ .io = io, .store = store });
+    defer project.deinit();
+    const definitions = try a.alloc(Rule.Definition, project_rules.len);
+    for (project_rules, definitions) |rule, *definition| definition.* = rule.definition;
+    const all = try std.mem.concat(a, Rule.Definition, &.{ definitions, try Runner.packageRules(a, &project) });
+    record.outcome = .argument_failure;
+    var policy = Policy.resolve(a, project_file, repo_options, all, problems) catch |err| return flushed(problems, err);
+    // The seams and test inputs name paths from the root, as the files do.
+    const real_root = try std.Io.Dir.cwd().realPathFileAlloc(io, project_file.root, a);
+    policy.base.paths_from = real_root;
+    policy.base.names_from = real_root;
+    var files: std.ArrayList(Runner.FileConfig) = .empty;
+    for (project.sources) |*source| if (source.input.selected) {
+        const file = by_path.get(source.input.name) orelse continue;
+        try files.append(a, .{ .file = source.id, .config = try policy.forFile(a, file) });
+    };
+    record.outcome = .tool_failure;
+    var report = try Runner.run(gpa, &project, .{ .config = policy.base, .project_rules = project_rules, .files = files.items, .io = io });
+    defer report.deinit();
+    const judged = try a.dupe(Report.Diagnostic, report.diagnostics);
+    var fails = false;
+    for (judged) |*diagnostic| {
+        const file = by_path.get(project.at(diagnostic.span.file).input.name) orelse continue;
+        diagnostic.verdict = policy.verdict(diagnostic.rule, diagnostic.level, file);
+        fails = fails or diagnostic.verdict.?.fails;
+    }
+    report.diagnostics = judged;
+    report.notes = policy.notes;
+    // The fixes are made before the report is written, which counts them, and written after it.
+    const changed = if (arguments.fix) try Fix.apply(a, &project, &report, .{ .escapes_before = escapes_before }) else &.{};
+    if (arguments.fix) {
+        var sites: usize = 0;
+        for (changed) |file| sites += file.sites;
+        report.fixed = .{ .sites = sites, .files = changed.len };
+    }
+    record.outcome = .output_failure;
+    var rendered: std.Io.Writer.Allocating = .init(a);
+    try report.write(&rendered.writer, &project, arguments.format);
+    const output = rendered.written();
+    try writer.writeAll(output);
+    try writer.flush();
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(output, &digest, .{});
+    record.output_bytes = output.len;
+    record.output_sha256 = try result_a.dupe(u8, &std.fmt.bytesToHex(&digest, .lower));
+    for (changed) |file| try root.writeFile(io, .{ .sub_path = project.at(file.file).input.name, .data = file.bytes });
+    for (assembled.inputs) |input| if (input.selected) {
+        record.sources += 1;
+    };
+    record.findings = report.diagnostics.len;
+    record.suppressed = report.suppressed;
+    record.completed = report.complete;
+    record.outcome = if (!report.complete) .analysis_incomplete else if (fails) .findings else .clean;
+    return if (!report.complete) 2 else if (fails) 1 else 0;
+}
+
+/// What reading a project file writes its problems to.
+const Reading = struct { a: std.mem.Allocator, problems: *std.Io.Writer };
+
+fn projectFile(reading: Reading, bytes: []const u8) (Contract.ReadError || std.Io.Writer.Error)!Contract.ProjectFile {
+    return Contract.readProject(reading.a, bytes, reading.problems);
+}
+
+/// `err`, once what was written to `problems` is out.
+fn flushed(problems: *std.Io.Writer, err: anytype) (@TypeOf(err) || std.Io.Writer.Error)!u8 {
+    try problems.flush();
+    return err;
+}
+
+/// A project file holds the run's inputs and policy: an input or rule option beside it would
+/// be a second source of either, so any is refused. The report's format, the fix and the escapes
+/// a run before reported are the run's own.
+fn onlyBeside(arguments: Arguments, problems: *std.Io.Writer) !void {
+    inline for (@typeInfo(Arguments).@"struct".field_names) |name| {
+        const own = comptime for ([_][]const u8{ "project", "format", "fix", "escapes_before", "contract" }) |allowed| {
+            if (std.mem.eql(u8, name, allowed)) break true;
+        } else false;
+        if (own) continue;
+        if (given(@field(arguments, name))) {
+            try problems.print("glint: `{s}` is not read beside --project: the project file holds the run's inputs and policy\n", .{name});
+            try problems.flush();
+            return error.InvalidArguments;
+        }
+    }
+}
+
+/// Whether an option was given: a value, a list with an entry, a flag set.
+fn given(value: anytype) bool {
+    return switch (@typeInfo(@TypeOf(value))) {
+        .optional => value != null,
+        .bool => value,
+        .pointer => value.len != 0,
+        else => @compileError("an option of a kind `given` does not read"),
+    };
+}
+
+/// The project file's files by their path, each once: a file listed twice is two settings for it.
+fn selectedFiles(a: std.mem.Allocator, project_file: Contract.ProjectFile, problems: *std.Io.Writer) !std.StringHashMapUnmanaged(Contract.ProjectFile.File) {
+    var by_path: std.StringHashMapUnmanaged(Contract.ProjectFile.File) = .empty;
+    for (project_file.files) |file| {
+        const entry = try by_path.getOrPut(a, try Assembly.normalize(a, file.path));
+        if (entry.found_existing) {
+            try problems.print("project file: files: {s} is listed twice\n", .{file.path});
+            try problems.flush();
+            return error.InvalidProjectFile;
+        }
+        entry.value_ptr.* = file;
+    }
+    return by_path;
+}
+
+/// The escapes a run before reported (`--escapes-before`).
+fn escapeRecord(a: std.mem.Allocator, io: std.Io, path: []const u8) ![]const Fix.Escaped {
+    const bytes = try aegis.own.readFile(io, std.Io.Dir.cwd(), path, a, .fromRaw(16 * 1024 * 1024));
+    // A record is a file another run wrote, which the fix reads as input until parsed.
+    return aegis.input.Untrusted([]const u8).init(bytes).parse(a, Fix.escapeRecord);
+}
+
+/// The repository's glint.json the policy names, as written; none where the policy names none or
+/// its floor refuses one (`Policy.resolve` says so).
+fn repoOptions(a: std.mem.Allocator, io: std.Io, root: std.Io.Dir, policy: Contract.ProjectFile.Policy, problems: *std.Io.Writer) !?Contract.Written {
+    const path = policy.repo_options orelse return null;
+    if (Policy.refuses(policy)) return null;
+    const bytes = try aegis.own.readFile(io, root, path, a, .fromRaw(4 * 1024 * 1024));
+    // A repository's configuration is its content: input until parsed.
+    return aegis.input.Untrusted([]const u8).init(bytes).parse(a, written) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try problems.print("{s}: not a configuration glint reads ({t})\n", .{ path, err });
+            try problems.flush();
+            return error.Refused;
+        },
+    };
+}
+
+fn written(a: std.mem.Allocator, bytes: []const u8) std.json.ParseError(std.json.Scanner)!Contract.Written {
+    return std.json.parseFromSliceLeaky(Contract.Written, a, bytes, .{});
+}
 
 /// Help, the version or the contract's versions, written: the run answered and checked nothing.
 fn told(writer: *std.Io.Writer, record: *Result.Record) !u8 {

@@ -259,8 +259,9 @@ glint surface --project FILE
 glint --contract
 ```
 
-`--project` replaces the file, module, root, package, external, exported, setting and level flags; given with
-any of them it is an argument failure. `glint --contract` prints exactly `glint-contract 1` (or `glint-contract 1
+`--project` replaces every input and rule option (files, modules, roots, packages, externals, exported roots,
+`--config`, the levels and the code options); given with any of them it is an argument failure. `--format`,
+`--fix` and `--escapes-before` are the run's own. `glint --contract` prints exactly `glint-contract 1` (or `glint-contract 1
 2` inside a version window) and exits 0; an older glint exits with its usage, which preflight names as too old.
 
 **The project file** is JSON, `"version": 1`, its paths relative to its `root`. The caller owns its own
@@ -285,21 +286,26 @@ caller: levels, a floor and P006's entries arrive as data, and its messages name
     in-repo configuration may lower), `package_defaults` (each package's declared rule is held at its own
     default) and `refuse_repo_options` (a repository's glint.json is refused). A refusal names the floor: "Z026
     is held at gate by the caller's floor; a configuration may only raise it, not set it to report".
-  - `shipped_bans`, `disallowed` (P006's entries), `fact_budget`.
+  - `shipped_bans`, `disallowed` (P006's entries), `fact_budget`, `strict_suppressions` and `metrics` (both
+    false unless written).
   - `config`: the in-repo configuration in glint's own schema, the one glint.json uses ("Configuration, seams
-    and suppression"), mapped by the caller from wherever it keeps it. Its `rules` amend `levels` and its code options apply. Refused
-    there: `profile` (the defaults are `levels`), `max_function_lines` and `function_exceptions` (per file, in
-    `files`), an unknown field, a removed, folded or doubled rule, and a name neither glint nor a package of the
-    run has.
-  - `repo_options`: the repository's glint.json, or null. Unless the floor refuses it, its code options are read,
-    its function-length keys refused, and its profile and rules noted as not read.
+    and suppression"), mapped by the caller from wherever it keeps it, and read as written: only the keys it
+    writes apply, so the caller's values hold where it is silent. Its `rules` amend `levels`; its code options
+    apply, its lists (`disallowed`, `seams`, `test_inputs`) joining the caller's and glint.json's. Refused there:
+    `profile` (the defaults are `levels`), `max_function_lines` and `function_exceptions` (per file, in `files`),
+    `strict_suppressions` and `metrics` (the caller's), an unknown field, a doubled rule, and a name neither glint
+    nor a package of the run has, in glint's words for it (a rule 0.8 removed names what to write instead).
+  - `repo_options`: the repository's glint.json by its path from `root`, or null. Unless the floor refuses it,
+    the code options it writes are read (`config`'s over them), its function-length keys refused, and its
+    profile, rules, strict suppressions and metrics noted as not read.
 
   A package's declared rule joins at its own default (a ban a finding, hygiene a report) and holds shipped files
   only.
 
-**Outputs.** The JSON report, version 1, gains: each diagnostic's `fails`, `shipped_ban` and `carried` (the
-upstream whose verification carries the site); `notes`; and with `--fix`, `fixed` (`sites` and the `files`
-written). A fixed file glint cannot write fails the run (`output_failure`, the path on stderr). The result record
+**Outputs.** The JSON report, version 1, gains under a project file: each diagnostic's `fails`, `shipped_ban`
+and `carried` (a shipped ban's site in a vendored file, which its verification carries); `notes`, where there
+are any; and with `--fix`, `fixed` (`sites` and the `files` written). A run of the command line's flags writes
+none of them. The exit status is the verdicts': 1 where a finding fails, whatever its level. A fixed file glint cannot write fails the run (`output_failure`, the path on stderr). The result record
 is unchanged; a policy refusal is `argument_failure` with glint's message. The surface (`--surface FILE`, or
 `glint surface` alone for the tag side of a release's comparison) is `glint-surface 1`, then one line per
 declaration a consumer reaches, sorted, without repeats: `<module>.<declaration path> <description>`, the

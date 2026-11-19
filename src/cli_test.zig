@@ -88,6 +88,49 @@ test "--contract answers the project-file versions on one line, exits 0 and chec
     try std.testing.expectEqualStrings("glint-contract 1\n", output.written());
 }
 
+/// A run over a project file selecting `src/a.zig`, which imports `src/b.zig` and names it
+/// nowhere (Z013's finding), with Z013 at `weight`: its exit status and its JSON report.
+fn projectRun(a: std.mem.Allocator, tmp: *std.testing.TmpDir, weight: []const u8, output: *std.Io.Writer.Allocating) !u8 {
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/a.zig", .data = "const unused = @import(\"b.zig\");\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/b.zig", .data = "" });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var file: std.Io.Writer.Allocating = .init(a);
+    defer file.deinit();
+    try file.writer.writeAll("{\"version\": 1, \"root\": ");
+    try std.json.Stringify.value(root, .{}, &file.writer);
+    try file.writer.print(
+        \\, "files": [{{"path": "src/a.zig", "kind": "production", "ships": true, "max_function_lines": 120}}],
+        \\ "policy": {{"levels": [{{"rule": "Z013", "weight": "{s}"}}], "shipped_bans": [], "fact_budget": 100000}}}}
+    , .{weight});
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project.json", .data = file.written() });
+    const project = try resultPath(a, tmp, "project.json");
+    defer a.free(project);
+    return cli.execute(a, std.testing.io, &.{ "glint", "--project", project, "--format", "json" }, &output.writer, &quiet.writer, .{});
+}
+
+test "--project runs a project file under its policy: a finding's verdict is in the report, and the exit status is the verdicts'" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    // Weighed a finding, Z013's report fails the run.
+    try std.testing.expectEqual(@as(u8, 1), try projectRun(a, &tmp, "finding", &output));
+    try std.testing.expect(std.mem.find(u8, output.written(), "\"rule\":\"Z013\"") != null);
+    try std.testing.expect(std.mem.find(u8, output.written(), "\"level\":\"report\"") != null);
+    try std.testing.expect(std.mem.find(u8, output.written(), "\"fails\":true,\"shipped_ban\":false,\"carried\":false") != null);
+    // Weighed a report, it is reported and fails nothing.
+    output.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 0), try projectRun(a, &tmp, "report", &output));
+    try std.testing.expect(std.mem.find(u8, output.written(), "\"fails\":false") != null);
+    // An input or rule option beside the project file is a second source of the run's inputs.
+    const project = try resultPath(a, &tmp, "project.json");
+    defer a.free(project);
+    try std.testing.expectError(error.InvalidArguments, cli.execute(a, std.testing.io, &.{ "glint", "--project", project, "--gate", "Z013" }, &output.writer, &quiet.writer, .{}));
+}
+
 test "completion missing input and bad arguments never certify clean" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

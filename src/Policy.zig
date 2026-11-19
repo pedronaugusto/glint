@@ -10,6 +10,7 @@ const Rules = @import("Rule.zig");
 const Rule = Rules.Rule;
 const Config = Rules.Config;
 const Contract = @import("Contract.zig");
+const Report = @import("Report.zig");
 const ProjectFile = Contract.ProjectFile;
 const Weight = ProjectFile.Weight;
 
@@ -29,11 +30,11 @@ notes: []const []const u8,
 pub const Error = error{ OutOfMemory, Refused } || std.Io.Writer.Error;
 
 /// The policy `project` asks, over the rules `definitions` holds (glint's and the run's
-/// packages', `Runner.packageRules`), with `repo_options` the bytes of the glint.json
-/// `policy.repo_options` names, which the caller reads. Each refusal is one line on `problems`,
-/// all of them written before `Refused`: a setting glint does not honour is a gate that is not
-/// there.
-pub fn resolve(a: std.mem.Allocator, project: ProjectFile, repo_options: ?[]const u8, definitions: []const Rules.Definition, problems: *std.Io.Writer) Error!Policy {
+/// packages', `Runner.packageRules`), with `repo_options` the glint.json `policy.repo_options`
+/// names as it is written, which the caller reads (none where the floor refuses one, `refuses`).
+/// Each refusal is one line on `problems`, all of them written before `Refused`: a setting glint
+/// does not honour is a gate that is not there.
+pub fn resolve(a: std.mem.Allocator, project: ProjectFile, repo_options: ?Contract.Written, definitions: []const Rules.Definition, problems: *std.Io.Writer) Error!Policy {
     const policy = project.policy;
     var r: Resolver = .{ .a = a, .definitions = definitions, .problems = problems };
     var table: std.ArrayList(Entry) = .empty;
@@ -65,6 +66,12 @@ pub fn resolve(a: std.mem.Allocator, project: ProjectFile, repo_options: ?[]cons
     return .{ .base = base, .findings = findings.items, .shipped_bans = shipped, .release = project.release, .notes = r.notes.items };
 }
 
+/// Whether the caller's floor refuses a repository's glint.json, which is then not read.
+pub fn refuses(policy: ProjectFile.Policy) bool {
+    const floor = policy.floor orelse return false;
+    return floor.refuse_repo_options;
+}
+
 /// glint's configuration for `file`: the base with its function ceiling (P003 off where it has
 /// none) and exceptions, the shipped bans off where the package does not ship it, and the rules of
 /// its text off where it is its upstream's copy.
@@ -86,7 +93,7 @@ pub fn forFile(policy: Policy, a: std.mem.Allocator, file: ProjectFile.File) err
 /// What a finding means to the caller: whether it fails the run, whether a ban that holds what
 /// the package ships made it, and whether it is carried (a shipped ban's, in a file the caller
 /// verified as its upstream's copy: that verification is its reason, and it fails nothing).
-pub const Verdict = struct { fails: bool, shipped_ban: bool, carried: bool };
+pub const Verdict = Report.Verdict;
 
 /// The verdict on a finding of `rule` at `level` in `file`.
 pub fn verdict(policy: Policy, rule: Rule, level: Config.Level, file: ProjectFile.File) Verdict {
@@ -202,15 +209,11 @@ const Resolver = struct {
 
     /// The repository's glint.json at `path`: refused where the floor refuses one, else the code
     /// options it writes.
-    fn repository(r: *Resolver, base: *Config, path: []const u8, bytes: ?[]const u8, floor: ?ProjectFile.Floor) Error!void {
+    fn repository(r: *Resolver, base: *Config, path: []const u8, written: ?Contract.Written, floor: ?ProjectFile.Floor) Error!void {
         if (floor) |f| if (f.refuse_repo_options) {
             return r.refuse("{s}: the caller's floor refuses a repository's glint.json: its settings belong in the configuration the caller reads", .{path});
         };
-        const written = std.json.parseFromSliceLeaky(Contract.Written, r.a, bytes orelse "{}", .{}) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return r.refuse("{s}: not a configuration glint reads ({t})", .{ path, err }),
-        };
-        try r.options(base, path, written, .repository);
+        try r.options(base, path, written orelse .{}, .repository);
     }
 
     const Source = enum { repository, config };
@@ -316,6 +319,10 @@ fn projectOf(policy: ProjectFile.Policy) ProjectFile {
     return .{ .version = 1, .root = ".", .files = &.{}, .policy = policy };
 }
 
+fn writtenOf(a: std.mem.Allocator, json: []const u8) !Contract.Written {
+    return std.json.parseFromSliceLeaky(Contract.Written, a, json, .{});
+}
+
 fn levelIn(policy: Policy, rule: Rule) Config.Level {
     return policy.base.level(rule);
 }
@@ -398,7 +405,7 @@ test "policy: a repository's glint.json lends the code options it writes, unless
         \\ "disallowed": [{"source": "std", "declaration": "debug.print", "reason": "r", "replacement": "x"}]}
     ;
     const base: ProjectFile.Policy = .{ .levels = &.{.{ .rule = "P007", .weight = .finding }}, .shipped_bans = &.{}, .fact_budget = 1, .repo_options = "glint.json", .config = .{ .max_line_length = 120 } };
-    const policy = try resolve(a, projectOf(base), json, &.{}, &problems.writer);
+    const policy = try resolve(a, projectOf(base), try writtenOf(a, json), &.{}, &problems.writer);
     try testing.expectEqualStrings("", problems.written());
     // The configuration's option over the repository's; the lists join.
     try testing.expectEqual(@as(u32, 120), policy.base.max_line_length);
@@ -408,11 +415,12 @@ test "policy: a repository's glint.json lends the code options it writes, unless
 
     var refusing = base;
     refusing.floor = .{ .refuse_repo_options = true };
-    try testing.expectError(error.Refused, resolve(a, projectOf(refusing), json, &.{}, &problems.writer));
+    try testing.expect(refuses(refusing));
+    try testing.expectError(error.Refused, resolve(a, projectOf(refusing), null, &.{}, &problems.writer));
     try testing.expectEqualStrings("glint.json: the caller's floor refuses a repository's glint.json: its settings belong in the configuration the caller reads\n", problems.written());
 
     problems.clearRetainingCapacity();
-    try testing.expectError(error.Refused, resolve(a, projectOf(base), "{\"max_function_lines\": 80, \"seams\": [{\"file\": \"a.zig\", \"rules\": [\"A099\"], \"reason\": \"r\"}]}", &.{}, &problems.writer));
+    try testing.expectError(error.Refused, resolve(a, projectOf(base), try writtenOf(a, "{\"max_function_lines\": 80, \"seams\": [{\"file\": \"a.zig\", \"rules\": [\"A099\"], \"reason\": \"r\"}]}"), &.{}, &problems.writer));
     try testing.expectEqualStrings("glint.json: `max_function_lines` is set per file by the caller (`files[].max_function_lines`)\nseams: `A099` is not a rule glint has\n", problems.written());
 }
 
