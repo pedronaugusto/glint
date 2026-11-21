@@ -1859,9 +1859,16 @@ fn holdsTypes(value: Value) ?bool {
 }
 
 /// What a reader that takes `value` for a type answers where `holdsTypes` does not know: the
-/// value's own unknown, else one this does not read.
+/// value's own unknown, or that of what it points at or holds (`?T` of a `T` not known), else
+/// one this does not read.
 fn typesUnknown(value: Value) Value {
-    return if (value == .unknown) value else .{ .unknown = .unsupported };
+    var at = value;
+    while (true) at = switch (at) {
+        .pointer => |inner| inner.child.*,
+        .array, .optional => |inner| inner.*,
+        .unknown => return at,
+        else => return .{ .unknown = .unsupported },
+    };
 }
 
 /// A type built from `types`, a list of its fields' types (an array of them, a pointer to one,
@@ -1919,8 +1926,21 @@ fn fieldType(self: *Facts, of: Value, field_name: ?[]const u8) ResolveError!Valu
     const container = switch (of) {
         .container => |c| c,
         .unknown => |why| return .{ .unknown = why },
-        // A choice of types: no one container's field.
-        .alternatives => return .{ .unknown = .unsupported },
+        // A choice of types a build picks (`std.posix.sockaddr.un`, one per system): each one's
+        // field, one of them. A part with no such field (`void` where the system has none) is
+        // a build in which this code does not compile.
+        .alternatives => |parts| {
+            var each: std.ArrayList(Value) = .empty;
+            for (parts) |part| {
+                if (part == .primitive) continue;
+                if (field_name) |name| if (part == .container and self.lacks(part.container, name)) continue;
+                const one = try self.fieldType(part, field_name);
+                if (one == .unknown) return one;
+                try each.append(self.gpa, one);
+            }
+            if (each.items.len == 0) return .{ .unknown = .unsupported };
+            return self.choose(each.items);
+        },
         else => return .{ .unknown = .unsupported },
     };
     // A container a type function makes has its fields' types where the call that made it is
@@ -2189,6 +2209,9 @@ fn memberValue(self: *Facts, lhs: Value, name: []const u8) ResolveError!Value {
         },
         // An array's one member is its length, a number.
         .array => return if (std.mem.eql(u8, name, "len")) .scalar else .{ .unknown = .unresolved },
+        // An enum Zig makes (a `union(enum)`'s tag type, `@Enum`'s) declares only its tags: a
+        // member is one of them, a value with no store.
+        .primitive => |made| return if (std.mem.eql(u8, made, "@Enum")) .scalar else .{ .unknown = .unresolved },
         .unknown => return lhs,
         .alternatives => return .{ .unknown = .unresolved },
         else => return .{ .unknown = .unresolved },
@@ -4652,6 +4675,11 @@ fn payload(self: *Facts, value: Value, wrapper: std.meta.Tag(Value)) ResolveErro
             break :blk self.choose(kept.items);
         },
         .unknown => value,
+        // Zig unwraps only an optional or an error union: one read here as a payload is one
+        // whose wrapper a peer adds, which this reading keeps no record of (`(p.dependencyLazy(
+        // n, .{}) catch null) orelse return` makes the catch's `*Dependency` optional), and the
+        // unwrap gives that payload, as `unwrappedCondition` reads a capture.
+        .pointer, .instance, .array, .scalar => value,
         else => .{ .unknown = .unsupported },
     };
 }
@@ -5096,9 +5124,15 @@ fn conditional(self: *Facts, env: ?*const Env, file: Project.FileId, payload_tok
 fn unwrappedCondition(self: *Facts, value: Value) ResolveError!Value {
     return switch (value) {
         .alternatives => |each| blk: {
-            const parts = try self.gpa.alloc(Value, each.len);
-            for (each, parts) |one, *part| part.* = try self.unwrappedCondition(one);
-            break :blk self.choose(parts);
+            // A part no capture reads (`parts: if (identifiers) ?Within else void`'s `void`)
+            // compiles only where the condition is another of the choice.
+            var parts: std.ArrayList(Value) = .empty;
+            for (each) |one| switch (one) {
+                .primitive, .error_set => {},
+                else => try parts.append(self.gpa, try self.unwrappedCondition(one)),
+            };
+            if (parts.items.len == 0) break :blk .{ .unknown = .unsupported };
+            break :blk self.choose(parts.items);
         },
         .optional, .error_union => |inner| inner.*,
         // Zig unwraps only an optional or an error union: a condition read as a payload is one
@@ -5135,9 +5169,30 @@ fn switchPayload(self: *Facts, env: ?*const Env, file: Project.FileId, case_node
         .unknown => return subject,
         // A number, a boolean or an error: the capture is the subject's value.
         .scalar, .primitive, .error_set => return subject,
-        .alternatives => return .{ .unknown = .unsupported },
+        // A subject a build picks (`impl: Impl`, a union per system): the prong's capture of
+        // each, one of them.
+        .alternatives => |parts| {
+            var each: std.ArrayList(Value) = .empty;
+            for (parts) |part| {
+                const holder = switch (part) {
+                    .instance, .container => |c| c,
+                    else => return .{ .unknown = .unsupported },
+                };
+                const one = try self.prongPayload(file, whole, full, holder);
+                if (one == .unknown) return one;
+                try each.append(self.gpa, one);
+            }
+            return self.choose(each.items);
+        },
         else => return .{ .unknown = .unsupported },
     };
+    return self.prongPayload(file, whole, full, container);
+}
+
+/// What a prong of `whole`, a switch on a value of `container`, captures: the value itself, or a
+/// union's payload for the fields the prong takes.
+fn prongPayload(self: *Facts, file: Project.FileId, whole: Ast.full.Switch, full: Ast.full.SwitchCase, container: Container) ResolveError!Value {
+    const tree = &self.project.at(file).file.tree;
     if (!self.isUnion(container)) return .{ .instance = container };
     // A union's `else` prong captures the union itself; an `inline else` prong each payload.
     if (full.ast.values.len == 0 and full.inline_token == null) return .{ .instance = container };
@@ -6741,6 +6796,13 @@ pub fn definition(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Reso
             .primitive, .scalar, .error_set => return .none,
             // A choice of holders, each with its own member: the one declaration they all name.
             .alternatives => |parts| return self.definitionOfChoice(parts, try self.memberName(tree.tokenSlice(data[1]))),
+            // Type information of one kind (`@typeInfo(T).pointer`) is a value of std's type for
+            // it, whose members it reads (`info.sentinel()`).
+            .reflected => |r| switch (try self.reflectedKind(r.at)) {
+                .instance => |c| c,
+                .unknown => |why| return .{ .unknown = why },
+                else => return .{ .unknown = .unsupported },
+            },
             // Any other value a member of which is not read here.
             else => return .{ .unknown = .unsupported },
         };
@@ -6845,6 +6907,39 @@ pub fn literalDeclaration(self: *Facts, file: Project.FileId, node: Ast.Node.Ind
         break :called if (call.ast.fn_expr == node) parent else null;
     };
     return self.placeMember(try self.literalType(file, call_node orelse node), name, call_node != null);
+}
+
+/// `literalDeclaration`, where the place is a choice a build picks whose parts name different
+/// declarations (`.inner = if (is_windows) .initStreaming(f, io, b) else .init(s, io, b)`, the
+/// field's type one per system): each part's, once each, as `membersOfChoice` reads a member of
+/// a choice of holders. Through an optional, an error union and a pointer, as one place's.
+pub fn literalDeclarations(self: *Facts, file: Project.FileId, node: Ast.Node.Index, name: []const u8) ResolveError!Definitions {
+    switch (try self.literalDeclaration(file, node, name)) {
+        .decl => |decl| return .{ .decls = try self.gpa.dupe(Decl, &.{decl}) },
+        .none => return .{ .decls = &.{} },
+        .unknown => |why| if (why != .unsupported) return .{ .unknown = why },
+    }
+    const tree = &self.project.at(file).file.tree;
+    const call_node = called: {
+        if (tree.nodeTag(node) != .enum_literal) break :called null;
+        const parent = self.project.at(file).model.parentOf(node) orelse break :called null;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, parent) orelse break :called null;
+        break :called if (call.ast.fn_expr == node) parent else null;
+    };
+    const place = try self.literalType(file, call_node orelse node);
+    if (place != .alternatives) return .{ .unknown = .unsupported };
+    var parts: std.ArrayList(Value) = .empty;
+    for (place.alternatives) |part| {
+        var inner = part;
+        while (true) inner = switch (inner) {
+            .pointer => |p| p.child.*,
+            .optional, .error_union => |o| o.*,
+            else => break,
+        };
+        try parts.appendSlice(self.gpa, valueParts(&inner));
+    }
+    return self.membersOfChoice(parts.items, name);
 }
 
 /// The member `name` of the type a literal's place gives, `holder`, through an optional, an
@@ -7203,6 +7298,14 @@ fn reflectedMember(self: *Facts, r: Reflected, name: []const u8) ResolveError!Va
 /// the type `std.builtin.Type` declares it (`@typeInfo(T).pointer.size` a `Type.Pointer.Size`,
 /// `.@"struct".layout` a `Type.ContainerLayout`), where the project maps std.
 fn reflectedField(self: *Facts, at: @FieldType(Reflected, "at"), name: []const u8) ResolveError!Value {
+    const kind = try self.reflectedKind(at);
+    if (kind == .unknown) return kind;
+    return self.memberValue(kind, name);
+}
+
+/// The value of `std.builtin.Type`'s kind that information `at` is (`@typeInfo(T).pointer` a
+/// `Type.Pointer`), where the project maps std.
+fn reflectedKind(self: *Facts, at: @FieldType(Reflected, "at")) ResolveError!Value {
     const tag: []const u8 = switch (at) {
         .pointer => "pointer",
         .optional => "optional",
@@ -7215,9 +7318,7 @@ fn reflectedField(self: *Facts, at: @FieldType(Reflected, "at"), name: []const u
         .info, .params, .part, .size => return .{ .unknown = .unsupported },
     };
     // The information is a `Type` value: its field `tag` holds a value of the kind's own type.
-    const kind = try self.memberValue(try self.instance(try self.stdMember(&.{ "builtin", "Type" })), tag);
-    if (kind == .unknown) return kind;
-    return self.memberValue(kind, name);
+    return self.memberValue(try self.instance(try self.stdMember(&.{ "builtin", "Type" })), tag);
 }
 
 /// What `info.is_tuple` is on the reading `env` binds, where `node` is one and `info` a
@@ -12659,10 +12760,10 @@ pub const calls = struct {
             else => null,
         };
         if (choice) |parts| {
-            // A choice of types (`Hasher(wide)` a `switch` returns): a type's member binds
-            // nothing, as one type's does.
+            // A choice of types (`Hasher(wide)` a `switch` returns, `std.c.W` a namespace on some
+            // systems and `void` on others): a type's member binds nothing, as one type's does.
             if (value == .alternatives) for (parts) |one| {
-                if (one != .container) break;
+                if (one != .container and one != .primitive) break;
             } else return .none;
             if (tree.nodeTag(callee) != .field_access) return .{ .unknown = .unsupported };
             const name = try facts.memberName(tree.tokenSlice(tree.nodeData(callee).node_and_token[1]));
@@ -13480,6 +13581,9 @@ fn operatorPlace(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
             if (rhs == node) return .scalar;
             return if (tree.nodeTag(parent) == .shl or tree.nodeTag(parent) == .shr or tree.nodeTag(parent) == .shl_sat) try self.placeType(env, file, parent, 1) else try self.typeOf(try self.resolveIn(env, file, lhs), {});
         },
+        // Operands Zig gives no result type: a negation's, a complement's, what is dereferenced,
+        // unwrapped, read a field of, indexed or sliced, an index or a bound, and a statement.
+        .bool_not, .negation, .negation_wrap, .bit_not, .deref, .unwrap_optional, .field_access, .array_access, .slice_open, .slice, .slice_sentinel, .block_two, .block_two_semicolon, .block, .block_semicolon => return .scalar,
         else => return null,
     }
 }
@@ -13494,6 +13598,8 @@ fn builtinPlace(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.
     // `@unionInit(T, name, init)`: `init` takes the named field's type; a name only a reading
     // spells (`@tagName(tag)` in an `inline else` prong) any field's, one of them.
     if (args.len == 3 and args[2] == node and std.mem.eql(u8, name, "@unionInit")) return self.fieldType(try self.resolveIn(env, file, args[0]), try self.nameIn(env, file, args[1], 0));
+    // `@memset(dest, elem)`: `elem` takes the type of an element of `dest`.
+    if (args.len == 2 and args[1] == node and std.mem.eql(u8, name, "@memset")) return self.typeOf(try self.indexed(try self.resolveIn(env, file, args[0]), {}), {});
     // `@splat(x)`: `x` takes the element type of the array or vector the place gives.
     if (args.len == 1 and std.mem.eql(u8, name, "@splat")) return switch (try self.placeType(env, file, parent, depth + 1)) {
         .array => |each| each.*,
@@ -13539,12 +13645,14 @@ fn parameterType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
             else => break,
         };
         if (typed == .fn_type) return self.fnTypeParameter(typed.fn_type, position);
-        // A choice of functions a build picks (`std.c.msync`, one per OS), called on a namespace
-        // rather than a value: the parameter each declares, one of them.
-        if (typed == .alternatives and !try self.calledOnValue(env, file, call.ast.fn_expr)) {
+        // A choice of functions a build picks (`std.c.msync`, one per OS): the parameter each
+        // declares, one of them. Called on a value of a choice of types (`value.compare(x)`),
+        // each is a method of its own and the value binds its first parameter.
+        if (typed == .alternatives) {
+            const receiver: usize = @intFromBool(try self.calledOnValue(env, file, call.ast.fn_expr));
             var each: std.ArrayList(Value) = .empty;
             for (typed.alternatives) |part| try each.append(self.gpa, switch (part) {
-                .function => |function| try self.functionParameter(function, position),
+                .function => |function| try self.functionParameter(function, position + receiver),
                 .fn_type => |key| try self.fnTypeParameter(key, position),
                 .pointer => |inner| if (inner.child.* == .fn_type) try self.fnTypeParameter(inner.child.fn_type, position) else return .{ .unknown = .unsupported },
                 else => return .{ .unknown = .unsupported },
@@ -13622,6 +13730,11 @@ fn calledOnValue(self: *Facts, env: ?*const Env, file: Project.FileId, fn_expr: 
     if (tree.nodeTag(fn_expr) != .field_access) return false;
     return switch (try self.resolveIn(env, file, tree.nodeData(fn_expr).node_and_token[0])) {
         .container => false,
+        // A namespace a build picks (`posix.system`, one per OS; `void` on some): a type, each
+        // of them.
+        .alternatives => |parts| for (parts) |part| {
+            if (part != .container and part != .primitive) break true;
+        } else false,
         else => true,
     };
 }

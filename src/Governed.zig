@@ -237,12 +237,16 @@ fn literalSite(self: *Context, governed: []const Governed, renamed: []const []co
     const tree = &self.project.at(self.file).file.tree;
     const spelled = try Model.identifier(self.allocator, tree.tokenSlice(label));
     if (!spelledAny(self, governed, renamed, spelled, label)) return;
-    switch (try self.facts.literalDeclaration(self.file, literal, spelled)) {
-        .none => {},
+    switch (try self.facts.literalDeclarations(self.file, literal, spelled)) {
         .unknown => |why| try leave(self, unread, value, why),
-        .decl => |decl| switch (try paired(self, decl)) {
-            .pair => |pair| try append(self, governed, renamed, label, value, spelled, &pair, out),
-            .unknown => |why| try leave(self, unread, value, why),
+        // One per part of a place a build picks, each with its origin: one site at most.
+        .decls => |found| {
+            var pairs: std.ArrayList(Facts.Decl) = .empty;
+            for (found) |decl| switch (try paired(self, decl)) {
+                .pair => |pair| try pairs.appendSlice(self.allocator, &pair),
+                .unknown => |why| return leave(self, unread, value, why),
+            };
+            try append(self, governed, renamed, label, value, spelled, pairs.items, out);
         },
     }
 }
@@ -1114,12 +1118,16 @@ const Reached = union(enum) { decls: []const Facts.Decl, unknown: Facts.Unknown 
 /// What a site refers to: its declaration through aliases, or the member of each container its
 /// receiver may be.
 fn reach(self: *Context, node: Ast.Node.Index, tag: Ast.Node.Tag, spelled: []const u8, governed: []const Governed) Context.Error!Reached {
-    if (tag == .enum_literal) switch (try self.facts.literalDeclaration(self.file, node, spelled)) {
+    if (tag == .enum_literal) switch (try self.facts.literalDeclarations(self.file, node, spelled)) {
         .unknown => |why| return .{ .unknown = why },
-        .none => return .{ .decls = &.{} },
-        .decl => |decl| return switch (try paired(self, decl)) {
-            .pair => |pair| .{ .decls = try self.allocator.dupe(Facts.Decl, &pair) },
-            .unknown => |why| .{ .unknown = why },
+        // One per part of a place a build picks, each with its origin.
+        .decls => |found| {
+            var decls: std.ArrayList(Facts.Decl) = .empty;
+            for (found) |decl| switch (try paired(self, decl)) {
+                .pair => |pair| try decls.appendSlice(self.allocator, &pair),
+                .unknown => |why| return .{ .unknown = why },
+            };
+            return .{ .decls = decls.items };
         },
     };
     const definition = if (tag == .identifier or tag == .field_access) try self.facts.definition(self.file, node) else try self.facts.reflected(self.file, node);
