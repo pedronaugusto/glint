@@ -1,0 +1,6 @@
+.{
+    // The rule reads an open call's literal options, the local its handle initializes and the
+    // methods called through that local; other rows carry no case of it.
+    .no_hole = .{ .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .aggregate, .memory, .branch },
+    .no_twin = .{ .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .aggregate, .memory, .branch },
+}

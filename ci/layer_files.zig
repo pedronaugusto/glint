@@ -15,6 +15,7 @@ pub const layers = [_]Layer{
         "src/Written.zig",
         "src/SameOperands.zig",
         "src/LostUpdate.zig",
+        "src/WriteOnlyHandle.zig",
         "src/RepeatedCondition.zig",
         "src/NarrowWidened.zig",
         "src/LargeStackArray.zig",
