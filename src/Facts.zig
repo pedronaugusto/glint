@@ -13376,7 +13376,9 @@ fn placeType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
         const whole = if (array.ast.type_expr.unwrap()) |t| try self.resolveIn(env, file, t) else try self.placeType(env, file, parent, depth + 1);
         return switch (whole) {
             .array => |each| each.*,
-            .unknown => whole,
+            // An untyped tuple's element (`const batched = .{ .{ .run = f } }`) takes no type
+            // from it: an anonymous literal, as the tuple is.
+            .unknown, .scalar => whole,
             .alternatives => .{ .unknown = .unsupported },
             else => .{ .unknown = .unsupported },
         };
@@ -13385,13 +13387,11 @@ fn placeType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
         .assign => return if (tree.nodeData(parent).node_and_node[1] == node) try self.resolveIn(env, file, tree.nodeData(parent).node_and_node[0]) else .{ .unknown = .unsupported },
         // `try`, `comptime` and `nosuspend` give their operand their own place (`try`'s
         // operand is the error union around it, read through as a literal's field is).
-        .@"try", .@"comptime", .@"nosuspend", .grouped_expression, .@"orelse", .@"catch", .@"if", .if_simple, .@"switch", .switch_comma => return self.placeType(env, file, parent, depth + 1),
-        // An operand compared with another (`size != .slice`) takes the other's type: Zig gives
-        // both one.
-        .equal_equal, .bang_equal => {
-            const lhs, const rhs = tree.nodeData(parent).node_and_node;
-            return self.typeOf(try self.resolveIn(env, file, if (lhs == node) rhs else lhs), {});
-        },
+        .@"try", .@"comptime", .@"nosuspend", .grouped_expression, .@"orelse", .@"catch" => return self.placeType(env, file, parent, depth + 1),
+        // A branch gives the whole its value; the condition, or what a switch tests, Zig gives no
+        // result type (`if (f()) |r|`).
+        .@"if", .if_simple => return if (tree.fullIf(parent).?.ast.cond_expr == node) .scalar else self.placeType(env, file, parent, depth + 1), // unreachable: the tag is an if's
+        .@"switch", .switch_comma => return if (tree.fullSwitch(parent).?.ast.condition == node) .scalar else self.placeType(env, file, parent, depth + 1), // unreachable: the tag is a switch's
         // An anonymous literal under `&` is what the pointer its place gives points at: a `*T`'s
         // `&.{}` is a `T`; a slice's or a many-item pointer's (a `pointer` to the element too)
         // `&.{ a, b }` an array of the element. Where that element is itself an array, a `*[N]E`
@@ -13440,7 +13440,8 @@ fn placeType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
         // A loop's `else` gives the loop's value.
         .@"for", .for_simple, .@"while", .while_simple, .while_cont => {
             const otherwise = if (tree.fullFor(parent)) |loop| loop.ast.else_expr else tree.fullWhile(parent).?.ast.else_expr; // unreachable: the tag is a loop's
-            return if (otherwise.unwrap() == node) self.placeType(env, file, parent, depth + 1) else .{ .unknown = .unsupported };
+            // Its condition, inputs, continue expression and body take no result type.
+            return if (otherwise.unwrap() == node) self.placeType(env, file, parent, depth + 1) else .scalar;
         },
         .@"return" => {
             var at: ?Ast.Node.Index = model.parentOf(parent);
@@ -13453,9 +13454,34 @@ fn placeType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
             }
             return .{ .unknown = .unsupported };
         },
-        else => {},
+        else => if (try self.operatorPlace(env, file, node, parent)) |place| return place,
     }
     return self.builtinPlace(env, file, node, parent, depth);
+}
+
+/// The type an operator gives its operand: an operand compared with or combined with another
+/// (`size != .slice`, `a + @bitCast(b)`) takes the other's, as Zig gives both one; a compound
+/// assignment's value its target's; a shift's amount none of these (`Log2Int`), a number. Null
+/// where `parent` is no such operator.
+fn operatorPlace(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index, parent: Ast.Node.Index) ResolveError!?Value {
+    const tree = &self.project.at(file).file.tree;
+    switch (tree.nodeTag(parent)) {
+        .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .add, .sub, .mul, .div, .mod, .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .bit_and, .bit_or, .bit_xor => {
+            const lhs, const rhs = tree.nodeData(parent).node_and_node;
+            return try self.typeOf(try self.resolveIn(env, file, if (lhs == node) rhs else lhs), {});
+        },
+        .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_bit_and, .assign_bit_or, .assign_bit_xor => {
+            const lhs, const rhs = tree.nodeData(parent).node_and_node;
+            if (rhs != node) return .{ .unknown = .unsupported };
+            return try self.typeOf(try self.resolveIn(env, file, lhs), {});
+        },
+        .shl, .shr, .shl_sat, .assign_shl, .assign_shr, .assign_shl_sat => {
+            const lhs, const rhs = tree.nodeData(parent).node_and_node;
+            if (rhs == node) return .scalar;
+            return if (tree.nodeTag(parent) == .shl or tree.nodeTag(parent) == .shr or tree.nodeTag(parent) == .shl_sat) try self.placeType(env, file, parent, 1) else try self.typeOf(try self.resolveIn(env, file, lhs), {});
+        },
+        else => return null,
+    }
 }
 
 /// The type a builtin's operand takes from it (`placeType`'s, where the place is a builtin call).
@@ -13512,7 +13538,20 @@ fn parameterType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
             .alternatives => break,
             else => break,
         };
-        return if (typed == .fn_type) self.fnTypeParameter(typed.fn_type, position) else .{ .unknown = .unsupported };
+        if (typed == .fn_type) return self.fnTypeParameter(typed.fn_type, position);
+        // A choice of functions a build picks (`std.c.msync`, one per OS), called on a namespace
+        // rather than a value: the parameter each declares, one of them.
+        if (typed == .alternatives and !try self.calledOnValue(env, file, call.ast.fn_expr)) {
+            var each: std.ArrayList(Value) = .empty;
+            for (typed.alternatives) |part| try each.append(self.gpa, switch (part) {
+                .function => |function| try self.functionParameter(function, position),
+                .fn_type => |key| try self.fnTypeParameter(key, position),
+                .pointer => |inner| if (inner.child.* == .fn_type) try self.fnTypeParameter(inner.child.fn_type, position) else return .{ .unknown = .unsupported },
+                else => return .{ .unknown = .unsupported },
+            });
+            return self.choose(each.items);
+        }
+        return .{ .unknown = .unsupported };
     }
     const decl = callee.function;
     var receiver: usize = 0;
@@ -13572,6 +13611,32 @@ fn parameterType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
         // Written in terms of a `comptime T: type` parameter: the call's argument for it.
         if (try self.written(.{ .file = file, .call = call, .decl = decl, .function = function, .receiver = receiver }, type_expr, 0)) |bound| return bound;
         return self.resolve(decl.file, type_expr);
+    }
+    return .{ .unknown = .unsupported };
+}
+
+/// Whether a call's callee is read off a value (`x.method()`), which then binds as the receiver,
+/// rather than off a namespace or type (`std.c.msync`).
+fn calledOnValue(self: *Facts, env: ?*const Env, file: Project.FileId, fn_expr: Ast.Node.Index) ResolveError!bool {
+    const tree = &self.project.at(file).file.tree;
+    if (tree.nodeTag(fn_expr) != .field_access) return false;
+    return switch (try self.resolveIn(env, file, tree.nodeData(fn_expr).node_and_token[0])) {
+        .container => false,
+        else => true,
+    };
+}
+
+/// The type a function declares its parameter at `position`, read as written; `.scalar` for
+/// `anytype`, unknown where it has none there.
+fn functionParameter(self: *Facts, decl: Decl, position: usize) ResolveError!Value {
+    const tree = &self.project.at(decl.file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, self.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return .{ .unknown = .unsupported };
+    var it = proto.iterate(tree);
+    var at: usize = 0;
+    while (it.next()) |param| : (at += 1) {
+        if (at != position) continue;
+        return if (param.type_expr) |type_expr| self.resolve(decl.file, type_expr) else .scalar;
     }
     return .{ .unknown = .unsupported };
 }
