@@ -10,10 +10,13 @@
 //! target), which the program reaches past std's checked layer. Production code only; an
 //! operation the program runs only as it compiles has none of these dangers, but for assembly,
 //! `@extern` and `@ptrFromInt`, whose symbol or address the program uses where it runs. Zig's two
-//! interface idioms are not read, as neither has an alternative: `@fieldParentPtr` as the operand
-//! of an `@alignCast` (`@alignCast(@fieldParentPtr("f", p))`, std.Io's own), the two read as one;
-//! a bare `@fieldParentPtr`, a parent pointer no build checks the field pointer was taken from, is
-//! a finding; and a
+//! interface idioms are not read, as neither has an alternative: `@fieldParentPtr`, bare or as the
+//! operand of an `@alignCast` (`@alignCast(@fieldParentPtr("f", p))`), read as one: both spellings
+//! make the same parent-pointer claim, neither proves the field pointer was taken from that parent,
+//! and the `@alignCast` adds a runtime check where Zig already proved the alignment as it compiled,
+//! so a rule that read one spelling would push code toward the worse one; it is std's own
+//! interface idiom (std.Io's readers and writers recovering their state), which glint cannot tell
+//! from a misuse; and a
 //! `@ptrCast`, with or without the `@alignCast` inside it, from a `*anyopaque` to a pointer to one
 //! item, how std.mem.Allocator's `ptr`, std.Io's `userdata` and every hand-written vtable recover
 //! their owner. A `@ptrCast` from `*anyopaque` to a slice or a many-item pointer stays a finding.
@@ -93,9 +96,6 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         if (pointerCast(name) and !nestedCast(c, tree, node) and !recovery(tree, node, name) and !try ownerRecovery(c, tree, node, name)) {
             try c.at(rule, token, try c.allocator.print("{s}: a pointer conversion no build checks", .{name}));
         }
-        if (std.mem.eql(u8, name, "@fieldParentPtr") and !recovered(c, tree, node)) {
-            try c.at(rule, token, "@fieldParentPtr: a parent pointer no build checks the field pointer was taken from; only as @alignCast(@fieldParentPtr(...)), the interface idiom, or at the package's seam");
-        }
         if (std.mem.startsWith(u8, name, "@cVa")) try c.at(rule, token, try c.allocator.print("{s}: C variadic arguments read as whatever type the program names, which no build checks", .{name}));
         if (std.mem.eql(u8, name, "@setFloatMode")) {
             var buffer: [2]Ast.Node.Index = undefined;
@@ -163,14 +163,6 @@ fn recovery(tree: *const Ast, node: Ast.Node.Index, name: []const u8) bool {
     var operand = args[0];
     while (tree.nodeTag(operand) == .grouped_expression) operand = tree.nodeData(operand).node_and_token[0];
     return std.mem.eql(u8, Facts.builtinName(tree, operand) orelse return false, "@fieldParentPtr");
-}
-
-/// Whether the `@fieldParentPtr` at `node` is the operand of an `@alignCast`, past parentheses.
-fn recovered(c: *Context, tree: *const Ast, node: Ast.Node.Index) bool {
-    const model = &c.project.at(c.file).model;
-    var parent = model.parentOf(node) orelse return false;
-    while (tree.nodeTag(parent) == .grouped_expression) parent = model.parentOf(parent) orelse return false;
-    return std.mem.eql(u8, Facts.builtinName(tree, parent) orelse return false, "@alignCast");
 }
 
 /// Whether the pointer cast at `node` is the operand of another, past parentheses.

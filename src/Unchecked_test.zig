@@ -374,7 +374,7 @@ test "P007 finds the unchecked operations, a cast nested in another once, a supp
     ), 4);
 }
 
-test "P007 reads a slice's .ptr as the many-item pointer it is, and a bare @fieldParentPtr; the idiom stays unread" {
+test "P007 reads a slice's .ptr as the many-item pointer it is; @fieldParentPtr, bare or under @alignCast, stays unread" {
     try expect(.P007,
         \\pub fn f(b: []const u8) usize {
         \\    return @intFromPtr(b.ptr + 1);
@@ -386,7 +386,7 @@ test "P007 reads a slice's .ptr as the many-item pointer it is, and a bare @fiel
         \\pub fn idiom(link: *u32) *Node {
         \\    return @alignCast(@fieldParentPtr("link", link));
         \\}
-    , 2);
+    , 1);
 }
 
 test "Z006 leaves a type std's type function gives alone; a labeled block's value is a value" {
