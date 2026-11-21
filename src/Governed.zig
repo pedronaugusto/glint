@@ -93,17 +93,6 @@ pub const Declared = union(enum) {
     decls: []const Facts.Decl,
     none,
     unknown: Facts.Unknown,
-
-    /// The declarations, or null for none and for unknown alike, as every caller read them
-    /// before `Declared`: each use drops an unknown. Every use is to become a switch that makes
-    /// `.unknown` undecided where it decides; `orNull_test` counts them, the count only falls,
-    /// and at none this goes.
-    pub fn orNull(self: Declared) ?[]const Facts.Decl {
-        return switch (self) {
-            .decls => |decls| decls,
-            .none, .unknown => null,
-        };
-    }
 };
 
 /// The declarations `path` names from module `source`, without reporting. For facts that

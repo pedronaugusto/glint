@@ -1,7 +1,6 @@
 //! A test root: the rule context's contract tests.
 test {
     _ = @import("RuleContext_test.zig");
-    _ = @import("orNull_test.zig");
 }
 
 // The aegis files this binary's tests share (ci/aegis_sources.zig) are as they were frozen,

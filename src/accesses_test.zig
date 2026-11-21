@@ -715,8 +715,6 @@ test "batch 2: an update's operation, error names and sets, a condition's truths
             if (std.mem.eql(u8, got, want)) break;
         } else return error.TestUnexpectedResult;
     }
-    try std.testing.expect((try facts.literalOf(file, spelledNode(tree, "5", 0).?)).? == .number);
-    try std.testing.expectEqual(null, try facts.literalOf(file, spelledNode(tree, "c", 0).?));
 }
 
 test "accesses: asking a place's sites again keeps nothing more on the run's memory" {

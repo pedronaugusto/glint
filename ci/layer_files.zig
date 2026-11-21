@@ -49,7 +49,6 @@ pub const layers = [_]Layer{
         "src/SameTypeIds.zig",
         "src/Escapes.zig",
         "src/Metrics.zig",
-        "src/Program.zig",
     } },
     .{ .name = "rules", .patterns = &.{"src/Runner.zig"} },
     .{ .name = "filesystem CLI", .patterns = &.{ "src/cli.zig", "src/Result.zig" } },

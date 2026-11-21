@@ -39,14 +39,6 @@ pub const Malformed = struct { comment: File.Comment, why: []const u8 };
 /// What an escape in the aegis pack's form is told: the form it is now, and the fix that writes it.
 pub const old_escape = "an aegis escape is read no more: `" ++ form ++ "` (glint --fix rewrites it)";
 
-/// The file's suppressions; a malformed one is an error.
-pub fn parse(a: std.mem.Allocator, file: *const File) ParseError![]Suppression {
-    var malformed: std.ArrayList(Malformed) = .empty;
-    const found = try parseConfigured(a, file, &.{}, &malformed);
-    if (malformed.items.len != 0) return error.MalformedSuppression;
-    return found;
-}
-
 /// The file's suppressions, each malformed one appended to `malformed` instead.
 pub fn parseConfigured(a: std.mem.Allocator, file: *const File, definitions: []const rules.Definition, malformed: *std.ArrayList(Malformed)) std.mem.Allocator.Error![]Suppression {
     var result: std.ArrayList(Suppression) = .empty;
@@ -130,19 +122,25 @@ test "a suppression naming a rule 0.8 removed is told what to write instead" {
 test "suppression requires exact ID and reason from a real comment" {
     var file = try File.init(std.testing.allocator, opening ++ "Z013 -- public fixture below\nconst unused = @import(\"unused\");\n", .{});
     defer file.deinit();
-    const parsed = try parse(file.arena.allocator(), &file);
+    var malformed: std.ArrayList(Malformed) = .empty;
+    const parsed = try parseConfigured(file.arena.allocator(), &file, &.{}, &malformed);
+    try std.testing.expectEqual(@as(usize, 0), malformed.items.len);
     try std.testing.expectEqual(@as(usize, 1), parsed.len); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expect(try parsed[0].matches(.Z013, 1, 6));
     try std.testing.expect(!try parsed[0].matches(.Z003, 1, 6));
     var invalid = try File.init(std.testing.allocator, opening ++ "Z013\nconst x = 1;", .{});
     defer invalid.deinit();
-    try std.testing.expectError(error.MalformedSuppression, parse(invalid.arena.allocator(), &invalid));
+    var invalid_malformed: std.ArrayList(Malformed) = .empty;
+    _ = try parseConfigured(invalid.arena.allocator(), &invalid, &.{}, &invalid_malformed);
+    try std.testing.expectEqual(@as(usize, 1), invalid_malformed.items.len);
 }
 
 test "suppression one reason cannot suppress distinct sites on one line" {
     var file = try File.init(std.testing.allocator, "const a = @import(\"a\"); const b = @import(\"b\"); " ++ opening ++ "Z013 -- one justified site\n", .{});
     defer file.deinit();
-    const parsed = try parse(file.arena.allocator(), &file);
+    var malformed: std.ArrayList(Malformed) = .empty;
+    const parsed = try parseConfigured(file.arena.allocator(), &file, &.{}, &malformed);
+    try std.testing.expectEqual(@as(usize, 0), malformed.items.len);
     try std.testing.expect(try parsed[0].matches(.Z013, 0, 6));
     try std.testing.expectError(error.AmbiguousSuppression, parsed[0].matches(.Z013, 0, 31));
 }
@@ -150,13 +148,17 @@ test "suppression one reason cannot suppress distinct sites on one line" {
 test "a suppression names several rules, one site each; the aegis escape form is malformed" {
     var file = try File.init(std.testing.allocator, "const x = 1; " ++ opening ++ "Z013, Z003 -- both read here\n", .{});
     defer file.deinit();
-    const parsed = try parse(file.arena.allocator(), &file);
+    var malformed: std.ArrayList(Malformed) = .empty;
+    const parsed = try parseConfigured(file.arena.allocator(), &file, &.{}, &malformed);
+    try std.testing.expectEqual(@as(usize, 0), malformed.items.len);
     try std.testing.expect(try parsed[0].matches(.Z013, 0, 6));
     try std.testing.expect(try parsed[0].matches(.Z003, 0, 9));
     try std.testing.expect(!try parsed[0].matches(.Z011, 0, 6));
     for ([_][]const u8{ "const x = 1; // aegis: boundary(Z003): the C call\n", "const x = 1; // aegis: boundary: the C call\n", "const x = 1; " ++ opening ++ "Z013, Z013 -- twice\n", "const x = 1; " ++ opening ++ "-- none\n" }) |bytes| {
         var bad = try File.init(std.testing.allocator, bytes, .{});
         defer bad.deinit();
-        try std.testing.expectError(error.MalformedSuppression, parse(bad.arena.allocator(), &bad));
+        var bad_malformed: std.ArrayList(Malformed) = .empty;
+        _ = try parseConfigured(bad.arena.allocator(), &bad, &.{}, &bad_malformed);
+        try std.testing.expectEqual(@as(usize, 1), bad_malformed.items.len);
     }
 }
