@@ -403,7 +403,7 @@ pub fn reflectedByCall(self: *Context, node: Ast.Node.Index, types: []const Fact
         for (callees) |callee| {
             if (try self.facts.program(callee.file)) continue;
             if (handed) |made| if (try samePackage(self, callee.file, made.file)) continue;
-            const reads: Is = if (reflectsParameter(self, callee, position)) .yes else try castsParameter(self, callee, position, 0);
+            const reads: Is = if (reflectsParameter(self, callee, position)) .yes else try castsParameter(self, callee, position);
             switch (reads) {
                 .no => {},
                 .yes => if (handed != null) return .{ .yes = callee } else {
@@ -484,7 +484,7 @@ fn discarded(self: *Context, node: Ast.Node.Index) bool {
 /// of bytes it is handed (`castsParameter` over any parameter that holds data), or applies a
 /// reflective builtin to one of its parameters (`@typeInfo(T)`: `mem.zeroes`, `zeroInit`).
 fn makesFromData(self: *Context, function: Facts.Decl) Context.Error!Is {
-    const casts = try castsParameter(self, function, null, 0);
+    const casts = try castsParameter(self, function, null);
     if (casts == .yes) return .yes;
     const tree = &self.project.at(function.file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
@@ -518,8 +518,47 @@ fn isBitCast(name: []const u8) bool {
 /// any parameter that holds data the caller hands it: written `anytype`, or bytes (`[]const
 /// u8`, `*[n]u8`, `[*]u8`). Its own allocation or storage it keeps (`self.metadata`) is no
 /// parameter, so a cast of either is none: what it reads is what a value of the type wrote.
-fn castsParameter(self: *Context, function: Facts.Decl, position: ?usize, depth: u8) Context.Error!Is {
-    if (depth > 4) return .{ .unknown = .budget };
+///
+/// Read once per function and position for the run (`Casts`). A function the reading meets
+/// again while it is still being read (`addOne` calling `addOneAssumeCapacity` calling back)
+/// returns no cast by that path: a cast it returns is one some path that ends returns, the
+/// least answer the calls agree on. An answer that took such a function as `no` holds only once
+/// that function's own is known, so it is kept only where it is `yes`.
+fn castsParameter(self: *Context, function: Facts.Decl, position: ?usize) Context.Error!Is {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = self.keep();
+    defer self.allocator = rule_memory;
+    const memo = try self.facts.memo(Casts);
+    const key: Casts.Key = .{ .function = function, .position = position orelse Casts.any };
+    if (memo.found.get(key)) |known| return known;
+    if (memo.active.contains(key)) {
+        memo.assumed += 1;
+        return .no;
+    }
+    try memo.active.put(self.allocator, key, {});
+    const assumed = memo.assumed;
+    const found = try castsParameterRead(self, function, position);
+    _ = memo.active.remove(key);
+    // Taken as `no` below by none still being read: final.
+    if (found == .yes or memo.assumed == assumed) try memo.found.put(self.allocator, key, found);
+    // Its own reading met this function again: the answer is this function's, and those met
+    // within it are answered now.
+    if (memo.active.count() == 0) memo.assumed = 0;
+    return found;
+}
+
+/// The answers `castsParameter` read, by function and position, and those it is reading.
+pub const Casts = struct {
+    pub const Key = struct { function: Facts.Decl, position: usize };
+    /// A position that stands for any parameter holding data.
+    pub const any = std.math.maxInt(usize);
+    found: std.AutoHashMapUnmanaged(Key, Is) = .empty,
+    active: std.AutoHashMapUnmanaged(Key, void) = .empty,
+    /// How many times a reading met a function still being read, which it took as `no`.
+    assumed: usize = 0,
+};
+
+fn castsParameterRead(self: *Context, function: Facts.Decl, position: ?usize) Context.Error!Is {
     const tree = &self.project.at(function.file).file.tree;
     const declaration = self.facts.scopeNode(function);
     if (tree.nodeTag(declaration) != .fn_decl) return .no;
@@ -533,7 +572,7 @@ fn castsParameter(self: *Context, function: Facts.Decl, position: ?usize, depth:
         const at = tree.nodeMainToken(node);
         if (at < first or at > last) continue;
         const operand = tree.nodeData(node).opt_node.unwrap() orelse continue;
-        found = either(found, try returnsCast(self, function, operand, position, false, depth));
+        found = either(found, try returnsCast(self, function, operand, position, false));
         if (found == .yes) return .yes;
     }
     return found;
@@ -542,17 +581,16 @@ fn castsParameter(self: *Context, function: Facts.Decl, position: ?usize, depth:
 /// Whether the returned expression `node` is the parameter at `position` (or one holding data)
 /// cast, through the forms that hand on a value: grouping, `.*`, a slice, `try`, `@as`, both
 /// results of an `if`, `orelse` and `catch`, and a call it is handed to that returns it cast.
-fn returnsCast(self: *Context, function: Facts.Decl, node: Ast.Node.Index, position: ?usize, cast: bool, depth: u8) Context.Error!Is {
-    if (depth > 8) return .{ .unknown = .budget };
+fn returnsCast(self: *Context, function: Facts.Decl, node: Ast.Node.Index, position: ?usize, cast: bool) Context.Error!Is {
     const tree = &self.project.at(function.file).file.tree;
     switch (tree.nodeTag(node)) {
-        .grouped_expression => return returnsCast(self, function, tree.nodeData(node).node_and_token[0], position, cast, depth + 1),
-        .deref, .@"try", .address_of => return returnsCast(self, function, tree.nodeData(node).node, position, cast, depth + 1),
+        .grouped_expression => return returnsCast(self, function, tree.nodeData(node).node_and_token[0], position, cast),
+        .deref, .@"try", .address_of => return returnsCast(self, function, tree.nodeData(node).node, position, cast),
         .@"orelse", .@"catch" => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
-            return either(try returnsCast(self, function, lhs, position, cast, depth + 1), try returnsCast(self, function, rhs, position, cast, depth + 1));
+            return either(try returnsCast(self, function, lhs, position, cast), try returnsCast(self, function, rhs, position, cast));
         },
-        .slice_open, .slice, .slice_sentinel => return returnsCast(self, function, (tree.fullSlice(node) orelse return .no).ast.sliced, position, cast, depth + 1),
+        .slice_open, .slice, .slice_sentinel => return returnsCast(self, function, (tree.fullSlice(node) orelse return .no).ast.sliced, position, cast),
         .identifier => {
             const k = parameterAt(self, function, node) orelse return .no;
             return if (cast and if (position) |p| k == p else holdsData(self, function, k)) .yes else .no;
@@ -560,15 +598,15 @@ fn returnsCast(self: *Context, function: Facts.Decl, node: Ast.Node.Index, posit
         else => {},
     }
     if (tree.fullIf(node)) |branch| {
-        const then = try returnsCast(self, function, branch.ast.then_expr, position, cast, depth + 1);
+        const then = try returnsCast(self, function, branch.ast.then_expr, position, cast);
         const otherwise = branch.ast.else_expr.unwrap() orelse return then;
-        return either(then, try returnsCast(self, function, otherwise, position, cast, depth + 1));
+        return either(then, try returnsCast(self, function, otherwise, position, cast));
     }
     if (Facts.builtinName(tree, node)) |name| {
         var buffer: [2]Ast.Node.Index = undefined;
         const args = Facts.builtinArgs(tree, node, &buffer);
-        if (std.mem.eql(u8, name, "@as") and args.len == 2) return returnsCast(self, function, args[1], position, cast, depth + 1);
-        if (isBitCast(name) and args.len >= 1) return returnsCast(self, function, args[args.len - 1], position, true, depth + 1);
+        if (std.mem.eql(u8, name, "@as") and args.len == 2) return returnsCast(self, function, args[1], position, cast);
+        if (isBitCast(name) and args.len >= 1) return returnsCast(self, function, args[args.len - 1], position, true);
         return .no;
     }
     // A call the parameter is handed to: the callee returns it cast, or it was cast here.
@@ -580,7 +618,7 @@ fn returnsCast(self: *Context, function: Facts.Decl, node: Ast.Node.Index, posit
     var found: Is = .no;
     for (args, 0..) |arg, i| {
         if (castWritten(self, function, arg)) {
-            found = either(found, try returnsCast(self, function, arg, position, false, depth + 1));
+            found = either(found, try returnsCast(self, function, arg, position, false));
             if (found == .yes) return .yes;
         }
         const k = handedParameter(self, function, arg) orelse continue;
@@ -594,7 +632,7 @@ fn returnsCast(self: *Context, function: Facts.Decl, node: Ast.Node.Index, posit
             },
         };
         for (callees) |callee| {
-            found = either(found, try castsParameter(self, callee, i, depth + 1));
+            found = either(found, try castsParameter(self, callee, i));
             if (found == .yes) return .yes;
         }
     }

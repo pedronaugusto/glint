@@ -659,17 +659,22 @@ test "P006 binds an external symbol, the program's own declaration of it too" {
     try std.testing.expectEqual(@as(usize, 2), report.diagnostics.len); // safe: fixture sites counted by hand.
 }
 
-test "P006 reports a governed name it cannot resolve where no other declaration has it, a ban's reading, and leaves other names alone" {
+test "P006 counts a governed name read on a generic value outside its language, and leaves other names alone" {
     var report = try ownershipRun(
         \\pub const Kind = enum { sync, close };
         \\pub const Op = union(enum) { sync, read: u32 };
         \\pub fn a(f: anytype) void { f.sync(); f.flush(); _ = f.fdatasync; }
     , &durability);
     defer report.deinit();
+    // What `f` is only an instantiation decides: `f.sync` and `f.fdatasync` spell governed names
+    // and are counted outside the ban, neither reported nor passed; `flush` is no governed name.
     try std.testing.expect(report.complete);
-    // `sync` is also Kind's and Op's tag: it cannot be shown to be File.sync. Only fdatasync is
-    // posix.fdatasync's name alone.
-    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: one unique governed name.
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
+    var outside: usize = 0;
+    for (report.outside) |rule| if (std.mem.eql(u8, rule.name, "P006")) {
+        outside = rule.sites;
+    };
+    try std.testing.expectEqual(@as(usize, 2), outside);
 }
 
 test "P006 production scope leaves test code out" {
@@ -795,7 +800,7 @@ test "metrics count assertion calls by the declaration their callee resolves to"
     try std.testing.expect(std.mem.find(u8, text.written(), "metrics: 1 files, 5 functions, 2 with an assertion, 5 assertions (std.debug.assert 3, its replacements 2)\n") != null);
 }
 
-test "P006 decides an unresolved receiver by what Zig allows at the site" {
+test "P006 refutes an unresolved receiver by what Zig allows at the site, and counts a generic one outside" {
     // A configuration value named like a sync call, read from a generic database and used as
     // a receiver, and a method given an enum literal where the governed one takes a struct.
     var report = try ownershipRun(
@@ -803,8 +808,16 @@ test "P006 decides an unresolved receiver by what Zig allows at the site" {
         \\pub fn b(db: anytype) void { db.file().sync(); }
     , &durability);
     defer report.deinit();
-    // `db.file().sync()` may be File.sync: a ban reports what it cannot refute.
-    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: one site cannot be refuted.
+    // `fsync.sync(.pack)` is refuted: the governed sync takes no enum literal. `db.file().sync()`
+    // may be File.sync, as only an instantiation of `b` decides: counted outside the ban, neither
+    // reported nor passed.
+    try std.testing.expect(report.complete);
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
+    var outside: usize = 0;
+    for (report.outside) |rule| if (std.mem.eql(u8, rule.name, "P006")) {
+        outside = rule.sites;
+    };
+    try std.testing.expectEqual(@as(usize, 1), outside);
 }
 
 test "review Z006 accepts a name a generic reads on its type parameter that an outside type declares" {
