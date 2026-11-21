@@ -12650,12 +12650,18 @@ pub const calls = struct {
         const value = try facts.resolveIn(env, file, holder);
         // A type's member, or a typeless literal's field, binds nothing.
         if (value == .container or value == .literal) return .none;
-        // A choice of holders (`if (T == bool) &memo.found else &memo.needed`): bound where
-        // each is a value whose member so named is a method, as one holder is.
-        if (value == .alternatives) {
+        // A choice of holders (`if (T == bool) &memo.found else &memo.needed`), or a pointer to
+        // one (`&child.state.cgroup` where the field's type is a platform's): bound where each
+        // is a value whose member so named is a method, as one holder is.
+        const choice: ?[]const Facts.Value = switch (value) {
+            .alternatives => |parts| parts,
+            .pointer => |p| if (p.child.* == .alternatives) p.child.alternatives else null,
+            else => null,
+        };
+        if (choice) |parts| {
             // A choice of types (`Hasher(wide)` a `switch` returns): a type's member binds
             // nothing, as one type's does.
-            for (value.alternatives) |one| {
+            if (value == .alternatives) for (parts) |one| {
                 if (one != .container) break;
             } else return .none;
             if (tree.nodeTag(callee) != .field_access) return .{ .unknown = .unsupported };
@@ -12663,7 +12669,7 @@ pub const calls = struct {
             // Whether a part of the choice holds the member: Zig compiles the call only where
             // one does.
             var held = false;
-            for (value.alternatives) |one| {
+            for (parts) |one| {
                 // A pointer to, or an optional of, a choice of instances: each of them.
                 const inner: Facts.Value = switch (one) {
                     .pointer => |p| p.child.*,
@@ -13449,11 +13455,45 @@ fn placeType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
         },
         else => {},
     }
+    return self.builtinPlace(env, file, node, parent, depth);
+}
+
+/// The type a builtin's operand takes from it (`placeType`'s, where the place is a builtin call).
+fn builtinPlace(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index, parent: Ast.Node.Index, depth: usize) ResolveError!Value {
+    const tree = &self.project.at(file).file.tree;
     var args_buffer: [2]Ast.Node.Index = undefined;
     const args = builtinArgs(tree, parent, &args_buffer);
-    if (args.len == 2 and args[1] == node and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@as")) return self.resolveIn(env, file, args[0]);
+    const name = builtinName(tree, parent) orelse return .{ .unknown = .unsupported };
+    if (args.len == 2 and args[1] == node and std.mem.eql(u8, name, "@as")) return self.resolveIn(env, file, args[0]);
+    // `@unionInit(T, name, init)`: `init` takes the named field's type; a name only a reading
+    // spells (`@tagName(tag)` in an `inline else` prong) any field's, one of them.
+    if (args.len == 3 and args[2] == node and std.mem.eql(u8, name, "@unionInit")) return self.fieldType(try self.resolveIn(env, file, args[0]), try self.nameIn(env, file, args[1], 0));
+    // `@splat(x)`: `x` takes the element type of the array or vector the place gives.
+    if (args.len == 1 and std.mem.eql(u8, name, "@splat")) return switch (try self.placeType(env, file, parent, depth + 1)) {
+        .array => |each| each.*,
+        .unknown => |why| .{ .unknown = why },
+        else => .{ .unknown = .unsupported },
+    };
+    // Pointer casts chained are one cast (`@ptrCast(@alignCast(p))`): the operand takes the
+    // place the whole chain writes into.
+    for (pointer_casts) |cast| if (args.len == 1 and std.mem.eql(u8, name, cast)) return self.placeType(env, file, parent, depth + 1);
+    // An operand Zig gives no result type: what it is is its own (`@errorCast(@errorFromInt(n))`,
+    // a conversion's operand, a type a query asks of).
+    for (no_result_type) |builtin_name| if (std.mem.eql(u8, name, builtin_name)) return .scalar;
     return .{ .unknown = .unsupported };
 }
+
+/// The pointer casts Zig chains into one, the outermost's result type given to each.
+const pointer_casts = [_][]const u8{ "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@addrSpaceCast" };
+
+/// Builtins whose operands Zig gives no result type: a conversion's operand is read as it is,
+/// and a query's is a type or a value it asks of.
+const no_result_type = [_][]const u8{
+    "@errorCast",  "@errorFromInt", "@intFromError", "@intFromEnum",    "@enumFromInt", "@intFromBool",
+    "@intFromPtr", "@ptrFromInt",   "@backingInt",   "@fromBackingInt", "@bitCast",     "@intCast",
+    "@truncate",   "@floatCast",    "@intFromFloat", "@floatFromInt",   "@TypeOf",      "@sizeOf",
+    "@alignOf",    "@bitSizeOf",    "@typeInfo",     "@typeName",       "@tagName",     "@errorName",
+};
 
 /// The written type of a call's argument at `position`: the callee's parameter (a method's
 /// receiver first), a made container's method read with the arguments that made it.
