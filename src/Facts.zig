@@ -2280,6 +2280,13 @@ fn memberOfChoice(self: *Facts, choices: []const Value, name: []const u8) Resolv
             else => try kept.append(self.gpa, try self.memberValue(choice, name)),
         },
         .alternatives => try kept.append(self.gpa, try self.memberValue(choice, name)),
+        // Information on a type of another kind than the one read (`@typeInfo(@TypeOf(
+        // system.ioctl)).@"fn"` where a system has no such function): the choice that holds it
+        // is another, as Zig compiles the read only there.
+        .reflected => |r| {
+            if (r.at == .info) if (try self.kindOfType(r.of.*)) |kind| if (!std.mem.eql(u8, kind, name)) continue;
+            try kept.append(self.gpa, try self.memberValue(choice, name));
+        },
         else => try kept.append(self.gpa, try self.memberValue(choice, name)),
     };
     if (kept.items.len == 0) return .{ .unknown = .unresolved };
@@ -12827,7 +12834,8 @@ pub const calls = struct {
             },
         }
         return switch (value) {
-            .instance, .pointer, .optional => .{ .bound = holder },
+            // Type information of one kind is a value of std's type for it (`info.sentinel()`).
+            .instance, .pointer, .optional, .reflected => .{ .bound = holder },
             .unknown => |why| .{ .unknown = why },
             .alternatives => .{ .unknown = .unsupported },
             else => .{ .unknown = .unsupported },
@@ -12887,12 +12895,12 @@ pub const calls = struct {
         };
     }
 
-    /// Whether a callee is a field read, `x.f` or `x.f.*`, through parentheses: a call through a
-    /// function-pointer field.
+    /// Whether a callee is a field read, `x.f`, `x.f.*` or `x.f.?`, through parentheses: a call
+    /// through a function-pointer field.
     fn calledField(tree: *const Ast, node: Ast.Node.Index) bool {
         var callee = node;
         while (true) switch (tree.nodeTag(callee)) {
-            .grouped_expression => callee = tree.nodeData(callee).node_and_token[0],
+            .grouped_expression, .unwrap_optional => callee = tree.nodeData(callee).node_and_token[0],
             .deref => callee = tree.nodeData(callee).node,
             .field_access => return true,
             .builtin_call_two, .builtin_call_two_comma => return std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(callee)), "@field"),
