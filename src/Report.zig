@@ -27,6 +27,10 @@ metrics: ?Metrics = null,
 seams: []const SeamCount = &.{},
 /// Each test input entry (`Config.test_inputs`), with how many files it holds.
 test_inputs: []const TestInputCount = &.{},
+/// Per ban, the sites outside its language: what it reads there only an instantiation or the
+/// build decides (a generic position, `Facts.Unknown.meaning`). Never a finding and never a
+/// pass: the scope its table row states, counted.
+outside: []const RuleSites = &.{},
 
 /// A seam, where it is and why, the sites it held per rule, and whether it is stale: its rules
 /// all ran and it held none.
@@ -139,6 +143,11 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
                 try writer.writeAll(if (seam.stale) " (stale: it holds no site)\n" else "\n");
             }
             for (self.test_inputs) |entry| try writer.print("test inputs: {s}: {d} files{s}\n", .{ entry.pattern, entry.files, if (entry.files == 0) " (stale)" else "" });
+            if (self.outside.len != 0) {
+                try writer.writeAll("outside: sites only an instantiation or the build decides: ");
+                for (self.outside, 0..) |rule, i| try writer.print("{s}{s} {d}", .{ if (i == 0) "" else ", ", rule.name, rule.sites });
+                try writer.writeByte('\n');
+            }
             if (self.metrics) |metrics| try textMetrics(writer, metrics);
         },
         .json => {
@@ -166,6 +175,8 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
             try std.json.Stringify.value(self.seams, .{}, writer);
             try writer.writeAll(",\"test_inputs\":");
             try std.json.Stringify.value(self.test_inputs, .{}, writer);
+            try writer.writeAll(",\"outside\":");
+            try std.json.Stringify.value(self.outside, .{}, writer);
             if (self.metrics) |metrics| {
                 try writer.writeAll(",\"metrics\":{");
                 try jsonCounts(writer, metrics.total);

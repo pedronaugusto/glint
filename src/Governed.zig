@@ -148,10 +148,9 @@ fn moduleRoots(self: *Context, source: []const u8) Context.Error![]const Project
 pub const Unread = struct { node: Ast.Node.Index, why: Facts.Unknown };
 
 /// Every reference in the checked file that reaches a governed declaration, into `out`; a
-/// reference that does not resolve but spells a name only a governed declaration has in the
-/// program (`unique`) into `unread`, for the caller to judge: under a ban a finding, under hygiene
-/// nothing. An enum literal and a literal's field name are no reference: unresolved, they spell
-/// nothing.
+/// reference spelling a governed name that does not resolve (a member access, a decl literal, a
+/// literal's field, a builtin's field name) into `unread`, with why, for the caller to judge:
+/// under a ban no pass (`Context.unknownAt`), under hygiene nothing.
 pub fn sitesLeaving(self: *Context, governed: []const Governed, out: *std.ArrayList(Site), unread: *std.ArrayList(Unread)) Context.Error!void {
     if (governed.len == 0) return;
     // What each target is also called, by an alias whose own site this run does not report.
@@ -218,7 +217,6 @@ pub fn sitesLeaving(self: *Context, governed: []const Governed, out: *std.ArrayL
                 // method of its own: the binding reaches one only through an alias its type
                 // declares, which is that alias's site.
                 if (why == .generic and tag == .field_access and methodCall(self, node) and free(self, governed, spelled)) continue;
-                if (tag == .enum_literal or !try unique(self, governed, spelled)) continue;
                 try unread.append(self.allocator, .{ .node = node, .why = why });
                 continue;
             },
@@ -240,10 +238,11 @@ fn literalSite(self: *Context, governed: []const Governed, renamed: []const []co
     const spelled = try Model.identifier(self.allocator, tree.tokenSlice(label));
     if (!spelledAny(self, governed, renamed, spelled, label)) return;
     switch (try self.facts.literalDeclaration(self.file, literal, spelled)) {
-        .unknown, .none => {},
+        .none => {},
+        .unknown => |why| try leave(self, unread, value, why),
         .decl => |decl| switch (try paired(self, decl)) {
             .pair => |pair| try append(self, governed, renamed, label, value, spelled, &pair, out),
-            .unknown => |why| if (try unique(self, governed, spelled)) try leave(self, unread, value, why),
+            .unknown => |why| try leave(self, unread, value, why),
         },
     }
 }
@@ -294,62 +293,18 @@ fn fieldSites(self: *Context, governed: []const Governed, renamed: []const []con
         const aliases: []const []const u8 = if (own) &.{} else names;
         for ([_][]const []const u8{ &.{g.name}, aliases }) |list| for (list) |name| {
             if (!self.facts.mayName(named, name) or (self.inTest(site) and g.target.production)) continue;
-            if (value == .unknown) {
-                if (try unique(self, governed, name)) try leave(self, unread, node, value.unknown);
-                return;
-            }
+            if (value == .unknown) return leave(self, unread, node, value.unknown);
             var options: std.ArrayList(Facts.Container) = .empty;
             try containers(self, value, &options);
             for (options.items) |container| {
                 const decl = self.facts.member(container, name) orelse continue;
                 switch (try paired(self, decl)) {
                     .pair => |pair| try append(self, governed, renamed, site, node, name, &pair, out),
-                    .unknown => |why| return if (try unique(self, governed, name)) leave(self, unread, node, why),
+                    .unknown => |why| return leave(self, unread, node, why),
                 }
             }
         };
     }
-}
-
-/// How many declarations of the run's program carry each name: every field, and every variable
-/// and function of a file or container, std's included. A local is never a member.
-const Names = struct {
-    built: bool = false,
-    counts: std.StringHashMapUnmanaged(u32) = .empty,
-};
-
-/// Whether `spelled` names no declaration of the program but a governed one: then a reference
-/// spelling it that does not resolve identifies it. A name another declaration also has
-/// (`read`, `init`, `run`) cannot be shown to be the governed one, and spells nothing.
-fn unique(self: *Context, governed: []const Governed, spelled: []const u8) Context.Error!bool {
-    const names = try self.facts.memo(Names);
-    if (!names.built) {
-        names.built = true;
-        for (self.project.sources) |*source| {
-            if (source.input.kind == .zon) continue;
-            for (source.model.declarations) |decl| {
-                switch (decl.kind) {
-                    .field => {},
-                    .variable, .function => switch (source.model.scopes[@backingInt(decl.scope)].kind) {
-                        .file, .container => {},
-                        else => continue,
-                    },
-                    .parameter, .capture => continue,
-                }
-                const entry = try names.counts.getOrPut(self.facts.gpa, decl.name);
-                entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
-            }
-        }
-    }
-    const all = names.counts.get(spelled) orelse return true;
-    var own: std.ArrayList(Facts.Decl) = .empty;
-    for (governed) |g| for (g.decls) |decl| {
-        if (!std.mem.eql(u8, self.project.at(decl.file).model.declarations[@backingInt(decl.index)].name, spelled)) continue;
-        for (own.items) |known| {
-            if (std.meta.eql(known, decl)) break;
-        } else try own.append(self.allocator, decl);
-    };
-    return all <= own.items.len;
 }
 
 /// Whether a governed target is a field of its container.
@@ -372,25 +327,38 @@ pub const Made = union(enum) { no, yes: ?Facts.Decl, unknown: Facts.Unknown };
 /// own package with a result of that type: those of its package are judged only where generic,
 /// their result written in terms of their own parameter. The callee is given (`yes`) for the
 /// caller to weigh its own library; one that makes from data whose result does not resolve is
-/// unknown, but for a generic's binding, judged where it is bound.
+/// unknown, but for a generic's binding, judged where it is bound. A callee no reading resolves
+/// is unknown where its result may be one of `types`: one, or unknown itself.
 pub fn madeByCall(self: *Context, node: Ast.Node.Index, types: []const Facts.Container) Context.Error!Made {
     if (types.len == 0) return .no;
     const call = (try Facts.calls.at(self.facts, self.file, node)) orelse return .no;
     const callees: []const Facts.Decl = switch (call.callee) {
         .function => |function| &.{function},
         .choice => |each| each,
-        .any => return .no,
+        .any => |why| return if (try reachable(self, node, call, types, why)) |unknown| .{ .unknown = unknown } else .no,
     };
     var result: ?Facts.Value = null;
+    var unknown: ?Facts.Unknown = null;
     for (callees) |callee| {
         if (try self.facts.program(callee.file)) continue;
         if (result == null) result = try self.facts.resolve(self.file, node);
         const made = madeType(result.?, types) orelse {
-            if (result.? == .unknown and result.?.unknown != .generic and try makesFromData(self, callee)) return .{ .unknown = result.?.unknown };
+            if (result.? == .unknown and result.?.unknown != .generic) switch (try makesFromData(self, callee)) {
+                .yes => return .{ .unknown = result.?.unknown },
+                .no => {},
+                .unknown => |why| unknown = why,
+            };
             continue;
         };
         if (!reflectiveResult(self, callee) and try samePackage(self, callee.file, made.file)) continue;
-        if (!try makesFromData(self, callee)) continue;
+        switch (try makesFromData(self, callee)) {
+            .yes => {},
+            .no => continue,
+            .unknown => |why| {
+                unknown = why;
+                continue;
+            },
+        }
         // A copy of memory out of a value of the same type (`std.mem.bytesToValue(T,
         // std.mem.asBytes(&t))`, `Facts.accesses.copyAt`) makes it from its own bytes.
         if (try Facts.accesses.copyAt(self.facts, self.file, node)) |copy| if (madeType(try self.facts.resolve(self.file, copy.from.node()), types)) |from| {
@@ -398,7 +366,7 @@ pub fn madeByCall(self: *Context, node: Ast.Node.Index, types: []const Facts.Con
         };
         return .{ .yes = callee };
     }
-    return .no;
+    return if (unknown) |why| .{ .unknown = why } else .no;
 }
 
 /// Whether the call at `node` hands one of `types`, or a value of or pointer to one, to a
@@ -409,43 +377,131 @@ pub fn madeByCall(self: *Context, node: Ast.Node.Index, types: []const Facts.Con
 /// (`std.meta.fieldNames(T)`, `fieldInfo`, `tags`: `@typeInfo(T)`). A function that only holds
 /// a type it is given (`std.ArrayList(T)`: `@sizeOf`, `@alignOf`), allocates or keeps storage
 /// for it (`Allocator.alloc(T, n)`, `realloc`, whose bytes of the old memory never reach its
-/// result), or copies a value (`std.mem.swap`) is none. The callee is given.
-pub fn reflectedByCall(self: *Context, node: Ast.Node.Index, types: []const Facts.Container) Context.Error!?Facts.Decl {
-    if (types.len == 0) return null;
-    const call = (try Facts.calls.at(self.facts, self.file, node)) orelse return null;
-    const args = switch (call.args) {
-        .known => |known| known,
-        .unknown => return null,
-    };
+/// result), or copies a value (`std.mem.swap`) is none. The callee is given. Unknown where an
+/// argument that may be one of `types` (one, or unknown itself) goes to a callee or a parameter
+/// no reading resolves, or where what a library callee does with it is unknown.
+pub const Reflected = union(enum) { no, yes: Facts.Decl, unknown: Facts.Unknown };
+pub fn reflectedByCall(self: *Context, node: Ast.Node.Index, types: []const Facts.Container) Context.Error!Reflected {
+    if (types.len == 0) return .no;
+    const call = (try Facts.calls.at(self.facts, self.file, node)) orelse return .no;
     const callees: []const Facts.Decl = switch (call.callee) {
         .function => |function| &.{function},
         .choice => |each| each,
-        .any => return null,
+        .any => |why| return if (try reachable(self, node, call, types, why)) |unknown| .{ .unknown = unknown } else .no,
     };
+    const args = switch (call.args) {
+        .known => |known| known,
+        .unknown => |why| return .{ .unknown = why },
+    };
+    var unknown: ?Facts.Unknown = null;
     for (args, 0..) |arg, position| {
-        const handed = madeType(try self.facts.resolve(self.file, arg), types) orelse continue;
+        const value = try self.facts.resolve(self.file, arg);
+        // An argument whose type is unknown may be one of them where a library callee reads it.
+        const handed = madeType(value, types);
+        const unread = if (handed == null) unknownIn(value) else null;
+        if (handed == null and unread == null) continue;
         for (callees) |callee| {
-            if (try self.facts.program(callee.file) or try samePackage(self, callee.file, handed.file)) continue;
-            if (try castsParameter(self, callee, position, 0) or reflectsParameter(self, callee, position)) return callee;
+            if (try self.facts.program(callee.file)) continue;
+            if (handed) |made| if (try samePackage(self, callee.file, made.file)) continue;
+            const reads: Is = if (reflectsParameter(self, callee, position)) .yes else try castsParameter(self, callee, position, 0);
+            switch (reads) {
+                .no => {},
+                .yes => if (handed != null) return .{ .yes = callee } else {
+                    unknown = unread;
+                },
+                .unknown => |why| unknown = why,
+            }
         }
     }
-    return null;
+    return if (unknown) |why| .{ .unknown = why } else .no;
+}
+
+/// Whether a call whose callee no reading resolves (`why`) may make or read one of `types`: only
+/// through what it is handed, its receiver as written and its arguments, or through the type
+/// its place gives its result (`std.mem.zeroes(T)` is handed `T`; `const s: S = f(b)` is placed in
+/// `S`). Each of them known and none of `types`: no (null). Otherwise why it is unknown: `why`
+/// where one of them is governed, its own unknown where one is unknown. A result the program
+/// discards (a statement, `_ =`) is no value kept, so it has no place to read.
+fn reachable(self: *Context, node: Ast.Node.Index, call: Facts.calls.Call, types: []const Facts.Container, why: Facts.Unknown) Context.Error!?Facts.Unknown {
+    const tree = &self.project.at(self.file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const full = tree.fullCall(&buffer, node) orelse return why;
+    var holder: [1]Ast.Node.Index = undefined;
+    const receiver: []const Ast.Node.Index = if (tree.nodeTag(call.callee_expr) == .field_access) blk: {
+        holder[0] = tree.nodeData(call.callee_expr).node_and_token[0];
+        break :blk &holder;
+    } else &.{};
+    for ([_][]const Ast.Node.Index{ receiver, full.ast.params }) |list| for (list) |arg| {
+        const value = try self.facts.resolve(self.file, arg);
+        if (madeType(value, types) != null) return why;
+        if (unknownIn(value)) |unknown| return unknown;
+    };
+    if (discarded(self, node)) return null;
+    const place = try self.facts.literalTypeIn(null, self.file, node);
+    // No type written for the result (`const v = f(b)`): the callee's result is its type.
+    if (place == .scalar) return why;
+    if (madeType(place, types) != null) return why;
+    return unknownIn(place);
+}
+
+/// Whether the call at `node` is a statement of its own, or assigned to `_`, past `try`,
+/// parentheses, and a `catch` or `orelse` it is the left side of.
+fn discarded(self: *Context, node: Ast.Node.Index) bool {
+    const tree = &self.project.at(self.file).file.tree;
+    const model = &self.project.at(self.file).model;
+    var at = node;
+    var parent = model.parentOf(at) orelse return false;
+    while (switch (tree.nodeTag(parent)) {
+        .@"try", .grouped_expression => true,
+        .@"catch", .@"orelse" => tree.nodeData(parent).node_and_node[0] == at,
+        // A prong's or a branch's value is the switch's or the `if`'s.
+        .switch_case, .switch_case_one, .switch_case_inline, .switch_case_inline_one => tree.fullSwitchCase(parent).?.ast.target_expr == at, // safe: the tag is a case's
+        .@"switch", .switch_comma => tree.fullSwitch(parent).?.ast.condition != at, // safe: the tag is a switch's
+        .@"if", .if_simple => if (tree.fullIf(parent)) |branch| branch.ast.cond_expr != at else false,
+        else => false,
+    }) {
+        at = parent;
+        parent = model.parentOf(at) orelse return false;
+    }
+    switch (tree.nodeTag(parent)) {
+        .block, .block_semicolon, .block_two, .block_two_semicolon => return true,
+        .@"defer", .@"errdefer" => return true,
+        // A loop's body: its value is no loop's result.
+        .@"while", .while_simple, .while_cont, .@"for", .for_simple => {
+            if (tree.fullWhile(parent)) |loop| return loop.ast.then_expr == at;
+            if (tree.fullFor(parent)) |loop| return loop.ast.then_expr == at;
+            return false;
+        },
+        .assign => {
+            const lhs, const rhs = tree.nodeData(parent).node_and_node;
+            return rhs == at and tree.nodeTag(lhs) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(lhs)), "_");
+        },
+        else => return false,
+    }
 }
 
 /// Whether a library function makes the value it returns from untyped data: it returns a cast
 /// of bytes it is handed (`castsParameter` over any parameter that holds data), or applies a
 /// reflective builtin to one of its parameters (`@typeInfo(T)`: `mem.zeroes`, `zeroInit`).
-fn makesFromData(self: *Context, function: Facts.Decl) Context.Error!bool {
-    if (try castsParameter(self, function, null, 0)) return true;
+fn makesFromData(self: *Context, function: Facts.Decl) Context.Error!Is {
+    const casts = try castsParameter(self, function, null, 0);
+    if (casts == .yes) return .yes;
     const tree = &self.project.at(function.file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
-    const proto = tree.fullFnProto(&buffer, self.project.at(function.file).model.declarations[@backingInt(function.index)].node) orelse return false;
+    const proto = tree.fullFnProto(&buffer, self.project.at(function.file).model.declarations[@backingInt(function.index)].node) orelse return casts;
     var parameters = proto.iterate(tree);
     var position: usize = 0;
     while (parameters.next()) |_| : (position += 1) {
-        if (reflectsParameter(self, function, position)) return true;
+        if (reflectsParameter(self, function, position)) return .yes;
     }
-    return false;
+    return casts;
+}
+
+/// Yes where either is, else unknown where either is, else no.
+fn either(a: Is, b: Is) Is {
+    if (a == .yes or b == .yes) return .yes;
+    if (a == .unknown) return a;
+    return b;
 }
 
 /// The casts that carry a value to another type and keep its bits.
@@ -462,74 +518,103 @@ fn isBitCast(name: []const u8) bool {
 /// any parameter that holds data the caller hands it: written `anytype`, or bytes (`[]const
 /// u8`, `*[n]u8`, `[*]u8`). Its own allocation or storage it keeps (`self.metadata`) is no
 /// parameter, so a cast of either is none: what it reads is what a value of the type wrote.
-fn castsParameter(self: *Context, function: Facts.Decl, position: ?usize, depth: u8) Context.Error!bool {
-    if (depth > 4) return false;
+fn castsParameter(self: *Context, function: Facts.Decl, position: ?usize, depth: u8) Context.Error!Is {
+    if (depth > 4) return .{ .unknown = .budget };
     const tree = &self.project.at(function.file).file.tree;
     const declaration = self.facts.scopeNode(function);
-    if (tree.nodeTag(declaration) != .fn_decl) return false;
+    if (tree.nodeTag(declaration) != .fn_decl) return .no;
     const body = tree.nodeData(declaration).node_and_node[1];
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
+    var found: Is = .no;
     for (tree.nodes.items(.tag), 0..) |tag, raw| {
         if (tag != .@"return") continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(raw));
         const at = tree.nodeMainToken(node);
         if (at < first or at > last) continue;
         const operand = tree.nodeData(node).opt_node.unwrap() orelse continue;
-        if (try returnsCast(self, function, operand, position, false, depth)) return true;
+        found = either(found, try returnsCast(self, function, operand, position, false, depth));
+        if (found == .yes) return .yes;
     }
-    return false;
+    return found;
 }
 
 /// Whether the returned expression `node` is the parameter at `position` (or one holding data)
 /// cast, through the forms that hand on a value: grouping, `.*`, a slice, `try`, `@as`, both
 /// results of an `if`, `orelse` and `catch`, and a call it is handed to that returns it cast.
-fn returnsCast(self: *Context, function: Facts.Decl, node: Ast.Node.Index, position: ?usize, cast: bool, depth: u8) Context.Error!bool {
-    if (depth > 8) return false;
+fn returnsCast(self: *Context, function: Facts.Decl, node: Ast.Node.Index, position: ?usize, cast: bool, depth: u8) Context.Error!Is {
+    if (depth > 8) return .{ .unknown = .budget };
     const tree = &self.project.at(function.file).file.tree;
     switch (tree.nodeTag(node)) {
         .grouped_expression => return returnsCast(self, function, tree.nodeData(node).node_and_token[0], position, cast, depth + 1),
         .deref, .@"try", .address_of => return returnsCast(self, function, tree.nodeData(node).node, position, cast, depth + 1),
         .@"orelse", .@"catch" => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
-            return try returnsCast(self, function, lhs, position, cast, depth + 1) or try returnsCast(self, function, rhs, position, cast, depth + 1);
+            return either(try returnsCast(self, function, lhs, position, cast, depth + 1), try returnsCast(self, function, rhs, position, cast, depth + 1));
         },
-        .slice_open, .slice, .slice_sentinel => return returnsCast(self, function, (tree.fullSlice(node) orelse return false).ast.sliced, position, cast, depth + 1),
+        .slice_open, .slice, .slice_sentinel => return returnsCast(self, function, (tree.fullSlice(node) orelse return .no).ast.sliced, position, cast, depth + 1),
         .identifier => {
-            const k = parameterAt(self, function, node) orelse return false;
-            return cast and if (position) |p| k == p else holdsData(self, function, k);
+            const k = parameterAt(self, function, node) orelse return .no;
+            return if (cast and if (position) |p| k == p else holdsData(self, function, k)) .yes else .no;
         },
         else => {},
     }
     if (tree.fullIf(node)) |branch| {
-        if (try returnsCast(self, function, branch.ast.then_expr, position, cast, depth + 1)) return true;
-        const otherwise = branch.ast.else_expr.unwrap() orelse return false;
-        return returnsCast(self, function, otherwise, position, cast, depth + 1);
+        const then = try returnsCast(self, function, branch.ast.then_expr, position, cast, depth + 1);
+        const otherwise = branch.ast.else_expr.unwrap() orelse return then;
+        return either(then, try returnsCast(self, function, otherwise, position, cast, depth + 1));
     }
     if (Facts.builtinName(tree, node)) |name| {
         var buffer: [2]Ast.Node.Index = undefined;
         const args = Facts.builtinArgs(tree, node, &buffer);
         if (std.mem.eql(u8, name, "@as") and args.len == 2) return returnsCast(self, function, args[1], position, cast, depth + 1);
         if (isBitCast(name) and args.len >= 1) return returnsCast(self, function, args[args.len - 1], position, true, depth + 1);
-        return false;
+        return .no;
     }
     // A call the parameter is handed to: the callee returns it cast, or it was cast here.
-    const call = (try Facts.calls.at(self.facts, function.file, node)) orelse return false;
+    const call = (try Facts.calls.at(self.facts, function.file, node)) orelse return .no;
     const args = switch (call.args) {
         .known => |known| known,
-        .unknown => return false,
+        .unknown => |why| return if (handsParameter(self, function, tree, node, position)) .{ .unknown = why } else .no,
     };
-    const callees: []const Facts.Decl = switch (call.callee) {
-        .function => |one| &.{one},
-        .choice => |each| each,
-        .any => return false,
-    };
+    var found: Is = .no;
     for (args, 0..) |arg, i| {
-        if (castWritten(self, function, arg) and try returnsCast(self, function, arg, position, false, depth + 1)) return true;
+        if (castWritten(self, function, arg)) {
+            found = either(found, try returnsCast(self, function, arg, position, false, depth + 1));
+            if (found == .yes) return .yes;
+        }
         const k = handedParameter(self, function, arg) orelse continue;
         if (if (position) |p| k != p else !holdsData(self, function, k)) continue;
-        for (callees) |callee| if (try castsParameter(self, callee, i, depth + 1)) return true;
+        const callees: []const Facts.Decl = switch (call.callee) {
+            .function => |one| &.{one},
+            .choice => |each| each,
+            .any => |why| {
+                found = either(found, .{ .unknown = why });
+                continue;
+            },
+        };
+        for (callees) |callee| {
+            found = either(found, try castsParameter(self, callee, i, depth + 1));
+            if (found == .yes) return .yes;
+        }
     }
+    return found;
+}
+
+/// Whether the call at `node` in `function` is handed the parameter at `position` (or one holding
+/// data) among its arguments as written, its receiver included.
+fn handsParameter(self: *Context, function: Facts.Decl, tree: *const Ast, node: Ast.Node.Index, position: ?usize) bool {
+    var buffer: [1]Ast.Node.Index = undefined;
+    const full = tree.fullCall(&buffer, node) orelse return false;
+    var written: [1]Ast.Node.Index = undefined;
+    const receiver: []const Ast.Node.Index = if (tree.nodeTag(full.ast.fn_expr) == .field_access) blk: {
+        written[0] = tree.nodeData(full.ast.fn_expr).node_and_token[0];
+        break :blk &written;
+    } else &.{};
+    for ([_][]const Ast.Node.Index{ full.ast.params, receiver }) |list| for (list) |arg| {
+        const k = handedParameter(self, function, arg) orelse continue;
+        if (if (position) |p| k == p else holdsData(self, function, k)) return true;
+    };
     return false;
 }
 
@@ -658,6 +743,18 @@ fn madeType(value: Facts.Value, types: []const Facts.Container) ?Facts.Container
     };
     for (types) |t| if (t.file == found.file and t.scope == found.scope) return t;
     return null;
+}
+
+/// Why a value is unknown, read through pointers, optionals and error unions as `madeType` reads
+/// it: null where it is known (a choice holds no unknown).
+pub fn unknownIn(value: Facts.Value) ?Facts.Unknown {
+    var at = value;
+    while (true) at = switch (at) {
+        .pointer => |inner| inner.child.*,
+        .optional, .error_union => |inner| inner.*,
+        .unknown => |why| return why,
+        else => return null,
+    };
 }
 
 /// Whether two files are of one package: both std's, or both of one package their caller names.

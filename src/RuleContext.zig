@@ -45,10 +45,14 @@ pub const Sink = struct {
     /// a suppression: a rule that leaves a finding to another (D001's container for what it
     /// holds) leaves it only where that one is reported. A sink that suppresses nothing says no.
     suppresses: *const fn (*Sink, rules.Rule, u32) bool = suppressesNothing,
+    /// A site of the rule at the offset that is outside its language (`Facts.Unknown.meaning`):
+    /// counted per rule, never a finding. A sink that counts nothing drops it.
+    outside: *const fn (*Sink, rules.Rule, u32) Error!void = countsNothing,
 
     fn suppressesNothing(_: *Sink, _: rules.Rule, _: u32) bool {
         return false;
     }
+    fn countsNothing(_: *Sink, _: rules.Rule, _: u32) Error!void {}
 };
 /// Compiled rule. Metadata and callback are validated once before execution.
 pub const Rule = struct { definition: rules.Definition, check: *const fn (*RuleContext) Error!void };
@@ -200,6 +204,24 @@ pub fn suppressedAt(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.Tok
 /// finding or nothing; a configuration that cannot be read is neither.
 pub fn refuse(self: *RuleContext, why: []const u8) Error!void {
     return self.sink.refuse(self.sink, why);
+}
+/// A ban's site where a fact it reads is unknown (`why`), never a pass and never a finding. Where
+/// the unknown is glint's own failure the run is incomplete: a run error names the rule, the
+/// place and the reason, so the gate fails by name. Where it is outside the ban's language (a
+/// generic position, `Facts.Unknown.meaning`) the site is counted for the rule in the report.
+/// Hygiene stays silent on an unknown and never calls this.
+pub fn unknownAt(self: *RuleContext, rule: rules.Rule, token: Ast.TokenIndex, why: Facts.Unknown) Error!void {
+    const tree = try self.project.syntax(try self.source());
+    if (token >= tree.tokens.len) return error.InvalidHandle;
+    const start = tree.tokenStart(token);
+    switch (why.meaning()) {
+        .outside => return self.sink.outside(self.sink, rule, start),
+        .failure => {
+            const location = tree.tokenLocation(0, token);
+            const named = (rules.definition(rule, self.definitions) orelse return error.InvalidSelection).name;
+            try self.refuse(try self.allocator.print("{d}:{d}: {s} cannot read `{s}`: glint does not resolve what it reads there ({t}), so it can neither report nor pass the site", .{ location.line + 1, location.column + 1, named, tree.tokenSlice(token), why }));
+        },
+    }
 }
 /// Whether a token is test code: inside a `test` block, or in an input the caller classifies as a
 /// test or the configuration's `test_inputs` names, whoever runs glint. Nothing else is: a file

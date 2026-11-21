@@ -7,7 +7,10 @@
 //! value of a local or file-level `const` it names, followed through what gives a value
 //! (`Facts.accesses.valuesOf`: parentheses, `try`, `orelse`, an `if`'s or a `switch`'s results).
 //! A receiver that may be a stream in one branch is reported. A `var` and a parameter are not
-//! followed. Test code is read too: a test's child program writes its streams as any other.
+//! followed. Test code is read too: a test's child program writes its streams as any other. A
+//! call that may be the writer, or a receiver that may be a stream, where what it reads is unknown
+//! is no pass: glint's own failure makes the run incomplete, and a generic position is counted
+//! outside the ban (`Context.unknownAt`).
 const Ast = @import("std").zig.Ast;
 const Context = @import("RuleContext.zig");
 const Rule = @import("Rule.zig").Rule;
@@ -18,43 +21,72 @@ const Written = @import("Written.zig");
 pub fn check(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     for (try Facts.calls.in(c.facts, c.file)) |call| {
+        const token = tree.nodeMainToken(call.node);
+        switch (try Governed.mayCallStd(c, call.node, "Io.File.writer")) {
+            .no => continue,
+            .yes => {},
+            .unknown => |why| {
+                try c.unknownAt(rule, token, why);
+                continue;
+            },
+        }
         const args = switch (call.args) {
             .known => |args| args,
-            .unknown => continue,
+            .unknown => |why| {
+                try c.unknownAt(rule, token, why);
+                continue;
+            },
         };
         // `file.writer(io, buffer)` binds the file first; `Io.File.writer(file, io, buffer)` passes it.
         if (args.len != 3) continue;
-        if (try Governed.stdCall(c, call.node, "Io.File.writer") != .yes) continue;
-        const stream = try streamOf(c, tree, args[0], 0) orelse continue;
-        try c.at(rule, tree.nodeMainToken(call.node), switch (stream) {
-            .stdout => "standard output through a positional writer writes at an offset, over a file the output is redirected to; use writerStreaming (or ensign's streaming stdout)",
-            .stderr => "standard error through a positional writer writes at an offset, over a file the output is redirected to; use writerStreaming (or ensign's streaming stderr)",
-        });
+        const stream = try streamOf(c, tree, args[0], 0);
+        switch (stream) {
+            .none => continue,
+            .unknown => |why| {
+                try c.unknownAt(rule, token, why);
+                continue;
+            },
+            .stdout, .stderr => {},
+        }
+        try c.at(rule, token, if (stream == .stdout)
+            "standard output through a positional writer writes at an offset, over a file the output is redirected to; use writerStreaming (or ensign's streaming stdout)"
+        else
+            "standard error through a positional writer writes at an offset, over a file the output is redirected to; use writerStreaming (or ensign's streaming stderr)");
     }
 }
 
-const Stream = enum { stdout, stderr };
+const Stream = union(enum) { stdout, stderr, none, unknown: Facts.Unknown };
 
-/// The standard stream the value at `node` may be, or null where it is none.
-fn streamOf(c: *Context, tree: *const Ast, node: Ast.Node.Index, depth: u8) Context.Error!?Stream {
+/// The standard stream the value at `node` may be: one where any of its values may be (a stream
+/// is what is reported), none where none is, unknown where one is unknown and none is a stream.
+fn streamOf(c: *Context, tree: *const Ast, node: Ast.Node.Index, depth: u8) Context.Error!Stream {
     // A chain of `const`s naming one another ends long before this.
-    if (depth > 8) return null;
+    if (depth > 8) return .{ .unknown = .budget };
     const leaves = switch (try Facts.accesses.valuesOf(c.facts, c.file, node)) {
         .leaves => |leaves| leaves,
-        .unknown => return null,
+        .unknown => |why| return .{ .unknown = why },
     };
+    var found: Stream = .none;
     for (leaves) |leaf| {
         const at = Written.ungrouped(tree, leaf);
         if (Facts.calls.written(tree, at)) {
-            if (try Governed.stdCall(c, at, "Io.File.stdout") == .yes) return .stdout;
-            if (try Governed.stdCall(c, at, "Io.File.stderr") == .yes) return .stderr;
+            for ([_]struct { []const u8, Stream }{ .{ "Io.File.stdout", .stdout }, .{ "Io.File.stderr", .stderr } }) |each| switch (try Governed.mayCallStd(c, at, each[0])) {
+                .yes => return each[1],
+                .no => {},
+                .unknown => |why| found = .{ .unknown = why },
+            };
             continue;
         }
         if (tree.nodeTag(at) != .identifier) continue;
         const init = constInit(c, tree, at) orelse continue;
-        if (try streamOf(c, tree, init, depth + 1)) |stream| return stream;
+        const held = try streamOf(c, tree, init, depth + 1);
+        switch (held) {
+            .none => {},
+            .unknown => found = held,
+            .stdout, .stderr => return held,
+        }
     }
-    return null;
+    return found;
 }
 
 /// The value a `const` the identifier at `node` names is given, in the same file.
@@ -76,4 +108,13 @@ test "breadth: positional stream: stdout or stderr through writer reported, as w
     try breadth.expectFindings(check, "const std = @import(\"std\"); const Io = std.Io; pub fn f(io: Io, b: []u8) void { const out = Io.File.stdout(); _ = out.writer(io, b); _ = Io.File.writer(Io.File.stderr(), io, b); }", 2);
     try breadth.expectFindings(check, "const std = @import(\"std\"); pub fn f(io: std.Io, b: []u8) void { _ = std.Io.File.stdout().writerStreaming(io, b); const err = std.Io.File.stderr(); _ = err.writerStreaming(io, b); }", 0);
     try breadth.expectFindings(check, "const std = @import(\"std\"); pub fn f(io: std.Io, file: std.Io.File, b: []u8) void { _ = file.writer(io, b); }", 0);
+}
+
+test "positional stream: a writer call on a value only a binding types is counted outside the ban; one on what glint does not resolve stops the run" {
+    // `out`'s type is the caller's: a generic position, never a verdict.
+    try breadth.expectUnknowns(check, "const std = @import(\"std\"); pub fn f(io: std.Io, out: anytype, b: []u8) void { _ = out.writer(io, b); }", 0, 0, 1);
+    // A name nothing declares: glint's own failure, by name.
+    try breadth.expectUnknowns(check, "const std = @import(\"std\"); pub fn f(io: std.Io, b: []u8) void { _ = nowhere.writer(io, b); }", 0, 1, 0);
+    // A member another name spells is no writer call: nothing to decide.
+    try breadth.expectUnknowns(check, "const std = @import(\"std\"); pub fn f(out: anytype) void { _ = out.flush(); }", 0, 0, 0);
 }

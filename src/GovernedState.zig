@@ -86,12 +86,13 @@ pub fn check(c: *Context, definition: Rule.Definition) Context.Error!void {
         const entry = all[site.index];
         try c.atDefinition(definition.id, site.token, try c.allocator.print("internal field '{s}' of {s}: {s}'s alone; use the type's own API", .{ declName(c.project, site.decl), typeName(c, entry), entry.package.name }), site.decl);
     }
-    // Under a ban, a reference spelling an internal field that does not resolve cannot be shown
-    // not to be it: a finding. A hygiene rule reports only what it resolves.
-    if (declared.kind == .ban) for (unread.items) |missed| {
+    // Under a ban, a reference spelling an internal field that does not resolve is no pass
+    // (`Context.unknownAt`). A hygiene rule reports only what it resolves.
+    const ban = declared.kind == .ban;
+    if (ban) for (unread.items) |missed| {
         const token = tree.firstToken(missed.node);
         if ((try reported.getOrPut(c.allocator, token)).found_existing) continue;
-        try c.at(definition.id, token, try c.allocator.print("a reference spelling an internal field {s} governs does not resolve ({t}), so it cannot be shown to be another", .{ definition.name, missed.why }));
+        try c.unknownAt(definition.id, token, missed.why);
     };
 
     // Casts and reflection over a governed type.
@@ -101,7 +102,17 @@ pub fn check(c: *Context, definition: Rule.Definition) Context.Error!void {
         const token = tree.nodeMainToken(node);
         if (c.inTest(token)) continue;
         const kind: enum { cast, reflection } = if (among(&casts, name)) .cast else if (among(&reflection, name)) .reflection else continue;
-        const found = (try governedIn(c, node, name, kind == .cast, types.items)) orelse continue;
+        // A cast written inside another (`@ptrCast(@alignCast(p))`) is one conversion: the
+        // outermost reads it, from the innermost operand to the outermost's place.
+        if (kind == .cast and enclosingCast(c, tree, node) != null) continue;
+        const found = switch (try governedIn(c, node, name, kind == .cast, types.items)) {
+            .found => |found| found,
+            .none => continue,
+            .unknown => |why| {
+                if (ban and !(try reported.getOrPut(c.allocator, token)).found_existing) try c.unknownAt(definition.id, token, why);
+                continue;
+            },
+        };
         if ((try reported.getOrPut(c.allocator, token)).found_existing) continue;
         const entry = ofContainer(all, found) orelse all[0];
         try c.at(definition.id, token, try c.allocator.print("{s} over {s}: its state is {s}'s alone; use the type's own makers and API", .{ name, typeName(c, entry), entry.package.name }));
@@ -118,11 +129,22 @@ pub fn check(c: *Context, definition: Rule.Definition) Context.Error!void {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(raw));
         const token = tree.nodeMainToken(node);
         if (c.inTest(token)) continue;
-        const callee = switch (try Governed.madeByCall(c, node, types.items)) {
-            .yes => |callee| callee,
-            .no, .unknown => try Governed.reflectedByCall(c, node, types.items),
-        } orelse continue;
         const at = tree.firstToken(node);
+        const made = try Governed.madeByCall(c, node, types.items);
+        const callee = switch (made) {
+            .yes => |callee| callee,
+            .no, .unknown => switch (try Governed.reflectedByCall(c, node, types.items)) {
+                .yes => |callee| callee,
+                .no => {
+                    if (made == .unknown and ban and !(try reported.getOrPut(c.allocator, at)).found_existing) try c.unknownAt(definition.id, at, made.unknown);
+                    continue;
+                },
+                .unknown => |why| {
+                    if (ban and !(try reported.getOrPut(c.allocator, at)).found_existing) try c.unknownAt(definition.id, at, if (made == .unknown) made.unknown else why);
+                    continue;
+                },
+            },
+        } orelse continue;
         if ((try reported.getOrPut(c.allocator, at)).found_existing) continue;
         const named = c.project.at(callee.file).model.declarations[@backingInt(callee.index)].name;
         try c.at(definition.id, at, try c.allocator.print("{s} reads or makes a governed type by reflection: its state is {s}'s alone; use the type's own makers and API", .{ named, all[0].package.name }));
@@ -139,18 +161,70 @@ fn among(names: []const []const u8, name: []const u8) bool {
     return false;
 }
 
-/// The governed type a cast's operand or result is, or a reflective builtin reads, if any.
-fn governedIn(c: *Context, node: Ast.Node.Index, name: []const u8, cast: bool, types: []const Facts.Container) Context.Error!?Facts.Container {
+/// The governed type a cast's operand or result is, or a reflective builtin reads: found, none,
+/// or unknown where what it reads is unknown and none it reads is governed.
+const In = union(enum) { found: Facts.Container, none, unknown: Facts.Unknown };
+fn governedIn(c: *Context, node: Ast.Node.Index, name: []const u8, cast: bool, types: []const Facts.Container) Context.Error!In {
     const tree = &c.project.at(c.file).file.tree;
     var buffer: [2]Ast.Node.Index = undefined;
     const args = Facts.builtinArgs(tree, node, &buffer);
-    if (args.len == 0) return null;
+    if (args.len == 0) return .none;
     // `@fieldParentPtr`'s holder is the type its result points at; every other one reads its
     // first operand (`@field(h, n)`, `@typeInfo(T)`, `@offsetOf(T, n)`), a cast its last.
-    const operand = if (std.mem.eql(u8, name, "@fieldParentPtr")) null else if (cast) args[args.len - 1] else args[0];
-    if (operand) |each| if (madeType(try c.facts.resolve(c.file, each), types)) |found| return found;
-    if (!cast and operand != null) return null;
-    return madeType(try c.facts.castTypeIn(null, c.file, node), types);
+    const operand = if (std.mem.eql(u8, name, "@fieldParentPtr")) null else if (cast) innermost(tree, args[args.len - 1]) else args[0];
+    var unknown: ?Facts.Unknown = null;
+    if (operand) |each| {
+        const value = try c.facts.resolve(c.file, each);
+        if (madeType(value, types)) |found| return .{ .found = found };
+        unknown = Governed.unknownIn(value);
+    }
+    if (!cast and operand != null) return if (unknown) |why| .{ .unknown = why } else .none;
+    // A cast to an integer makes a number, never one of `types`: its operand alone is read.
+    if (among(&to_integer, name)) return if (unknown) |why| .{ .unknown = why } else .none;
+    const result = try c.facts.castTypeIn(null, c.file, outermost(c, tree, node));
+    if (madeType(result, types)) |found| return .{ .found = found };
+    if (unknown orelse Governed.unknownIn(result)) |why| return .{ .unknown = why };
+    return .none;
+}
+
+/// The cast `node` is written inside, past parentheses, if one.
+fn enclosingCast(c: *Context, tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
+    const model = &c.project.at(c.file).model;
+    var parent = model.parentOf(node) orelse return null;
+    while (tree.nodeTag(parent) == .grouped_expression) parent = model.parentOf(parent) orelse return null;
+    return if (among(&casts, Facts.builtinName(tree, parent) orelse return null)) parent else null;
+}
+
+/// The casts whose result is an integer by what they are, whatever their place.
+const to_integer = [_][]const u8{ "@intFromEnum", "@backingInt", "@intFromError", "@intFromPtr" };
+
+/// The casts that keep what a pointer points at: an inner one's result is its outer one's.
+const keeping = [_][]const u8{ "@alignCast", "@constCast", "@volatileCast", "@addrSpaceCast" };
+
+/// The outermost of the pointee-keeping casts `node` is written inside (itself where none):
+/// the place that types it (`@alignCast(@fieldParentPtr("f", p))` placed in `*T` makes a `*T`).
+fn outermost(c: *Context, tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
+    var at = node;
+    while (enclosingCast(c, tree, at)) |outer| {
+        if (!among(&keeping, Facts.builtinName(tree, outer).?)) break; // safe: enclosingCast gives a builtin call
+        at = outer;
+    }
+    return at;
+}
+
+/// The operand under every cast written inside one another (`@ptrCast(@alignCast(p))`'s `p`),
+/// past parentheses.
+fn innermost(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
+    var at = node;
+    while (true) {
+        while (tree.nodeTag(at) == .grouped_expression) at = tree.nodeData(at).node_and_token[0];
+        const name = Facts.builtinName(tree, at) orelse return at;
+        if (!among(&casts, name)) return at;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const args = Facts.builtinArgs(tree, at, &buffer);
+        if (args.len == 0) return at;
+        at = args[args.len - 1];
+    }
 }
 
 /// The one of `types` a value is, holds by pointer, optional or error union, or names as a type.

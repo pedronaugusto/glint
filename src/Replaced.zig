@@ -73,7 +73,9 @@ pub fn check(c: *Context, definition: Rule.Definition) Context.Error!void {
             }),
             .symbol => |symbol| try governed.append(c.allocator, .{ .target = .{ .declaration = symbol, .production = true }, .index = i, .name = symbol, .decls = &.{}, .symbol = symbol }),
             .builtin => try builtins.append(c.allocator, i),
-            .unresolved => {},
+            // A target the declaring package's own run refuses (`PackageRules` problems): under a
+            // ban, its sites here are unread, so this run is incomplete too.
+            .unresolved => if (declared.kind == .ban) try c.refuse(try c.allocator.print("{s}: an entry of {s}'s lint_rules names a target glint does not resolve, so its sites here are unread", .{ definition.name, entry.package.name })),
         }
     }
     var sites: std.ArrayList(Governed.Site) = .empty;
@@ -110,14 +112,14 @@ pub fn check(c: *Context, definition: Rule.Definition) Context.Error!void {
         const fix = if (each.fix.len == 0 or unused.len == 0) each.fix else try std.mem.concat(c.allocator, Report.Edit, &.{ each.fix, unused });
         try c.atDefinitionFixed(definition.id, each.site.token, try message(c, each.entry), each.site.decl, fix);
     }
-    // Under a ban, a reference spelling a target's name that does not resolve cannot be shown
-    // not to be it: a finding. A hygiene rule reports only what it resolves.
+    // Under a ban, a reference spelling a target's name that does not resolve is no pass
+    // (`Context.unknownAt`). A hygiene rule reports only what it resolves.
     if (declared.kind == .ban) for (unread.items) |missed| {
         const tree = &c.project.at(c.file).file.tree;
-        try c.at(definition.id, tree.firstToken(missed.node), try c.allocator.print("a reference spelling a declaration {s} reports does not resolve ({t}), so it cannot be shown to be another", .{ definition.name, missed.why }));
+        try c.unknownAt(definition.id, tree.firstToken(missed.node), missed.why);
     };
     try builtinSites(c, definition, all, builtins.items);
-    try heldSites(c, definition, all, held.items);
+    try heldSites(c, definition, declared.kind == .ban, all, held.items);
 }
 
 /// Whether `entry` governs the site at `node`: anywhere outside its package; inside it, only
@@ -277,7 +279,7 @@ fn builtinSites(c: *Context, definition: Rule.Definition, all: []const Entry, in
 /// Each struct field whose type is an entry's target held by value (`.held = .field`): the
 /// type itself, or an optional, an array or an error union of it, each holding one or more by
 /// value, never a pointer, slice or optional pointer to it.
-fn heldSites(c: *Context, definition: Rule.Definition, all: []const Entry, indexes: []const usize) Context.Error!void {
+fn heldSites(c: *Context, definition: Rule.Definition, ban: bool, all: []const Entry, indexes: []const usize) Context.Error!void {
     if (indexes.len == 0) return;
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
@@ -289,8 +291,13 @@ fn heldSites(c: *Context, definition: Rule.Definition, all: []const Entry, index
         for (indexes) |index| {
             const entry = all[index];
             for (entry.replacement.declarations()) |target| {
-                if (!try heldBy(c, value, target)) continue;
-                if (c.inTest(decl.token) or !try applies(c, entry, decl.node)) continue;
+                const held = try heldBy(c, value, target);
+                if (held == .no or c.inTest(decl.token) or !try applies(c, entry, decl.node)) continue;
+                // Under a ban, a field whose type is unknown is no pass (`Context.unknownAt`).
+                if (held == .unknown) {
+                    if (ban) try c.unknownAt(definition.id, decl.token, held.unknown);
+                    continue;
+                }
                 try c.at(definition.id, decl.token, try message(c, entry));
             }
         }
@@ -298,22 +305,24 @@ fn heldSites(c: *Context, definition: Rule.Definition, all: []const Entry, index
 }
 
 /// Whether a field's type `value` holds `target`'s type by value: it, or an optional, array or
-/// error union of it, through any number of them (`[2]?std.Io.File`).
-fn heldBy(c: *Context, value: Facts.Value, target: Facts.Decl) Context.Error!bool {
+/// error union of it, through any number of them (`[2]?std.Io.File`). Unknown where the type, or
+/// what it holds by value, is.
+fn heldBy(c: *Context, value: Facts.Value, target: Facts.Decl) Context.Error!Facts.Is {
     const made = try c.facts.declaration(target);
     const want = switch (made) {
         .container, .instance => |container| container,
-        else => return false,
+        else => return .no,
     };
     var current = value;
     while (true) switch (current) {
         .optional, .array, .error_union => |inner| current = inner.*,
-        .container, .instance => |container| return container.file == want.file and container.scope == want.scope,
+        .container, .instance => |container| return if (container.file == want.file and container.scope == want.scope) .yes else .no,
         .alternatives => |parts| {
-            for (parts) |part| if (try heldBy(c, part, target)) return true;
-            return false;
+            for (parts) |part| if (try heldBy(c, part, target) == .yes) return .yes;
+            return .no;
         },
-        else => return false,
+        .unknown => |why| return .{ .unknown = why },
+        else => return .no,
     };
 }
 

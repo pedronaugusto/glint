@@ -101,6 +101,8 @@ pub const fixture_std =
 pub const Found = struct {
     messages: std.ArrayList([]const u8) = .empty,
     refused: usize = 0,
+    /// Sites the rule found outside its language (`Context.unknownAt`).
+    outside: usize = 0,
     fixes: std.ArrayList([]const u8) = .empty,
 
     pub fn deinit(self: *Found, gpa: std.mem.Allocator) void {
@@ -124,7 +126,7 @@ pub fn runWith(gpa: std.mem.Allocator, project: *const Project, file: Project.Fi
     const a = arena.allocator();
     var facts: Facts = .{ .project = project, .gpa = a, .backing = gpa };
     defer facts.deinit();
-    var sink: Context.Sink = .{ .diagnostic = Collect.diagnostic, .refuse = Collect.refuse, .config = Collect.configOf };
+    var sink: Context.Sink = .{ .diagnostic = Collect.diagnostic, .refuse = Collect.refuse, .config = Collect.configOf, .outside = Collect.outside };
     var collector: Collect = .{ .gpa = gpa, .config = selected(base) };
     const before = collecting;
     collecting = &collector;
@@ -152,6 +154,10 @@ const Collect = struct {
     fn refuse(_: *Context.Sink, _: []const u8) Context.Error!void {
         const self = collecting orelse return;
         self.found.refused += 1;
+    }
+    fn outside(_: *Context.Sink, _: Rule, _: u32) Context.Error!void {
+        const self = collecting orelse return;
+        self.found.outside += 1;
     }
     fn configOf(_: *Context.Sink, _: Project.FileId) rules.Config {
         const self = collecting orelse return selected(.none());
@@ -183,6 +189,22 @@ pub fn expectFindingsNamed(comptime check: Check, name: []const u8, source: []co
     defer found.deinit(gpa);
     try std.testing.expectEqual(expected, found.messages.items.len);
     try std.testing.expectEqual(@as(usize, 0), found.refused);
+}
+
+/// Runs `check` over `source` and expects `findings` findings, `refused` run errors (a ban's
+/// unknown that is glint's own failure) and `outside` sites outside the rule's language.
+pub fn expectUnknowns(comptime check: Check, source: []const u8, findings: usize, refused: usize, outside: usize) !void {
+    const gpa = std.testing.allocator;
+    var project = try Project.init(gpa, &.{
+        .{ .name = "fixture", .stem = "Fixture", .bytes = source },
+        .{ .name = "standard", .bytes = fixture_std, .selected = false },
+    }, &.{.{ .from = 0, .target = 1, .spelling = "std" }}, .{});
+    defer project.deinit();
+    var found = try run(gpa, &project, project.sources[0].id, check);
+    defer found.deinit(gpa);
+    try std.testing.expectEqual(findings, found.messages.items.len);
+    try std.testing.expectEqual(refused, found.refused);
+    try std.testing.expectEqual(outside, found.outside);
 }
 
 /// As `expectFindings`, under `base`'s options (its limits).

@@ -220,7 +220,37 @@ pub const Reflected = struct { of: *const Value, at: enum { info, pointer, size,
 /// of it, and every member read through it.
 /// Whether something is so: yes, no, or unknown and why.
 pub const Is = union(enum) { yes, no, unknown: Unknown };
-pub const Unknown = enum { invalid_front_end, unresolved, missing_mapping, computed_import, comptime_dependent, cycle, budget, unsupported, absent, generic, zig_own, erased_field, external };
+pub const Unknown = enum {
+    invalid_front_end,
+    unresolved,
+    missing_mapping,
+    computed_import,
+    comptime_dependent,
+    cycle,
+    budget,
+    unsupported,
+    absent,
+    generic,
+    zig_own,
+    erased_field,
+    external,
+
+    /// What an unknown means to a ban (`RuleContext.unknownAt`). `failure`: glint's own, on code
+    /// the run holds whole (a file it cannot parse, an import no mapping names, a reference it
+    /// does not resolve, a cycle, a budget spent, a construct it does not read): the run is
+    /// incomplete, by name. `outside`: outside every ban's language by its definition, as a
+    /// ban covers resolved callees and types: a value only an instantiation or the build decides
+    /// (`generic`, `comptime_dependent`, `zig_own`), a name computed as it compiles
+    /// (`computed_import`), code this build does not compile (`absent`), bytes a build step makes
+    /// (`external`), a function a field holds (`erased_field`). Counted per rule, never a
+    /// verdict.
+    pub fn meaning(self: Unknown) enum { failure, outside } {
+        return switch (self) {
+            .invalid_front_end, .unresolved, .missing_mapping, .cycle, .budget, .unsupported => .failure,
+            .generic, .comptime_dependent, .zig_own, .computed_import, .absent, .external, .erased_field => .outside,
+        };
+    }
+};
 /// The declaration an expression names (`definition`, `reflected`, `origin`): one known, none
 /// (no reference at all: a literal, a call, a member its holder does not declare, a primitive),
 /// or unknown and why (a holder that does not resolve, a choice of holders, a computed name, a
@@ -272,8 +302,10 @@ pub const Value = union(enum) {
 /// A pointer to `child`: to one item (`*T`), to many (`[*]T`), a slice (`[]T`) or a C pointer,
 /// as its type says (`std.builtin.Type.Pointer.Size`); null where what makes it does not say
 /// (a slicing: bounds known as the program compiles make a pointer to an array, others a
-/// slice). Two pointers are the same type only of the same size.
-pub const Pointer = struct { child: *const Value, size: ?Size };
+/// slice). Two pointers are the same type only of the same size. `decided`: false where the size
+/// is one no reading decides (`@Pointer(info.size, ...)` of a type only a binding gives), never a
+/// slicing's.
+pub const Pointer = struct { child: *const Value, size: ?Size, decided: bool = true };
 pub const Size = std.builtin.Type.Pointer.Size;
 pub const ResolveError = Model.InitError;
 /// A type built from its fields' types, the type itself or a value of it as `container` and
@@ -1670,7 +1702,10 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
     if (std.mem.eql(u8, name, "@Pointer") and args.len == 4) {
         const child = try self.resolveIn(env, file, args[2]);
         if (child == .unknown) return child;
-        return self.pointerTo(child, try self.sizeNamed(env, file, args[0]));
+        // A size no reading decides (`info.size` of a type only a binding gives) is the build's
+        // to choose: the pointer keeps what it points at, its size left undecided.
+        const size = try self.sizeNamed(env, file, args[0]);
+        return .{ .pointer = .{ .child = try self.boxed(child), .size = size, .decided = size != null } };
     }
     // A vector is indexed as an array of its lanes, and holds only numbers, truth values and
     // pointers.
@@ -8278,7 +8313,14 @@ fn boundByCallers(self: *Facts, parameter: Decl, position: usize) ResolveError!V
     const found = (try self.callArguments(function, position)) orelse return .{ .unknown = .generic };
     // A call that passes something from a module the build does not have is not compiled.
     var values: std.ArrayList(Value) = .empty;
-    for (found) |value| if (!absent(value)) try values.append(self.gpa, value);
+    for (found) |value| {
+        if (absent(value)) continue;
+        // A binding made through the function itself (`formOf(@typeInfo(T).optional.child)`
+        // in `formOf`), or one past the budget: the calls' bindings are not all read, so the
+        // parameter is what it is without them, a generic position each binding decides.
+        if (value == .unknown and (value.unknown == .cycle or value.unknown == .budget)) return .{ .unknown = .generic };
+        try values.append(self.gpa, value);
+    }
     // No call the build compiles binds it: whatever binding is made decides.
     if (values.items.len == 0) return .{ .unknown = .generic };
     return self.choose(values.items);
@@ -12515,24 +12557,22 @@ pub const calls = struct {
             if (tree.nodeTag(callee) != .field_access) return .{ .unknown = .unsupported };
             const name = try facts.memberName(tree.tokenSlice(tree.nodeData(callee).node_and_token[1]));
             for (value.alternatives) |one| {
-                const container = switch (one) {
-                    .instance => |c| c,
-                    .pointer => |inner| switch (inner.child.*) {
-                        .instance => |c| c,
-                        .alternatives => return .{ .unknown = .unsupported },
-                        else => return .{ .unknown = .unsupported },
-                    },
-                    .optional => |inner| switch (inner.*) {
-                        .instance => |c| c,
-                        .alternatives => return .{ .unknown = .unsupported },
-                        else => return .{ .unknown = .unsupported },
-                    },
-                    .unknown => |why| return .{ .unknown = why },
-                    .alternatives => return .{ .unknown = .unsupported },
-                    else => return .{ .unknown = .unsupported },
+                // A pointer to, or an optional of, a choice of instances: each of them.
+                const inner: Facts.Value = switch (one) {
+                    .pointer => |p| p.child.*,
+                    .optional => |o| o.*,
+                    else => one,
                 };
-                const decl = facts.member(container, name) orelse return .{ .unknown = .unresolved };
-                if (facts.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind != .function) return .{ .unknown = .unsupported };
+                const each: []const Facts.Value = if (inner == .alternatives) inner.alternatives else &.{inner};
+                for (each) |part| {
+                    const container = switch (part) {
+                        .instance => |c| c,
+                        .unknown => |why| return .{ .unknown = why },
+                        else => return .{ .unknown = .unsupported },
+                    };
+                    const decl = facts.member(container, name) orelse return .{ .unknown = .unresolved };
+                    if (facts.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind != .function) return .{ .unknown = .unsupported };
+                }
             }
             return .{ .bound = holder };
         }
@@ -12551,7 +12591,16 @@ pub const calls = struct {
             else => switch (try facts.declaration(decl)) {
                 .function => {},
                 .unknown => |why| return .{ .unknown = why },
-                .alternatives => return .{ .unknown = .unsupported },
+                // A choice of values (`pub const write = if (native) writeNative else
+                // writePortable`): a method where every one is a function, none where none is.
+                .alternatives => |parts| {
+                    var functions: usize = 0;
+                    for (parts) |part| {
+                        if (part == .function) functions += 1;
+                    }
+                    if (functions == 0) return .none;
+                    if (functions != parts.len) return .{ .unknown = .unsupported };
+                },
                 else => return .none,
             },
         }

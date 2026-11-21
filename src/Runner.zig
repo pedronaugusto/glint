@@ -35,7 +35,7 @@ suppressed: usize = 0,
 hidden: std.AutoHashMapUnmanaged(struct { usize, rules.Rule }, Report.Diagnostic) = .empty,
 stale: std.ArrayList(Report.Stale) = .empty,
 /// Where the rules' findings come in; each callback gets the runner back from it.
-sink: Context.Sink = .{ .diagnostic = sinkDiagnostic, .refuse = sinkRefuse, .config = sinkConfig, .suppresses = sinkSuppresses },
+sink: Context.Sink = .{ .diagnostic = sinkDiagnostic, .refuse = sinkRefuse, .config = sinkConfig, .suppresses = sinkSuppresses, .outside = sinkOutside },
 malformed: std.ArrayList(Report.Malformed) = .empty,
 complete: bool = true,
 definitions: []const rules.Definition = &.{},
@@ -44,6 +44,10 @@ files: []const FileConfig = &.{},
 file: Project.FileId = undefined,
 /// The sites each seam held, by seam (its index in the base configuration) and rule.
 seam_sites: std.AutoHashMapUnmanaged(struct { usize, rules.Rule }, usize) = .empty,
+/// Each site a rule found outside its language (`Context.unknownAt`), once, and how many each
+/// rule found.
+outside_sites: std.AutoHashMapUnmanaged(struct { Project.FileId, rules.Rule, u32 }, void) = .empty,
+outside_counts: std.AutoArrayHashMapUnmanaged(rules.Rule, usize) = .empty,
 
 pub const RunError = Suppression.ParseError || Context.Error || std.Io.Cancelable;
 pub const Options = struct {
@@ -170,7 +174,8 @@ pub fn run(gpa: std.mem.Allocator, project: *const Project, options: Options) Ru
     // after the copy would be lost with the arena's earlier state.
     const seams = try runner.seamCounts(config);
     const test_inputs = try testInputCounts(a, project, config);
-    return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .errors = runner.errors.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale.items.len, .stale = runner.stale.items, .malformed = runner.malformed.items, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null, .seams = seams, .test_inputs = test_inputs };
+    const outside = try runner.outsideCounts();
+    return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .errors = runner.errors.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale.items.len, .stale = runner.stale.items, .malformed = runner.malformed.items, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null, .seams = seams, .test_inputs = test_inputs, .outside = outside };
 }
 
 /// Each seam of `config` with the sites it held per rule; stale where every rule it names ran
@@ -363,6 +368,28 @@ fn sinkSuppresses(sink: *Context.Sink, rule: rules.Rule, start: u32) bool {
     const line = runner.project.at(runner.file).file.line(start);
     for (runner.suppressions) |suppression| if (suppression.applies(rule, line)) return true;
     return false;
+}
+/// A site of `rule` at `start` of the current file outside its language: counted once.
+fn sinkOutside(sink: *Context.Sink, rule: rules.Rule, start: u32) Context.Error!void {
+    const runner: *Runner = @fieldParentPtr("sink", sink);
+    if ((try runner.outside_sites.getOrPut(runner.a, .{ runner.file, rule, start })).found_existing) return;
+    const count = try runner.outside_counts.getOrPut(runner.a, rule);
+    if (!count.found_existing) count.value_ptr.* = 0;
+    count.value_ptr.* += 1;
+}
+/// The sites each rule found outside its language, by the rule's name.
+fn outsideCounts(runner: *const Runner) error{OutOfMemory}![]const Report.RuleSites {
+    const counts = try runner.a.alloc(Report.RuleSites, runner.outside_counts.count());
+    for (runner.outside_counts.keys(), runner.outside_counts.values(), counts) |rule, sites, *count| {
+        const named = rules.definition(rule, runner.definitions) orelse unreachable; // safe: a rule that ran is defined.
+        count.* = .{ .name = named.name, .sites = sites };
+    }
+    std.mem.sort(Report.RuleSites, counts, {}, struct {
+        fn less(_: void, a: Report.RuleSites, b: Report.RuleSites) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.less);
+    return counts;
 }
 fn sinkRefuse(sink: *Context.Sink, why: []const u8) Context.Error!void {
     const runner: *Runner = @fieldParentPtr("sink", sink);

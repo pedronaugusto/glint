@@ -62,8 +62,11 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         if (std.mem.eql(u8, name, "@field")) {
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, node, &buffer);
-            if (args.len == 2) if (try namespaceBinding(c, try c.facts.resolve(c.file, args[0]))) |binding|
-                try c.at(rule, token, try c.allocator.print("std.{s}: a raw binding past std's checked layer; only at the package's seam", .{binding}));
+            if (args.len == 2) switch (try namespaceBinding(c, try c.facts.resolve(c.file, args[0]))) {
+                .binding => |binding| try c.at(rule, token, try c.allocator.print("std.{s}: a raw binding past std's checked layer; only at the package's seam", .{binding})),
+                .none => {},
+                .unknown => |why| try c.unknownAt(rule, token, why),
+            };
             continue;
         }
         if (!try atRuntime(c, node)) continue;
@@ -189,7 +192,17 @@ fn lengthless(c: *Context, rule: Rule) Context.Error!void {
         if (c.inTest(token) or !try atRuntime(c, node)) continue;
         const value = try c.facts.resolve(c.file, operand);
         const size: Facts.Size = if (try slicePointer(c, tree, operand)) .many else switch (value) {
-            .pointer => |pointer| pointer.size orelse continue,
+            // A null size is a slicing's (a slice or a pointer to an array, never lengthless), or
+            // one only a binding decides: no pass.
+            .pointer => |pointer| pointer.size orelse {
+                if (!pointer.decided) try c.unknownAt(rule, token, .comptime_dependent);
+                continue;
+            },
+            // An operand whose type is unknown may be a many-item pointer: no pass.
+            .unknown => |why| {
+                try c.unknownAt(rule, token, why);
+                continue;
+            },
             else => continue,
         };
         if (size != .many and size != .c) continue;
@@ -214,14 +227,19 @@ fn slicePointer(c: *Context, tree: *const Ast, written: Ast.Node.Index) Context.
 }
 
 /// std's reinterpretations by name: `mem.bytesAsValue` and `mem.bytesAsSlice`. A reference spelling
-/// one that does not resolve cannot be shown to be another: a finding, as under any ban.
+/// one that does not resolve is no pass, as under any ban (`Context.unknownAt`).
 fn reinterpreted(c: *Context, rule: Rule) Context.Error!void {
     // A std that declares neither has none to reference: silent, as a lookup that finds none is.
     var found: std.ArrayList(Governed.Governed) = .empty;
     for ([_][]const u8{ "mem.bytesAsValue", "mem.bytesAsSlice" }, 0..) |path, i| {
         const decls = switch (try Governed.declarations(c, "std", path)) {
             .decls => |decls| decls,
-            .none, .unknown => continue,
+            .none => continue,
+            // A std the run cannot read: the file's first token stands for every site of it.
+            .unknown => |why| {
+                try c.unknownAt(rule, 0, why);
+                continue;
+            },
         };
         try found.append(c.allocator, .{ .target = .{ .source = "std", .declaration = path, .production = true }, .index = i, .name = path["mem.".len..], .decls = decls, .symbol = null });
     }
@@ -230,7 +248,7 @@ fn reinterpreted(c: *Context, rule: Rule) Context.Error!void {
     try Governed.sitesLeaving(c, found.items, &sites, &unread);
     for (sites.items) |site| try c.atDefinition(rule, site.token, "a reinterpretation of bytes as another type no build checks", site.decl);
     const tree = &c.project.at(c.file).file.tree;
-    for (unread.items) |missed| try c.at(rule, tree.firstToken(missed.node), try c.allocator.print("a reference spelling std's mem.bytesAsValue or bytesAsSlice does not resolve ({t}), so it cannot be shown to be another", .{missed.why}));
+    for (unread.items) |missed| try c.unknownAt(rule, tree.firstToken(missed.node), missed.why);
 }
 
 /// A member of std's raw OS and C bindings, named where the program reaches it: a member access
@@ -243,23 +261,28 @@ fn rawBindings(c: *Context, rule: Rule) Context.Error!void {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(raw));
         const member = tree.nodeData(node).node_and_token[1];
         if (c.inTest(member)) continue;
-        const binding = (try namespaceBinding(c, try c.facts.resolve(c.file, tree.nodeData(node).node_and_token[0]))) orelse continue;
-        try c.at(rule, member, try c.allocator.print("std.{s}: a raw binding past std's checked layer; only at the package's seam", .{binding}));
+        switch (try namespaceBinding(c, try c.facts.resolve(c.file, tree.nodeData(node).node_and_token[0]))) {
+            .binding => |binding| try c.at(rule, member, try c.allocator.print("std.{s}: a raw binding past std's checked layer; only at the package's seam", .{binding})),
+            .none => {},
+            .unknown => |why| try c.unknownAt(rule, member, why),
+        }
     }
 }
 
 /// The raw binding a holder is, or any build's choice of it is: a binding's namespace, the file
 /// itself (or a file of its directory), never a type it declares, so a constant std's portable
-/// layer takes from it (`std.posix.E.AGAIN`) is none.
-fn namespaceBinding(c: *Context, value: Facts.Value) Context.Error!?[]const u8 {
+/// layer takes from it (`std.posix.E.AGAIN`) is none. Unknown where the holder is.
+const Binding = union(enum) { binding: []const u8, none, unknown: Facts.Unknown };
+fn namespaceBinding(c: *Context, value: Facts.Value) Context.Error!Binding {
     for (Facts.valueParts(&value)) |part| switch (part) {
         .container => |container| {
             if (container.scope != c.facts.rootOf(container.file).scope) continue;
-            if (try bindingOf(c, container.file)) |binding| return binding;
+            if (try bindingOf(c, container.file)) |binding| return .{ .binding = binding };
         },
+        .unknown => |why| return .{ .unknown = why },
         else => {},
     };
-    return null;
+    return .none;
 }
 
 /// Which raw binding a std file is, if one: `c`, `os.linux` or `os.windows`, or a file of theirs.

@@ -389,6 +389,29 @@ test "P007 reads a slice's .ptr as the many-item pointer it is; @fieldParentPtr,
     , 1);
 }
 
+/// P007 alone over `program`: its findings, its sites outside the ban, and whether the run is complete.
+fn unknowns(program: []const u8, findings: usize, outside: usize, complete: bool) !void {
+    var project = try sources.projectAs(std.testing.allocator, program, .{}, &std_files, &std_imports);
+    defer project.deinit();
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = .{ .enabled = .empty, .selections = &.{.{ .rule = .P007, .level = .report }} } });
+    defer report.deinit();
+    try std.testing.expectEqual(findings, report.diagnostics.len);
+    var counted: usize = 0;
+    for (report.outside) |rule| if (std.mem.eql(u8, rule.name, "P007")) {
+        counted = rule.sites;
+    };
+    try std.testing.expectEqual(outside, counted);
+    try std.testing.expectEqual(complete, report.complete);
+    try std.testing.expectEqual(@as(usize, if (complete) 0 else 1), report.errors.len);
+}
+
+test "P007: an index into a value only a binding types is counted outside the ban, never a pass; one glint does not resolve makes the run incomplete, by name" {
+    try unknowns("pub fn f(p: anytype) u8 {\n    return p[1];\n}\n", 0, 1, true);
+    try unknowns("pub fn g() u8 {\n    return nowhere[1];\n}\n", 0, 0, false);
+    // A slice's index is checked: nothing to decide.
+    try unknowns("pub fn h(b: []const u8) u8 {\n    return b[1];\n}\n", 0, 0, true);
+}
+
 test "Z006 leaves a type std's type function gives alone; a labeled block's value is a value" {
     try expect(.Z006,
         \\const std = @import("std");
