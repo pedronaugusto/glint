@@ -335,6 +335,39 @@ test "a build script reads a module's name as the build runner binds it: a depen
     try std.testing.expectEqual(null, std.mem.find(u8, mapped.written(), "missing_mapping"));
 }
 
+test "a module name given several roots reaches each, as modules that bind it apart do" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "lib");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "lib/root.zig", .data = "pub const other = 1;\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "lib/bench.zig", .data = "pub extern \"c\" fn fsync(fd: c_int) c_int;\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "main.zig", .data = "const lib = @import(\"lib\");\npub fn f() void { _ = lib.fsync(0); }\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data =
+        \\{"profile": "none", "rules": [{"id": "P006", "level": "gate"}],
+        \\ "disallowed": [{"declaration": "fsync", "reason": "durability belongs to airlock", "replacement": "airlock.syncFile", "owners": ["airlock"]}]}
+    });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    const paths = [_][]const u8{ "config.json", "lib/root.zig", "lib/bench.zig", "main.zig" };
+    var joined: [paths.len][]const u8 = undefined;
+    for (paths, &joined) |path, *out| out.* = try std.Io.Dir.path.join(a, &.{ root, path });
+    defer for (joined) |path| a.free(path);
+    const library = try std.mem.concat(a, u8, &.{ "lib=", joined[1] });
+    defer a.free(library);
+    const bench = try std.mem.concat(a, u8, &.{ "lib=", joined[2] });
+    defer a.free(bench);
+    // The library's root alone declares no `fsync`: a call Zig refuses there reaches nothing.
+    var alone: std.Io.Writer.Allocating = .init(a);
+    defer alone.deinit();
+    try std.testing.expectEqual(@as(u8, 0), try cli.execute(a, std.testing.io, &.{ "glint", "--config", joined[0], "--module", library, joined[3] }, &alone.writer, &quiet.writer, .{}));
+    // With the module that binds the name apart, the call reaches its `fsync`.
+    var both: std.Io.Writer.Allocating = .init(a);
+    defer both.deinit();
+    try std.testing.expectEqual(@as(u8, 1), try cli.execute(a, std.testing.io, &.{ "glint", "--config", joined[0], "--module", library, "--module", bench, joined[3] }, &both.writer, &quiet.writer, .{})); // safe: findings exit.
+    try std.testing.expect(std.mem.find(u8, both.written(), "main.zig:2") != null);
+}
+
 test "--only beside --config runs only its rules, under the configuration's options and never its rules" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

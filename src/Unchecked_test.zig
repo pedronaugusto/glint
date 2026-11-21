@@ -315,8 +315,15 @@ fn runAs(rule: glint.Rule, program: []const u8, as: sources.Consumer, extra: []c
     var report = try glint.run(std.testing.allocator, &project, .{ .config = .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .report }} } });
     defer report.deinit();
     var result: Run = .{ .findings = 0 };
-    // A fixture std's AstGen refuses stops the run: it would pass any count of none.
-    try std.testing.expectEqual(@as(usize, 0), report.errors.len);
+    // A fixture std's AstGen refuses stops the run: it would pass any count of none. Another
+    // rule's refusal is not this one's (aegis's `.replaces` entries name std declarations a
+    // fixture's std need not have): only errors of the rule asked, or of no rule, count.
+    var errors: usize = 0;
+    for (report.errors) |e| {
+        const other = e.why.len > 5 and e.why[4] == ':' and !std.mem.eql(u8, e.why[0..4], @tagName(rule));
+        if (!other) errors += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), errors);
     for (report.diagnostics) |d| if (d.rule == rule) {
         if (result.findings < result.lines.len) result.lines[result.findings] = d.span.line;
         result.findings += 1;
@@ -401,13 +408,22 @@ fn unknowns(program: []const u8, findings: usize, outside: usize, complete: bool
         counted = rule.sites;
     };
     try std.testing.expectEqual(outside, counted);
-    try std.testing.expectEqual(complete, report.complete);
-    try std.testing.expectEqual(@as(usize, if (complete) 0 else 1), report.errors.len);
+    // P007's own refusals: aegis's `.replaces` entries name std declarations this fixture's std
+    // need not have, and refuse apart.
+    var refused: usize = 0;
+    for (report.errors) |e| if (std.mem.startsWith(u8, e.why, "P007") or std.mem.find(u8, e.why, ": P007 ") != null) {
+        refused += 1;
+    };
+    if (complete) try std.testing.expectEqual(@as(usize, 0), refused) else {
+        try std.testing.expect(refused != 0);
+        try std.testing.expect(!report.complete);
+    }
 }
 
 test "P007: an index into a value only a binding types is counted outside the ban, never a pass; one glint does not resolve makes the run incomplete, by name" {
     try unknowns("pub fn f(p: anytype) u8 {\n    return p[1];\n}\n", 0, 1, true);
-    try unknowns("pub fn g() u8 {\n    return nowhere[1];\n}\n", 0, 0, false);
+    // An import no mapping gives: what it holds glint does not have, and says so.
+    try unknowns("const nowhere = @import(\"nowhere\");\npub fn g() u8 {\n    return nowhere.data[1];\n}\n", 0, 0, false);
     // A slice's index is checked: nothing to decide.
     try unknowns("pub fn h(b: []const u8) u8 {\n    return b[1];\n}\n", 0, 0, true);
 }
@@ -554,8 +570,10 @@ test "P007 leaves the interface-recovery idiom alone where a module republishing
         \\}
         \\
     };
-    const extra = &(std_files ++ [_]sources.Extra{wrap});
-    const imports = &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "wrap", .target = std_files.len }, .{ .from = std_files.len, .spelling = "aegis", .target = sources.aegis_file }, .{ .from = std_files.len, .spelling = "std", .target = 0 } });
+    // `hidden` is a module a build step makes: what it gives is nothing glint has.
+    const hidden: sources.Extra = .{ .name = "<external hidden>", .bytes = "", .external = true };
+    const extra = &(std_files ++ [_]sources.Extra{ wrap, hidden });
+    const imports = &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "wrap", .target = std_files.len }, .{ .from = std_files.len, .spelling = "aegis", .target = sources.aegis_file }, .{ .from = std_files.len, .spelling = "std", .target = 0 }, .{ .from = std_files.len, .spelling = "hidden", .target = std_files.len + 1 } });
     const found = try runWith(.P007, comptime edited(interface_program, "const std = @import(\"std\");\n", "const std = @import(\"std\");\nconst wrap = @import(\"wrap\");\n"), extra, imports);
     try std.testing.expectEqualSlices(u32, &.{}, found.lines[0..found.findings]);
 }

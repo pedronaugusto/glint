@@ -6750,11 +6750,41 @@ pub fn definition(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Reso
 }
 
 /// The declaration a member of a choice of holders names: the one every part that can hold the
-/// member names. A part that has no member a name reads (an optional, an error union, a number,
-/// a type declaring none so named) is not the holder wherever Zig compiles the access, as
-/// `memberOfChoice` reads one. Parts naming different declarations are not read here.
+/// member names. Parts naming different declarations name one each build takes, which one name
+/// does not say: `definitions` gives them all.
 fn definitionOfChoice(self: *Facts, parts: []const Value, name: []const u8) ResolveError!Named {
-    var found: ?Decl = null;
+    return switch (try self.membersOfChoice(parts, name)) {
+        .decls => |decls| if (decls.len == 1) .{ .decl = decls[0] } else .{ .unknown = .unsupported },
+        .unknown => |why| .{ .unknown = why },
+    };
+}
+
+/// The declarations a name or a member access names: one, or each a choice of holders may give.
+pub const Definitions = union(enum) { decls: []const Decl, unknown: Unknown };
+
+/// `definition`, a choice of holders read part by part: the declaration each part that holds the
+/// member names, every one of them. Empty where it names none (a primitive, a number's member).
+pub fn definitions(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Definitions {
+    const tree = &self.project.at(file).file.tree;
+    if (tree.nodeTag(node) == .field_access) {
+        const data = tree.nodeData(node).node_and_token;
+        const value = try self.resolve(file, data[0]);
+        const holder = if (value == .pointer) value.pointer.child.* else value;
+        if (holder == .alternatives) return self.membersOfChoice(holder.alternatives, try self.memberName(tree.tokenSlice(data[1])));
+    }
+    return switch (try self.definition(file, node)) {
+        .decl => |decl| .{ .decls = try self.gpa.dupe(Decl, &.{decl}) },
+        .none => .{ .decls = &.{} },
+        .unknown => |why| .{ .unknown = why },
+    };
+}
+
+/// The declarations a member of a choice of holders names, once each. A part that has no member
+/// a name reads (an optional, an error union, a number, a type declaring none so named) is not
+/// the holder wherever Zig compiles the access, as `memberOfChoice` reads one; with none that
+/// holds it, the access names nothing Zig compiles: unresolved.
+fn membersOfChoice(self: *Facts, parts: []const Value, name: []const u8) ResolveError!Definitions {
+    var found: std.ArrayList(Decl) = .empty;
     for (parts) |one| {
         const part = if (one == .pointer) one.pointer.child.* else one;
         const container = switch (part) {
@@ -6765,10 +6795,12 @@ fn definitionOfChoice(self: *Facts, parts: []const Value, name: []const u8) Reso
         };
         if (self.lacks(container, name)) continue;
         const decl = self.member(container, name) orelse return .{ .unknown = .unresolved };
-        if (found) |first| if (first.file != decl.file or first.index != decl.index) return .{ .unknown = .unsupported };
-        found = decl;
+        for (found.items) |known| {
+            if (known.file == decl.file and known.index == decl.index) break;
+        } else try found.append(self.gpa, decl);
     }
-    return if (found) |decl| .{ .decl = decl } else .{ .unknown = .unresolved };
+    if (found.items.len == 0) return .{ .unknown = .unresolved };
+    return .{ .decls = found.items };
 }
 
 /// Literal reflection binds a declaration only on a concrete, resolved container.
@@ -6860,6 +6892,50 @@ pub fn origin(self: *Facts, start: Decl) ResolveError!Named {
             .unknown => |why| return .{ .unknown = why },
         };
     }
+}
+
+/// `origin`, through an alias of a member of a choice of holders (`const sync = state.flush`
+/// where `state` is a platform's type): each declaration a build may take is followed to its
+/// own origin, every one of them. A cycle of aliases Zig refuses, and is unknown as in `origin`.
+pub fn origins(self: *Facts, start: Decl) ResolveError!Definitions {
+    var found: std.ArrayList(Decl) = .empty;
+    var path: std.ArrayList(Decl) = .empty;
+    defer path.deinit(self.gpa);
+    if (try self.originsFrom(start, &found, &path)) |why| return .{ .unknown = why };
+    return .{ .decls = found.items };
+}
+
+fn originsFrom(self: *Facts, current: Decl, found: *std.ArrayList(Decl), path: *std.ArrayList(Decl)) ResolveError!?Unknown {
+    for (path.items) |earlier| if (std.meta.eql(earlier, current)) return .cycle;
+    const record = self.project.at(current.file).model.declarations[@backingInt(current.index)];
+    const own: ?Ast.Node.Index = own: {
+        if (record.kind != .variable) break :own null;
+        const tree = &self.project.at(current.file).file.tree;
+        const expr = tree.fullVarDecl(record.node).?.ast.init_node.unwrap() orelse break :own null;
+        if (tree.nodeTag(expr) != .identifier and tree.nodeTag(expr) != .field_access) break :own null;
+        break :own expr;
+    };
+    const expr = own orelse {
+        for (found.items) |known| {
+            if (std.meta.eql(known, current)) break;
+        } else try found.append(self.gpa, current);
+        return null;
+    };
+    const next = switch (try self.definitions(current.file, expr)) {
+        .decls => |decls| decls,
+        .unknown => |why| return why,
+    };
+    // An alias of a primitive (`const Int = u8`) is its own origin.
+    if (next.len == 0) {
+        for (found.items) |known| {
+            if (std.meta.eql(known, current)) break;
+        } else try found.append(self.gpa, current);
+        return null;
+    }
+    try path.append(self.gpa, current);
+    defer _ = path.pop();
+    for (next) |each| if (try self.originsFrom(each, found, path)) |why| return why;
+    return null;
 }
 
 /// A value of the type `value` names: an instance of a container, and through a pointer,

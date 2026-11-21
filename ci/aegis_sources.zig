@@ -256,7 +256,8 @@ fn withLib(gpa: std.mem.Allocator, consumer: []const u8, lib: []const u8, select
 
 /// A source of another module beside aegis's, such as a fixture standing for std, in the
 /// package `package` names (none where empty); ZON data a Zig file imports where `kind` says.
-pub const Extra = struct { name: []const u8, bytes: []const u8, package: []const u8 = "", kind: @FieldType(Project.Input, "kind") = .zig };
+/// A source beside aegis's; `external`: a module a build step makes, bodiless (`Project.Input.external`).
+pub const Extra = struct { name: []const u8, bytes: []const u8, package: []const u8 = "", kind: @FieldType(Project.Input, "kind") = .zig, external: bool = false };
 /// An import among the extra sources, by their index in what the caller gives; a null `from` is
 /// the consumer's, a `target` of `consumer_file` the consumer itself and of `aegis_file` aegis's
 /// root.
@@ -335,7 +336,7 @@ pub fn projectAs(gpa: std.mem.Allocator, consumer: []const u8, as: Consumer, ext
         inputs[i] = aegisInput(source);
         inputs[i].compilations = others;
     }
-    for (extra, sources.len + 1..) |source, i| inputs[i] = .{ .name = source.name, .bytes = source.bytes, .kind = source.kind, .selected = false, .package = source.package, .compilations = others };
+    for (extra, sources.len + 1..) |source, i| inputs[i] = .{ .name = source.name, .bytes = source.bytes, .kind = source.kind, .selected = false, .package = source.package, .compilations = others, .external = source.external };
     const mapped = try imports(gpa);
     defer gpa.free(mapped);
     // The std the consumer imports is aegis's too, as one build binds one std for every module.

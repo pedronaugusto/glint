@@ -173,11 +173,17 @@ const Loader = struct {
                 for (self.options.build_modules.items) |module| if (std.mem.eql(u8, spelling, module.name)) {
                     try self.map(from, spelling, try self.load(module.path, false), .build);
                 };
+                // A program's module, by its name: each root a `--module` of the name gives, as
+                // modules of the program bind the name apart (a benchmark's `relic` is not the
+                // library's root), an import of it read as any of them.
+                var by_module = false;
+                if (!std.mem.eql(u8, spelling, Project.std_module)) for (self.options.modules.items) |module| if (std.mem.eql(u8, spelling, module.name)) {
+                    by_module = true;
+                    try self.map(from, spelling, try self.load(module.path, false), .program);
+                };
+                if (by_module) continue;
                 const target_path = (try aegis.input.Untrusted(Spelling).init(.{ .from = cursor, .text = spelling }).parse(self, Loader.importPath)) orelse continue;
-                const program = !std.mem.eql(u8, spelling, Project.std_module) and for (self.options.modules.items) |module| {
-                    if (std.mem.eql(u8, spelling, module.name)) break true;
-                } else false;
-                try self.map(from, spelling, try self.load(target_path, false), if (program) .program else .every);
+                try self.map(from, spelling, try self.load(target_path, false), .every);
             }
         }
     }
@@ -256,7 +262,7 @@ const Loader = struct {
     /// An `@import` a loaded file spells, and the file it is written in.
     const Spelling = struct { from: usize, text: []const u8 };
 
-    /// The file an import names: std's or a module's root by its name, or a relative path,
+    /// The file an import names: std's root, or a relative path,
     /// resolved against the importing file's directory, inside the roots as Zig requires of a
     /// module's imports; null for a name that is no file of the run.
     fn importPath(self: *Loader, spelling: Spelling) error{ OutOfMemory, ImportOutsideRoots }!?[]const u8 {
@@ -264,7 +270,6 @@ const Loader = struct {
             const lib = self.options.zig_lib_path orelse return null;
             return try std.Io.Dir.path.join(self.a, &.{ lib, "std", "std.zig" });
         }
-        for (self.options.modules.items) |module| if (std.mem.eql(u8, spelling.text, module.name)) return module.path;
         // A relative path names a Zig file or a ZON one (`@import("data.zon")`), read as ZON.
         if (!std.mem.endsWith(u8, spelling.text, ".zig") and !std.mem.endsWith(u8, spelling.text, ".zon")) return null;
         if (spelling.from >= self.canonical_paths.items.len) return null;
@@ -375,7 +380,7 @@ pub const Arguments = struct {
             .fix = .{ .negatable = false, .help = "Apply each finding's deterministic fix to its file (the aegis pack's), and remove escapes that cover nothing; the report is the run before them" },
             .escapes_before = .{ .value_name = "FILE", .hint = .file, .help = "The escapes a run before reported (its text report, or preflight's escapes.txt): --fix names an escape in the older form, at that place with those words, with only the rules listed for it there that find something now, and leaves one not listed to its owner; never with --only" },
             .zig_lib_path = .{ .value_name = "DIR", .hint = .directory, .section = "Inputs", .help = "Zig's library, for std's imports" },
-            .module = .{ .value_name = "NAME=FILE", .section = "Inputs", .help = "A module the files import by name, and its root file, repeated" },
+            .module = .{ .value_name = "NAME=FILE", .section = "Inputs", .help = "A module the files import by name, and its root file, repeated; a name given several roots (modules that bind it apart) reaches each" },
             .build_module = .{ .value_name = "NAME=FILE", .section = "Inputs", .help = "A dependency's build script a build script imports by name (`@import(\"aegis\")` in build.zig), repeated: without one, a build script's import of a name only --module gives reaches nothing" },
             .exported = .{ .value_name = "FILE", .hint = .file, .section = "Inputs", .help = "The root of a module the package exports, repeated: Z012 reads the public surface these reach, and none without one" },
             .external = .{ .value_name = "NAME", .section = "Inputs", .help = "A module whose bytes a build step makes (translate-c, a Run step's output), repeated: an import of it is read as nothing glint has, never linted" },

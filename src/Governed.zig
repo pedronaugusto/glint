@@ -997,9 +997,9 @@ fn aliasesIn(self: *Context, comptime among: AliasScope, found: *Aliases(among),
                 else => {},
             },
             .unknown => unknown = true,
-            else => switch (try self.facts.origin(decl)) {
-                .decl => |reached| try aliasOf(self, found, reached, decl, d.name),
-                .none => {},
+            // Each declaration it may name, through a choice of holders a build decides.
+            else => switch (try self.facts.origins(decl)) {
+                .decls => |reached| for (reached) |each| try aliasOf(self, found, each, decl, d.name),
                 .unknown => unknown = true,
             },
         }
