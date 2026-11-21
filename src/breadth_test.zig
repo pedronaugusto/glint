@@ -12,6 +12,7 @@ const rules = @import("Rule.zig");
 
 pub const SameOperands = @import("SameOperands.zig");
 pub const LostUpdate = @import("LostUpdate.zig");
+pub const WriteOnlyHandle = @import("WriteOnlyHandle.zig");
 pub const RepeatedCondition = @import("RepeatedCondition.zig");
 pub const NarrowWidened = @import("NarrowWidened.zig");
 pub const LargeStackArray = @import("LargeStackArray.zig");
@@ -95,6 +96,22 @@ pub const fixture_std =
     \\        pub fn stderr() File { return .{ .handle = 2 }; }
     \\        pub fn writer(file: File, io: Io, buffer: []u8) Writer { _ = file; _ = io; _ = buffer; return .{}; }
     \\        pub fn writerStreaming(file: File, io: Io, buffer: []u8) Writer { _ = file; _ = io; _ = buffer; return .{}; }
+    \\        pub const Stat = struct { size: u64 };
+    \\        pub fn stat(file: File, io: Io) !Stat { _ = file; _ = io; return .{ .size = 0 }; }
+    \\        pub fn length(file: File, io: Io) !u64 { _ = file; _ = io; return 0; }
+    \\        pub fn setLength(file: File, io: Io, n: u64) !void { _ = file; _ = io; _ = n; }
+    \\        pub fn sync(file: File, io: Io) !void { _ = file; _ = io; }
+    \\        pub fn close(file: File, io: Io) void { _ = file; _ = io; }
+    \\        pub fn readPositional(file: File, io: Io, buffers: []const []u8, offset: u64) !usize { _ = file; _ = io; _ = offset; return buffers.len; }
+    \\    };
+    \\    pub const Dir = struct {
+    \\        handle: i32,
+    \\        pub const OpenFileOptions = struct { mode: enum { read_only, write_only, read_write } = .read_only };
+    \\        pub const CreateFileOptions = struct { read: bool = false, truncate: bool = true };
+    \\        pub fn openFile(dir: Dir, io: Io, path: []const u8, options: OpenFileOptions) !File { _ = dir; _ = io; _ = path; _ = options; return .{ .handle = 3 }; }
+    \\        pub fn createFile(dir: Dir, io: Io, path: []const u8, options: CreateFileOptions) !File { _ = dir; _ = io; _ = path; _ = options; return .{ .handle = 3 }; }
+    \\        pub fn openFileAbsolute(io: Io, path: []const u8, options: OpenFileOptions) !File { _ = io; _ = path; _ = options; return .{ .handle = 3 }; }
+    \\        pub fn createFileAbsolute(io: Io, path: []const u8, options: CreateFileOptions) !File { _ = io; _ = path; _ = options; return .{ .handle = 3 }; }
     \\    };
     \\};
 ;
@@ -242,6 +259,7 @@ pub fn expectFixes(comptime check: Check, source: []const u8, expected: usize, f
 test {
     _ = SameOperands;
     _ = LostUpdate;
+    _ = WriteOnlyHandle;
     _ = RepeatedCondition;
     _ = NarrowWidened;
     _ = LargeStackArray;

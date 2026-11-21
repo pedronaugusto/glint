@@ -73,9 +73,9 @@ vocabulary, the configuration, run errors, and what glint does not claim.
 - **Hygiene**: naming, syntax the next Zig refuses (Z003, Z034), line and function length, deprecated calls,
   private types in public signatures, unused imports, dead declarations, an assertion of `a and b`, debug
   prints, identifying integers of one type that may stand for one another (P008), a pointer into the frame
-  returned (P009), a call handed the place a compound assignment updates (Z057), and the breadth rules
-  Z035-Z056 (same operands, constant conditions, narrow arithmetic widened, large stack arrays, NaN and
-  inexact float comparisons, and more).
+  returned (P009), a call handed the place a compound assignment updates (Z057), a stat or read on a file
+  opened write-only (Z058), and the breadth rules Z035-Z056 (same operands, constant conditions, narrow
+  arithmetic widened, large stack arrays, NaN and inexact float comparisons, and more).
 - **Not in scope**: proving that a program cannot panic, tracking input or overflow, or the lifetime of a
   pointer. Those belong to ReleaseSafe, to aegis's types, and to each package's fuzzing and testing allocator.
   glint never runs the checked project's build or its comptime code.

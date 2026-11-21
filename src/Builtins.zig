@@ -35,6 +35,7 @@ const PublicAnytype = @import("PublicAnytype.zig");
 const RepeatedCondition = @import("RepeatedCondition.zig");
 const SameOperands = @import("SameOperands.zig");
 const LostUpdate = @import("LostUpdate.zig");
+const WriteOnlyHandle = @import("WriteOnlyHandle.zig");
 const SelfRecursion = @import("SelfRecursion.zig");
 const UndefinedConst = @import("UndefinedConst.zig");
 const UndefinedReason = @import("UndefinedReason.zig");
@@ -87,6 +88,7 @@ fn breadth(context: *Context) RunError!void {
     if (context.config.has(.Z055)) try PublicAnytype.check(context, .Z055);
     if (context.config.has(.Z056)) try EmptyBranch.check(context, .Z056);
     if (context.config.has(.Z057)) try LostUpdate.check(context, .Z057);
+    if (context.config.has(.Z058)) try WriteOnlyHandle.check(context, .Z058);
     if (context.config.has(.P007)) try Unchecked.check(context, .P007);
     if (context.config.has(.P008)) try SameTypeIds.check(context, .P008);
     if (context.config.has(.P009)) try Escapes.check(context, .P009);
