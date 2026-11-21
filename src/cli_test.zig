@@ -285,6 +285,56 @@ test "a package directory names its files' package, the innermost one winning" {
     try std.testing.expectError(error.InvalidPackage, cli.execute(a, std.testing.io, &.{ "glint", "--package", "=dir", joined[3] }, &output.writer, &quiet.writer, .{}));
 }
 
+test "a build script reads a module's name as the build runner binds it: a dependency no mapping gives, never the program's module" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const call = "const lib = @import(\"lib\");\npub fn f() void { _ = lib.fsync(0); }\n";
+    try tmp.dir.createDirPath(std.testing.io, "app/src");
+    try tmp.dir.createDirPath(std.testing.io, "app/build");
+    try tmp.dir.createDirPath(std.testing.io, "lib");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/build.zig.zon", .data = ".{ .name = .app, .version = \"0.0.0\" }\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/build.zig", .data = "const helper = @import(\"build/helper.zig\");\nconst lib = @import(\"lib\");\npub fn build() void { _ = lib.fsync(0); helper.f(); }\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/build/helper.zig", .data = call });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/src/main.zig", .data = call });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "lib/root.zig", .data = "pub extern \"c\" fn fsync(fd: c_int) c_int;\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "lib/build.zig", .data = "pub fn fsync(fd: c_int) c_int {\n    return fd;\n}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data =
+        \\{"profile": "none", "rules": [{"id": "P006", "level": "gate"}],
+        \\ "disallowed": [{"declaration": "fsync", "reason": "durability belongs to airlock", "replacement": "airlock.syncFile", "owners": ["airlock"]}]}
+    });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    const paths = [_][]const u8{ "config.json", "lib/root.zig", "app/build.zig", "app/build/helper.zig", "app/src/main.zig", "lib/build.zig" };
+    var joined: [paths.len][]const u8 = undefined;
+    for (paths, &joined) |path, *out| out.* = try std.Io.Dir.path.join(a, &.{ root, path });
+    defer for (joined) |path| a.free(path);
+    const module = try std.mem.concat(a, u8, &.{ "lib=", joined[1] });
+    defer a.free(module);
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    const status = try cli.execute(a, std.testing.io, &.{ "glint", "--config", joined[0], "--module", module, joined[2], joined[3], joined[4] }, &output.writer, &quiet.writer, .{});
+    // The program's call reaches the library's `fsync`; the build runner's `lib` is the
+    // dependency's build script, which no mapping gives: glint reads nothing there and says so.
+    try std.testing.expectEqual(@as(u8, 2), status); // safe: an incomplete run exits 2.
+    try std.testing.expect(std.mem.find(u8, output.written(), "main.zig:2") != null);
+    try std.testing.expectEqual(null, std.mem.find(u8, output.written(), "build.zig:3:24: P006: disallowed"));
+    try std.testing.expectEqual(null, std.mem.find(u8, output.written(), "helper.zig:2:24: P006: disallowed"));
+    try std.testing.expect(std.mem.count(u8, output.written(), "(missing_mapping)") == 2);
+    // With the dependency's build script named, the build runner's `lib.fsync` is its own: no
+    // ban's, and read.
+    const script = try std.mem.concat(a, u8, &.{ "lib=", joined[5] });
+    defer a.free(script);
+    var mapped: std.Io.Writer.Allocating = .init(a);
+    defer mapped.deinit();
+    const complete = try cli.execute(a, std.testing.io, &.{ "glint", "--config", joined[0], "--module", module, "--build-module", script, joined[2], joined[3], joined[4] }, &mapped.writer, &quiet.writer, .{});
+    try std.testing.expectEqual(@as(u8, 1), complete); // safe: findings exit.
+    try std.testing.expect(std.mem.find(u8, mapped.written(), "main.zig:2") != null);
+    try std.testing.expectEqual(null, std.mem.find(u8, mapped.written(), "build.zig:3"));
+    try std.testing.expectEqual(null, std.mem.find(u8, mapped.written(), "helper.zig:2"));
+    try std.testing.expectEqual(null, std.mem.find(u8, mapped.written(), "missing_mapping"));
+}
+
 test "--only beside --config runs only its rules, under the configuration's options and never its rules" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

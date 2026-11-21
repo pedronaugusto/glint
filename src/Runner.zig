@@ -47,7 +47,7 @@ seam_sites: std.AutoHashMapUnmanaged(struct { usize, rules.Rule }, usize) = .emp
 /// Each site a rule found outside its language (`Context.unknownAt`), once, and how many each
 /// rule found.
 outside_sites: std.AutoHashMapUnmanaged(struct { Project.FileId, rules.Rule, u32 }, void) = .empty,
-outside_counts: std.AutoArrayHashMapUnmanaged(rules.Rule, usize) = .empty,
+outside_counts: std.array_hash_map.Auto(rules.Rule, usize) = .empty,
 
 pub const RunError = Suppression.ParseError || Context.Error || std.Io.Cancelable;
 pub const Options = struct {

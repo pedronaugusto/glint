@@ -22,6 +22,8 @@ const Parsed = struct {
     exported: std.ArrayList([]const u8) = .empty,
     /// Modules whose bytes a build step makes, by name (`Project.Input.external`).
     externals: std.ArrayList([]const u8) = .empty,
+    /// Dependencies' build scripts, by the name a build script imports each as.
+    build_modules: std.ArrayList(Module) = .empty,
     /// Directories whose files belong to a named package (`Project.Input.package`).
     packages: std.ArrayList(Module) = .empty,
     roots: std.ArrayList([]const u8) = .empty,
@@ -45,6 +47,8 @@ const Loader = struct {
     options: *const Parsed,
     inputs: std.ArrayList(Project.Input) = .empty,
     mappings: std.ArrayList(Project.Import) = .empty,
+    /// The compilation each mapping's name is bound in (`compile`).
+    bound: std.ArrayList(Bound) = .empty,
     /// Each loaded file's position in `inputs`, by its canonical path.
     paths: std.StringHashMapUnmanaged(usize) = .empty,
     canonical_paths: std.ArrayList([]const u8) = .empty,
@@ -161,18 +165,92 @@ const Loader = struct {
                 const external = for (self.options.externals.items) |name| {
                     if (std.mem.eql(u8, name, spelling)) break true;
                 } else false;
-                const target = if (external) try self.externalInput(spelling) else target: {
-                    const target_path = (try aegis.input.Untrusted(Spelling).init(.{ .from = cursor, .text = spelling }).parse(self, Loader.importPath)) orelse continue;
-                    break :target try self.load(target_path, false);
+                if (external) {
+                    try self.map(from, spelling, try self.externalInput(spelling), .every);
+                    continue;
+                }
+                // A dependency's build script, by the name a build script imports it as.
+                for (self.options.build_modules.items) |module| if (std.mem.eql(u8, spelling, module.name)) {
+                    try self.map(from, spelling, try self.load(module.path, false), .build);
                 };
-                var duplicate = false;
-                for (self.mappings.items) |m| if (m.from == from and std.mem.eql(u8, m.spelling, spelling)) {
-                    duplicate = true;
-                    break;
-                };
-                if (!duplicate) try self.mappings.append(self.a, .{ .from = from, .spelling = spelling, .target = target });
+                const target_path = (try aegis.input.Untrusted(Spelling).init(.{ .from = cursor, .text = spelling }).parse(self, Loader.importPath)) orelse continue;
+                const program = !std.mem.eql(u8, spelling, Project.std_module) and for (self.options.modules.items) |module| {
+                    if (std.mem.eql(u8, spelling, module.name)) break true;
+                } else false;
+                try self.map(from, spelling, try self.load(target_path, false), if (program) .program else .every);
             }
         }
+    }
+
+    /// Where an import's name is bound: in every compilation that compiles the file (a path,
+    /// std, an external module), or in one alone: a `--module`'s in the program's, a
+    /// `--build-module`'s in the build runner's.
+    const Bound = enum { every, program, build };
+
+    fn map(self: *Loader, from: usize, spelling: []const u8, target: usize, bound: Bound) !void {
+        for (self.mappings.items) |m| if (m.from == from and m.target == target and std.mem.eql(u8, m.spelling, spelling)) return;
+        try self.mappings.append(self.a, .{ .from = from, .spelling = spelling, .target = target });
+        try self.bound.append(self.a, bound);
+    }
+
+    /// The compilations that compile each loaded file, as Zig's build has them. A build script
+    /// (a `build.zig` beside its package's `build.zig.zon`) is the build runner's, and so is
+    /// each file it reaches; every other file is the program's, and so is each file it reaches.
+    /// A `--module` names a module of the program's and a `--build-module` a dependency's build
+    /// script: the build runner binds a name to the second, the program to the first. A build
+    /// script's import of a name only `--module` gives reaches nothing
+    /// (`Facts.Unknown.missing_mapping`), never the library's root.
+    fn compile(self: *Loader) !void {
+        const count = self.inputs.items.len;
+        const build = try self.a.alloc(bool, count);
+        const program = try self.a.alloc(bool, count);
+        for (build, 0..) |*is, position| is.* = !self.inputs.items[position].external and try self.buildScript(self.canonical_paths.items[position]);
+        try self.reach(build, .build);
+        for (program, build) |*is, built| is.* = !built;
+        try self.reach(program, .program);
+        for (self.inputs.items, build, program) |*input, built, made| input.compilations = if (built and made) .both else if (built) .build else .program;
+        // A name bound in one compilation holds in it alone; from a file only the other
+        // compiles it reaches nothing.
+        var kept: usize = 0;
+        for (self.mappings.items, self.bound.items) |mapping, bound| {
+            var edge = mapping;
+            const in: Project.Compilations = switch (bound) {
+                .every => mapping.compilation orelse self.inputs.items[mapping.from].compilations,
+                .program => .program,
+                .build => .build,
+            };
+            switch (self.inputs.items[mapping.from].compilations) {
+                .both => if (bound != .every) {
+                    edge.compilation = in;
+                },
+                else => |only| if (only != in) continue,
+            }
+            self.mappings.items[kept] = edge;
+            kept += 1;
+        }
+        self.mappings.shrinkRetainingCapacity(kept);
+    }
+
+    /// Marks every file an import of a marked file reaches in `compilation`.
+    fn reach(self: *Loader, marked: []bool, compilation: Bound) !void {
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (self.mappings.items, self.bound.items) |mapping, bound| {
+                if (bound != .every and bound != compilation) continue;
+                if (marked[mapping.from] and !marked[mapping.target]) {
+                    marked[mapping.target] = true;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    /// Whether `canonical` is a build script: `build.zig` in a package's root, beside the
+    /// `build.zig.zon` that names the package.
+    fn buildScript(self: *Loader, canonical: []const u8) !bool {
+        if (!std.mem.eql(u8, std.Io.Dir.path.basename(canonical), "build.zig")) return false;
+        return try self.manifest(std.Io.Dir.path.dirname(canonical) orelse return false) != null;
     }
 
     /// An `@import` a loaded file spells, and the file it is written in.
@@ -268,6 +346,7 @@ pub const Arguments = struct {
     escapes_before: ?[]const u8 = null,
     zig_lib_path: ?[]const u8 = null,
     module: []const []const u8 = &.{},
+    build_module: []const []const u8 = &.{},
     exported: []const []const u8 = &.{},
     external: []const []const u8 = &.{},
     root: []const []const u8 = &.{},
@@ -297,6 +376,7 @@ pub const Arguments = struct {
             .escapes_before = .{ .value_name = "FILE", .hint = .file, .help = "The escapes a run before reported (its text report, or preflight's escapes.txt): --fix names an escape in the older form, at that place with those words, with only the rules listed for it there that find something now, and leaves one not listed to its owner; never with --only" },
             .zig_lib_path = .{ .value_name = "DIR", .hint = .directory, .section = "Inputs", .help = "Zig's library, for std's imports" },
             .module = .{ .value_name = "NAME=FILE", .section = "Inputs", .help = "A module the files import by name, and its root file, repeated" },
+            .build_module = .{ .value_name = "NAME=FILE", .section = "Inputs", .help = "A dependency's build script a build script imports by name (`@import(\"aegis\")` in build.zig), repeated: without one, a build script's import of a name only --module gives reaches nothing" },
             .exported = .{ .value_name = "FILE", .hint = .file, .section = "Inputs", .help = "The root of a module the package exports, repeated: Z012 reads the public surface these reach, and none without one" },
             .external = .{ .value_name = "NAME", .section = "Inputs", .help = "A module whose bytes a build step makes (translate-c, a Run step's output), repeated: an import of it is read as nothing glint has, never linted" },
             .root = .{ .value_name = "DIR", .hint = .directory, .section = "Inputs", .help = "A directory imports may read files from, repeated" },
@@ -352,6 +432,7 @@ fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, problems: *st
     }
     try result.roots.appendSlice(a, arguments.root);
     for (arguments.module) |mapping| try result.modules.append(a, named(mapping) orelse return error.InvalidModule);
+    for (arguments.build_module) |mapping| try result.build_modules.append(a, named(mapping) orelse return error.InvalidModule);
     try result.exported.appendSlice(a, arguments.exported);
     try result.externals.appendSlice(a, arguments.external);
     for (arguments.package) |mapping| try result.packages.append(a, named(mapping) orelse return error.InvalidPackage);
@@ -614,12 +695,13 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
         try loader.roots.append(a, std.Io.Dir.path.dirname(canonical) orelse canonical);
     }
     if (configured.zig_lib_path) |lib| try loader.roots.append(a, try std.Io.Dir.cwd().realPathFileAlloc(io, lib, a));
-    for (configured.modules.items) |module| {
+    for ([_][]const Module{ configured.modules.items, configured.build_modules.items }) |modules| for (modules) |module| {
         const canonical = try std.Io.Dir.cwd().realPathFileAlloc(io, module.path, a);
         try loader.roots.append(a, std.Io.Dir.path.dirname(canonical) orelse canonical);
-    }
+    };
     record.outcome = .traversal_failure;
     try loader.imports();
+    try loader.compile();
     for (configured.exported.items) |root| {
         const canonical = try std.Io.Dir.cwd().realPathFileAlloc(io, root, a);
         if (loader.paths.get(canonical)) |position| loader.inputs.items[position].exported = true;

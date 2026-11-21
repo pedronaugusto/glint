@@ -2179,6 +2179,12 @@ fn memberValue(self: *Facts, lhs: Value, name: []const u8) ResolveError!Value {
         .pointer => |p| switch (p.child.*) {
             .instance, .container => |c| if (self.member(c, name)) |decl| return self.heldIn(c, decl, p.child.* == .instance) else return sequence(lhs, name),
             .alternatives => return self.map(p.child.*, name, memberValue),
+            // A pointer to what is not known: its member is not known, for the same reason (a
+            // `*T` of a generic `T` is generic), but a slice's `len` and `ptr` are its own.
+            .unknown => |why| {
+                const known: Value = if (p.size == .slice) sequence(lhs, name) else .{ .unknown = why };
+                return if (known == .unknown) .{ .unknown = why } else known;
+            },
             else => return sequence(lhs, name),
         },
         // An array's one member is its length, a number.
@@ -6733,14 +6739,36 @@ pub fn definition(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Reso
             .unknown => |why| return .{ .unknown = why },
             // A number, a truth value, an error set: no declaration is a member of one.
             .primitive, .scalar, .error_set => return .none,
-            // A choice of holders, each with its own member; any other value a member of which
-            // is not read here.
-            .alternatives => return .{ .unknown = .unsupported },
+            // A choice of holders, each with its own member: the one declaration they all name.
+            .alternatives => |parts| return self.definitionOfChoice(parts, try self.memberName(tree.tokenSlice(data[1]))),
+            // Any other value a member of which is not read here.
             else => return .{ .unknown = .unsupported },
         };
         return .of(self.member(container, try self.memberName(tree.tokenSlice(data[1]))));
     }
     return .none;
+}
+
+/// The declaration a member of a choice of holders names: the one every part that can hold the
+/// member names. A part that has no member a name reads (an optional, an error union, a number,
+/// a type declaring none so named) is not the holder wherever Zig compiles the access, as
+/// `memberOfChoice` reads one. Parts naming different declarations are not read here.
+fn definitionOfChoice(self: *Facts, parts: []const Value, name: []const u8) ResolveError!Named {
+    var found: ?Decl = null;
+    for (parts) |one| {
+        const part = if (one == .pointer) one.pointer.child.* else one;
+        const container = switch (part) {
+            .container, .instance => |c| c,
+            .unknown => |why| return .{ .unknown = why },
+            .optional, .error_union, .primitive, .scalar, .error_set => continue,
+            else => return .{ .unknown = .unsupported },
+        };
+        if (self.lacks(container, name)) continue;
+        const decl = self.member(container, name) orelse return .{ .unknown = .unresolved };
+        if (found) |first| if (first.file != decl.file or first.index != decl.index) return .{ .unknown = .unsupported };
+        found = decl;
+    }
+    return if (found) |decl| .{ .decl = decl } else .{ .unknown = .unresolved };
 }
 
 /// Literal reflection binds a declaration only on a concrete, resolved container.
@@ -12556,6 +12584,9 @@ pub const calls = struct {
             } else return .none;
             if (tree.nodeTag(callee) != .field_access) return .{ .unknown = .unsupported };
             const name = try facts.memberName(tree.tokenSlice(tree.nodeData(callee).node_and_token[1]));
+            // Whether a part of the choice holds the member: Zig compiles the call only where
+            // one does.
+            var held = false;
             for (value.alternatives) |one| {
                 // A pointer to, or an optional of, a choice of instances: each of them.
                 const inner: Facts.Value = switch (one) {
@@ -12568,12 +12599,20 @@ pub const calls = struct {
                     const container = switch (part) {
                         .instance => |c| c,
                         .unknown => |why| return .{ .unknown = why },
+                        // An error union or a number has no member a name reads: the call
+                        // compiles only where the holder is another of the choice (`Wrapped(E,
+                        // T)`, `T` where `E` is empty), as `memberOfChoice` reads one.
+                        .error_union, .primitive, .scalar => continue,
                         else => return .{ .unknown = .unsupported },
                     };
+                    // An instance of a type that declares no such member, likewise.
+                    if (facts.lacks(container, name)) continue;
                     const decl = facts.member(container, name) orelse return .{ .unknown = .unresolved };
                     if (facts.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind != .function) return .{ .unknown = .unsupported };
+                    held = true;
                 }
             }
+            if (!held) return .{ .unknown = .unresolved };
             return .{ .bound = holder };
         }
         // A field holds what it is given, and a call through it binds nothing.
