@@ -133,7 +133,7 @@ test "suppression one reason cannot suppress distinct sites on one line" {
     try std.testing.expectError(error.AmbiguousSuppression, parsed[0].matches(.Z013, 0, 31));
 }
 
-test "a suppression names several rules, one site each; the aegis escape form is malformed" {
+test "a suppression names several rules, one site each; one naming a rule twice or none is malformed" {
     var file = try File.init(std.testing.allocator, "const x = 1; " ++ opening ++ "Z013, Z003 -- both read here\n", .{});
     defer file.deinit();
     var malformed: std.ArrayList(Malformed) = .empty;

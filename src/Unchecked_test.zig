@@ -653,19 +653,17 @@ test "the fix drops from a suppression each rule that ran and met no site under 
     ), out.bytes);
 }
 
-test "one suppression names each rule it covers on its line, one site each; an `// aegis:` comment is a comment" {
+test "one suppression names each rule it covers on its line, one site each" {
     var project = try sources.projectWithSources(std.testing.allocator, comptime suppressed(
         \\pub fn f(parent_id: u32, child_id: u32) *u8 { return @ptrFromInt(parent_id + child_id); } // @ignore: P007, P008 -- the board's two register ids
         \\pub fn g(parent_id: u32, child_id: u32) *u8 { return @ptrFromInt(parent_id + child_id); } // @ignore: P007 -- only the conversion
-        \\pub fn h(a: usize) *u8 { return @ptrFromInt(a); } // aegis: boundary(P007): no suppression
     ), &std_files, &std_imports);
     defer project.deinit();
     var report = try glint.run(std.testing.allocator, &project, .{ .config = .{ .enabled = .empty, .selections = &.{ .{ .rule = .P007, .level = .gate }, .{ .rule = .P008, .level = .gate } } } });
     defer report.deinit();
-    // g's P008 stands, and h's P007 under a comment that is no suppression.
-    try std.testing.expectEqual(@as(usize, 2), report.diagnostics.len); // safe: fixture counts are representable.
+    // g's P008 stands.
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: fixture counts are representable.
     try std.testing.expectEqual(@as(u32, 2), report.diagnostics[0].span.line);
-    try std.testing.expectEqual(@as(u32, 3), report.diagnostics[1].span.line);
     try std.testing.expectEqual(@as(usize, 3), report.suppressed); // safe: f's two and g's one.
     try std.testing.expectEqual(@as(usize, 0), report.malformed.len); // safe: none malformed.
     try std.testing.expect(report.complete);

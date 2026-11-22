@@ -8,7 +8,6 @@ const names = @import("names.zig");
 const Ast = std.zig.Ast;
 const Context = @import("RuleContext.zig");
 const Report = @import("Report.zig");
-const Suppression = @import("Suppression.zig");
 const DeadDeclarations = @import("DeadDeclarations.zig");
 const Disallowed = @import("Disallowed.zig");
 const Governed = @import("Governed.zig");

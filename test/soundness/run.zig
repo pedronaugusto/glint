@@ -620,7 +620,7 @@ fn verdictOf(output: []const u8, status: u8, rule: []const u8, before: ?[]const 
 test "a case's verdict: a run error of its files refuses it" {
     try std.testing.expectEqual(Verdict.clean, verdictOf("", 0, "A009", null));
     try std.testing.expectEqual(Verdict.refused, verdictOf("error: /s/case.zig: its analysis ran out of the fact budget\n", 2, "A009", null));
-    try std.testing.expectEqual(Verdict.refused, verdictOf("suppression: /s/case.zig:1:1: malformed: an aegis escape is read no more\n", 2, "A009", null));
+    try std.testing.expectEqual(Verdict.refused, verdictOf("suppression: /s/case.zig:1:1: malformed: a suppression needs its written reason\n", 2, "A009", null));
     try std.testing.expectEqual(Verdict.clean, verdictOf("suppression: /s/case.zig:1:1: A009 suppresses nothing\n", 0, "A009", null));
     try std.testing.expectEqual(Verdict.refused, verdictOf("", 2, "A009", null));
     try std.testing.expectEqual(Verdict.flagged, verdictOf("A009: /s/case.zig:3:5: input used\nerror: /s/case.zig: x\n", 2, "A009", null));

@@ -144,7 +144,7 @@ declaration.
   of the package where the file has none, under the module name the package's other files use. Any other answer
   is a malformed entry: no fix is made from a guess at how the answer is called.
 
-Version 1 (`.roles`, `.pairs`, `.door`, `.deprecated`, the old `.replaces`) is read no more. A part of
+A `lint_rules` of a version other than 2 is read as no rules, its version a finding in the declarer. A part of
 `lint_rules` glint cannot read is a malformed entry where it is written, and the declaring package's run is a
 run error. In a consumer, an unresolved reference inside a banned file is a finding.
 
