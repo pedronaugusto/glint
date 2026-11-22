@@ -7,5 +7,8 @@
         // src/brotli/Compress.zig:68)
         "deferred/b9-waiter_unlinked_in_defer/twin.zig",
         "call/b9-slice_copied_out/twin.zig",
+        // review b9 precision: std.mem.swap of a local (lookout src/Baseline.zig:279, relic
+        // src/patch/range_diff.zig:743)
+        "call/b9-mem_swap/twin.zig",
     },
 }
