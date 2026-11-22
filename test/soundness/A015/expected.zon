@@ -1,6 +1,8 @@
 .{
-    // A015 is a rule aegis declares (its lint_rules, read from the pinned aegis): one site it reports
-    // and one it must not, through the aegis type. Its other rows hold none.
-    .no_hole = .{ .assignment, .destructure, .capture, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch },
-    .no_twin = .{ .assignment, .destructure, .capture, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch },
+    // A015 is a rule aegis declares (its lint_rules, read from the pinned aegis): a handle type
+    // reaching a field's type through each way a type is held, held by value, and the same type
+    // borrowed by pointer.
+    // A field's type is evaluated as the program compiles, where no statement runs: no deferred
+    // statement and no memory a load or store moves reaches it.
+    .na = .{ .deferred, .memory },
 }

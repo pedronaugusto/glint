@@ -1,6 +1,8 @@
 .{
-    // A012 is a rule aegis declares (its lint_rules, read from the pinned aegis): one site it reports
-    // and one it must not, inside the seam the case declares. Its other rows hold none.
-    .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch },
-    .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch },
+    // A012 is a rule aegis declares (its lint_rules, read from the pinned aegis), on where a project
+    // selects it: std's list or queue type reached through each way a name is held, and the same
+    // way reaching bounded's; the call row's twins inside the seam the case declares.
+    // A target is a declaration, reached only by a name evaluated as the program compiles; memory
+    // a load or store moves holds runtime values, never a name.
+    .na = .{.memory},
 }

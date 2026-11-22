@@ -1,6 +1,8 @@
 .{
-    // A013 is a rule aegis declares (its lint_rules, read from the pinned aegis): one site it reports
-    // and one it must not, through the aegis type. Its other rows hold none.
-    .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch },
-    .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch },
+    // A013 is a rule aegis declares (its lint_rules, read from the pinned aegis): std's assert
+    // reached through each way a name is held, and the same way reaching aegis's assert; an assert
+    // evaluated as the program compiles is none.
+    // A target is a declaration, reached only by a name evaluated as the program compiles; memory
+    // a load or store moves holds runtime values, never a name.
+    .na = .{.memory},
 }
