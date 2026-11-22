@@ -6473,6 +6473,10 @@ fn ownReading(self: *Facts, function: Decl, into: OwnStores.Into, from: usize) R
             return false;
         },
     };
+    // Each reading, a reading again after an assumption fell among them, is one of the
+    // budget's resolutions: past the budget, it cannot tell.
+    if (self.budgetSpent()) return null;
+    self.remaining -= 1;
     const depth = own_stores.stack.items.len;
     try own_stores.stack.append(self.gpa, key);
     try own_stores.found.put(self.gpa, key, .{ .reading = depth });
