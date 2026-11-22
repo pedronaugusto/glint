@@ -4702,6 +4702,8 @@ pub fn callResult(self: *Facts, callee: Value, _: void) ResolveError!Value {
         }
         return self.instance(result);
     }
+    // A pointer to a declared function (`&ntdll.NtFsControlFile`): what calling it returns.
+    if (callee == .pointer and callee.pointer.child.* == .function) return self.callResult(callee.pointer.child.*, {});
     // A value of a function type (`comptime read: fn (u8) T`) or a pointer to one (a
     // vtable's `*const fn (...) T`, which a call reads through): what the type declares it
     // returns, whichever function is passed.
@@ -5799,7 +5801,10 @@ pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
             // Written, its type holds types: one that does not, or not known, returned above.
             const declared_types = if (variable.ast.type_node.unwrap()) |t| holdsTypes(try self.resolve(decl.file, t)) orelse true else false;
             if (declared_types or try self.holdsTypeValue(initial, 0) or (variable.ast.type_node == .none and mayBeType(initial) and self.compileTime(decl) and !try self.initIsValue(decl.file, value, 0))) {
-                const given = (try self.givenValues(decl)) orelse return .{ .unknown = .unresolved };
+                // Types live only as the program compiles: values its stores do not show (a
+                // list grown by itself in a loop, `types = types ++ .{L}`) are what evaluating
+                // the code computes, which glint does not run.
+                const given = (try self.givenValues(decl)) orelse return .{ .unknown = if (declared_types) .comptime_dependent else .unresolved };
                 return self.choose(given);
             }
             if (!callable(initial)) return initial;
@@ -13834,23 +13839,7 @@ fn placeType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
         const name = try self.memberName(tree.tokenSlice(Model.initName(tree, node) orelse return .{ .unknown = .unsupported }));
         return self.literalFieldType(whole, name);
     }
-    if (tree.fullArrayInit(&parent_buffer, parent)) |array| {
-        const whole = if (array.ast.type_expr.unwrap()) |t| try self.resolveIn(env, file, t) else try self.placeType(env, file, parent, depth + 1);
-        return switch (whole) {
-            .array => |each| each.*,
-            // An untyped tuple's element (`const batched = .{ .{ .run = f } }`) takes no type
-            // from it: an anonymous literal, as the tuple is.
-            .unknown, .scalar => whole,
-            // A tuple type's (`struct { Io.File.Handle, Direction }`): its field at the
-            // element's position.
-            .container, .instance => |c| if (!self.tupleType(c)) .{ .unknown = .unsupported } else blk: {
-                const position = std.mem.findScalar(Ast.Node.Index, array.ast.elements, node) orelse break :blk .{ .unknown = .unsupported };
-                break :blk self.tupleFieldType(c, position);
-            },
-            .alternatives => .{ .unknown = .unsupported },
-            else => .{ .unknown = .unsupported },
-        };
-    }
+    if (tree.fullArrayInit(&parent_buffer, parent)) |array| return self.elementPlace(env, file, node, parent, array, depth);
     switch (tree.nodeTag(parent)) {
         .assign => return if (tree.nodeData(parent).node_and_node[1] == node) try self.resolveIn(env, file, tree.nodeData(parent).node_and_node[0]) else .{ .unknown = .unsupported },
         // `try`, `comptime` and `nosuspend` give their operand their own place (`try`'s
@@ -13925,6 +13914,55 @@ fn placeType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
         else => if (try self.operatorPlace(env, file, node, parent)) |place| return place,
     }
     return self.builtinPlace(env, file, node, parent, depth);
+}
+
+/// The place of `node`, an element of the array or tuple literal `parent` (`array`): an array's
+/// element type, a tuple type's field at its position, a destructure's variable's type.
+fn elementPlace(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index, parent: Ast.Node.Index, array: Ast.full.ArrayInit, depth: usize) ResolveError!Value {
+    // A tuple a destructure takes apart (`const fd, const direction: Direction = switch
+    // (what) { .readable => |fd| .{ fd, .read }, ... }`): each element its variable's type.
+    if (array.ast.type_expr == .none) if (std.mem.findScalar(Ast.Node.Index, array.ast.elements, node)) |position| {
+        if (try self.destructurePlace(env, file, parent, position)) |place| return place;
+    };
+    const whole = if (array.ast.type_expr.unwrap()) |t| try self.resolveIn(env, file, t) else try self.placeType(env, file, parent, depth + 1);
+    return switch (whole) {
+        .array => |each| each.*,
+        // An untyped tuple's element (`const batched = .{ .{ .run = f } }`) takes no type
+        // from it: an anonymous literal, as the tuple is.
+        .unknown, .scalar => whole,
+        // A tuple type's (`struct { Io.File.Handle, Direction }`): its field at the
+        // element's position.
+        .container, .instance => |c| if (!self.tupleType(c)) .{ .unknown = .unsupported } else blk: {
+            const position = std.mem.findScalar(Ast.Node.Index, array.ast.elements, node) orelse break :blk .{ .unknown = .unsupported };
+            break :blk self.tupleFieldType(c, position);
+        },
+        .alternatives => .{ .unknown = .unsupported },
+        else => .{ .unknown = .unsupported },
+    };
+}
+
+/// The place of the element at `position` of a tuple literal a destructure takes apart, as its
+/// value or a branch of it (through parentheses, `try`, a `switch`'s prongs and an `if`'s
+/// branches): the type its variable declares, none (`.scalar`) for one declaring none. Null where
+/// the literal is no such value.
+fn destructurePlace(self: *Facts, env: ?*const Env, file: Project.FileId, literal: Ast.Node.Index, position: usize) ResolveError!?Value {
+    const tree = &self.project.at(file).file.tree;
+    const model = &self.project.at(file).model;
+    var at = literal;
+    while (model.parentOf(at)) |parent| : (at = parent) switch (tree.nodeTag(parent)) {
+        .grouped_expression, .@"try", .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline => {},
+        .@"switch", .switch_comma => if (tree.fullSwitch(parent).?.ast.condition == at) return null, // unreachable: the tag is a switch's
+        .@"if", .if_simple => if (tree.fullIf(parent).?.ast.cond_expr == at) return null, // unreachable: the tag is an if's
+        .assign_destructure => {
+            const full = tree.assignDestructure(parent);
+            if (full.ast.value_expr != at or position >= full.ast.variables.len) return null;
+            const variable = tree.fullVarDecl(full.ast.variables[position]) orelse return null;
+            const t = variable.ast.type_node.unwrap() orelse return .scalar;
+            return try self.resolveIn(env, file, t);
+        },
+        else => return null,
+    };
+    return null;
 }
 
 /// The type an operator gives its operand: an operand compared with or combined with another
