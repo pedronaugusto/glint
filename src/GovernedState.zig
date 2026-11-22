@@ -105,6 +105,10 @@ pub fn check(c: *Context, definition: Rule.Definition) Context.Error!void {
         // A cast written inside another (`@ptrCast(@alignCast(p))`) is one conversion: the
         // outermost reads it, from the innermost operand to the outermost's place.
         if (kind == .cast and enclosingCast(c, tree, node) != null) continue;
+        // `@field` with a name it spells (`@field(S, "expose")`, a `const` holding one) is a
+        // member reference, read as one above (an internal field's is that finding); only a name
+        // it computes is reflection.
+        if (std.mem.eql(u8, name, "@field") and try writtenName(c, tree, node)) continue;
         const found = switch (try governedIn(c, node, name, kind == .cast, types.items)) {
             .found => |found| found,
             .none => continue,
@@ -155,6 +159,17 @@ pub fn check(c: *Context, definition: Rule.Definition) Context.Error!void {
 const casts = [_][]const u8{ "@enumFromInt", "@intFromEnum", "@backingInt", "@fromBackingInt", "@bitCast", "@addrSpaceCast", "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@ptrFromInt", "@errorFromInt", "@intFromError" };
 /// The builtins that read a type's fields or layout by name.
 const reflection = [_][]const u8{ "@typeInfo", "@field", "@hasField", "@FieldType", "@offsetOf", "@bitOffsetOf", "@fieldParentPtr" };
+
+/// Whether a `@field`'s name is one it spells (`Facts.fieldName`'s `.name`).
+fn writtenName(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!bool {
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = Facts.builtinArgs(tree, node, &buffer);
+    if (args.len != 2) return false;
+    return switch (try c.facts.fieldName(c.file, args[1])) {
+        .name => true,
+        .each_of, .names, .computed => false,
+    };
+}
 
 fn among(names: []const []const u8, name: []const u8) bool {
     for (names) |each| if (std.mem.eql(u8, each, name)) return true;

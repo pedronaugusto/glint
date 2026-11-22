@@ -1,7 +1,6 @@
 .{
+    // A001 is a rule aegis declares (its lint_rules, read from the pinned aegis): a touch of a
+    // governed type's internal field, through each way the holder reaches it, and the same
+    // value through the type's own API.
     .open = .{},
-    // A001 is a rule aegis declares (its lint_rules, read from the pinned aegis): sites it reports
-    // and ones it must not, through the aegis types. Its other rows hold none.
-    .no_hole = .{ .assignment, .destructure, .capture, .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .unwrap, .aggregate, .memory, .branch },
-    .no_twin = .{ .assignment, .destructure, .capture, .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .unwrap, .aggregate, .memory, .branch },
 }
