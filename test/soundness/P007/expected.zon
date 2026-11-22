@@ -2,11 +2,15 @@
     .open = .{
         // review 6 precision: a call through a function-pointer field whose only stored function writes whole
         // review 6 precision: the safe holder of a function-pointer field
+        // review b9: @setFloatMode reads only the written enum literal `.optimized`, not a const holding it
+        "assignment/b9-float_mode_const/hole.zig",
+        // review b9: nor the mode written by its full name, std.builtin.FloatMode.optimized
+        "field/b9-float_mode_full_name/hole.zig",
     },
     // The rows whose holes were the interface-recovery idiom's (a copy of the interface field
     // behind `@alignCast(@fieldParentPtr(...))`), which P007 does not read (glint-0.8-shape,
     // what the bans do not claim): assignment, capture, field, address, compile_time, aggregate,
     // memory.
-    .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .deferred, .jump, .inline_loop, .unwrap, .aggregate, .branch },
+    .no_hole = .{ .destructure, .capture, .address, .deferred, .jump, .inline_loop, .unwrap, .aggregate, .branch },
     .no_twin = .{ .field, .deferred, .inline_loop, .aggregate, .branch },
 }
