@@ -203,8 +203,9 @@ pub const Spelled = union(enum) { name: []const u8, number: usize };
 pub const Reflected = struct { of: *const Value, at: enum { info, pointer, size, optional, array, error_union, function, params, structure, tagged, enumeration, part } };
 /// Why a value is unknown. `absent`: it comes from a module the build does not have for this
 /// file (Project.Input.absent), or it is a parameter no function of a reflected choice has
-/// (`param_types[6]` of a table whose functions take at most six), so the code that needs it
-/// is not compiled in this build.
+/// (`param_types[6]` of a table whose functions take at most six), or an element past the end
+/// of a tuple literal a binding passes (`args[1]` under a comptime test of another name), so
+/// the code that needs it is not compiled in this build.
 /// `generic`: it depends on a type or `anytype` parameter that calls from outside the
 /// project's reading bind (a consumer's, or a use other than a call), so each binding decides
 /// it where it is made; what is read of it (its type information, its parts) stays so.
@@ -1676,7 +1677,16 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
     if (std.mem.eql(u8, name, "@call") and args.len == 3) {
         const passed = switch ((try calls.at(self, file, node)).?.args) { // unreachable: a three-operand `@call` is a call
             .known => |each| each,
-            .unknown => |why| return .{ .unknown = why },
+            // A tuple not written as a literal (`a.*`, `.{ c, n } ++ args`): what the callee
+            // declares it returns, read without the arguments; a result that needs them is
+            // what reading it alone gives (a type parameter's: `generic`).
+            .unknown => |why| {
+                const callee = try self.resolveIn(env, file, args[1]);
+                if (callee == .unknown) return callee;
+                const result = if (callee == .alternatives) try self.map(callee, {}, callResult) else try self.callResult(callee, {});
+                if (result == .unknown and result.unknown == .unresolved) return .{ .unknown = why };
+                return result;
+            },
         };
         return self.calledValue(file, node, .{ .ast = .{ .lparen = tree.nodeMainToken(node), .fn_expr = args[1], .params = passed } });
     }
@@ -1892,6 +1902,9 @@ fn reified(self: *Facts, types: Value) ResolveError!Value {
         else => return .{ .unknown = .unsupported },
     };
     if (each == .unknown) return each;
+    // A list known only as one of `type`s (`var field_types: [n]type = undefined`, which a loop
+    // fills): its types are what evaluating the code computes, which glint does not run.
+    if (each == .primitive and std.mem.eql(u8, each.primitive, "type")) return .{ .unknown = .comptime_dependent };
     return .{ .reified = .{ .fields = try self.boxed(each) } };
 }
 fn reifiedEach(self: *Facts, types: Value, _: void) ResolveError!Value {
@@ -1946,6 +1959,9 @@ fn fieldType(self: *Facts, of: Value, field_name: ?[]const u8) ResolveError!Valu
             if (each.items.len == 0) return .{ .unknown = .unsupported };
             return self.choose(each.items);
         },
+        // A type `@Struct` or `@Union` builds from a list of its fields' types: one of them,
+        // whichever field is named (`reified` read the list, or said why not).
+        .reified => |built| return built.fields.*,
         else => return .{ .unknown = .unsupported },
     };
     // A container a type function makes has its fields' types where the call that made it is
@@ -6572,7 +6588,9 @@ fn destructuredAt(self: *Facts, value: Value, position: usize) ResolveError!Valu
         .reified => |built| return self.instance(built.fields.*),
         .literal => |literal| {
             const parts = try self.literalParts(literal);
-            return if (position < parts.len) parts[position] else .{ .unknown = .unsupported };
+            // An element past a literal's end (`args[1]` of a binding passing one, under a
+            // comptime test of another name): code Zig compiles in no build of that binding.
+            return if (position < parts.len) parts[position] else .{ .unknown = .absent };
         },
         .alternatives => |each| {
             const mapped = try self.gpa.alloc(Value, each.len);
@@ -7294,6 +7312,25 @@ fn reflectedMember(self: *Facts, r: Reflected, name: []const u8) ResolveError!Va
         .structure, .tagged, .enumeration => {
             // Names are strings whatever the type is (a typeless literal's among them).
             if (std.mem.eql(u8, name, "field_names") or std.mem.eql(u8, name, "decl_names")) return try self.pointerTo(try self.pointerTo(.{ .primitive = "u8" }, .slice), .slice);
+            // A choice of types (`Op.Result` over each operation): each part of this kind, one of
+            // them; a part of another kind is a build of a prong Zig does not analyse for it.
+            if (r.of.* == .alternatives) {
+                const wanted: []const u8 = switch (r.at) {
+                    .structure => "struct",
+                    .tagged => "union",
+                    else => "enum",
+                };
+                var kept: std.ArrayList(Value) = .empty;
+                for (r.of.alternatives) |part| {
+                    const kind = try self.kindOfType(part) orelse return unsupported;
+                    if (!std.mem.eql(u8, kind, wanted)) continue;
+                    const one = try self.reflectedMember(.{ .of = try self.boxed(part), .at = r.at }, name);
+                    if (one == .unknown) return one;
+                    try kept.append(self.gpa, one);
+                }
+                if (kept.items.len == 0) return unsupported;
+                return self.choose(kept.items);
+            }
             const container = self.reflectedContainer(r) orelse return if (r.of.* == .unknown) r.of.* else unsupported;
             if (std.mem.eql(u8, name, "field_types") and r.at != .enumeration) return try self.pointerTo(try self.fieldTypes(container), .slice);
             if (std.mem.eql(u8, name, "field_values") and r.at == .enumeration) return try self.pointerTo(.scalar, .slice);
@@ -13714,6 +13751,8 @@ const no_result_type = [_][]const u8{
     "@intFromPtr", "@ptrFromInt",   "@backingInt",   "@fromBackingInt", "@bitCast",     "@intCast",
     "@truncate",   "@floatCast",    "@intFromFloat", "@floatFromInt",   "@TypeOf",      "@sizeOf",
     "@alignOf",    "@bitSizeOf",    "@typeInfo",     "@typeName",       "@tagName",     "@errorName",
+    // Operands whose type is the peer type of them all, which none is given.
+    "@min",        "@max",
 };
 
 /// The written type of a call's argument at `position`: the callee's parameter (a method's
