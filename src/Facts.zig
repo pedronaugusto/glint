@@ -473,8 +473,10 @@ pub fn resolve(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolve
     self.assumed = try self.settle(file, node, outer);
     const wide = self.wide;
     const value = try self.resolveInner(file, node);
-    // Read with none left, a part of it may have come back unknown(budget): it is not kept.
-    if (self.remaining != 0 and !self.wideSince(wide)) try self.cache.put(self.gpa, key, value);
+    // Read with none left, a part of it may have come back unknown(budget): it is not kept. A
+    // cycle is the answer of a query in progress (a recursive generic's binding read inside its
+    // own reading), not the node's: asked once that query is done, it is read again.
+    if (self.remaining != 0 and !self.wideSince(wide) and !holdsCycle(value, 0)) try self.cache.put(self.gpa, key, value);
     return value;
 }
 
@@ -7976,7 +7978,11 @@ pub fn bindTo(self: *Facts, file: Project.FileId, fn_expr: Ast.Node.Index, param
         }
     }
     for (params) |arg| {
-        try args.append(lists, try self.boundArgument(try self.resolveIn(outer, file, arg)));
+        // An argument read through the function itself (a cycle: its reading is in progress)
+        // binds a generic position, as the callers' bindings do (`boundByCallers`): the reading,
+        // kept, is never one whose parameter is that query's cycle.
+        const argument = try self.resolveIn(outer, file, arg);
+        try args.append(lists, if (throughItself(argument)) .{ .unknown = .generic } else try self.boundArgument(argument));
         try truths.append(lists, self.truth(outer, file, arg));
         try spelled.append(lists, try self.spelledIn(outer, file, arg));
         try values.append(lists, try self.valueIn(outer, file, arg, 0));
@@ -8216,8 +8222,9 @@ fn resolveIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
     const wide = self.wide;
     const value = try self.readBound(e, file, node);
     // Read with none left, a part of it may have come back unknown(budget): it is not kept;
-    // nor what an answer wider than the built analysis gives was read on (`wideSince`).
-    if (self.remaining != 0 and !self.wideSince(wide)) try self.bound.put(self.gpa, key, value);
+    // nor what an answer wider than the built analysis gives was read on (`wideSince`); nor a
+    // cycle, the answer of a query in progress (as `resolve` keeps none).
+    if (self.remaining != 0 and !self.wideSince(wide) and !holdsCycle(value, 0)) try self.bound.put(self.gpa, key, value);
     return value;
 }
 
@@ -8572,12 +8579,37 @@ fn boundByCallers(self: *Facts, parameter: Decl, position: usize) ResolveError!V
         // A binding made through the function itself (`formOf(@typeInfo(T).optional.child)`
         // in `formOf`), or one past the budget: the calls' bindings are not all read, so the
         // parameter is what it is without them, a generic position each binding decides.
-        if (value == .unknown and (value.unknown == .cycle or value.unknown == .budget)) return .{ .unknown = .generic };
+        if ((value == .unknown and value.unknown == .budget) or throughItself(value)) return .{ .unknown = .generic };
         try values.append(self.gpa, value);
     }
     // No call the build compiles binds it: whatever binding is made decides.
     if (values.items.len == 0) return .{ .unknown = .generic };
     return self.choose(values.items);
+}
+
+/// Whether a binding is made through the function being read itself: a cycle, itself or in what
+/// it wraps or a part of it (`Deref(info.child)` in `Deref`; `formOf(T)` where `T` comes of
+/// `deref(inner)`, whose own binding reads `formOf`'s). Each binding decides it: `generic`.
+fn throughItself(value: Value) bool {
+    return holdsCycle(value, 0);
+}
+
+/// Whether a value is or holds a cycle: itself, what it wraps, a part of a choice, the type
+/// information is read off (`.reflected`), a built type's fields. Such a value is the answer of a
+/// query in progress, kept by none (`resolve`, `resolveIn`) and bound by none (`throughItself`).
+fn holdsCycle(value: Value, depth: usize) bool {
+    if (depth == 32) return false;
+    return switch (value) {
+        .unknown => |why| why == .cycle,
+        .pointer => |inner| holdsCycle(inner.child.*, depth + 1),
+        .array, .optional, .error_union => |inner| holdsCycle(inner.*, depth + 1),
+        .reflected => |r| holdsCycle(r.of.*, depth + 1),
+        .reified => |built| holdsCycle(built.fields.*, depth + 1),
+        .alternatives => |parts| for (parts) |part| {
+            if (holdsCycle(part, depth + 1)) break true;
+        } else false,
+        else => false,
+    };
 }
 
 /// Whether a value comes from a module the build does not have, itself or through what
