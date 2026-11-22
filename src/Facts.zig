@@ -4148,6 +4148,13 @@ pub fn readingFrom(self: *Facts, file: Project.FileId, node: Ast.Node.Index, dec
     };
 }
 
+/// Whether `node` is a value, never a type (`valueIn`, read in no reading): what a `.primitive`
+/// the node resolves to is, a value of it (`comptime R: u8`'s `R`) or the type itself, as the
+/// value model holds both alike.
+pub fn isValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
+    return self.valueIn(null, file, node, 0);
+}
+
 /// Whether `node`, read in `env`, is a value, never a type, whatever its type: an address, a
 /// dereference, a slice or a literal; a runtime `var` (Zig refuses one of type `type`); a
 /// parameter neither `comptime` nor `anytype` (a `type` one must be `comptime`), or an
@@ -4200,9 +4207,17 @@ fn valueIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
             var it = proto.iterate(tree);
             const position = while (it.next()) |param| {
                 if (param.name_token != record.token) continue;
-                if (param.type_expr != null) {
+                if (param.type_expr) |declared| {
                     const marked = param.comptime_noalias orelse return true;
-                    return tree.tokenTag(marked) != .keyword_comptime;
+                    if (tree.tokenTag(marked) != .keyword_comptime) return true;
+                    // A `comptime` one is a value where its type is one no type is of: a
+                    // number, a `bool` (`comptime R: u8`), a container the program declares.
+                    // `type`, or a type a binding chooses, may hold one.
+                    return switch (try self.resolve(file, declared)) {
+                        .primitive => |named| !std.mem.eql(u8, named, "type") and !std.mem.eql(u8, named, "anytype"),
+                        .container => true,
+                        else => false,
+                    };
                 }
                 break self.parameterPosition(file, function, record.token) orelse return false;
             } else return false;
@@ -5810,7 +5825,8 @@ pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
             // wherever it is read: one declaration, several types over its life.
             // Written, its type holds types: one that does not, or not known, returned above.
             const declared_types = if (variable.ast.type_node.unwrap()) |t| holdsTypes(try self.resolve(decl.file, t)) orelse true else false;
-            if (declared_types or try self.holdsTypeValue(initial, 0) or (variable.ast.type_node == .none and mayBeType(initial) and self.compileTime(decl) and !try self.initIsValue(decl.file, value, 0))) {
+            const untyped_type = variable.ast.type_node == .none and (writtenAsType(tree, value) or (mayBeType(initial) and self.compileTime(decl) and !try self.initIsValue(decl.file, value, 0)));
+            if (declared_types or try self.holdsTypeValue(initial, 0) or untyped_type) {
                 // Types live only as the program compiles: values its stores do not show (a
                 // list grown by itself in a loop, `types = types ++ .{L}`) are what evaluating
                 // the code computes, which glint does not run.
@@ -5872,11 +5888,31 @@ fn mayBeType(value: Value) bool {
     return false;
 }
 
+/// Whether an initializer is written as a type, which no value is: a pointer, array, optional,
+/// error union or function type, an error set, or a primitive type's name (`[]const u8`). A
+/// `var` given one holds types, which Zig allows only as it compiles, wherever its function
+/// is called from (`comptime g()` of a `g` returning `usize`).
+fn writtenAsType(tree: *const Ast, node: Ast.Node.Index) bool {
+    var at = node;
+    while (tree.nodeTag(at) == .grouped_expression) at = tree.nodeData(at).node_and_token[0];
+    return switch (tree.nodeTag(at)) {
+        .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range, .array_type, .array_type_sentinel, .optional_type, .error_union, .error_set_decl, .fn_proto, .fn_proto_one, .fn_proto_simple, .fn_proto_multi => true,
+        .identifier => {
+            // std's primitives hold four values too.
+            const name = tree.tokenSlice(tree.nodeMainToken(at));
+            inline for (.{ "undefined", "null", "true", "false" }) |value| if (std.mem.eql(u8, name, value)) return false;
+            return std.zig.primitives.isPrimitive(name);
+        },
+        else => false,
+    };
+}
+
 /// Whether a `var` is one Zig evaluates at compile time, where alone it may hold a type
 /// ("variable of type 'type' must be const or comptime"): declared `comptime var`, in a
-/// `comptime` scope, or in a function whose result is `type`. A function called only at
-/// compile time with none of these is not read so: the value model does not yet tell a pointer
-/// or array type from a value of one, which reading it would need.
+/// `comptime` scope, or in a function whose result is `type`. A var in a function called only
+/// at compile time with none of these holds types where its initializer is written as one
+/// (`writtenAsType`); otherwise it is not read so, as the value model does not tell a pointer or
+/// array type from a value of one.
 fn compileTime(self: *Facts, decl: Decl) bool {
     const source = self.project.at(decl.file);
     const tree = &source.file.tree;

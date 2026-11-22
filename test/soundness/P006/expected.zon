@@ -7,10 +7,4 @@
     // reading (glint-0.8-shape).
     .no_hole = .{ .capture, .unwrap },
     .no_twin = .{ .capture, .unwrap },
-    .open = .{
-        // A var only compile-time calls evaluate may hold a type, but the value model does not
-        // yet tell a pointer type from a pointer (Value.pointer is both): the var reads as its
-        // first value (Facts.compileTime).
-        "assignment/p06-28_compile_time_call_var/hole.zig",
-    },
 }

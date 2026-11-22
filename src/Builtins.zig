@@ -667,7 +667,12 @@ fn syntaxRules(self: *Context) RunError!void {
                     .unknown => if (try typeParameter(self, expr)) {
                         if (names.acronymIssue(name)) try self.at(.Z032, decl.token, "treat acronyms in type names as ordinary words, for example XmlParser");
                     },
-                    .container, .primitive, .error_set, .pointer, .array, .optional, .error_union, .fn_type => {
+                    // A primitive is the type or a value of it alike (`comptime R: u8`'s `R`):
+                    // the expression says which (`Facts.isValue`).
+                    .primitive => if (try self.facts.isValue(self.file, expr)) {
+                        if (!try interfaceName(self, decl, name)) try self.at(.Z006, decl.token, "value binding should use snake_case");
+                    } else if (names.acronymIssue(name)) try self.at(.Z032, decl.token, "treat acronyms in type names as ordinary words, for example XmlParser"),
+                    .container, .error_set, .pointer, .array, .optional, .error_union, .fn_type => {
                         if (names.acronymIssue(name)) try self.at(.Z032, decl.token, "treat acronyms in type names as ordinary words, for example XmlParser");
                     },
                     // A type built from field types names a type; a value of one is a value.
