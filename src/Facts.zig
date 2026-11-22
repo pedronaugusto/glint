@@ -220,7 +220,9 @@ pub const Reflected = struct { of: *const Value, at: enum { info, pointer, size,
 /// whose initializer names functions is the choice of them, read as one (`erasedCallee`).
 /// `external`: it is a module whose bytes exist only after a build step runs (translate-c's
 /// output, a Run step's output file: Project.Input.external), which no reading has: an import
-/// of it, and every member read through it.
+/// of it, and every member read through it; and a call through a pointer `@extern` gives, a
+/// foreign symbol the link resolves (`externCallee`): code glint never holds, outside every
+/// ban, while the `extern` declaration itself is where P007's seams govern it.
 /// Whether something is so: yes, no, or unknown and why.
 pub const Is = union(enum) { yes, no, unknown: Unknown };
 pub const Unknown = enum {
@@ -12888,6 +12890,9 @@ pub const calls = struct {
             // A function value whose functions are not known, which a field, a parameter or a
             // var holds: `fieldOf` gives its type (`erased`), as for any value of a function
             // type, so the read says which.
+            // A foreign symbol the link resolves (`@extern(*const F, ...)`, whose pointer reads
+            // as its type alone): code glint never holds, not Zig whose functions are unknown.
+            if (try externCallee(facts, file, callee, 0)) return .{ .any = .external };
             if (why == .unresolved and try erasedCallee(facts, file, callee, 0)) return .{ .any = .erased_callee };
             return .{ .any = why };
         }
@@ -12933,6 +12938,54 @@ pub const calls = struct {
                 return erasedCallee(facts, decl.file, variable.ast.init_node.unwrap() orelse return false, depth + 1);
             },
             .function, .capture, .field => return false,
+        }
+    }
+
+    /// Whether a callee is a pointer `@extern` gives: the builtin's own result, a `const` it
+    /// initializes, either branch of an `if` both of whose branches are one, or the result of a
+    /// call to a function each of whose own `return`s gives one (cloak's
+    /// `s2n.routine(F, name)`, returning `@extern(*const F, .{ .name = ... })`).
+    fn externCallee(facts: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: usize) Error!bool {
+        if (depth == 16) return false;
+        const tree = &facts.project.at(file).file.tree;
+        var callee = node;
+        while (true) switch (tree.nodeTag(callee)) {
+            .grouped_expression, .unwrap_optional => callee = tree.nodeData(callee).node_and_token[0],
+            .deref, .@"try" => callee = tree.nodeData(callee).node,
+            else => break,
+        };
+        switch (tree.nodeTag(callee)) {
+            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(callee)), "@extern"),
+            .@"if", .if_simple => {
+                const full = tree.fullIf(callee).?;
+                const otherwise = full.ast.else_expr.unwrap() orelse return false;
+                return try externCallee(facts, file, full.ast.then_expr, depth + 1) and try externCallee(facts, file, otherwise, depth + 1);
+            },
+            .identifier => {
+                const decl = switch (try facts.definition(file, callee)) {
+                    .decl => |decl| decl,
+                    .none, .unknown => return false,
+                };
+                const record = facts.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+                if (record.kind != .variable) return false;
+                const owner = &facts.project.at(decl.file).file.tree;
+                const variable = owner.fullVarDecl(record.node) orelse return false;
+                if (owner.tokenTag(variable.ast.mut_token) != .keyword_const) return false;
+                return externCallee(facts, decl.file, variable.ast.init_node.unwrap() orelse return false, depth + 1);
+            },
+            else => {
+                var buffer: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&buffer, callee) orelse return false;
+                const decl = switch (try facts.resolve(file, call.ast.fn_expr)) {
+                    .function => |decl| decl,
+                    else => return false,
+                };
+                const record = facts.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+                const returns = try facts.ownReturns(decl, record) orelse return false;
+                if (returns.len == 0) return false;
+                for (returns) |returned| if (!try externCallee(facts, decl.file, returned, depth + 1)) return false;
+                return true;
+            },
         }
     }
 
