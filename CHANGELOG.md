@@ -103,6 +103,7 @@ closed construct list. In short, for a configuration written for 0.7:
 
 ### Changed
 
+- Pins aegis 0.4.0 and ensign 0.4.0, their releases, where it pinned aegis f52eabe and ensign 1e6ff3c by commit: every graph holds one hash of each, and the aegis rules glint reads are the release's.
 - Development: glint's own CI is held to preflight's family policy (`"policy": "family"` in ci/preflight.json) and runs the hardened profile (`"hardened": true` in ci/workflow.json).
 - `addLint` maps std (`--zig-lib-path`, the build's Zig library) for every run it makes: an import no run maps is a run error in 0.8, and every Zig file reaches std. Map a project's own modules with `--module NAME=FILE` in `.args`.
 - A table's own id is read by its structure, never its name: a non-exhaustive `enum(Repr) { _ }` declared directly in a container whose values a table of that container's values is indexed by (`t[@backingInt(id)]`). Such an index is within the table only where every make of that id in the program (`@fromBackingInt`, `@enumFromInt`) counts the table's entries; where one does not, or one is made by `@bitCast` or `@ptrCast` or by a conversion whose type does not resolve, the position is undecided, neither cleared nor a finding by the id's shape. An id of a container no table of which it indexes is no table's: making it from an integer is no A009 site.

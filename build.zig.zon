@@ -6,13 +6,13 @@
     .paths = .{ "build.zig", "build.zig.zon", "ci/layer_files.zig", "src", "examples", "docs", "README.md", "CHANGELOG.md", "LICENSE" },
     .dependencies = .{
         .aegis = .{
-            .url = "git+https://github.com/pedronaugusto/aegis#f52eabef3ec6534c3a74bea3a3b7d95a91ce2581",
-            .hash = "aegis-0.2.4-rsxouoquDQApwYDuGdd2YyEeTeNp6CnJoOZKdVCfc3jt",
+            .url = "git+https://github.com/pedronaugusto/aegis?ref=v0.4.0#4739dccd71cfc16b0c15bc27e2d7dca76de9bc21",
+            .hash = "aegis-0.4.0-rsxouv1KDgCdGc-mhY-qBfyE70ar4OQiGGKHKndirWnQ",
         },
 
         .ensign = .{
-            .url = "git+https://github.com/pedronaugusto/ensign#1e6ff3cbf3fa7fa6024ecc5e6e485a884af3b953",
-            .hash = "ensign-0.3.1-6eMTD4C3BQBEku2xvEmP1XX4xd4egoiEI4ztNGqx3foe",
+            .url = "git+https://github.com/pedronaugusto/ensign?ref=v0.4.0#b2eff8e12477646cb5080d4dc9046b9db01d4f6f",
+            .hash = "ensign-0.4.0-6eMTDzG9BQACQVy33mHglI09ENzUhYe8tWeRizNKAPky",
         },
     },
     .dev_dependencies = .{
