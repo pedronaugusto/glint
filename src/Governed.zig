@@ -398,6 +398,16 @@ pub fn reflectedByCall(self: *Context, node: Ast.Node.Index, types: []const Fact
         .unknown => |why| return .{ .unknown = why },
     };
     var unknown: ?Facts.Unknown = null;
+    // A library function of the format convention: what its literal format places.
+    for (callees) |callee| {
+        if (try self.facts.program(callee.file)) continue;
+        const params = formatParams(self, callee) orelse continue;
+        switch (try formatReads(self, self.file, args, params, .{ .types = types })) {
+            .yes => return .{ .yes = callee },
+            .no => {},
+            .unknown => |why| unknown = why,
+        }
+    }
     for (args, 0..) |arg, position| {
         const value = try self.facts.resolve(self.file, arg);
         // An argument whose type is unknown may be one of them where a library callee reads it.
@@ -407,7 +417,9 @@ pub fn reflectedByCall(self: *Context, node: Ast.Node.Index, types: []const Fact
         for (callees) |callee| {
             if (try self.facts.program(callee.file)) continue;
             if (handed) |made| if (try samePackage(self, callee.file, made.file)) continue;
-            const reads: Is = if (reflectsParameter(self, callee, position)) .yes else try castsParameter(self, callee, position);
+            // The value itself, not a pointer to it: its type is the governed type.
+            const by_value = handed != null and value != .pointer;
+            const reads: Is = either(try reflectsDeep(self, callee, position, by_value, 0), try castsParameter(self, callee, position));
             switch (reads) {
                 .no => {},
                 .yes => if (handed != null) return .{ .yes = callee } else {
@@ -763,6 +775,288 @@ fn reflectsParameter(self: *Context, function: Facts.Decl, position: usize) bool
         if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(operands[0])), spelled)) return true;
     }
     return false;
+}
+
+/// How deep `reflectsDeep` follows a parameter handed on: past it, a named refusal.
+const reflection_depth = 8;
+
+/// Whether a library function reads its parameter at `position` by reflection, there or through
+/// what it hands it on to: a reflective builtin applied to the parameter (`reflectsParameter`)
+/// or to its type (`@TypeOf(key)`, or a constant holding either: `const Key = @TypeOf(key)`),
+/// or a call handing either on to a function that reads it so (std's `autoHash(h, key)`, whose
+/// `typeContainsSlice(Key)` reads `@typeInfo`; json's `value(v, ...)`, whose `s.write(v)` does),
+/// a function of the format convention read by its placeholders (`formatReads`). Unknown where
+/// such a call's callee or arguments no reading resolves, or past `reflection_depth` calls deep
+/// (`budget`): never a pass. Memoized as `castsParameter` is, a function met again while it is
+/// read taken as `no` until its own reading ends. Its type is the governed type only where the
+/// parameter holds the value itself (`by_value`): a pointer's or a slice's type is read by
+/// `@typeInfo(@TypeOf(slice))` (`Allocator.realloc`), never the type it points at, so there only
+/// a reflective builtin given the parameter itself counts.
+fn reflectsDeep(self: *Context, function: Facts.Decl, position: usize, by_value: bool, depth: usize) Context.Error!Is {
+    if (depth > reflection_depth) return .{ .unknown = .budget };
+    const rule_memory = self.keep();
+    defer self.allocator = rule_memory;
+    const memo = try self.facts.memo(Reflects);
+    const key: Casts.Key = .{ .function = function, .position = position * 2 + @intFromBool(by_value) };
+    if (memo.found.get(key)) |known| return known;
+    if (memo.active.contains(key)) {
+        memo.assumed += 1;
+        return .no;
+    }
+    try memo.active.put(self.allocator, key, {});
+    const assumed = memo.assumed;
+    const found = try reflectsDeepRead(self, function, position, by_value, depth);
+    _ = memo.active.remove(key);
+    if (found == .yes or memo.assumed == assumed) try memo.found.put(self.allocator, key, found);
+    if (memo.active.count() == 0) memo.assumed = 0;
+    return found;
+}
+
+/// The answers `reflectsDeep` read, as `Casts` keeps `castsParameter`'s.
+pub const Reflects = struct {
+    found: std.AutoHashMapUnmanaged(Casts.Key, Is) = .empty,
+    active: std.AutoHashMapUnmanaged(Casts.Key, void) = .empty,
+    assumed: usize = 0,
+};
+
+fn reflectsDeepRead(self: *Context, function: Facts.Decl, position: usize, by_value: bool, depth: usize) Context.Error!Is {
+    if (reflectsParameter(self, function, position)) return .yes;
+    const tree = &self.project.at(function.file).file.tree;
+    const model = &self.project.at(function.file).model;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, model.declarations[@backingInt(function.index)].node) orelse return .no;
+    var parameters = proto.iterate(tree);
+    var index: usize = 0;
+    const name = while (parameters.next()) |parameter| : (index += 1) {
+        if (index == position) break parameter.name_token orelse return .no;
+    } else return .no;
+    const declaration = self.facts.scopeNode(function);
+    if (tree.nodeTag(declaration) != .fn_decl) return .no;
+    const body = tree.nodeData(declaration).node_and_node[1];
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
+    // The names that hold the parameter or its type: it, and, by value, each constant given
+    // either.
+    var names: std.ArrayList([]const u8) = .empty;
+    try names.append(self.allocator, tree.tokenSlice(name));
+    var grew = by_value;
+    while (grew) {
+        grew = false;
+        for (tree.nodes.items(.tag), 0..) |_, raw| {
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(raw));
+            const at = tree.nodeMainToken(node);
+            if (at < first or at > last) continue;
+            const variable = tree.fullVarDecl(node) orelse continue;
+            if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) continue;
+            const init = variable.ast.init_node.unwrap() orelse continue;
+            if (!namesSubject(tree, init, names.items, by_value)) continue;
+            const held = tree.tokenSlice(variable.ast.mut_token + 1);
+            if (amongNames(names.items, held)) continue;
+            try names.append(self.allocator, held);
+            grew = true;
+        }
+    }
+    var unknown: ?Facts.Unknown = null;
+    for (tree.nodes.items(.tag), 0..) |_, raw| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(raw));
+        const at = tree.nodeMainToken(node);
+        if (at < first or at > last) continue;
+        // A reflective builtin applied to one of the names.
+        if (Facts.builtinName(tree, node)) |builtin| {
+            if (!amongNames(&reflective, builtin)) continue;
+            var arguments: [2]Ast.Node.Index = undefined;
+            const operands = Facts.builtinArgs(tree, node, &arguments);
+            if (operands.len != 0 and namesSubject(tree, operands[0], names.items, by_value)) return .yes;
+            continue;
+        }
+        // A call handing one of them on.
+        if (!Facts.calls.written(tree, node)) continue;
+        const call = (try Facts.calls.at(self.facts, function.file, node)) orelse continue;
+        var full_buffer: [1]Ast.Node.Index = undefined;
+        const full = tree.fullCall(&full_buffer, node) orelse continue;
+        var hands = false;
+        for (full.ast.params) |param| hands = hands or namesSubject(tree, param, names.items, by_value) or holdsSubject(tree, param, names.items, by_value);
+        if (tree.nodeTag(full.ast.fn_expr) == .field_access) hands = hands or namesSubject(tree, tree.nodeData(full.ast.fn_expr).node_and_token[0], names.items, by_value);
+        if (!hands) continue;
+        const args = switch (call.args) {
+            .known => |known| known,
+            .unknown => |why| {
+                unknown = why;
+                continue;
+            },
+        };
+        const callees: []const Facts.Decl = switch (call.callee) {
+            .function => |one| &.{one},
+            .choice => |each| each,
+            .any => |why| {
+                unknown = why;
+                continue;
+            },
+        };
+        for (callees) |callee| {
+            const reads: Is = if (formatParams(self, callee)) |params|
+                try formatReads(self, function.file, args, params, .{ .names = .{ .list = names.items, .by_value = by_value } })
+            else reads: {
+                var each: Is = .no;
+                for (args, 0..) |arg, handed| {
+                    if (!namesSubject(tree, arg, names.items, by_value)) continue;
+                    each = either(each, try reflectsDeep(self, callee, handed, by_value, depth + 1));
+                }
+                break :reads each;
+            };
+            switch (reads) {
+                .yes => return .yes,
+                .no => {},
+                .unknown => |why| unknown = why,
+            }
+        }
+    }
+    return if (unknown) |why| .{ .unknown = why } else .no;
+}
+
+fn amongNames(list: []const []const u8, name: []const u8) bool {
+    for (list) |each| if (std.mem.eql(u8, each, name)) return true;
+    return false;
+}
+
+/// Whether `node`, parentheses aside, is one of `names`, or, `by_value`, `@TypeOf` of one.
+fn namesSubject(tree: *const Ast, node: Ast.Node.Index, names: []const []const u8, by_value: bool) bool {
+    var at = node;
+    while (tree.nodeTag(at) == .grouped_expression) at = tree.nodeData(at).node_and_token[0];
+    if (tree.nodeTag(at) == .identifier) return amongNames(names, tree.tokenSlice(tree.nodeMainToken(at)));
+    if (!by_value) return false;
+    const builtin = Facts.builtinName(tree, at) orelse return false;
+    if (!std.mem.eql(u8, builtin, "@TypeOf")) return false;
+    var arguments: [2]Ast.Node.Index = undefined;
+    const operands = Facts.builtinArgs(tree, at, &arguments);
+    return operands.len == 1 and namesSubject(tree, operands[0], names, by_value);
+}
+
+/// Whether `node` is a tuple or struct literal one of whose elements is one of `names`.
+fn holdsSubject(tree: *const Ast, node: Ast.Node.Index, names: []const []const u8, by_value: bool) bool {
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullArrayInit(&buffer, node)) |init| {
+        for (init.ast.elements) |element| if (namesSubject(tree, element, names, by_value)) return true;
+    } else if (tree.fullStructInit(&buffer, node)) |init| {
+        for (init.ast.fields) |field| if (namesSubject(tree, field, names, by_value)) return true;
+    }
+    return false;
+}
+
+/// A library function's format convention, std's print family (`Writer.print`, `debug.print`,
+/// `log.err`, `fmt.allocPrint`, `debug.panic`): a `comptime` parameter named `fmt` or `format`
+/// whose next parameter is `anytype`, the arguments its placeholders place.
+const FormatParams = struct { format: usize, args: usize };
+
+fn formatParams(self: *Context, function: Facts.Decl) ?FormatParams {
+    const tree = &self.project.at(function.file).file.tree;
+    const record = self.project.at(function.file).model.declarations[@backingInt(function.index)];
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, record.node) orelse return null;
+    var parameters = proto.iterate(tree);
+    var index: usize = 0;
+    var format: ?usize = null;
+    while (parameters.next()) |parameter| : (index += 1) {
+        if (format) |at| {
+            const untyped = if (parameter.anytype_ellipsis3) |token| tree.tokenTag(token) == .keyword_anytype else false;
+            return if (untyped) .{ .format = at, .args = index } else null;
+        }
+        const name = parameter.name_token orelse continue;
+        const fixed = if (parameter.comptime_noalias) |token| tree.tokenTag(token) == .keyword_comptime else false;
+        const spelled = tree.tokenSlice(name);
+        if (fixed and (std.mem.eql(u8, spelled, "fmt") or std.mem.eql(u8, spelled, "format"))) format = index;
+    }
+    return null;
+}
+
+/// Where a format-convention call's arguments hold the subject: a governed value (`types`, at
+/// the program's call) or a name a library function reads it by (`names`).
+const Subject = union(enum) { types: []const Facts.Container, names: struct { list: []const []const u8, by_value: bool } };
+
+/// Whether a call of the format convention (`params`) reads the subject by reflection, by its
+/// literal format's placeholders: an argument holding it placed as `{f}` (the type's own
+/// `format`) or `{*}` (its address) is not read; placed any other way (`{any}`, `{}`, `{s}`)
+/// std's `printValue` walks its fields. `args` are the call's arguments in its callee's
+/// parameter order. A format no literal writes, where an argument holds the subject, is refused
+/// (`unsupported`): no reading here says what it places; never a pass.
+fn formatReads(self: *Context, file: Project.FileId, args: []const Ast.Node.Index, params: FormatParams, subject: Subject) Context.Error!Is {
+    if (params.args >= args.len or params.format >= args.len) return .no;
+    const tree = &self.project.at(file).file.tree;
+    var at = args[params.args];
+    while (tree.nodeTag(at) == .grouped_expression) at = tree.nodeData(at).node_and_token[0];
+    // Each argument the format can place, by position or by name, and whether it holds the subject.
+    var holds: std.ArrayList(struct { name: ?[]const u8, is: Is }) = .empty;
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullArrayInit(&buffer, at)) |init| {
+        for (init.ast.elements) |element| try holds.append(self.allocator, .{ .name = null, .is = try subjectIn(self, file, element, subject) });
+    } else if (tree.fullStructInit(&buffer, at)) |init| {
+        for (init.ast.fields) |field| try holds.append(self.allocator, .{
+            .name = if (Model.initName(tree, field)) |token| tree.tokenSlice(token) else null,
+            .is = try subjectIn(self, file, field, subject),
+        });
+    } else return .no;
+    var any: Is = .no;
+    for (holds.items) |one| any = either(any, one.is);
+    if (any == .no) return .no;
+    const format = args[params.format];
+    if (tree.nodeTag(format) != .string_literal) return .{ .unknown = .unsupported };
+    const raw = tree.tokenSlice(tree.nodeMainToken(format));
+    const text = raw[1 .. raw.len - 1];
+    var next: usize = 0;
+    var i: usize = 0;
+    var found: Is = .no;
+    while (i < text.len) : (i += 1) {
+        if (text[i] == '}') {
+            if (i + 1 < text.len and text[i + 1] == '}') i += 1;
+            continue;
+        }
+        if (text[i] != '{') continue;
+        if (i + 1 < text.len and text[i + 1] == '{') {
+            i += 1;
+            continue;
+        }
+        const close = std.mem.findScalarPos(u8, text, i, '}') orelse return .{ .unknown = .unsupported };
+        var inner = text[i + 1 .. close];
+        i = close;
+        // `{[name]...}`, `{2...}`, or the next argument.
+        var placed: ?Is = null;
+        if (inner.len != 0 and inner[0] == '[') {
+            const end = std.mem.findScalar(u8, inner, ']') orelse return .{ .unknown = .unsupported };
+            const wanted = inner[1..end];
+            inner = inner[end + 1 ..];
+            for (holds.items) |one| if (one.name) |named| if (std.mem.eql(u8, named, wanted)) {
+                placed = one.is;
+            };
+        } else {
+            var digits: usize = 0;
+            while (digits < inner.len and std.ascii.isDigit(inner[digits])) digits += 1;
+            const position = if (digits != 0) std.fmt.parseInt(usize, inner[0..digits], 10) catch return .{ .unknown = .unsupported } else blk: {
+                next += 1;
+                break :blk next - 1;
+            };
+            inner = inner[digits..];
+            if (position < holds.items.len) placed = holds.items[position].is;
+        }
+        const is = placed orelse continue;
+        const specifier = inner[0 .. std.mem.findScalar(u8, inner, ':') orelse inner.len];
+        if (std.mem.eql(u8, specifier, "f") or std.mem.eql(u8, specifier, "*")) continue;
+        found = either(found, is);
+        if (found == .yes) return found;
+    }
+    return found;
+}
+
+/// Whether the argument at `node` holds the subject: a value of a governed type or a pointer to
+/// one (`types`), unknown where its type is; or a name of it (`names`).
+fn subjectIn(self: *Context, file: Project.FileId, node: Ast.Node.Index, subject: Subject) Context.Error!Is {
+    return switch (subject) {
+        .names => |names| if (namesSubject(&self.project.at(file).file.tree, node, names.list, names.by_value)) .yes else .no,
+        .types => |types| blk: {
+            const value = try self.facts.resolve(file, node);
+            if (madeType(value, types) != null) break :blk .yes;
+            break :blk if (unknownIn(value)) |why| .{ .unknown = why } else .no;
+        },
+    };
 }
 
 /// The one of `types` a value is, or points at, through optionals and error unions; of a
