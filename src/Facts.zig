@@ -2248,7 +2248,12 @@ fn memberValue(self: *Facts, lhs: Value, name: []const u8) ResolveError!Value {
     if (lhs == .reflected) return self.reflectedMember(lhs.reflected, name);
     if (lhs == .literal) return self.literalField(lhs.literal, name);
     if (lhs == .pointer and lhs.pointer.child.* == .literal) return self.literalField(lhs.pointer.child.literal, name);
-    if (lhs == .pointer and lhs.pointer.child.* == .alternatives) return self.memberOfChoice(lhs.pointer.child.alternatives, name);
+    // A slice's `len` and `ptr` are its own, whichever element a build chooses (`[]T` with `T`
+    // an `i16` or an `i32`); another member is the element's, part by part.
+    if (lhs == .pointer and lhs.pointer.child.* == .alternatives) {
+        if (lhs.pointer.size == .slice and (std.mem.eql(u8, name, "len") or std.mem.eql(u8, name, "ptr"))) return sequence(lhs, name);
+        return self.memberOfChoice(lhs.pointer.child.alternatives, name);
+    }
     if (lhs == .alternatives) return self.memberOfChoice(lhs.alternatives, name);
     // A value of a type `@Struct` or `@Tuple` builds: whichever field the name is, it holds one
     // of the types the list gives (the names are computed as it compiles; a build reading one it
@@ -2306,9 +2311,11 @@ pub fn declaresTag(self: *const Facts, container: Container, name: []const u8) b
     return self.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind == .field;
 }
 
-/// Whether a container written in the program declares no member `name`.
+/// Whether a container written in the program declares no member `name`. One a type function
+/// makes (symbolic) too: its arguments choose its members' types, never their names, which its
+/// body writes (`Agree(G)` declares `init` and no `agree`, whatever `G` is).
 fn lacks(self: *const Facts, container: Container, name: []const u8) bool {
-    return !container.symbolic and self.member(container, name) == null;
+    return self.member(container, name) == null;
 }
 
 /// A field of an anonymous struct literal: the value the literal gives it.
@@ -4704,6 +4711,9 @@ pub fn callResult(self: *Facts, callee: Value, _: void) ResolveError!Value {
     }
     // A pointer to a declared function (`&ntdll.NtFsControlFile`): what calling it returns.
     if (callee == .pointer and callee.pointer.child.* == .function) return self.callResult(callee.pointer.child.*, {});
+    // A callee not known is the reason its result is not: a generic position's call (a
+    // `comptime f: anytype` no caller binds) is as generic as the function it calls.
+    if (callee == .unknown) return callee;
     // A value of a function type (`comptime read: fn (u8) T`) or a pointer to one (a
     // vtable's `*const fn (...) T`, which a call reads through): what the type declares it
     // returns, whichever function is passed.
@@ -13164,6 +13174,14 @@ pub const calls = struct {
             // A foreign symbol the link resolves (`@extern(*const F, ...)`, whose pointer reads
             // as its type alone): code glint never holds, not Zig whose functions are unknown.
             if (try externCallee(facts, file, callee, 0)) return .{ .any = .external };
+            // A function a call gives out of what a `const` stores (`actions.get(name)` of a
+            // `StaticStringMap` made `.initComptime` from a literal of named functions): one of
+            // the functions the literal names.
+            found.clearRetainingCapacity();
+            if (why == .unresolved and try storedCallees(facts, file, callee, &found, 0)) return switch (found.items.len) {
+                1 => .{ .function = found.items[0] },
+                else => .{ .choice = try facts.gpa.dupe(Facts.Decl, found.items) },
+            };
             if (why == .unresolved and try erasedCallee(facts, file, callee, 0)) return .{ .any = .erased_callee };
             return .{ .any = why };
         }
@@ -13180,7 +13198,9 @@ pub const calls = struct {
     /// parentheses, `.*`, `.?`, `try`, an `orelse`'s or a `catch`'s value, and a capture of one
     /// (`if (s.vtable.link) |link|`). A `const` is what
     /// its initializer is: a field it reads is erased, functions it names are not
-    /// (`const f = h.elicit orelse return` reads a field; a call's result is neither).
+    /// (`const f = h.elicit orelse return` reads a field). A call's result whose functions
+    /// `storedCallees` does not read (a map built as the program runs, a receiver a parameter,
+    /// a field or a `var` holds) is erased likewise.
     fn erasedCallee(facts: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: usize) Error!bool {
         if (depth == 16) return false;
         const tree = &facts.project.at(file).file.tree;
@@ -13190,7 +13210,7 @@ pub const calls = struct {
             .deref, .@"try" => callee = tree.nodeData(callee).node,
             // An element is held where its array is (`fs[0]()` of a `var fs`).
             .@"orelse", .@"catch", .array_access => callee = tree.nodeData(callee).node_and_node[0],
-            .field_access => return true,
+            .field_access, .call, .call_comma, .call_one, .call_one_comma => return true,
             .builtin_call_two, .builtin_call_two_comma => return std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(callee)), "@field"),
             .identifier => break,
             else => return false,
@@ -13213,6 +13233,95 @@ pub const calls = struct {
             // (params.Comb) |Comb|`): a field's value is erased as the field is.
             .capture => return erasedCallee(facts, decl.file, facts.captureSource(decl.file, record) orelse return false, depth + 1),
             .function, .field => return false,
+        }
+    }
+
+    /// Whether a callee is a function a call gives out of what a `const` stores, the functions
+    /// added to `found`: through what `erasedCallee` reads through and `const`s, a call on a
+    /// receiver (`actions` of `actions.get(name)`) a `const` holds, whose initializer is a
+    /// literal or a call given one (`.initComptime(.{ .{ "text", text }, ... })`). What the
+    /// literal names, read part by part, and what the call itself is given, are the functions
+    /// the call can give: a `const` holds nothing its initializer does not give it.
+    fn storedCallees(facts: *Facts, file: Project.FileId, node: Ast.Node.Index, found: *std.ArrayList(Facts.Decl), depth: usize) Error!bool {
+        if (depth == 16) return false;
+        const tree = &facts.project.at(file).file.tree;
+        var callee = node;
+        while (true) switch (tree.nodeTag(callee)) {
+            .grouped_expression, .unwrap_optional => callee = tree.nodeData(callee).node_and_token[0],
+            .deref, .@"try" => callee = tree.nodeData(callee).node,
+            .@"orelse", .@"catch" => callee = tree.nodeData(callee).node_and_node[0],
+            .identifier => {
+                const source = (try constSource(facts, file, callee)) orelse return false;
+                return storedCallees(facts, source.file, source.node, found, depth + 1);
+            },
+            else => break,
+        };
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, callee) orelse return false;
+        if (try returnedCallees(facts, file, call, found)) return true;
+        found.clearRetainingCapacity();
+        if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
+        const holder = tree.nodeData(call.ast.fn_expr).node_and_token[0];
+        if (tree.nodeTag(holder) != .identifier) return false;
+        const store = (try constSource(facts, file, holder)) orelse return false;
+        const store_tree = &facts.project.at(store.file).file.tree;
+        var made_buffer: [1]Ast.Node.Index = undefined;
+        const sources: []const Ast.Node.Index = if (store_tree.fullCall(&made_buffer, store.node)) |made| made.ast.params else &.{store.node};
+        for (sources) |source| _ = try heldFunctions(facts, try facts.resolve(store.file, source), found, 0);
+        for (call.ast.params) |given| _ = try heldFunctions(facts, try facts.resolve(file, given), found, 0);
+        return found.items.len != 0;
+    }
+
+    /// Whether a call is to a function each of whose own `return`s names functions (`return
+    /// &a;`), the functions added to `found`: those are the ones its result can be.
+    fn returnedCallees(facts: *Facts, file: Project.FileId, call: Ast.full.Call, found: *std.ArrayList(Facts.Decl)) Error!bool {
+        const decl = switch (try facts.resolve(file, call.ast.fn_expr)) {
+            .function => |decl| decl,
+            else => return false,
+        };
+        const record = facts.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+        const returns = try facts.ownReturns(decl, record) orelse return false;
+        if (returns.len == 0) return false;
+        for (returns) |returned| if (try heldFunctions(facts, try facts.resolve(decl.file, returned), found, 0) == 0) return false;
+        return true;
+    }
+
+    /// The initializer of the `const` an identifier names, or of the capture's source; null for
+    /// anything else (a `var`, a parameter, a field).
+    fn constSource(facts: *Facts, file: Project.FileId, identifier: Ast.Node.Index) Error!?struct { file: Project.FileId, node: Ast.Node.Index } {
+        const decl = switch (try facts.definition(file, identifier)) {
+            .decl => |decl| decl,
+            .none, .unknown => return null,
+        };
+        const record = facts.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+        switch (record.kind) {
+            .variable => {
+                const owner = &facts.project.at(decl.file).file.tree;
+                const variable = owner.fullVarDecl(record.node) orelse return null;
+                if (owner.tokenTag(variable.ast.mut_token) == .keyword_var) return null;
+                return .{ .file = decl.file, .node = variable.ast.init_node.unwrap() orelse return null };
+            },
+            .capture => return .{ .file = decl.file, .node = facts.captureSource(decl.file, record) orelse return null },
+            .parameter, .function, .field => return null,
+        }
+    }
+
+    /// The functions a stored value names: itself, what it points at, a literal's parts.
+    /// How many it names, each added once to `found`.
+    fn heldFunctions(facts: *Facts, value: Facts.Value, found: *std.ArrayList(Facts.Decl), depth: usize) Error!usize {
+        if (depth == 8) return 0;
+        switch (value) {
+            .function => |decl| {
+                try add(found, decl);
+                return 1;
+            },
+            .pointer => |inner| return heldFunctions(facts, inner.child.*, found, depth + 1),
+            .literal => |key| {
+                var named: usize = 0;
+                for (try facts.literalParts(key)) |part| named += try heldFunctions(facts, part, found, depth + 1);
+                return named;
+            },
+            else => return 0,
         }
     }
 
@@ -14682,6 +14791,63 @@ test "a slice of what does not resolve is a slice: its `.len` is its count, neve
     const sliced_value = try facts.resolve(file, slice.?);
     try std.testing.expect(sliced_value == .pointer);
     try std.testing.expectEqual(Size.slice, sliced_value.pointer.size.?);
+}
+
+test "a generic position's call is generic, a slice's `ptr` its own whichever element a build chooses, and a made type lacks what its body does not declare" {
+    // `shuffle` is a `comptime anytype` no call binds: calling it is generic as it is. `s` is
+    // a slice of an `i32` or an `i16`: its `ptr` is the slice's, never the element's. `T` is
+    // `Agree(u8)` or `Public(u8)`: only `Public`'s body declares `agree`, the one part read.
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes =
+        \\fn find(comptime shuffle: anytype, x: u8) u8 {
+        \\    const shuffled = shuffle(x);
+        \\    return shuffled;
+        \\}
+        \\const E = if (@sizeOf(usize) == 8) i32 else i16;
+        \\fn first(s: []E) usize {
+        \\    const pointer = s.ptr;
+        \\    return @intFromPtr(pointer);
+        \\}
+        \\fn Agree(comptime G: type) type {
+        \\    return struct {
+        \\        g: G,
+        \\    };
+        \\}
+        \\fn Public(comptime G: type) type {
+        \\    return struct {
+        \\        agree: Agree(G),
+        \\    };
+        \\}
+        \\fn w(comptime c: bool, t: if (c) Agree(u8) else Public(u8)) void {
+        \\    if (@hasField(@TypeOf(t), "agree")) {
+        \\        const agree = t.agree;
+        \\        _ = agree;
+        \\    }
+        \\}
+    }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const local = struct {
+        /// The value of the initializer of the `const` named `name`.
+        fn initValue(of: *Facts, name: []const u8) !Value {
+            const source = &of.project.sources[0];
+            for (source.model.declarations) |decl| {
+                if (decl.kind != .variable or !std.mem.eql(u8, decl.name, name)) continue;
+                const variable = source.file.tree.fullVarDecl(decl.node).?;
+                return of.resolve(source.id, variable.ast.init_node.unwrap().?);
+            }
+            return error.TestUnexpectedResult;
+        }
+    };
+    const shuffled = try local.initValue(&facts, "shuffled");
+    try std.testing.expect(shuffled == .unknown and shuffled.unknown == .generic);
+    const pointer = try local.initValue(&facts, "pointer");
+    try std.testing.expect(pointer == .pointer);
+    try std.testing.expectEqual(Size.slice, pointer.pointer.size.?);
+    const agree = try local.initValue(&facts, "agree");
+    try std.testing.expect(agree == .instance);
 }
 
 test "a function's value in a private alias or table is followed for every reader; a public alias, or a private one returned, escapes" {

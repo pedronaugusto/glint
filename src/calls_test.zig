@@ -19,6 +19,9 @@ const method = "const S = struct {\n    fn m(self: S, x: u8) void {\n        _ =
 const vtable = "const V = struct { f: *const fn () void };\n";
 const typed = "const T = struct {\n    fn init(n: u8) T {\n        _ = n;\n        return .{};\n    }\n    fn take(self: T, t: T) void {\n        _ = self;\n        _ = t;\n    }\n};\n";
 
+/// A type that stores functions its `init` is given and gives one out by `get`.
+const store = "const M = struct {\n    t: []const *const fn () void,\n    fn init(t: []const *const fn () void) M {\n        return .{ .t = t };\n    }\n    fn get(self: M, i: usize) *const fn () void {\n        return self.t[i];\n    }\n};\n";
+
 const rows = [_]Row{
     .{ .name = "direct", .source = fns ++ "fn w() void {\n    a();\n}\n", .expected = &.{"4 a 0"} },
     .{ .name = "method on a value", .source = method ++ "fn w(s: S) void {\n    s.m(1);\n}\n", .expected = &.{"8 m r2"} },
@@ -63,7 +66,11 @@ const rows = [_]Row{
     .{ .name = "a load of memory a caller gives", .source = fns ++ "pub fn w(slot: **const fn () void) void {\n    @atomicStore(*const fn () void, slot, &a, .release);\n    @atomicLoad(*const fn () void, slot, .acquire)();\n}\n", .expected = &.{"5 any unresolved 0"} },
     .{ .name = "its dereference, which the load reads as", .source = fns ++ "pub fn w(slot: **const fn () void) void {\n    slot.*();\n}\n", .expected = &.{"4 any erased_callee 0"} },
     .{ .name = "an element", .source = fns ++ "var fs = [_]*const fn () void{ &a, &b };\nfn w() void {\n    fs[0]();\n}\n", .expected = &.{"5 any erased_callee 0"} },
-    .{ .name = "a call's result", .source = fns ++ "fn get() *const fn () void {\n    return &a;\n}\nfn w() void {\n    get()();\n}\n", .expected = &.{ "7 any unresolved 0", "7 get 0" } },
+    .{ .name = "a call's result, each return naming a function", .source = fns ++ "fn get(c: bool) *const fn () void {\n    if (c) return &a;\n    return &b;\n}\nfn w() void {\n    get(true)();\n}\n", .expected = &.{ "8 a|b 0", "8 get 1" } },
+    .{ .name = "a call's result, a return not naming one", .source = fns ++ "pub fn get(f: *const fn () void) *const fn () void {\n    return f;\n}\nfn w() void {\n    get(&a)();\n}\n", .expected = &.{ "7 any erased_callee 0", "7 get 1" } },
+    .{ .name = "a call's result out of what a constant stores, the functions its literal names", .source = fns ++ store ++ "const m: M = .init(&.{ &a, &b });\nfn w(i: usize) void {\n    m.get(i)();\n}\n", .expected = &.{ "12 init 1", "14 a|b 0", "14 get r2" } },
+    .{ .name = "a call's result out of what a var stores", .source = fns ++ store ++ "var m: M = .init(&.{ &a, &b });\nfn w(i: usize) void {\n    m.get(i)();\n}\n", .expected = &.{ "12 init 1", "14 any erased_callee 0", "14 get r2" } },
+    .{ .name = "a call's result out of what a parameter holds", .source = fns ++ store ++ "fn w(m: M, i: usize) void {\n    m.get(i)();\n}\n", .expected = &.{ "13 any erased_callee 0", "13 get r2" } },
     .{ .name = "a foreign symbol", .source = "fn w() void {\n    @extern(*const fn () callconv(.c) void, .{ .name = \"x\" })();\n}\n", .expected = &.{"2 any external 0"} },
     .{ .name = "a constant choosing foreign symbols", .source = "fn w(c: bool) void {\n    const f = if (c) @extern(*const fn () callconv(.c) void, .{ .name = \"x\" }) else @extern(*const fn () callconv(.c) void, .{ .name = \"y\" });\n    f();\n}\n", .expected = &.{"3 any external 0"} },
     .{ .name = "a call's result, each return a foreign symbol", .source = "fn get(comptime name: []const u8) *const fn () callconv(.c) void {\n    return @extern(*const fn () callconv(.c) void, .{ .name = name });\n}\nfn w() void {\n    get(\"x\")();\n}\n", .expected = &.{ "5 any external 0", "5 get 1" } },
