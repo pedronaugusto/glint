@@ -118,14 +118,28 @@ const Reached = union(enum) {
 };
 
 /// What a check's walk has found, each once: a value's reach by its node, the reach of what is
-/// stored into a local by the local, and each function's stores and calls. A value or local met
-/// again while its own reach is being found (null) is met through a cycle, and reaches none by it.
+/// stored into a local by the local, and each function's stores and calls.
+///
+/// A value or local met again while its own reach is being found is met through a cycle, and is
+/// assumed to reach none, what a finite run of its stores makes. What is found under that
+/// assumption is kept only while it holds: where the value assumed comes out reaching none, each
+/// reach found under it stands; where it comes out reaching a local, they are dropped, and found
+/// again when next asked, the value's own reach then known (`Walk.findOnce`).
 const Memo = struct {
-    reached: std.AutoHashMapUnmanaged(Key, ?Reached) = .empty,
-    stored: std.AutoHashMapUnmanaged(Model.Declaration.Id, ?Reached) = .empty,
+    reached: std.AutoHashMapUnmanaged(Key, State) = .empty,
+    stored: std.AutoHashMapUnmanaged(Model.Declaration.Id, State) = .empty,
     parts: ?std.AutoHashMapUnmanaged(Ast.Node.Index, Parts) = null,
+    /// How many findings are open, each one's depth its place among them.
+    open: usize = 0,
+    /// The shallowest open finding one met again since the innermost began.
+    low: usize = std.math.maxInt(usize),
+    /// What was found under an assumption about one still open.
+    provisional: std.ArrayList(Entry) = .empty,
 
     const Key = struct { node: Ast.Node.Index, function: Ast.Node.Index };
+    const State = union(enum) { reading: usize, read: Reached };
+    const Which = enum { reached, stored };
+    const Entry = union(Which) { reached: Key, stored: Model.Declaration.Id };
     /// A function's stores of a value (`Facts.accesses.storesIn`'s sets) and its calls.
     const Parts = struct { sites: std.ArrayList(Facts.accesses.Site) = .empty, calls: std.ArrayList(Ast.Node.Index) = .empty };
 };
@@ -182,14 +196,62 @@ const Walk = struct {
     /// reach found is one of the file's resolutions, so the walk ends within the fact budget,
     /// whatever the function's size: past it, the file's analysis is refused as short of budget.
     fn escaping(self: Walk, written: Ast.Node.Index, function: Ast.Node.Index) Context.Error!Reached {
-        const key: Memo.Key = .{ .node = Facts.ungrouped(self.tree, written), .function = function };
-        if (self.memo.reached.get(key)) |known| return known orelse .none;
+        return self.findOnce(.{ .reached = .{ .node = Facts.ungrouped(self.tree, written), .function = function } }, function);
+    }
+
+    /// The reach `entry` names, found once as `Memo` keeps it: met again while open, assumed
+    /// none; found under an assumption about an open one, kept as long as that one reaches none.
+    fn findOnce(self: Walk, entry: Memo.Entry, function: Ast.Node.Index) Context.Error!Reached {
+        const a = self.c.allocator;
+        const memo = self.memo;
+        const known = switch (entry) {
+            .reached => |key| memo.reached.get(key),
+            .stored => |d| memo.stored.get(d),
+        };
+        if (known) |state| switch (state) {
+            .read => |kept| return kept,
+            .reading => |depth| {
+                memo.low = @min(memo.low, depth);
+                return .none;
+            },
+        };
+        // Each reach found is one of the file's resolutions: past the budget, none, and the
+        // file's analysis is short.
         if (self.c.facts.budgetSpent()) return .none;
         self.c.facts.remaining -= 1;
-        try self.memo.reached.put(self.c.allocator, key, null);
-        const reached = try self.reaching(key.node, function);
-        try self.memo.reached.put(self.c.allocator, key, reached);
+        const depth = memo.open;
+        try self.keep(entry, .{ .reading = depth });
+        memo.open += 1;
+        const outer_low = memo.low;
+        memo.low = std.math.maxInt(usize);
+        const kept_before = memo.provisional.items.len;
+        const reached = switch (entry) {
+            .reached => |key| try self.reaching(key.node, function),
+            .stored => |d| try self.storedOnce(d, function),
+        };
+        memo.open -= 1;
+        const low = memo.low;
+        memo.low = @min(outer_low, low);
+        try self.keep(entry, .{ .read = reached });
+        if (low < depth) {
+            // Found under an assumption about one further out: it stands or falls with that one.
+            try memo.provisional.append(a, entry);
+        } else if (memo.provisional.items.len > kept_before) {
+            // Its own assumption, none: held where it comes out none.
+            if (reached != .none) for (memo.provisional.items[kept_before..]) |undone| switch (undone) {
+                .reached => |key| _ = memo.reached.remove(key),
+                .stored => |d| _ = memo.stored.remove(d),
+            };
+            memo.provisional.shrinkRetainingCapacity(kept_before);
+        }
         return reached;
+    }
+
+    fn keep(self: Walk, entry: Memo.Entry, state: Memo.State) Context.Error!void {
+        switch (entry) {
+            .reached => |key| try self.memo.reached.put(self.c.allocator, key, state),
+            .stored => |d| try self.memo.stored.put(self.c.allocator, d, state),
+        }
     }
 
     /// The local `node`, a value of `function`, reaches into, as `escaping` finds it.
@@ -411,11 +473,7 @@ const Walk = struct {
     /// a `|*r|` capture of `d`), or a call that stores an argument through `d` (a method on it,
     /// `map.put(&name, v)`, or `d`'s address handed in).
     fn storedInto(self: Walk, d: Model.Declaration.Id, function: Ast.Node.Index) Context.Error!Reached {
-        if (self.memo.stored.get(d)) |known| return known orelse .none;
-        try self.memo.stored.put(self.c.allocator, d, null);
-        const reached = try self.storedOnce(d, function);
-        try self.memo.stored.put(self.c.allocator, d, reached);
-        return reached;
+        return self.findOnce(.{ .stored = d }, function);
     }
 
     fn storedOnce(self: Walk, d: Model.Declaration.Id, function: Ast.Node.Index) Context.Error!Reached {
