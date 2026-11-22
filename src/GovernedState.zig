@@ -14,7 +14,8 @@
 //! A rule that reads `.exits` is hygiene: an exit's result (`raw()`) given straight to arithmetic, a
 //! comparison or a narrowing cast (into a type that cannot hold every value of the exit's, both
 //! widths known) loses the type's checks. Only a call that resolves to an exit
-//! is read, and only that certain shape: a value kept in a name first is not followed.
+//! is read, and only that certain shape: straight, or through a const local it initializes and the
+//! const locals that alias it; a var or a call's argument takes the value out of the reading.
 const std = @import("std");
 const Ast = std.zig.Ast;
 const Context = @import("RuleContext.zig");

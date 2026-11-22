@@ -1,7 +1,7 @@
 .{
-    // A004 is a rule aegis declares (its lint_rules, read from the pinned aegis): one site it reports
-    // and one it must not, through the aegis type, straight and through a const local. Its other rows
-    // hold none.
-    .no_hole = .{ .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .unwrap, .aggregate, .memory, .branch },
-    .no_twin = .{ .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .unwrap, .aggregate, .memory, .branch },
+    // A004 is a rule aegis declares (its lint_rules, read from the pinned aegis): an exit's bare
+    // value given straight, or through const locals, to arithmetic, a comparison or a narrowing
+    // cast, its holder reached through each way a value is held; and the same value handed on
+    // whole, or widened.
+    .open = .{},
 }
