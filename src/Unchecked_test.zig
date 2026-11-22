@@ -444,6 +444,51 @@ test "Z006 leaves a type std's type function gives alone; a labeled block's valu
     , 0);
 }
 
+test "P009's walk finds each value's reach once, and is charged to the file's fact budget" {
+    // Each local's pointer handed, with every other's, to a call that stores one through the
+    // other: every name is met again through every call. A walk that found each value afresh
+    // re-read the function past any time; found once, it is a resolution each.
+    const width = 12;
+    const wide = comptime blk: {
+        @setEvalBranchQuota(100_000);
+        var body: []const u8 = "fn keep(into: **u32, from: *u32) void {\n    into.* = from;\n}\npub fn f() u32 {\n";
+        for (0..width) |i| body = body ++ std.fmt.comptimePrint("    var a{d}: u32 = {d};\n    var p{d}: *u32 = &a{d};\n", .{ i, i, i, i });
+        for (0..width) |i| for (0..width) |j| if (i != j) {
+            body = body ++ std.fmt.comptimePrint("    keep(&p{d}, p{d});\n", .{ i, j });
+        };
+        break :blk body ++ "    return p0.*;\n}\n";
+    };
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = wide }}, &.{}, .{});
+    defer project.deinit();
+    const walked = try leastBudget(&project, .P009);
+    // Its least budget past what reading the file alone takes is the walk's: one each at least
+    // for the locals it finds reaches of.
+    const read = try leastBudget(&project, .Z013);
+    try std.testing.expect(walked >= read + width);
+    // Short of it, the run is refused as short of budget: a named refusal, never a run that does
+    // not end.
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = .{ .enabled = .empty, .selections = &.{.{ .rule = .P009, .level = .report }}, .fact_budget = walked - 1 } });
+    defer report.deinit();
+    try std.testing.expect(!report.complete);
+    const named = for (report.errors) |e| {
+        if (std.mem.find(u8, e.why, "fact budget") != null) break true;
+    } else false;
+    try std.testing.expect(named);
+}
+
+/// The least fact budget a run of `rule` alone over `project` completes in, found by halving.
+fn leastBudget(project: *glint.Project, rule: glint.Rule) !usize {
+    var low: usize = 0;
+    var high: usize = 100_000;
+    while (low + 1 < high) {
+        const middle = low + (high - low) / 2;
+        var report = try glint.run(std.testing.allocator, project, .{ .config = .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .report }}, .fact_budget = middle } });
+        defer report.deinit();
+        if (report.complete) high = middle else low = middle;
+    }
+    return high;
+}
+
 test "P009 finds a pointer into the frame carried out of the call" {
     try expect(.P009, "pub fn f(n: usize) []u8 { var buf: [16]u8 = undefined; buf[0] = 1; return buf[0..n]; }", 1);
     try expect(.P009, "pub fn f() *u32 { var x: u32 = 1; x += 1; const out = &x; return out; }", 1);

@@ -40,7 +40,8 @@ const Found = struct { node: Ast.Node.Index, operand: Ast.Node.Index, stored: ?A
 pub fn check(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
-    const self: Walk = .{ .c = c, .tree = tree, .model = model };
+    var memo: Memo = .{};
+    const self: Walk = .{ .c = c, .tree = tree, .model = model, .memo = &memo };
     var found: std.ArrayList(Found) = .empty;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .@"return") continue;
@@ -93,7 +94,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         if (c.inTest(tree.nodeMainToken(node))) continue;
         const function = self.enclosing(node) orelse continue;
         if (stored) |target| if (!try self.outlives(target)) continue;
-        const reached = try self.escaping(operand, function, 0);
+        const reached = try self.escaping(operand, function);
         if (reached == .none) continue;
         if (stored) |target| if (try self.restored(function, target, node)) continue;
         const local = switch (reached) {
@@ -116,10 +117,24 @@ const Reached = union(enum) {
     none,
 };
 
+/// What a check's walk has found, each once: a value's reach by its node, the reach of what is
+/// stored into a local by the local, and each function's stores and calls. A value or local met
+/// again while its own reach is being found (null) is met through a cycle, and reaches none by it.
+const Memo = struct {
+    reached: std.AutoHashMapUnmanaged(Key, ?Reached) = .empty,
+    stored: std.AutoHashMapUnmanaged(Model.Declaration.Id, ?Reached) = .empty,
+    parts: ?std.AutoHashMapUnmanaged(Ast.Node.Index, Parts) = null,
+
+    const Key = struct { node: Ast.Node.Index, function: Ast.Node.Index };
+    /// A function's stores of a value (`Facts.accesses.storesIn`'s sets) and its calls.
+    const Parts = struct { sites: std.ArrayList(Facts.accesses.Site) = .empty, calls: std.ArrayList(Ast.Node.Index) = .empty };
+};
+
 const Walk = struct {
     c: *Context,
     tree: *const Ast,
     model: *const Model,
+    memo: *Memo,
 
     /// The function whose body holds `node`, or null outside one, inside `comptime`, or in a
     /// function returning `type`: all comptime frames.
@@ -163,19 +178,31 @@ const Walk = struct {
         return .{ d, decl };
     }
 
-    /// The local a pointer value reaches into: through `depth` aliases so far.
-    fn escaping(self: Walk, written: Ast.Node.Index, function: Ast.Node.Index, depth: u8) Context.Error!Reached {
+    /// The local a pointer value reaches into, found once for the check (`Memo`). Each value's
+    /// reach found is one of the file's resolutions, so the walk ends within the fact budget,
+    /// whatever the function's size: past it, the file's analysis is refused as short of budget.
+    fn escaping(self: Walk, written: Ast.Node.Index, function: Ast.Node.Index) Context.Error!Reached {
+        const key: Memo.Key = .{ .node = Facts.ungrouped(self.tree, written), .function = function };
+        if (self.memo.reached.get(key)) |known| return known orelse .none;
+        if (self.c.facts.budgetSpent()) return .none;
+        self.c.facts.remaining -= 1;
+        try self.memo.reached.put(self.c.allocator, key, null);
+        const reached = try self.reaching(key.node, function);
+        try self.memo.reached.put(self.c.allocator, key, reached);
+        return reached;
+    }
+
+    /// The local `node`, a value of `function`, reaches into, as `escaping` finds it.
+    fn reaching(self: Walk, node: Ast.Node.Index, function: Ast.Node.Index) Context.Error!Reached {
         const tree = self.tree;
-        const node = Facts.ungrouped(tree, written);
-        if (depth > 8) return .none;
         // A value carried or chosen (`.?`, `try`, both sides of `orelse` and `catch`, an `if`'s
         // or a `switch`'s results, a labeled block's `break`s, `@as`): each value it may give.
         switch (try Facts.accesses.valuesOf(self.c.facts, self.c.file, node)) {
-            .leaves => |leaves| if (leaves.len != 1 or leaves[0] != node) return self.first(leaves, function, depth + 1),
+            .leaves => |leaves| if (leaves.len != 1 or leaves[0] != node) return self.first(leaves, function),
             .unknown => return .none,
         }
         switch (tree.nodeTag(node)) {
-            .address_of => return self.addressOf(tree.nodeData(node).node, function, depth),
+            .address_of => return self.addressOf(tree.nodeData(node).node, function),
             .slice_open, .slice, .slice_sentinel => {
                 const sliced = (tree.fullSlice(node) orelse return .none).ast.sliced;
                 const root = (try self.storage(sliced)) orelse return .none;
@@ -189,7 +216,7 @@ const Walk = struct {
                     return .none;
                 var others: std.ArrayList(Facts.Key) = .empty;
                 for (given) |each| if (!try self.slicesItself(each.node, d)) try others.append(self.c.allocator, each);
-                return self.first(others.items, function, depth + 1);
+                return self.first(others.items, function);
             },
             // A name for a pointer: each value it or a part of it is given (`Facts.givenTo`),
             // what a `const` holds; a store that may give it any value may give it a local's
@@ -199,36 +226,36 @@ const Walk = struct {
                 // what the source gives, a loop's each element of a literal it runs over.
                 if (self.capture(node, function)) |record| {
                     const source = self.c.facts.captureSource(self.c.file, record) orelse return .none;
-                    if (tree.tokenTag(record.token - 1) == .asterisk) return self.pointed(source, function, depth + 1);
+                    if (tree.tokenTag(record.token - 1) == .asterisk) return self.pointed(source, function);
                     if (try self.c.facts.holdsNoAddress(try self.c.facts.resolve(self.c.file, node))) return .none;
-                    if (tree.fullFor(record.node) == null) return self.escaping(source, function, depth + 1);
+                    if (tree.fullFor(record.node) == null) return self.escaping(source, function);
                     var buffer: [2]Ast.Node.Index = undefined;
                     const literal = tree.fullArrayInit(&buffer, Facts.ungrouped(tree, source)) orelse return .none;
-                    return self.first(literal.ast.elements, function, depth + 1);
+                    return self.first(literal.ast.elements, function);
                 }
                 const d = self.own(node, function) orelse return .none;
                 // A name a destructure declares holds its element of the literal destructured.
-                if (self.destructuredElement(d)) |element| return self.escaping(element, function, depth + 1);
+                if (self.destructuredElement(d)) |element| return self.escaping(element, function);
                 // A value that holds no pointer (`[4]u8` returned whole) points nowhere.
                 if (try self.c.facts.holdsNoAddress(try self.typeOf(d))) return .none;
                 // What a store put into its own memory, by any name for it (`into.* = &x` of
                 // `const into = &p`, a `|*r|` capture's `r.buffer = &local`, a method that stores
                 // its argument through its receiver).
-                const stored = try self.storedInto(d, function, depth);
+                const stored = try self.storedInto(d, function);
                 if (stored == .local) return stored;
                 const given = (try self.c.facts.givenTo(.{ .file = self.c.file, .index = d }, true)) orelse
                     return .none;
-                return self.first(given, function, depth + 1);
+                return self.first(given, function);
             },
             // A pointer moved by a number points into the memory it did (`p + 1`); a difference
             // of two is a number.
             .add, .sub, .add_wrap, .sub_wrap => {
                 if (try self.c.facts.holdsNoAddress(try self.c.facts.resolve(self.c.file, node))) return .none;
-                return self.escaping(tree.nodeData(node).node_and_node[0], function, depth + 1);
+                return self.escaping(tree.nodeData(node).node_and_node[0], function);
             },
             // A slice's `ptr` points where the slice does.
             .field_access => return switch (try self.c.facts.languageField(self.c.file, node)) {
-                .ptr => self.escaping(tree.nodeData(node).node_and_token[0], function, depth + 1),
+                .ptr => self.escaping(tree.nodeData(node).node_and_token[0], function),
                 .len, .none, .unknown => .none,
             },
             else => {
@@ -236,24 +263,24 @@ const Walk = struct {
                 var arguments: [2]Ast.Node.Index = undefined;
                 const args = Facts.builtinArgs(tree, node, &arguments);
                 for ([_]struct { []const u8, usize }{ .{ "@ptrCast", 0 }, .{ "@alignCast", 0 }, .{ "@constCast", 0 }, .{ "@volatileCast", 0 }, .{ "@fieldParentPtr", 1 } }) |cast| {
-                    if (Facts.isBuiltin(tree, node, cast[0]) and cast[1] < args.len) return self.escaping(args[cast[1]], function, depth + 1);
+                    if (Facts.isBuiltin(tree, node, cast[0]) and cast[1] < args.len) return self.escaping(args[cast[1]], function);
                 }
                 var buffer: [2]Ast.Node.Index = undefined;
-                if (tree.fullStructInit(&buffer, node)) |literal| return self.first(literal.ast.fields, function, depth);
-                if (tree.fullArrayInit(&buffer, node)) |literal| return self.first(literal.ast.elements, function, depth);
+                if (tree.fullStructInit(&buffer, node)) |literal| return self.first(literal.ast.fields, function);
+                if (tree.fullArrayInit(&buffer, node)) |literal| return self.first(literal.ast.elements, function);
                 // A call's result holds what the callee returns of an argument (`same(&x)`).
                 var call_buffer: [1]Ast.Node.Index = undefined;
-                if (tree.fullCall(&call_buffer, node) != null) return self.returned(node, function, depth);
+                if (tree.fullCall(&call_buffer, node) != null) return self.returned(node, function);
                 return .none;
             },
         }
     }
 
     /// The local the address of the place `inner` points into.
-    fn addressOf(self: Walk, inner: Ast.Node.Index, function: Ast.Node.Index, depth: u8) Context.Error!Reached {
+    fn addressOf(self: Walk, inner: Ast.Node.Index, function: Ast.Node.Index) Context.Error!Reached {
         // A place reached through a pointer (`&p.*`, `&p.f`, `&s[i]`) is in the memory that
         // pointer points at.
-        if (try self.crossed(inner)) |pointer| return self.escaping(pointer, function, depth + 1);
+        if (try self.crossed(inner)) |pointer| return self.escaping(pointer, function);
         const root = (try self.storage(inner)) orelse return .none;
         // The local itself is its frame's memory, whatever its type.
         if (root == Facts.ungrouped(self.tree, inner)) return reach(try self.variable(root, function));
@@ -264,7 +291,7 @@ const Walk = struct {
     /// The local a pointer capture (`|*v|`) points into: the memory its source points at (a
     /// slice, a pointer to an array), or the source's own where it holds what it captures (an
     /// optional, a union, an array). A source whose type is not known shows neither: none.
-    fn pointed(self: Walk, source: Ast.Node.Index, function: Ast.Node.Index, depth: u8) Context.Error!Reached {
+    fn pointed(self: Walk, source: Ast.Node.Index, function: Ast.Node.Index) Context.Error!Reached {
         const typed = try self.c.facts.resolve(self.c.file, source);
         var pointer = false;
         var holder = false;
@@ -274,10 +301,10 @@ const Walk = struct {
             else => holder = true,
         };
         if (pointer) {
-            const out = try self.escaping(source, function, depth);
+            const out = try self.escaping(source, function);
             if (out == .local) return out;
         }
-        if (holder) return self.addressOf(source, function, depth);
+        if (holder) return self.addressOf(source, function);
         return .none;
     }
 
@@ -308,8 +335,8 @@ const Walk = struct {
 
     /// The first local one of `values` (expressions, or `Facts.Key`s of this file) reaches
     /// into, or none.
-    fn first(self: Walk, values: anytype, function: Ast.Node.Index, depth: u8) Context.Error!Reached {
-        for (values) |each| switch (try self.escaping(if (@TypeOf(each) == Facts.Key) each.node else each, function, depth)) {
+    fn first(self: Walk, values: anytype, function: Ast.Node.Index) Context.Error!Reached {
+        for (values) |each| switch (try self.escaping(if (@TypeOf(each) == Facts.Key) each.node else each, function)) {
             .local => |d| return .{ .local = d },
             .none => {},
         };
@@ -356,10 +383,10 @@ const Walk = struct {
 
     /// The local a call's result reaches into: an argument that does, which the callee returns
     /// (`same(&x)` of `fn same(p: *u32) *u32 { return p; }`).
-    fn returned(self: Walk, call: Ast.Node.Index, function: Ast.Node.Index, depth: u8) Context.Error!Reached {
+    fn returned(self: Walk, call: Ast.Node.Index, function: Ast.Node.Index) Context.Error!Reached {
         const read = (try self.callOf(call)) orelse return .none;
         for (read.args, 0..) |arg, from| {
-            const reached = try self.escaping(arg, function, depth + 1);
+            const reached = try self.escaping(arg, function);
             if (reached == .local and try self.every(read.functions, .{ .result = from })) return reached;
         }
         return .none;
@@ -379,44 +406,39 @@ const Walk = struct {
         return literal.ast.elements[position];
     }
 
-    /// Whether `node` lies inside `function`, by its tokens (a cheap test before `enclosing`).
-    fn within(self: Walk, node: Ast.Node.Index, function: Ast.Node.Index) bool {
-        const token = self.tree.nodeMainToken(node);
-        return token >= self.tree.firstToken(function) and token <= self.tree.lastToken(function) and self.enclosing(node) == function;
-    }
-
     /// The local, another than `d`, a pointer stored into `d`'s own memory reaches: a store into
     /// it or a part of it by any name (`into.* = &x` of `const into = &p`, `r.buffer = &local` of
     /// a `|*r|` capture of `d`), or a call that stores an argument through `d` (a method on it,
     /// `map.put(&name, v)`, or `d`'s address handed in).
-    fn storedInto(self: Walk, d: Model.Declaration.Id, function: Ast.Node.Index, depth: u8) Context.Error!Reached {
-        if (depth > 8) return .none;
-        for (try Facts.accesses.storesIn(self.c.facts, self.c.file)) |site| {
-            if (site.kind != .set or !self.within(site.node, function)) continue;
+    fn storedInto(self: Walk, d: Model.Declaration.Id, function: Ast.Node.Index) Context.Error!Reached {
+        if (self.memo.stored.get(d)) |known| return known orelse .none;
+        try self.memo.stored.put(self.c.allocator, d, null);
+        const reached = try self.storedOnce(d, function);
+        try self.memo.stored.put(self.c.allocator, d, reached);
+        return reached;
+    }
+
+    fn storedOnce(self: Walk, d: Model.Declaration.Id, function: Ast.Node.Index) Context.Error!Reached {
+        const parts = try self.partsOf(function);
+        for (parts.sites) |site| {
             const given = site.value orelse continue;
-            if (!try self.inMemoryOf(site.target orelse continue, d, function, depth)) continue;
-            const reached = try self.escaping(given, function, depth + 1);
+            if (!try self.inMemoryOf(site.target orelse continue, d, function)) continue;
+            const reached = try self.escaping(given, function);
             if (reached == .local and reached.local != d) return reached;
         }
-        for (self.tree.nodes.items(.tag), 0..) |tag, i| {
-            switch (tag) {
-                .call, .call_comma, .call_one, .call_one_comma => {},
-                else => continue,
-            }
-            const call: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            if (!self.within(call, function)) continue;
+        for (parts.calls) |call| {
             const read = (try self.callOf(call)) orelse continue;
             for (read.args, 0..) |holder, into| {
                 // A receiver is handed by its address; any other argument by its value, whose
                 // pointer is `d`'s memory only where it points into it.
                 const held = if (into == 0 and read.receiver) self.own(Facts.ungrouped(self.tree, holder), function) == d else blk: {
-                    const points = try self.escaping(holder, function, depth + 1);
+                    const points = try self.escaping(holder, function);
                     break :blk points == .local and points.local == d;
                 };
                 if (!held) continue;
                 for (read.args, 0..) |arg, from| {
                     if (from == into) continue;
-                    const reached = try self.escaping(arg, function, depth + 1);
+                    const reached = try self.escaping(arg, function);
                     if (reached != .local or reached.local == d) continue;
                     if (try self.every(read.functions, .{ .param = .{ .into = into, .from = from } })) return reached;
                 }
@@ -425,11 +447,41 @@ const Walk = struct {
         return .none;
     }
 
+    /// `function`'s stores of a value and its calls, gathered for every function of the file in
+    /// one pass the first time one is asked for.
+    fn partsOf(self: Walk, function: Ast.Node.Index) Context.Error!struct { sites: []const Facts.accesses.Site, calls: []const Ast.Node.Index } {
+        const a = self.c.allocator;
+        if (self.memo.parts == null) {
+            var gathered: std.AutoHashMapUnmanaged(Ast.Node.Index, Memo.Parts) = .empty;
+            for (try Facts.accesses.storesIn(self.c.facts, self.c.file)) |site| {
+                if (site.kind != .set) continue;
+                const holder = self.enclosing(site.node) orelse continue;
+                const entry = try gathered.getOrPut(a, holder);
+                if (!entry.found_existing) entry.value_ptr.* = .{};
+                try entry.value_ptr.sites.append(a, site);
+            }
+            for (self.tree.nodes.items(.tag), 0..) |tag, i| {
+                switch (tag) {
+                    .call, .call_comma, .call_one, .call_one_comma => {},
+                    else => continue,
+                }
+                const call: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                const holder = self.enclosing(call) orelse continue;
+                const entry = try gathered.getOrPut(a, holder);
+                if (!entry.found_existing) entry.value_ptr.* = .{};
+                try entry.value_ptr.calls.append(a, call);
+            }
+            self.memo.parts = gathered;
+        }
+        const parts = self.memo.parts.?.get(function) orelse return .{ .sites = &.{}, .calls = &.{} };
+        return .{ .sites = parts.sites.items, .calls = parts.calls.items };
+    }
+
     /// Whether the place `target` lies in `d`'s own memory: `d` or a part of it by its name, or
     /// a place a pointer into `d` reaches.
-    fn inMemoryOf(self: Walk, target: Ast.Node.Index, d: Model.Declaration.Id, function: Ast.Node.Index, depth: u8) Context.Error!bool {
+    fn inMemoryOf(self: Walk, target: Ast.Node.Index, d: Model.Declaration.Id, function: Ast.Node.Index) Context.Error!bool {
         if (try self.crossed(target)) |pointer| {
-            const into = try self.escaping(pointer, function, depth + 1);
+            const into = try self.escaping(pointer, function);
             return into == .local and into.local == d;
         }
         const root = (try self.storage(target)) orelse return false;
@@ -443,7 +495,7 @@ const Walk = struct {
     fn handedOut(self: Walk, call: Ast.Node.Index, function: Ast.Node.Index) Context.Error!?Handed {
         const read = (try self.callOf(call)) orelse return null;
         for (read.args, 0..) |arg, from| {
-            const reached = try self.escaping(arg, function, 0);
+            const reached = try self.escaping(arg, function);
             if (reached != .local) continue;
             const out: Handed = .{ .local = reached.local, .argument = arg };
             if (try self.everyStoresGlobally(read.functions, from)) return out;
