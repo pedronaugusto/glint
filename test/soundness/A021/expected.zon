@@ -1,6 +1,7 @@
 .{
-    // A021 is a rule aegis declares (its lint_rules, read from the pinned aegis): one site it reports
-    // and one it must not, inside the seam the case declares. Its other rows hold none.
-    .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch },
-    .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch },
+    // A021 is a rule aegis declares (its lint_rules, read from the pinned aegis): an unranked
+    // acquisition of an aegis guarded value reached through each way its pointer is held, and
+    // the same way reaching Order's ordered lock and its ranked acquisition; the acquisition
+    // inside the seam a case declares (call/guarded_acquire).
+    .open = .{},
 }
