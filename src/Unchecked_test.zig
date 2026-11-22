@@ -711,7 +711,11 @@ test "one suppression names each rule it covers on its line, one site each" {
     try std.testing.expectEqual(@as(u32, 2), report.diagnostics[0].span.line);
     try std.testing.expectEqual(@as(usize, 3), report.suppressed); // safe: f's two and g's one.
     try std.testing.expectEqual(@as(usize, 0), report.malformed.len); // safe: none malformed.
-    try std.testing.expect(report.complete);
+    // Neither rule refused: aegis's `.replaces` entries name std declarations this fixture's std
+    // need not have (std.crypto's), and refuse apart, under their own rules.
+    for (report.errors) |e| for ([_][]const u8{ "P007", "P008" }) |rule| {
+        try std.testing.expect(std.mem.find(u8, e.why, rule) == null);
+    };
 }
 
 test "P007 leaves a vtable's owner recovery from *anyopaque alone, and reports a cast from it to a slice or a many-item pointer" {

@@ -17,9 +17,10 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
                 if (c.inTest(token)) continue;
                 try c.at(rule, token, "`.?` traps where the value is null: write the reason it never is at this site");
             },
+            // The answer that only traps, however written: `unreachable`, a block of only that
+            // (`orelse { unreachable; }`), a switch whose every prong does (`Written.traps`).
             .@"orelse" => {
-                const answer = Written.ungrouped(tree, tree.nodeData(node).node_and_node[1]);
-                if (tree.nodeTag(answer) != .unreachable_literal) continue;
+                if (!Written.traps(tree, tree.nodeData(node).node_and_node[1], 0)) continue;
                 const token = tree.nodeMainToken(node);
                 if (c.inTest(token)) continue;
                 try c.at(rule, token, "`orelse unreachable` traps where the value is null: write the reason it never is at this site");
@@ -29,9 +30,9 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
                 // payload captured, its null trapping.
                 const branch = tree.fullIf(node) orelse continue;
                 if (branch.payload_token == null or branch.error_token != null) continue;
-                const answer = Written.ungrouped(tree, branch.ast.else_expr.unwrap() orelse continue);
-                if (tree.nodeTag(answer) != .unreachable_literal) continue;
-                const token = tree.nodeMainToken(answer);
+                const otherwise = branch.ast.else_expr.unwrap() orelse continue;
+                if (!Written.traps(tree, otherwise, 0)) continue;
+                const token = tree.nodeMainToken(Written.ungrouped(tree, otherwise));
                 if (c.inTest(token)) continue;
                 try c.at(rule, token, "`else unreachable` on an optional's capture traps where the value is null: write the reason it never is at this site");
             },
@@ -47,5 +48,8 @@ test "breadth: unwrap trap: .? and orelse unreachable reported; another orelse a
     try breadth.expectFindings(check, "test { const o: ?u8 = 1; _ = o.?; }", 0);
     try breadth.expectFindings(check, "pub fn f(o: ?u8) u8 { return if (o) |v| v else unreachable; }", 1);
     try breadth.expectFindings(check, "pub fn f(o: ?u8) u8 { return if (o) |v| v else 0; }", 0);
+    // The trap written as a block: the same unwrap.
+    try breadth.expectFindings(check, "pub fn f(o: ?u8) u8 { return (o orelse { unreachable; }) + if (o) |v| v else { unreachable; }; }", 2);
+    try breadth.expectFindings(check, "pub fn f(o: ?u8) u8 { return o orelse { return 0; }; }", 0);
     try breadth.expectFindings(check, "fn g() !u8 { return 1; } pub fn f() u8 { return if (g()) |v| v else |_| unreachable; }", 0);
 }

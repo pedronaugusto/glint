@@ -103,8 +103,20 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         if (std.mem.eql(u8, name, "@setFloatMode")) {
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, node, &buffer);
-            if (args.len == 1 and tree.nodeTag(args[0]) == .enum_literal and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(args[0])), "optimized"))
-                try c.at(rule, token, "@setFloatMode(.optimized): float results no build checks; only a measured hot loop validated at its boundary");
+            if (args.len != 1) continue;
+            // The mode is a compile-time value, read as the program fixes it: written (`.optimized`),
+            // through a constant holding it, or by its full name (`std.builtin.FloatMode.optimized`).
+            if (try c.facts.comptimeValue(null, c.file, args[0])) |mode| {
+                if (mode == .tag and std.mem.eql(u8, mode.tag.name, "optimized"))
+                    try c.at(rule, token, "@setFloatMode(.optimized): float results no build checks; only a measured hot loop validated at its boundary");
+                continue;
+            }
+            // Not fixed where it is written: a `comptime` parameter's is the instantiation's to
+            // decide; anything else (a build's choice) glint does not read, and says so.
+            var root = args[0];
+            while (tree.nodeTag(root) == .field_access) root = tree.nodeData(root).node_and_token[0];
+            const value = try c.facts.resolve(c.file, args[0]);
+            try c.unknownAt(rule, token, if (c.facts.comptimeParameter(c.file, root)) .generic else if (value == .unknown) value.unknown else .unsupported);
         }
     }
     const model = &c.project.at(c.file).model;

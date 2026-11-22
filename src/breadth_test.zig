@@ -75,6 +75,9 @@ pub const fixture_std =
     \\pub const posix = struct {
     \\    pub fn read(fd: i32, buf: []u8) !usize { _ = fd; return buf.len; }
     \\};
+    \\pub const debug = struct {
+    \\    pub fn panic(comptime format: []const u8, args: anytype) noreturn { _ = format; _ = args; unreachable; }
+    \\};
     \\pub const Io = struct {
     \\    pub const Writer = struct {
     \\        end: usize = 0,

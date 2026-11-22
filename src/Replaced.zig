@@ -287,27 +287,33 @@ fn builtinSites(c: *Context, definition: Rule.Definition, all: []const Entry, in
 
 /// Each struct field whose type is an entry's target held by value (`.held = .field`): the
 /// type itself, or an optional, an array or an error union of it, each holding one or more by
-/// value, never a pointer, slice or optional pointer to it.
+/// value, never a pointer, slice or optional pointer to it. Every field written in the file is
+/// read, a tuple's too (`struct { std.Io.File, u8 }`), which has no name and so no declaration:
+/// its site is its type's first token.
 fn heldSites(c: *Context, definition: Rule.Definition, ban: bool, all: []const Entry, indexes: []const usize) Context.Error!void {
     if (indexes.len == 0) return;
     const tree = &c.project.at(c.file).file.tree;
-    const model = &c.project.at(c.file).model;
-    for (model.declarations) |decl| {
-        if (decl.kind != .field) continue;
-        const field = model.containerField(tree, decl.node) orelse continue;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        switch (tag) {
+            .container_field, .container_field_init, .container_field_align => {},
+            else => continue,
+        }
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const field = tree.fullContainerField(node) orelse continue;
         const written = field.ast.type_expr.unwrap() orelse continue;
+        const token = if (field.ast.tuple_like) tree.firstToken(written) else field.ast.main_token;
         const value = try c.facts.resolve(c.file, written);
         for (indexes) |index| {
             const entry = all[index];
             for (entry.replacement.declarations()) |target| {
                 const held = try heldBy(c, value, target);
-                if (held == .no or c.inTest(decl.token) or !try applies(c, entry, decl.node)) continue;
+                if (held == .no or c.inTest(token) or !try applies(c, entry, node)) continue;
                 // Under a ban, a field whose type is unknown is no pass (`Context.unknownAt`).
                 if (held == .unknown) {
-                    if (ban) try c.unknownAt(definition.id, decl.token, held.unknown);
+                    if (ban) try c.unknownAt(definition.id, token, held.unknown);
                     continue;
                 }
-                try c.at(definition.id, decl.token, try message(c, entry));
+                try c.at(definition.id, token, try message(c, entry));
             }
         }
     }

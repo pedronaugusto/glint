@@ -1120,12 +1120,11 @@ fn comptimeValueRead(self: *Facts, env: ?*const Env, file: Project.FileId, node:
             if (held == .container) {
                 const k = held.container;
                 if (k.symbolic) return null;
-                const decl = self.member(k, name) orelse {
-                    // An enum's tag (`Kind.ranged`).
-                    const index = self.project.at(k.file).model.scopes[@backingInt(k.scope)].names.get(name) orelse return null;
-                    if (self.kindOf(k) != .keyword_enum or self.project.at(k.file).model.declarations[@backingInt(index)].kind != .field) return null;
-                    return .{ .tag = .{ .name = name, .of = k } };
-                };
+                const decl = self.member(k, name) orelse return null;
+                // An enum's tag (`Kind.ranged`, `std.builtin.FloatMode.optimized`): `member` finds
+                // its field, which is the tag, never a constant to chase.
+                if (self.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind == .field)
+                    return if (self.kindOf(k) == .keyword_enum) .{ .tag = .{ .name = name, .of = k } } else null;
                 return self.constantComptime(decl, try self.instanceOf(decl, k, env));
             }
             // A field of a struct literal the program fixes (`declared.contract`).
@@ -6465,6 +6464,23 @@ const OwnStores = struct {
 /// dropped and read again.
 pub fn storesAddress(self: *Facts, function: Decl, into: usize, from: usize) ResolveError!?bool {
     return self.ownReading(function, .{ .param = into }, from);
+}
+
+/// What each `return` of `function`'s own body gives (not a function's declared inside it), in
+/// `function.file`; null where it has no body glint reads (an `extern`, a prototype).
+pub fn returnedValues(self: *Facts, function: Decl) ResolveError!?[]const Ast.Node.Index {
+    const tree = self.syntaxOf(function.file);
+    const whole = self.scopeNode(function);
+    if (tree.nodeTag(whole) != .fn_decl) return null;
+    const body = tree.nodeData(whole).node_and_node[1];
+    var found: std.ArrayList(Ast.Node.Index) = .empty;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"return") continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        if (!self.ownStatement(function.file, whole, body, node)) continue;
+        try found.append(self.gpa, tree.nodeData(node).opt_node.unwrap() orelse continue);
+    }
+    return found.items;
 }
 
 /// Whether `function`'s result may be or hold what its parameter at `from` holds: an address

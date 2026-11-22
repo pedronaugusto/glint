@@ -105,6 +105,21 @@ pub fn ungrouped(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
     return at;
 }
 
+/// Whether `written` only traps: `unreachable`, a block that is only that, or a `switch` every
+/// prong of which only traps (`catch |e| switch (e) { error.Empty => unreachable }`). Z026 reads
+/// an error handler so, P010 an `orelse`'s answer.
+pub fn traps(tree: *const Ast, written: Ast.Node.Index, depth: u8) bool {
+    if (depth == 8) return false;
+    const node = ungrouped(tree, written);
+    if (tree.nodeTag(node) == .unreachable_literal) return true;
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.blockStatements(&buffer, node)) |statements| return statements.len == 1 and traps(tree, statements[0], depth + 1);
+    const full = tree.fullSwitch(node) orelse return false;
+    if (full.ast.cases.len == 0) return false;
+    for (full.ast.cases) |case| if (!traps(tree, tree.fullSwitchCase(case).?.ast.target_expr, depth + 1)) return false;
+    return true;
+}
+
 /// The value of an integer literal, or of `*`, `+`, `<<` over such literals; null for any other.
 pub fn literalInteger(tree: *const Ast, node: Ast.Node.Index) ?u128 {
     const at = ungrouped(tree, node);

@@ -5,6 +5,7 @@ const rules = @import("Rule.zig");
 const Model = @import("Model.zig");
 const Project = @import("Project.zig");
 const names = @import("names.zig");
+const Written = @import("Written.zig");
 const Ast = std.zig.Ast;
 const Context = @import("RuleContext.zig");
 const Report = @import("Report.zig");
@@ -337,26 +338,15 @@ fn emptyHandlers(self: *Context) RunError!void {
     }
 }
 
-/// Whether a handler only traps: `unreachable`, a block that is only that, or a `switch` every
-/// prong of which only traps (`catch |e| switch (e) { error.Empty => unreachable }`).
-fn traps(tree: *const Ast, written: Ast.Node.Index, depth: u8) bool {
-    if (depth == 8) return false;
-    const node = ungrouped(tree, written);
-    if (tree.nodeTag(node) == .unreachable_literal) return true;
-    var buffer: [2]Ast.Node.Index = undefined;
-    if (tree.blockStatements(&buffer, node)) |statements| return statements.len == 1 and traps(tree, statements[0], depth + 1);
-    const full = tree.fullSwitch(node) orelse return false;
-    if (full.ast.cases.len == 0) return false;
-    for (full.ast.cases) |case| if (!traps(tree, tree.fullSwitchCase(case).?.ast.target_expr, depth + 1)) return false;
-    return true;
-}
+/// Whether a handler only traps (`Written.traps`).
+const traps = Written.traps;
 
 /// Whether a handler is written empty, parentheses aside: a block (labeled or not) whose every
 /// statement is empty by this list or is `_ = X` of a `quiet` X; `@as(void, h)` of an empty `h`
 /// (Zig 0.17 refuses `void{}`); a `comptime`, `defer` or `errdefer` of an empty body; an `if` (a missing `else` empty)
 /// or a `switch` whose condition is `quiet` and every branch or prong empty, one prong at least, a
 /// prong that only traps counting as empty beside the others; `return`, `break` or `continue` with
-/// no operand.
+/// no operand, and `return` or `break` given an empty one (`return {}`, the void value).
 fn emptyHandler(tree: *const Ast, written: Ast.Node.Index) bool {
     const node = ungrouped(tree, written);
     var buffer: [2]Ast.Node.Index = undefined;
@@ -376,8 +366,11 @@ fn emptyHandler(tree: *const Ast, written: Ast.Node.Index) bool {
     switch (tree.nodeTag(node)) {
         .@"comptime", .@"defer" => return emptyHandler(tree, tree.nodeData(node).node),
         .@"errdefer" => return emptyHandler(tree, tree.nodeData(node).opt_token_and_node[1]),
-        .@"return" => return tree.nodeData(node).opt_node == .none,
-        .@"break", .@"continue" => return tree.nodeData(node).opt_token_and_opt_node[1] == .none,
+        // A bare `return` or `break`, or one giving the void value written (`return {}`,
+        // `break :blk {}`), the same statement.
+        .@"return" => return if (tree.nodeData(node).opt_node.unwrap()) |given| emptyHandler(tree, given) else true,
+        .@"break" => return if (tree.nodeData(node).opt_token_and_opt_node[1].unwrap()) |given| emptyHandler(tree, given) else true,
+        .@"continue" => return tree.nodeData(node).opt_token_and_opt_node[1] == .none,
         .builtin_call_two, .builtin_call_two_comma => {
             const args = tree.builtinCallParams(&buffer, node).?; // unreachable: the node is a builtin call
             return std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@as") and args.len == 2 and isName(tree, args[0], "void") and emptyHandler(tree, args[1]);
