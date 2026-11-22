@@ -219,8 +219,10 @@ pub const Reflected = struct { of: *const Value, at: enum { info, pointer, size,
 /// program is written, which a field, a parameter or a `var` holds: a field's or a var's stores
 /// not all seen (`storedFunctions`: a parameter's or a cast's value stored there, a file that may
 /// share the compilation unread), a field whose holder does not resolve, a parameter any caller
-/// gives. Its target is a value the program has as it runs: any function of its type. A `const`
-/// whose initializer names functions is the choice of them, read as one (`erasedCallee`).
+/// gives, a call's result whose functions are not read. Its target is a value the program has as
+/// it runs: any function of its type. A `const` whose initializer names functions, a call each of
+/// whose returns names functions, and a call on a `const` receiver whose initializer's literal
+/// names functions (`storedCallees`) are the choice of them, read as one (`erasedCallee`).
 /// `external`: it is a module whose bytes exist only after a build step runs (translate-c's
 /// output, a Run step's output file: Project.Input.external), which no reading has: an import
 /// of it, and every member read through it; and a call through a pointer `@extern` gives, a

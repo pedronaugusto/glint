@@ -1,4 +1,6 @@
-// P009: a std map's method given a key that slices a local stores it in the map returned.
+// P009: std's Environ.Map.put given a key that slices a local keeps a copy of it (`gpa.dupe`,
+// written over what getOrPut stored; the entry popped on failure): the map returned holds no
+// address into the frame.
 const std = @import("std");
 pub fn f(gpa: std.mem.Allocator) !std.process.Environ.Map {
     var map: std.process.Environ.Map = .init(gpa);
