@@ -212,9 +212,12 @@ pub const Reflected = struct { of: *const Value, at: enum { info, pointer, size,
 /// optimize mode, the build's options) any file imports, or the `root` std reads
 /// (`root.std_options`), which no library's reading binds; a type or value the compiler
 /// computes for each build, holding no store and none of the program's types.
-/// `erased_field`: a call through a field that holds a function pointer, whose stores are not
-/// all seen (`storedFunctions`: a parameter's or a cast's value stored there, a file that may
-/// share the compilation unread) or whose holder does not resolve: any function of its type.
+/// `erased_callee`: a call through a function value whose targets are not all seen as the
+/// program is written, which a field, a parameter or a `var` holds: a field's or a var's stores
+/// not all seen (`storedFunctions`: a parameter's or a cast's value stored there, a file that may
+/// share the compilation unread), a field whose holder does not resolve, a parameter any caller
+/// gives. Its target is a value the program has as it runs: any function of its type. A `const`
+/// whose initializer names functions is the choice of them, read as one (`erasedCallee`).
 /// `external`: it is a module whose bytes exist only after a build step runs (translate-c's
 /// output, a Run step's output file: Project.Input.external), which no reading has: an import
 /// of it, and every member read through it.
@@ -232,7 +235,7 @@ pub const Unknown = enum {
     absent,
     generic,
     zig_own,
-    erased_field,
+    erased_callee,
     external,
 
     /// What an unknown means to a ban (`RuleContext.unknownAt`). `failure`: glint's own, on code
@@ -242,12 +245,12 @@ pub const Unknown = enum {
     /// ban covers resolved callees and types: a value only an instantiation or the build decides
     /// (`generic`, `comptime_dependent`, `zig_own`), a name computed as it compiles
     /// (`computed_import`), code this build does not compile (`absent`), bytes a build step makes
-    /// (`external`), a function a field holds (`erased_field`). Counted per rule, never a
-    /// verdict.
+    /// (`external`), a function value a field, a parameter or a var holds (`erased_callee`).
+    /// Counted per rule, never a verdict.
     pub fn meaning(self: Unknown) enum { failure, outside } {
         return switch (self) {
             .invalid_front_end, .unresolved, .missing_mapping, .cycle, .budget, .unsupported => .failure,
-            .generic, .comptime_dependent, .zig_own, .computed_import, .absent, .external, .erased_field => .outside,
+            .generic, .comptime_dependent, .zig_own, .computed_import, .absent, .external, .erased_callee => .outside,
         };
     }
 };
@@ -603,7 +606,7 @@ fn holderOutside(self: *Facts, file: Project.FileId, access: Ast.Node.Index) Res
     return switch (try self.resolve(file, tree.nodeData(access).node_and_token[0])) {
         .unknown => |why| switch (why) {
             .invalid_front_end, .missing_mapping, .computed_import, .generic, .external => true,
-            .unresolved, .comptime_dependent, .cycle, .budget, .unsupported, .absent, .zig_own, .erased_field => false,
+            .unresolved, .comptime_dependent, .cycle, .budget, .unsupported, .absent, .zig_own, .erased_callee => false,
         },
         .alternatives => false, // a choice of known values (`choose` keeps no unknown in one): each in the run
         else => false,
@@ -12882,9 +12885,10 @@ pub const calls = struct {
         // A cast that keeps an address calls what it points at (`@as(*const fn () void, &f)()`).
         const callee = try facts.throughCasts(file, node);
         if (try functionsIn(try facts.resolveIn(env, file, callee), &found)) |why| {
-            // A function-pointer field read whose functions are not known: `fieldOf` gives its
-            // type (`erased`), as for any value of a function type, so the read says which.
-            if (why == .unresolved and calledField(&facts.project.at(file).file.tree, callee)) return .{ .any = .erased_field };
+            // A function value whose functions are not known, which a field, a parameter or a
+            // var holds: `fieldOf` gives its type (`erased`), as for any value of a function
+            // type, so the read says which.
+            if (why == .unresolved and try erasedCallee(facts, file, callee, 0)) return .{ .any = .erased_callee };
             return .{ .any = why };
         }
         return switch (found.items.len) {
@@ -12895,17 +12899,41 @@ pub const calls = struct {
         };
     }
 
-    /// Whether a callee is a field read, `x.f`, `x.f.*` or `x.f.?`, through parentheses: a call
-    /// through a function-pointer field.
-    fn calledField(tree: *const Ast, node: Ast.Node.Index) bool {
+    /// Whether a callee is a function value held where the program has its target only as it
+    /// runs: a field read (`x.f`, `@field(x, "f")`), a parameter, or a `var`, through
+    /// parentheses, `.*`, `.?`, `try`, and an `orelse`'s or a `catch`'s value. A `const` is what
+    /// its initializer is: a field it reads is erased, functions it names are not
+    /// (`const f = h.elicit orelse return` reads a field; a call's result is neither).
+    fn erasedCallee(facts: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: usize) Error!bool {
+        if (depth == 16) return false;
+        const tree = &facts.project.at(file).file.tree;
         var callee = node;
         while (true) switch (tree.nodeTag(callee)) {
             .grouped_expression, .unwrap_optional => callee = tree.nodeData(callee).node_and_token[0],
-            .deref => callee = tree.nodeData(callee).node,
+            .deref, .@"try" => callee = tree.nodeData(callee).node,
+            // An element is held where its array is (`fs[0]()` of a `var fs`).
+            .@"orelse", .@"catch", .array_access => callee = tree.nodeData(callee).node_and_node[0],
             .field_access => return true,
             .builtin_call_two, .builtin_call_two_comma => return std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(callee)), "@field"),
+            .identifier => break,
             else => return false,
         };
+        const decl = switch (try facts.definition(file, callee)) {
+            .decl => |decl| decl,
+            .none, .unknown => return false,
+        };
+        const model = &facts.project.at(decl.file).model;
+        const record = model.declarations[@backingInt(decl.index)];
+        switch (record.kind) {
+            .parameter => return true,
+            .variable => {
+                const owner = &facts.project.at(decl.file).file.tree;
+                const variable = owner.fullVarDecl(record.node) orelse return false;
+                if (owner.tokenTag(variable.ast.mut_token) == .keyword_var) return true;
+                return erasedCallee(facts, decl.file, variable.ast.init_node.unwrap() orelse return false, depth + 1);
+            },
+            .function, .capture, .field => return false,
+        }
     }
 
     /// Adds each function `value` names to `found`; why not, where it may be any.
@@ -13136,7 +13164,7 @@ test "an import only a test of std or a known library makes shares no compilatio
         } else unreachable;
         const call = (try calls.at(&facts, project.sources[0].id, node)).?;
         if (row.erased) {
-            try std.testing.expectEqual(Unknown.erased_field, call.callee.any);
+            try std.testing.expectEqual(Unknown.erased_callee, call.callee.any);
         } else {
             try std.testing.expectEqualStrings("a", project.at(call.callee.function.file).model.declarations[@backingInt(call.callee.function.index)].name);
         }
