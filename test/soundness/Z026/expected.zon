@@ -14,4 +14,11 @@
         // Atomics and @memcpy store an error into memory, keeping it.
         .memory,
     },
+    .open = .{
+        // review b9: a handler yielding undefined, a loop that never runs, or only a local and its
+        // discard drops the error with no reason
+        "unwrap/b9-catch_undefined/hole.zig",
+        "branch/b9-catch_empty_loop/hole.zig",
+        "unwrap/b9-handler_local_only/hole.zig",
+    },
 }

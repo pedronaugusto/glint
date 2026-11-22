@@ -2,5 +2,8 @@
     // A001 is a rule aegis declares (its lint_rules, read from the pinned aegis): a touch of a
     // governed type's internal field, through each way the holder reaches it, and the same
     // value through the type's own API.
-    .open = .{},
+    .open = .{
+        // review b9: a governed value handed to std.zon's serializer, read field by field
+        "call/b9-zon_serialize/hole.zig",
+    },
 }

@@ -1,4 +1,11 @@
 .{
     .no_hole = .{ .assignment, .deferred, .jump, .inline_loop, .branch },
-    .no_twin = .{ .assignment, .deferred, .jump, .inline_loop, .branch },
+    .no_twin = .{ .assignment, .jump, .inline_loop, .branch },
+    .open = .{
+        // review b9 precision: a stack waiter unlinked by a defer before the return (aegis
+        // src/Condition.zig:55), and a slice loaded through the pointer, never the pointer (warp
+        // src/brotli/Compress.zig:68)
+        "deferred/b9-waiter_unlinked_in_defer/twin.zig",
+        "call/b9-slice_copied_out/twin.zig",
+    },
 }
