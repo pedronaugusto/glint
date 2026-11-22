@@ -595,14 +595,14 @@ fn fixed(rule: glint.Rule, program: []const u8) ![]u8 {
     defer report.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const changed = try glint.Fix.apply(arena.allocator(), &project, &report, .{});
+    const changed = try glint.Fix.apply(arena.allocator(), &project, &report);
     if (changed.len == 0) return std.testing.allocator.dupe(u8, program);
     return std.testing.allocator.dupe(u8, changed[0].bytes);
 }
 
 /// `program` after the fixes of a run of `rules`, with the escapes a run before reported, and
 /// that run's report.
-fn fixedBy(rules: []const glint.Rule, program: []const u8, record: []const u8) !struct { bytes: []u8, stale: usize } {
+fn fixedBy(rules: []const glint.Rule, program: []const u8) !struct { bytes: []u8, stale: usize } {
     var project = try sources.projectWithSources(std.testing.allocator, program, &std_files, &std_imports);
     defer project.deinit();
     var selections: [8]glint.Config.Selection = undefined;
@@ -611,8 +611,7 @@ fn fixedBy(rules: []const glint.Rule, program: []const u8, record: []const u8) !
     defer report.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const before = try glint.Fix.escapeRecord(arena.allocator(), record);
-    const changed = try glint.Fix.apply(arena.allocator(), &project, &report, .{ .escapes_before = before });
+    const changed = try glint.Fix.apply(arena.allocator(), &project, &report);
     const bytes = if (changed.len == 0) program else changed[0].bytes;
     return .{ .bytes = try std.testing.allocator.dupe(u8, bytes), .stale = report.stale.len };
 }
@@ -634,7 +633,7 @@ test "the fix drops from a suppression each rule that ran and met no site under 
         \\}
         \\
     );
-    const out = try fixedBy(&.{ .P007, .P008 }, program, "");
+    const out = try fixedBy(&.{ .P007, .P008 }, program);
     defer std.testing.allocator.free(out.bytes);
     try std.testing.expectEqual(@as(usize, 3), out.stale);
     try std.testing.expectEqualStrings(comptime suppressed(
@@ -654,73 +653,22 @@ test "the fix drops from a suppression each rule that ran and met no site under 
     ), out.bytes);
 }
 
-test "one suppression names each rule it covers on its line, one site each; the aegis escape form is malformed" {
+test "one suppression names each rule it covers on its line, one site each; an `// aegis:` comment is a comment" {
     var project = try sources.projectWithSources(std.testing.allocator, comptime suppressed(
         \\pub fn f(parent_id: u32, child_id: u32) *u8 { return @ptrFromInt(parent_id + child_id); } // @ignore: P007, P008 -- the board's two register ids
         \\pub fn g(parent_id: u32, child_id: u32) *u8 { return @ptrFromInt(parent_id + child_id); } // @ignore: P007 -- only the conversion
-        \\pub fn h(a: usize) *u8 { return @ptrFromInt(a); } // aegis: boundary(A019): the old form
+        \\pub fn h(a: usize) *u8 { return @ptrFromInt(a); } // aegis: boundary(P007): no suppression
     ), &std_files, &std_imports);
     defer project.deinit();
     var report = try glint.run(std.testing.allocator, &project, .{ .config = .{ .enabled = .empty, .selections = &.{ .{ .rule = .P007, .level = .gate }, .{ .rule = .P008, .level = .gate } } } });
     defer report.deinit();
-    // g's P008 stands, and h's P007 under a comment glint reads no more.
+    // g's P008 stands, and h's P007 under a comment that is no suppression.
     try std.testing.expectEqual(@as(usize, 2), report.diagnostics.len); // safe: fixture counts are representable.
     try std.testing.expectEqual(@as(u32, 2), report.diagnostics[0].span.line);
     try std.testing.expectEqual(@as(u32, 3), report.diagnostics[1].span.line);
     try std.testing.expectEqual(@as(usize, 3), report.suppressed); // safe: f's two and g's one.
-    try std.testing.expectEqual(@as(usize, 1), report.malformed.len); // safe: the old escape.
-    try std.testing.expect(!report.complete);
-}
-
-test "the fix rewrites the aegis escape into a suppression under today's names, names an older one from a run's record and leaves one no record names, and removes one naming only a rule that went" {
-    const program =
-        \\pub fn a(p: usize) *u8 {
-        \\    return @ptrFromInt(p); // aegis: internal(A019, A014): the page the kernel hands back
-        \\}
-        \\pub fn b(p: usize) *u8 {
-        \\    return @ptrFromInt(p); // aegis: boundary: the device register
-        \\}
-        \\pub fn c(p: usize) *u8 {
-        \\    return @ptrFromInt(p); // aegis: no-danger(A010): gone with the flow engine
-        \\}
-        \\pub fn d(p: usize) *u8 {
-        \\    return @ptrFromInt(p); // aegis: design: no record names it
-        \\}
-        \\pub fn e(p: usize) *u8 {
-        \\    return @ptrFromInt(p); // aegis: no-danger(A003): a rule 0.8 removed
-        \\}
-        \\pub fn g(p: usize) *u8 {
-        \\    return @ptrFromInt(p); // aegis: design(A003, A019): one removed, one renamed
-        \\}
-        \\
-    ;
-    const out = try fixedBy(&.{.P007}, program, "glint: escape: consumer:5:28: boundary: the device register (A019)\n");
-    defer std.testing.allocator.free(out.bytes);
-    try std.testing.expectEqualStrings(comptime suppressed(
-        \\pub fn a(p: usize) *u8 {
-        \\    return @ptrFromInt(p); // @ignore: P007, P009 -- internal: the page the kernel hands back
-        \\}
-        \\pub fn b(p: usize) *u8 {
-        \\    return @ptrFromInt(p); // @ignore: P007 -- boundary: the device register
-        \\}
-        \\pub fn c(p: usize) *u8 {
-        \\    return @ptrFromInt(p);
-        \\}
-        \\pub fn d(p: usize) *u8 {
-        \\    return @ptrFromInt(p); // aegis: design: no record names it
-        \\}
-        \\pub fn e(p: usize) *u8 {
-        \\    return @ptrFromInt(p);
-        \\}
-        \\pub fn g(p: usize) *u8 {
-        \\    return @ptrFromInt(p); // @ignore: P007 -- design: one removed, one renamed
-        \\}
-        \\
-    ), out.bytes);
-    // A record line that names an escape and is not one is refused.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    try std.testing.expectError(error.InvalidEscapeRecord, glint.Fix.escapeRecord(arena.allocator(), "glint: escape: consumer:x:1: no-danger: why (A019)\n"));
+    try std.testing.expectEqual(@as(usize, 0), report.malformed.len); // safe: none malformed.
+    try std.testing.expect(report.complete);
 }
 
 test "P007 leaves a vtable's owner recovery from *anyopaque alone, and reports a cast from it to a slice or a many-item pointer" {
@@ -746,45 +694,6 @@ test "P007 leaves a vtable's owner recovery from *anyopaque alone, and reports a
         \\    return @ptrCast(p);
         \\}
     , 2);
-}
-
-test "the fix writes 0.7's reason on a catch unreachable as Z026's suppression; a bare one stays a finding, and one reason over two sites stays for its owner" {
-    const program =
-        \\fn g() !void {}
-        \\pub fn a() void {
-        \\    g() catch unreachable; // unreachable: g fails on nothing here
-        \\}
-        \\pub fn b() void {
-        \\    g() catch unreachable;
-        \\}
-        \\pub fn c() void {
-        \\    g() catch unreachable; g() catch unreachable; // unreachable: both checked by the caller
-        \\}
-        \\pub fn d() void {
-        \\    // unreachable: the reason on the line before, 0.7's other form
-        \\    g() catch unreachable;
-        \\}
-        \\
-    ;
-    const out = try fixedBy(&.{.Z026}, program, "");
-    defer std.testing.allocator.free(out.bytes);
-    try std.testing.expectEqualStrings(comptime suppressed(
-        \\fn g() !void {}
-        \\pub fn a() void {
-        \\    g() catch unreachable; // @ignore: Z026 -- g fails on nothing here
-        \\}
-        \\pub fn b() void {
-        \\    g() catch unreachable;
-        \\}
-        \\pub fn c() void {
-        \\    g() catch unreachable; g() catch unreachable; // unreachable: both checked by the caller
-        \\}
-        \\pub fn d() void {
-        \\    // @ignore: Z026 -- the reason on the line before, 0.7's other form
-        \\    g() catch unreachable;
-        \\}
-        \\
-    ), out.bytes);
 }
 
 test "P007 reads @setRuntimeSafety on the build mode in each mode: off where the build keeps the checks, a finding on anything it cannot decide" {

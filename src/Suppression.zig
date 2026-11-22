@@ -1,7 +1,6 @@
 //! One real comment, the rules it names, one site each and a nonempty written reason, in the
 //! form `form` spells, on its site's line or the line before. Every rule
-//! takes it, glint's own and those a package declares. A comment in the aegis pack's escape form
-//! (`// aegis: ...`) is read no more: it is malformed, and `glint --fix` rewrites it.
+//! takes it, glint's own and those a package declares.
 const std = @import("std");
 const File = @import("File.zig");
 const rules = @import("Rule.zig");
@@ -36,13 +35,10 @@ pub const ParseError = std.mem.Allocator.Error || error{ MalformedSuppression, A
 /// incomplete, with the comment named, never a run that silently suppresses.
 pub const Malformed = struct { comment: File.Comment, why: []const u8 };
 
-/// What an escape in the aegis pack's form is told: the form it is now, and the fix that writes it.
-pub const old_escape = "an aegis escape is read no more: `" ++ form ++ "` (glint --fix rewrites it)";
-
 /// The file's suppressions, each malformed one appended to `malformed` instead.
 pub fn parseConfigured(a: std.mem.Allocator, file: *const File, definitions: []const rules.Definition, malformed: *std.ArrayList(Malformed)) std.mem.Allocator.Error![]Suppression {
     var result: std.ArrayList(Suppression) = .empty;
-    for (file.comments) |comment| switch (try one(a, file, comment, definitions)) {
+    for (file.comments) |comment| switch (one(file, comment, definitions)) {
         .none => {},
         .found => |found| try result.append(a, found),
         .malformed => |why| try malformed.append(a, .{ .comment = comment, .why = why }),
@@ -52,9 +48,8 @@ pub fn parseConfigured(a: std.mem.Allocator, file: *const File, definitions: []c
 
 const Outcome = union(enum) { none, found: Suppression, malformed: []const u8 };
 
-fn one(a: std.mem.Allocator, file: *const File, comment: File.Comment, definitions: []const rules.Definition) std.mem.Allocator.Error!Outcome {
+fn one(file: *const File, comment: File.Comment, definitions: []const rules.Definition) Outcome {
     const raw = std.mem.trim(u8, file.source[comment.start + 2 .. comment.end], " \t\r");
-    if (std.mem.startsWith(u8, raw, "aegis:")) return .{ .malformed = old_escape };
     const head = keyword ++ ":";
     if (!std.mem.startsWith(u8, raw, head)) return .none;
     const rest = std.mem.trim(u8, raw[head.len..], " \t");
@@ -62,14 +57,7 @@ fn one(a: std.mem.Allocator, file: *const File, comment: File.Comment, definitio
     var found: Suppression = .{ .line = comment.line, .comment = comment, .reason = std.mem.trim(u8, why, " \t") };
     var listed_names = std.mem.tokenizeAny(u8, listed, ", \t");
     while (listed_names.next()) |id| {
-        const rule = rules.parseConfigured(id, definitions) orelse {
-            // One 0.8 removed: what to write instead, as a configuration naming it is told.
-            const gone = rules.removed(id) orelse return .{ .malformed = "a suppression names a rule glint does not have" };
-            var text: std.Io.Writer.Allocating = .init(a);
-            text.writer.writeAll("a suppression names a rule glint does not have: ") catch return error.OutOfMemory;
-            gone.write(&text.writer) catch return error.OutOfMemory;
-            return .{ .malformed = text.written() };
-        };
+        const rule = rules.parseConfigured(id, definitions) orelse return .{ .malformed = "a suppression names a rule glint does not have" };
         for (0..found.named_len) |i| if (found.named[i] == rule) return .{ .malformed = "a suppression names each rule once" };
         if (found.named_len == max_named) return .{ .malformed = "a suppression names at most eight rules" };
         found.named[found.named_len] = rule;
@@ -109,13 +97,13 @@ pub fn applies(self: *const Suppression, rule: rules.Rule, line: u32) bool {
     return self.line == line and std.mem.findScalar(rules.Rule, self.names(), rule) != null;
 }
 
-test "a suppression naming a rule 0.8 removed is told what to write instead" {
+test "a suppression naming a rule glint does not have is malformed, whatever the id" {
     var file = try File.init(std.testing.allocator, "const x = 1; " ++ opening ++ "A010 -- gone\nconst y = 1; " ++ opening ++ "Z999 -- never\n", .{});
     defer file.deinit();
     var malformed: std.ArrayList(Malformed) = .empty;
     _ = try parseConfigured(file.arena.allocator(), &file, &.{}, &malformed);
     try std.testing.expectEqual(@as(usize, 2), malformed.items.len);
-    try std.testing.expectEqualStrings("a suppression names a rule glint does not have: `A010` was removed in glint 0.8: remove it", malformed.items[0].why);
+    try std.testing.expectEqualStrings("a suppression names a rule glint does not have", malformed.items[0].why);
     try std.testing.expectEqualStrings("a suppression names a rule glint does not have", malformed.items[1].why);
 }
 
@@ -154,7 +142,7 @@ test "a suppression names several rules, one site each; the aegis escape form is
     try std.testing.expect(try parsed[0].matches(.Z013, 0, 6));
     try std.testing.expect(try parsed[0].matches(.Z003, 0, 9));
     try std.testing.expect(!try parsed[0].matches(.Z011, 0, 6));
-    for ([_][]const u8{ "const x = 1; // aegis: boundary(Z003): the C call\n", "const x = 1; // aegis: boundary: the C call\n", "const x = 1; " ++ opening ++ "Z013, Z013 -- twice\n", "const x = 1; " ++ opening ++ "-- none\n" }) |bytes| {
+    for ([_][]const u8{ "const x = 1; " ++ opening ++ "Z013, Z013 -- twice\n", "const x = 1; " ++ opening ++ "-- none\n" }) |bytes| {
         var bad = try File.init(std.testing.allocator, bytes, .{});
         defer bad.deinit();
         var bad_malformed: std.ArrayList(Malformed) = .empty;

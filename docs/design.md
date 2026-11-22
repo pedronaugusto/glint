@@ -113,19 +113,6 @@ entries of the vocabulary, under the ids aegis declares. As aegis declares them 
 | A015 | ban | replaces | Io.File, Io.Dir, net.Stream, net.Server and process.Child held by value in a struct field. |
 | A021 | ban, off by default | replaces | An unordered acquisition on aegis's guards, where the project selects ordering. |
 
-### Removed and renamed rules
-
-A configuration or a suppression naming a rule 0.8 removed is refused, with what to write instead. The table
-is `Rule.removed_rules` (`glint.RemovedRule`, `glint.removedRule`); no removed id is an alias.
-
-| IDs | Now |
-|---|---|
-| A002, A003, A005, A006, A010, A017, A018, A020 | Removed: remove them. aegis's owners, the testing allocator and fuzzing carry what they checked. |
-| A001, A004, A007, A008, A009, A011, A012, A013, A015, A021 | aegis's: declared in its `lint_rules`, rules wherever the program reaches aegis. |
-| A014, A016, A019 | Renamed P009, P008 and P007. |
-
-Any other name no rule of the run has is "not a rule glint has".
-
 ## The package vocabulary (version 2)
 
 `pub const lint_rules = .{ .version = 2, .include = .{...}, .rules = .{...}, .governed = .{...}, .replaces = .{...} };`
@@ -193,14 +180,9 @@ cache.store(key, value) catch {};
 
 It names one or more rules (`// glint-ignore: P007, A007 -- <reason>`), each covering one site on its line, and
 needs a non-empty reason. A malformed comment is reported where it is written, and every suppression is
-counted. There is no other form: the `// aegis: <reason>(<rule>): <why>` escape is malformed, and `--fix`
-rewrites it into a `glint-ignore` naming the rules it covers (an escape that names none takes the rules a record
-of an earlier run lists, `--escapes-before`; with no record it is left for its owner to name). A suppression
-naming a rule under the name 0.7 gave it takes today's (A019 is P007, A016 P008, A014 P009); a rule 0.8 removed
-(A002, A003, A005, A006, A010, A017, A018, A020, and 0.7's A012, another check than aegis's) is dropped from it,
-and one naming none left goes. `--fix` also rewrites 0.7's `// unreachable: <why>`, at a `catch unreachable` or
-alone on the line above it, into `// glint-ignore: Z026 -- <why>`, except where that line holds a second such
-site, which one suppression cannot name. No fix writes a suppression a site did not already have.
+counted. There is no other form: any other comment is a comment. A suppression naming a rule glint does not
+have is malformed. `--fix` drops from a suppression each rule that ran and met no site under it, and removes one
+naming none left. No fix writes a suppression a site did not already have.
 
 ## Model and run
 
@@ -236,7 +218,7 @@ flagging fails the run until the list says so. The rule's row above says why it 
 - an import no module mapping names: the import, the file, and how to map it (`--module NAME=FILE`, or the
   build's module graph through preflight, which maps the options modules, the roots a WriteFiles step embeds and
   the generated roots by their text); an import under a comptime branch the build does not take is nothing;
-- a configuration glint cannot read, a rule it does not have (with the removed-rule table's answer), a P003
+- a configuration glint cannot read, a rule it does not have, a P003
   exception naming no function, a P006 entry resolving to nothing.
 
 A module whose bytes the configuration holds (sources, copied files, a WriteFiles step's contents, an options
@@ -262,7 +244,7 @@ gives it its type (`const k: K = @import("k.zon")` is a `K`).
 from tests is production code.
 
 **Fixes.** `--fix` applies only a fix that follows from the site alone: Z034's parentheses, a package
-replacement's `.drop_in` call, and the rewrite of 0.7's suppression forms. No fix proves anything.
+replacement's `.drop_in` call, and a suppression's rule that met no site dropped. No fix proves anything.
 
 **Speed.** No numeric target: `bench/` is compiled by CI and run by hand, and no timing is gated.
 
@@ -296,14 +278,3 @@ which is the two kinds. From zlint: scopes, references and node links over the A
   target's build reaches is linted where that target's modules are mapped, and nowhere else.
 - That a hygiene rule's silence means the construct is absent. Only a ban's silence is a claim.
 - That a seam's or a suppression's reason is true. glint counts them; review judges them.
-
-## What was removed, and where it lives
-
-The proof engines left in 0.8.0: Taint, Range, Bounds, Proof, DangerFlow, the release walks, Escapes beyond
-P009's shape, Undefined's flow, ParentPointer's proofs, Summary, and the compiled-facts reader and exporter.
-So did the compiled aegis pack and the rules only the engines served (the table above). Each engine was an
-excuse analysis, a proof that a site is harmless, and the next spelling could fool each excuse: seven review
-rounds did not converge (review 7 found 33 holes in 13 rules, its second pass 15 more, seven of them repeats).
-A ban that reads only its construct cannot be fooled that way. All of it is on the
-`strict-1029b` branch, unchanged, as the 0.7 line left it. Per-instance compiler facts, if ever wanted again,
-are their own project.

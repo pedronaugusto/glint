@@ -999,7 +999,7 @@ fn dropInFixed(a: std.mem.Allocator, program: []const u8, findings: usize) ![]co
     defer report.deinit();
     try std.testing.expect(report.complete);
     try std.testing.expectEqual(findings, report.diagnostics.len);
-    const changed = try glint.Fix.apply(a, &project, &report, .{});
+    const changed = try glint.Fix.apply(a, &project, &report);
     for (changed) |one| if (@backingInt(one.file) == 0) return one.bytes;
     return program;
 }
