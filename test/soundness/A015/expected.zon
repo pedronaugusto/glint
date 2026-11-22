@@ -5,11 +5,4 @@
     // A field's type is evaluated as the program compiles, where no statement runs: no deferred
     // statement and no memory a load or store moves reaches it.
     .na = .{ .deferred, .memory },
-    .open = .{
-        // review b9 precision: a union field written without a type, an incomplete run
-        "field/b9-untyped_union_field/twin.zig",
-        // review b9 precision: an enum's fields, an incomplete run on every enum in a file that
-        // imports aegis (639 family sites at a0928dd, none at 10cd4ce)
-        "field/b9-enum_fields/twin.zig",
-    },
 }

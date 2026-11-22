@@ -777,6 +777,9 @@ fn reflectsParameter(self: *Context, function: Facts.Decl, position: usize) bool
     return false;
 }
 
+/// The builtins that read a type's fields, by name or place.
+const field_reading = [_][]const u8{ "@field", "@FieldType", "@hasField", "@offsetOf", "@bitOffsetOf" };
+
 /// How deep `reflectsDeep` follows a parameter handed on: past it, a named refusal.
 const reflection_depth = 8;
 
@@ -820,7 +823,10 @@ pub const Reflects = struct {
 };
 
 fn reflectsDeepRead(self: *Context, function: Facts.Decl, position: usize, by_value: bool, depth: usize) Context.Error!Is {
-    if (reflectsParameter(self, function, position)) return .yes;
+    // The function the program calls: any reflective builtin given the parameter, as before.
+    // Past it, only a builtin that reads the type's fields (`field_reading`): a generic asking
+    // what kind of type it was handed (`findScalarPos`'s `@typeInfo(T)`, a sort's) reads none.
+    if (depth == 0 and reflectsParameter(self, function, position)) return .yes;
     const tree = &self.project.at(function.file).file.tree;
     const model = &self.project.at(function.file).model;
     var buffer: [1]Ast.Node.Index = undefined;
@@ -863,7 +869,7 @@ fn reflectsDeepRead(self: *Context, function: Facts.Decl, position: usize, by_va
         if (at < first or at > last) continue;
         // A reflective builtin applied to one of the names.
         if (Facts.builtinName(tree, node)) |builtin| {
-            if (!amongNames(&reflective, builtin)) continue;
+            if (!amongNames(&field_reading, builtin)) continue;
             var arguments: [2]Ast.Node.Index = undefined;
             const operands = Facts.builtinArgs(tree, node, &arguments);
             if (operands.len != 0 and namesSubject(tree, operands[0], names.items, by_value)) return .yes;
@@ -1039,11 +1045,21 @@ fn formatReads(self: *Context, file: Project.FileId, args: []const Ast.Node.Inde
         }
         const is = placed orelse continue;
         const specifier = inner[0 .. std.mem.findScalar(u8, inner, ':') orelse inner.len];
-        if (std.mem.eql(u8, specifier, "f") or std.mem.eql(u8, specifier, "*")) continue;
+        if (!walksFields(specifier)) continue;
         found = either(found, is);
         if (found == .yes) return found;
     }
     return found;
+}
+
+/// Whether std's `printValue` walks a struct's fields placed by `specifier`: `{any}`, `{}`, and
+/// an optional's or an error union's (`{?}`, `{!}`) payload so placed. `{f}` calls the type's
+/// own `format`, `{d}`, `{x}`, `{e}`, `{B}` its own `formatNumber` or `formatByteSize`, `{*}`
+/// writes the address; `{s}` and `{c}` do not compile on a struct.
+fn walksFields(specifier: []const u8) bool {
+    var rest = specifier;
+    while (rest.len != 0 and (rest[0] == '?' or rest[0] == '!')) rest = rest[1..];
+    return rest.len == 0 or std.mem.eql(u8, rest, "any");
 }
 
 /// Whether the argument at `node` holds the subject: a value of a governed type or a pointer to

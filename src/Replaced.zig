@@ -300,6 +300,9 @@ fn heldSites(c: *Context, definition: Rule.Definition, ban: bool, all: []const E
         }
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const field = tree.fullContainerField(node) orelse continue;
+        // A field written without `name:` is a tuple's only in a struct: an enum's (`ltr`) and
+        // a union's untyped one (`none`) write their name there, no type.
+        if (field.ast.tuple_like and !inStruct(c, tree, node)) continue;
         const written = field.ast.type_expr.unwrap() orelse continue;
         const token = if (field.ast.tuple_like) tree.firstToken(written) else field.ast.main_token;
         const value = try c.facts.resolve(c.file, written);
@@ -317,6 +320,14 @@ fn heldSites(c: *Context, definition: Rule.Definition, ban: bool, all: []const E
             }
         }
     }
+}
+
+/// Whether the field at `node` is a `struct`'s (a tuple's, written without names, among them).
+fn inStruct(c: *Context, tree: *const Ast, node: Ast.Node.Index) bool {
+    const container = c.project.at(c.file).model.parentOf(node) orelse return false;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const full = tree.fullContainerDecl(&buffer, container) orelse return false;
+    return tree.tokenTag(full.ast.main_token) == .keyword_struct;
 }
 
 /// Whether a field's type `value` holds `target`'s type by value: it, or an optional, array or

@@ -9,7 +9,5 @@
         // (sort by the caller's comparator, findScalar's ==), and plain integers printed with {d}
         // (an incomplete run): lookout, almanac and visor fail on these at a0928dd
         "call/b9-sort_own_comparator/twin.zig",
-        "call/b9-find_scalar_id/twin.zig",
-        "capture/b9-print_raw_capture/twin.zig",
     },
 }
