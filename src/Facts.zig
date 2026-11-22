@@ -206,8 +206,9 @@ pub const Reflected = struct { of: *const Value, at: enum { info, pointer, size,
 /// (`param_types[6]` of a table whose functions take at most six), or an element past the end
 /// of a tuple literal a binding passes (`args[1]` under a comptime test of another name), or the
 /// capture of a prong of a switch on type information that names no kind the subject may be
-/// (`.@"struct" => |s|` where the type is an integer), so the code that needs it is not compiled
-/// in this build.
+/// (`.@"struct" => |s|` where the type is an integer), or a member a container written in the
+/// program does not declare (`declared.reexports` under an `@hasDecl` test it fails), so the
+/// code that needs it is not compiled in this build.
 /// `generic`: it depends on a type or `anytype` parameter that calls from outside the
 /// project's reading bind (a consumer's, or a use other than a call), so each binding decides
 /// it where it is made; what is read of it (its type information, its parts) stays so.
@@ -1416,12 +1417,14 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         // is a struct or an enum. Their results are numbers or booleans.
         .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bool_and, .bool_or, .bool_not, .negation, .negation_wrap, .bit_not, .mul, .mul_wrap, .mul_sat, .div, .mod, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor => return .scalar,
         // `+` and `-` also move many-item pointers: a number only from a number, and a pointer
-        // moved by a number is of the pointer's type (`self.metadata.? + idx`). Anything else
-        // (a pointer less a pointer) stays unknown.
+        // moved by a number is of the pointer's type (`self.metadata.? + idx`). An unknown left
+        // side keeps its reason (a member no build declares stays `absent`). Anything else (a
+        // pointer less a pointer) stays unknown.
         .add, .add_wrap, .add_sat, .sub, .sub_wrap, .sub_sat => {
             const operands = tree.nodeData(node).node_and_node;
             const lhs = try self.resolve(file, operands[0]);
             if (lhs == .scalar or lhs == .primitive) return .scalar;
+            if (lhs == .unknown) return lhs;
             if (lhs == .pointer and (tree.nodeTag(node) == .add or tree.nodeTag(node) == .sub)) {
                 const rhs = try self.resolve(file, operands[1]);
                 if (rhs == .scalar or rhs == .primitive) return lhs;
@@ -2318,7 +2321,10 @@ fn memberValue(self: *Facts, lhs: Value, name: []const u8) ResolveError!Value {
     // A tag named on an enum or a union type (`Color.red`, `Shape.empty`): a value of it.
     if (lhs == .container and self.declaresTag(container, name)) return .{ .instance = container };
     if (self.member(container, name)) |decl| return self.heldIn(container, decl, lhs == .instance);
-    return .{ .unknown = .unresolved };
+    // A member a container written in the program does not declare: Zig declares none
+    // conditionally, so code naming it is compiled in no build (the branch an `@hasDecl` test
+    // fails, `declared.reexports` of a `ci/layers.zig` declaring none).
+    return .{ .unknown = .absent };
 }
 
 /// What a member reads: `memberOf`'s answer, but for a field of a value declared `type`
@@ -2355,7 +2361,11 @@ fn lacks(self: *const Facts, container: Container, name: []const u8) bool {
 fn literalField(self: *Facts, literal: Key, name: []const u8) ResolveError!Value {
     const tree = &self.project.at(literal.file).file.tree;
     var buffer: [2]Ast.Node.Index = undefined;
-    const full = tree.fullStructInit(&buffer, literal.node) orelse return .{ .unknown = .unsupported };
+    const full = tree.fullStructInit(&buffer, literal.node) orelse {
+        // A tuple literal's one member is its length, a number (`types.len`), a joined one's too.
+        const tuple = tree.fullArrayInit(&buffer, literal.node) != null or tree.nodeTag(literal.node) == .array_cat;
+        return if (tuple and std.mem.eql(u8, name, "len")) .scalar else .{ .unknown = .unsupported };
+    };
     for (full.ast.fields) |field| {
         const label = try self.memberName(tree.tokenSlice(Model.initName(tree, field) orelse continue));
         if (std.mem.eql(u8, label, name)) return self.resolve(literal.file, field);
@@ -2398,7 +2408,9 @@ fn memberOfChoice(self: *Facts, choices: []const Value, name: []const u8) Resolv
         },
         else => try kept.append(self.gpa, try self.memberValue(choice, name)),
     };
-    if (kept.items.len == 0) return .{ .unknown = .unresolved };
+    // No part of the choice declares the member: the access compiles in no build (`absent`). A
+    // part that declares it was kept above, so a branch live in any one build is read there.
+    if (kept.items.len == 0) return .{ .unknown = .absent };
     return self.choose(kept.items);
 }
 
@@ -15008,6 +15020,52 @@ test "a generic position's call is generic, a slice's `ptr` its own whichever el
     try std.testing.expectEqual(Size.slice, pointer.pointer.size.?);
     const agree = try local.initValue(&facts, "agree");
     try std.testing.expect(agree == .instance);
+}
+
+test "a member a container declares in no build is absent, through a per-build choice and the arithmetic on it; one any part declares is read" {
+    // `Some` is `Wide` or `Narrow` per build, `None` `Plain` or `Narrow`: only `Wide` declares
+    // `base`, so `Some.base` is `Wide`'s and `None.base` and `Narrow.base` compile in no build.
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes =
+        \\const builtin = @import("builtin");
+        \\const Wide = struct {
+        \\    var storage = [_]u8{ 1, 2 };
+        \\    pub const base: [*]u8 = &storage;
+        \\};
+        \\const Narrow = struct {};
+        \\const Plain = struct {
+        \\    pub const count = 4;
+        \\};
+        \\const Some = if (builtin.mode == .debug) Wide else Narrow;
+        \\const None = if (builtin.mode == .debug) Plain else Narrow;
+        \\fn read() void {
+        \\    const some = Some.base + 1;
+        \\    const none = None.base + 1;
+        \\    const narrow = Narrow.base - 1;
+        \\    _ = .{ some, none, narrow };
+        \\}
+    }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const local = struct {
+        fn initValue(of: *Facts, name: []const u8) !Value {
+            const source = &of.project.sources[0];
+            for (source.model.declarations) |decl| {
+                if (decl.kind != .variable or !std.mem.eql(u8, decl.name, name)) continue;
+                const variable = source.file.tree.fullVarDecl(decl.node).?;
+                return of.resolve(source.id, variable.ast.init_node.unwrap().?);
+            }
+            return error.TestUnexpectedResult;
+        }
+    };
+    const some = try local.initValue(&facts, "some");
+    try std.testing.expect(some == .pointer);
+    for ([_][]const u8{ "none", "narrow" }) |name| {
+        const value = try local.initValue(&facts, name);
+        try std.testing.expect(value == .unknown and value.unknown == .absent);
+    }
 }
 
 test "a type a const optional of types holds is read through an if's capture, orelse and .?, and @Int's width through the arithmetic written" {
