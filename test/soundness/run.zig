@@ -13,7 +13,9 @@
 //! not read.
 //!
 //! Each rule's directory is a column of the matrix, and its `expected.zon` the rule's own: the
-//! cases glint does not pass yet (`open`, each a path under the rule's directory), the rows with
+//! cases glint does not pass yet (`open`, each a path under the rule's directory), the holes a
+//! hygiene rule's stated scope leaves out (`outside`, each a path, which must stay clean: the
+//! design table says why the rule is silent there), the rows with
 //! no hole or no twin yet (`no_hole`, `no_twin`), and the rows through which the rule's value
 //! cannot move (`na`, each with its reason), which hold no case. Each list is exact: a case that
 //! starts passing, or a cell that gains its hole or twin, fails the run until the list says so,
@@ -45,6 +47,7 @@ const Expected = struct {
     no_twin: []const Row = &.{},
     na: []const Row = &.{},
     open: []const []const u8 = &.{},
+    outside: []const []const u8 = &.{},
 };
 
 const Role = enum { hole, twin };
@@ -59,6 +62,8 @@ const Column = struct {
     expected: Expected,
     cells: std.EnumArray(Row, Cell) = .initFill(.{}),
     failing: usize = 0,
+    /// Its holes on the `outside` list.
+    outside: usize = 0,
 };
 
 /// A case to judge, and what its verdict is read against.
@@ -67,6 +72,8 @@ const Job = struct {
     path: []const u8,
     role: Role,
     listed: bool,
+    /// On the rule's `outside` list: a hole its scope leaves out, which must stay clean.
+    outside: bool,
     policy: ?[]const u8,
     before: ?[]const u8,
     absolute: []const u8,
@@ -101,6 +108,8 @@ pub fn main(init: std.process.Init) !void {
         column.* = .{ .rule = rule, .expected = try expectedOf(a, init.gpa, io, suite, rule) };
         var open: std.StringHashMapUnmanaged(void) = .empty;
         for (column.expected.open) |path| try open.put(a, path, {});
+        var outside: std.StringHashMapUnmanaged(void) = .empty;
+        for (column.expected.outside) |path| try outside.put(a, path, {});
         var rule_dir = try suite.openDir(io, rule, .{ .iterate = true });
         defer rule_dir.close(io);
         for (try sortedEntries(a, io, rule_dir, ".", .directory)) |row_name| {
@@ -132,6 +141,7 @@ pub fn main(init: std.process.Init) !void {
                         .path = path,
                         .role = role,
                         .listed = open.remove(path),
+                        .outside = outside.remove(path) and role == .hole,
                         .policy = policy,
                         .before = before,
                         .absolute = try std.Io.Dir.path.join(a, &.{ suite_path, rule, path }),
@@ -142,6 +152,8 @@ pub fn main(init: std.process.Init) !void {
         }
         var left = open.keyIterator();
         while (left.next()) |path| try w.print("{s}/{s}: on {s}/expected.zon's open list, and no such case\n", .{ rule, path.*, rule });
+        var beyond = outside.keyIterator();
+        while (beyond.next()) |path| try w.print("{s}/{s}: on {s}/expected.zon's outside list, and no such hole\n", .{ rule, path.*, rule });
     }
 
     // The case files Zig refuses, by their path.
@@ -165,6 +177,13 @@ pub fn main(init: std.process.Init) !void {
         const column = &columns.items[job.column];
         // A case Zig refuses is no program, so it passes nothing; it was named where refused.
         const compiles = !refusals.contains(job.absolute) and !(if (job.before) |before| refusals.contains(before) else false);
+        // A hole outside its rule's scope is the one hole that must be clean: one flagged is in
+        // the scope now, and the list says so no longer.
+        if (job.outside) {
+            column.outside += 1;
+            if (compiles and verdict != .clean) try w.print("{s}/{s}: {t}, and on {s}/expected.zon's outside list: in the rule's scope now; take it off\n", .{ column.rule, job.path, verdict, column.rule });
+            continue;
+        }
         const passes = compiles and switch (job.role) {
             .hole => verdict != .clean,
             .twin => verdict == .clean,
@@ -211,12 +230,18 @@ pub fn main(init: std.process.Init) !void {
         try o.writeByte('\n');
     }
     var failing: usize = 0;
+    var beyond: usize = 0;
     try o.writeAll("open:");
     for (columns.items) |column| {
         failing += column.failing;
         if (column.failing != 0) try o.print(" {s} {d}", .{ column.rule, column.failing });
     }
-    try o.print("\n{d} cases, {d} open, {d} cells empty; a cell is holes+twins, . none yet, - none possible\n", .{ jobs.items.len, failing, empty });
+    try o.writeAll("\noutside:");
+    for (columns.items) |column| {
+        beyond += column.outside;
+        if (column.outside != 0) try o.print(" {s} {d}", .{ column.rule, column.outside });
+    }
+    try o.print("\n{d} cases, {d} open, {d} outside, {d} cells empty; a cell is holes+twins, . none yet, - none possible\n", .{ jobs.items.len, failing, beyond, empty });
     try o.flush();
     if (failures.written().len != 0) {
         std.debug.print("{s}", .{failures.written()});

@@ -1074,6 +1074,23 @@ fn comptimeValueRead(self: *Facts, env: ?*const Env, file: Project.FileId, node:
             else => null,
         },
         .enum_literal => return .{ .tag = .{ .name = try self.memberName(tree.tokenSlice(tree.nodeMainToken(at))), .of = null } },
+        // Integer arithmetic written on two integers known here (`16 * 2`); none past i128.
+        .add, .sub, .mul, .shl => {
+            const sides = tree.nodeData(at).node_and_node;
+            const lhs = (try self.comptimeValue(env, file, sides[0])) orelse return null;
+            const rhs = (try self.comptimeValue(env, file, sides[1])) orelse return null;
+            if (lhs != .integer or rhs != .integer) return null;
+            const a = lhs.integer;
+            const b = rhs.integer;
+            const result = switch (tree.nodeTag(at)) {
+                .add => std.math.add(i128, a, b),
+                .sub => std.math.sub(i128, a, b),
+                .mul => std.math.mul(i128, a, b),
+                .shl => if (b < 0 or b > 126) return null else std.math.shlExact(i128, a, @intCast(b)),
+                else => unreachable, // unreachable: the four tags above
+            } catch return null;
+            return .{ .integer = result };
+        },
         .identifier => {
             const spelled = tree.tokenSlice(tree.nodeMainToken(at));
             if (std.mem.eql(u8, spelled, "true")) return .{ .boolean = true };
@@ -1650,6 +1667,19 @@ fn importValue(self: *Facts, file: Project.FileId, args: []const Ast.Node.Index)
 /// What a builtin call gives: an imported file, `@This()`, a reflected declaration, a type
 /// `@as` names, a value's type, a type's information; its operands read with `env`'s
 /// bindings where a generic call's reading gives them.
+/// An integer type of a signedness and width computed at compile time (`@Int`): the `uN` or
+/// `iN` its arguments are where they are written (`@Int(.unsigned, 16 * 2)` is a `u32`); else
+/// a number, whose width nothing here reads.
+fn intType(self: *Facts, env: ?*const Env, file: Project.FileId, args: []const Ast.Node.Index) ResolveError!Value {
+    const unread: Value = .{ .primitive = "@Int" };
+    if (args.len != 2) return unread;
+    const sign = (try self.comptimeValue(env, file, args[0])) orelse return unread;
+    const bits = (try self.comptimeValue(env, file, args[1])) orelse return unread;
+    if (sign != .tag or bits != .integer or bits.integer < 0 or bits.integer > 65535) return unread;
+    const letter: u8 = if (std.mem.eql(u8, sign.tag.name, "unsigned")) 'u' else if (std.mem.eql(u8, sign.tag.name, "signed")) 'i' else return unread;
+    return .{ .primitive = try self.gpa.print("{c}{d}", .{ letter, bits.integer }) };
+}
+
 fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
     const tree = &self.project.at(file).file.tree;
     const model = &self.project.at(file).model;
@@ -1740,9 +1770,7 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
     // A vector is indexed as an array of its lanes, and holds only numbers, truth values and
     // pointers.
     if (std.mem.eql(u8, name, "@Vector") and args.len == 2) return .{ .array = try self.boxed(try self.resolveIn(env, file, args[1])) };
-    // An integer type of a signedness and width computed at compile time: a number, whose width
-    // nothing here reads.
-    if (std.mem.eql(u8, name, "@Int")) return .{ .primitive = "@Int" };
+    if (std.mem.eql(u8, name, "@Int")) return self.intType(env, file, args);
     // An enum type built from names and values: it holds no value but its tag.
     if (std.mem.eql(u8, name, "@Enum")) return .{ .primitive = "@Enum" };
     if (std.mem.eql(u8, name, "@FieldType") and args.len == 2) return self.fieldType(try self.resolveIn(env, file, args[0]), try self.nameIn(env, file, args[1], 0));
@@ -2415,7 +2443,51 @@ fn fieldValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveE
 
 /// What `holder.name` is, written as a member access or as `@field(holder, "name")`.
 fn fieldNamed(self: *Facts, file: Project.FileId, holder: Ast.Node.Index, name: []const u8) ResolveError!Value {
-    return self.fieldOf(try self.resolve(file, holder), name);
+    const value = try self.fieldOf(try self.resolve(file, holder), name);
+    // A field that holds types (`id: ?type`), read off a `const` whose initializer writes it
+    // (`const config: Config = .{ .id = u32 }`): the type written, as a `const` of the field's
+    // type holds the type it is given.
+    if (!typeHolding(value)) return value;
+    const at = (try self.writtenField(file, holder, name)) orelse return value;
+    const given = try self.resolve(at.file, at.node);
+    // An optional's field holds the type as its payload (`?type` given `u32`).
+    if (value == .optional and given != .optional and given != .unknown) return .{ .optional = try self.boxed(given) };
+    return given;
+}
+
+/// Whether a value is `type` itself, or an optional of it: what a field declared so holds.
+fn typeHolding(value: Value) bool {
+    return switch (value) {
+        .primitive => |named| std.mem.eql(u8, named, "type"),
+        .optional => |inner| typeHolding(inner.*),
+        else => false,
+    };
+}
+
+/// The value a `const`'s struct-literal initializer writes for its field `name`, through
+/// parentheses and `const` aliases; null where `holder` names no such literal or it writes none.
+fn writtenField(self: *Facts, file: Project.FileId, holder: Ast.Node.Index, name: []const u8) ResolveError!?Key {
+    const tree = &self.project.at(file).file.tree;
+    var at = holder;
+    while (tree.nodeTag(at) == .grouped_expression) at = tree.nodeData(at).node_and_token[0];
+    if (tree.nodeTag(at) != .identifier) return null;
+    const decl = switch (try self.definition(file, at)) {
+        .decl => |decl| decl,
+        .none, .unknown => return null,
+    };
+    const record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+    if (record.kind != .variable) return null;
+    const owner = &self.project.at(decl.file).file.tree;
+    const variable = owner.fullVarDecl(record.node) orelse return null;
+    if (owner.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
+    const init = variable.ast.init_node.unwrap() orelse return null;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const literal = owner.fullStructInit(&buffer, init) orelse return (if (owner.nodeTag(init) == .identifier) self.writtenField(decl.file, init, name) else null);
+    for (literal.ast.fields) |field| {
+        const label = try self.memberName(owner.tokenSlice(Model.initName(owner, field) orelse continue));
+        if (std.mem.eql(u8, label, name)) return .{ .file = decl.file, .node = field };
+    }
+    return null;
 }
 
 /// What `name` read off `lhs` is (`fieldNamed`), the holder already read.
@@ -5820,7 +5892,20 @@ pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
         }
         if (variable.ast.init_node.unwrap()) |value| {
             const initial = try self.resolve(decl.file, value);
-            if (!mutable) return initial;
+            if (!mutable) {
+                // A `const` declared an optional of types holds the type it is given as its
+                // payload (`const configured: ?type = u32`), as a field declared so does.
+                // `null` (a scalar) is no payload.
+                if (variable.ast.type_node.unwrap()) |t| {
+                    const declared = try self.resolve(decl.file, t);
+                    const held = switch (initial) {
+                        .optional, .unknown, .scalar => false,
+                        else => true,
+                    };
+                    if (declared == .optional and typeHolding(declared) and held) return .{ .optional = try self.boxed(initial) };
+                }
+                return initial;
+            }
             // A `var` that holds types (`comptime var X: type = S;`) is each type it is given,
             // wherever it is read: one declaration, several types over its life.
             // Written, its type holds types: one that does not, or not known, returned above.
@@ -14884,6 +14969,46 @@ test "a generic position's call is generic, a slice's `ptr` its own whichever el
     try std.testing.expectEqual(Size.slice, pointer.pointer.size.?);
     const agree = try local.initValue(&facts, "agree");
     try std.testing.expect(agree == .instance);
+}
+
+test "a type a const optional of types holds is read through an if's capture, orelse and .?, and @Int's width through the arithmetic written" {
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes =
+        \\const Config = struct { id: ?type = null };
+        \\const config: Config = .{ .id = u32 };
+        \\const Captured = if (config.id) |T| T else usize;
+        \\const configured: ?type = u32;
+        \\const Defaulted = configured orelse usize;
+        \\const Unwrapped = configured.?;
+        \\const Wide = @Int(.unsigned, 16 * 2);
+    }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const source = &project.sources[0];
+    for ([_][]const u8{ "Captured", "Defaulted", "Unwrapped", "Wide" }) |name| {
+        for (source.model.declarations) |decl| {
+            if (decl.kind != .variable or !std.mem.eql(u8, decl.name, name)) continue;
+            const value = try facts.resolve(source.id, source.file.tree.fullVarDecl(decl.node).?.ast.init_node.unwrap().?);
+            // `Captured`'s `if` is not decided (an optional value is read as its type's, null or
+            // not): a choice that holds `u32`.
+            const has_u32 = for (valueParts(&value)) |part| {
+                if (part == .primitive and std.mem.eql(u8, part.primitive, "u32")) break true;
+            } else false;
+            std.testing.expect(has_u32 and (value == .primitive or std.mem.eql(u8, name, "Captured"))) catch |err| {
+                std.debug.print("{s}: {t}", .{ name, std.meta.activeTag(value) });
+                if (value == .unknown) std.debug.print(" {t}", .{value.unknown});
+                if (value == .primitive) std.debug.print(" {s}", .{value.primitive});
+                if (value == .alternatives) for (value.alternatives) |part| {
+                    std.debug.print(" {t}", .{std.meta.activeTag(part)});
+                    if (part == .primitive) std.debug.print("={s}", .{part.primitive});
+                };
+                std.debug.print("\n", .{});
+                return err;
+            };
+        }
+    }
 }
 
 test "a function's value in a private alias or table is followed for every reader; a public alias, or a private one returned, escapes" {

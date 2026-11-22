@@ -15,8 +15,10 @@ const Ast = std.zig.Ast;
 /// declaration uses (`pub const Link = Edge;`), a public signature's (an anonymous struct
 /// parameter) or what a reached type function returns. Two names are one integer when their
 /// types resolve to it, or are spelled the same and are an integer whatever a build chooses
-/// (`const Id = if (wide) u64 else u32`). P008 is hygiene: a type that does not resolve, or a
-/// choice that meets the other's only in some build, is not shown to be one, and is silent.
+/// (`const Id = if (wide) u64 else u32`), or one is an integer in every build that a build's
+/// choice of the other picks (`Id` against `u32`: both are `u32` in the build that picks it).
+/// P008 is hygiene: a type that does not resolve, or two choices whose parts meet (each build
+/// chooses on its own), is not shown to be one, and is silent.
 pub fn check(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
@@ -110,20 +112,27 @@ fn kindOf(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!?Ki
     }
 }
 
-/// The first two names that are one integer in every build.
+/// The first two names that are one integer in every build, or in a build one's choice picks.
 fn meet(names: []const Ast.TokenIndex, kinds: []const Kind) ?struct { first: Ast.TokenIndex, second: Ast.TokenIndex, kind: []const u8 } {
     for (kinds, 0..) |kind, i| for (kinds[0..i], 0..) |earlier, j| {
-        if (oneInteger(earlier, kind)) return .{ .first = names[j], .second = names[i], .kind = if (kind.integers.len == 1) kind.integers[0] else kind.spelled };
+        if (oneInteger(earlier, kind)) return .{ .first = names[j], .second = names[i], .kind = if (kind.integers.len == 1) kind.integers[0] else if (earlier.integers.len == 1) earlier.integers[0] else kind.spelled };
     };
     return null;
 }
 
-/// Whether two types are one integer in every build: spelled alike and an integer whatever a
-/// build chooses, or each the one same integer.
+/// Whether two types are one integer in some build, certainly: spelled alike and an integer
+/// whatever a build chooses; each the one same integer; or one integer in every build that the
+/// other's choice, read part by part, holds (the build that picks it).
 fn oneInteger(a: Kind, b: Kind) bool {
-    if (!a.all or !b.all) return false;
-    if (std.mem.eql(u8, a.spelled, b.spelled)) return true;
-    return a.integers.len == 1 and b.integers.len == 1 and std.mem.eql(u8, a.integers[0], b.integers[0]);
+    if (a.all and b.all and std.mem.eql(u8, a.spelled, b.spelled)) return true;
+    return picks(a, b) or picks(b, a);
+}
+
+/// Whether `one` is a single integer in every build and `choice` holds it among its parts.
+fn picks(one: Kind, choice: Kind) bool {
+    if (one.integers.len != 1 or !one.all or one.unknown) return false;
+    for (choice.integers) |part| if (std.mem.eql(u8, part, one.integers[0])) return true;
+    return false;
 }
 
 /// Which of a file's declarations at container level code outside the file may reach (by
