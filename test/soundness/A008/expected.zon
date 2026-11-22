@@ -1,6 +1,8 @@
 .{
-    // A008 is a rule aegis declares (its lint_rules, read from the pinned aegis): one site it reports
-    // and one it must not, inside the seam the case declares. Its other rows hold none.
-    .no_hole = .{ .assignment, .destructure, .capture, .address, .deferred, .jump, .inline_loop, .operator, .conversion, .unwrap, .aggregate, .memory, .branch },
-    .no_twin = .{ .assignment, .destructure, .capture, .address, .deferred, .jump, .inline_loop, .operator, .conversion, .unwrap, .aggregate, .memory, .branch },
+    // A008 is a rule aegis declares (its lint_rules, read from the pinned aegis): a reference to
+    // one of its targets (std's hand wipe, constant-time comparisons, every key type) reached
+    // through each way a name is held, and the same way reaching the answer.
+    // A target is a declaration, reached only by a name evaluated as the program compiles; memory
+    // a load or store moves holds runtime values, never a name.
+    .na = .{.memory},
 }

@@ -1443,10 +1443,13 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         .slice_open, .slice, .slice_sentinel => return self.sliced(try self.resolve(file, tree.fullSlice(node).?.ast.sliced), {}),
         // `++` joins arrays: the left side's kind, a string for a literal, and an array of the
         // elements for slices and pointers to arrays, whose lengths are known at compile time.
+        // Two tuple literals joined are one literal: the left's parts, then the right's
+        // (`literalParts`).
         .array_cat => {
             const lhs = try self.resolve(file, tree.nodeData(node).node_and_node[0]);
             return switch (lhs) {
                 .scalar, .array, .unknown => lhs,
+                .literal => if (try self.resolve(file, tree.nodeData(node).node_and_node[1]) == .literal) .{ .literal = .{ .file = file, .node = node } } else .{ .unknown = .unsupported },
                 .pointer => |to| switch (to.child.*) {
                     .array => to.child.*,
                     .unknown => to.child.*,
@@ -5947,6 +5950,7 @@ fn holdsTypeValue(self: *Facts, value: Value, depth: u8) ResolveError!bool {
         // Type information holds the types it describes (`info.pointer.child`).
         .reflected => return true,
         .literal => |key| {
+            if (try self.joinedLiterals(key)) |sides| return try self.holdsTypeValue(.{ .literal = sides[0] }, depth + 1) or try self.holdsTypeValue(.{ .literal = sides[1] }, depth + 1);
             const tree = &self.project.at(key.file).file.tree;
             var buffer: [2]Ast.Node.Index = undefined;
             const parts: []const Ast.Node.Index = if (tree.fullArrayInit(&buffer, key.node)) |init| init.ast.elements else if (tree.fullStructInit(&buffer, key.node)) |init| init.ast.fields else return true;
@@ -6933,11 +6937,24 @@ const Tuples = struct { kept: std.ArrayList(struct { key: Key, parts: []const Va
 
 pub fn literalParts(self: *Facts, literal: Key) ResolveError![]const Value {
     const tree = &self.project.at(literal.file).file.tree;
+    if (try self.joinedLiterals(literal)) |sides| return std.mem.concat(self.gpa, Value, &.{ try self.literalParts(sides[0]), try self.literalParts(sides[1]) });
     var buffer: [2]Ast.Node.Index = undefined;
     const nodes = if (tree.fullStructInit(&buffer, literal.node)) |full| full.ast.fields else if (tree.fullArrayInit(&buffer, literal.node)) |full| full.ast.elements else return &.{};
     const parts = try self.gpa.alloc(Value, nodes.len);
     for (nodes, parts) |node, *part| part.* = try self.resolve(literal.file, node);
     return parts;
+}
+
+/// The two literals a literal made by `++` joins (`.{a} ++ .{b}`), left then right; null for
+/// any other literal.
+fn joinedLiterals(self: *Facts, literal: Key) ResolveError!?[2]Key {
+    const tree = &self.project.at(literal.file).file.tree;
+    if (tree.nodeTag(literal.node) != .array_cat) return null;
+    const lhs, const rhs = tree.nodeData(literal.node).node_and_node;
+    const left = try self.resolve(literal.file, lhs);
+    const right = try self.resolve(literal.file, rhs);
+    if (left != .literal or right != .literal) return null;
+    return .{ left.literal, right.literal };
 }
 
 pub fn memberName(self: *Facts, raw: []const u8) ResolveError![]const u8 {
@@ -13762,6 +13779,22 @@ test "a capture is read once for the run: its name read again makes nothing new 
     const again = try facts.declaration(capture);
     facts.gpa = own;
     try std.testing.expect(sameValue(first, again));
+}
+
+test "two tuple literals joined by ++ hold the left's parts, then the right's" {
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "const A = struct {};\nconst B = struct {};\nconst left = .{A};\nconst both = left ++ .{B};\nconst second = both[1];\nconst first = both[0];\nconst mixed = left ++ \"b\";\n" }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const root = facts.rootOf(project.sources[0].id);
+    const second = try facts.declaration(facts.member(root, "second").?);
+    const first = try facts.declaration(facts.member(root, "first").?);
+    try std.testing.expect(second == .container and second.container.scope == (try facts.declaration(facts.member(root, "B").?)).container.scope);
+    try std.testing.expect(first == .container and first.container.scope == (try facts.declaration(facts.member(root, "A").?)).container.scope);
+    // A tuple joined with what is no tuple literal is not read as one.
+    try std.testing.expect(try facts.declaration(facts.member(root, "mixed").?) == .unknown);
 }
 
 test "facts read a ZON import as the value its file holds" {

@@ -149,8 +149,9 @@ fn answerArgument(c: *Context, entry: Entry, node: Ast.Node.Index) Context.Error
         parent = model.parentOf(at) orelse return false;
     }
     // A branch of a choice the argument is (`Secret(if (seeded) [n]u8 else T)`): the type handed
-    // to the answer either way.
-    while (tree.nodeTag(parent) == .grouped_expression or isBranchOf(tree, parent, at)) {
+    // to the answer either way. The operand `@as` converts (`Secret(@as(type, T))`) is the type
+    // handed to it too.
+    while (tree.nodeTag(parent) == .grouped_expression or isBranchOf(tree, parent, at) or isConverted(tree, parent, at)) {
         at = parent;
         parent = model.parentOf(at) orelse return false;
     }
@@ -178,6 +179,14 @@ fn isAnswer(entry: Entry, decl: Facts.Decl) bool {
 fn isBranchOf(tree: *const Ast, parent: Ast.Node.Index, child: Ast.Node.Index) bool {
     const branch = tree.fullIf(parent) orelse return false;
     return branch.ast.then_expr == child or branch.ast.else_expr.unwrap() == child;
+}
+
+/// Whether `child` is the operand the `@as` at `parent` converts, never the type it names.
+fn isConverted(tree: *const Ast, parent: Ast.Node.Index, child: Ast.Node.Index) bool {
+    if (!Facts.isBuiltin(tree, parent, "@as")) return false;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const arguments = tree.builtinCallParams(&buffer, parent) orelse return false;
+    return arguments.len == 2 and arguments[1] == child;
 }
 
 /// Whether `node`, a type, is an operand of `==` or `!=`: a comparison of types, which holds no
