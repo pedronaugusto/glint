@@ -204,8 +204,10 @@ pub const Reflected = struct { of: *const Value, at: enum { info, pointer, size,
 /// Why a value is unknown. `absent`: it comes from a module the build does not have for this
 /// file (Project.Input.absent), or it is a parameter no function of a reflected choice has
 /// (`param_types[6]` of a table whose functions take at most six), or an element past the end
-/// of a tuple literal a binding passes (`args[1]` under a comptime test of another name), so
-/// the code that needs it is not compiled in this build.
+/// of a tuple literal a binding passes (`args[1]` under a comptime test of another name), or the
+/// capture of a prong of a switch on type information that names no kind the subject may be
+/// (`.@"struct" => |s|` where the type is an integer), so the code that needs it is not compiled
+/// in this build.
 /// `generic`: it depends on a type or `anytype` parameter that calls from outside the
 /// project's reading bind (a consumer's, or a use other than a call), so each binding decides
 /// it where it is made; what is read of it (its type information, its parts) stays so.
@@ -384,10 +386,21 @@ fn declarationLiteral(self: *Facts, file: Project.FileId, node: Ast.Node.Index) 
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, parent) orelse return .{ .unknown = .comptime_dependent };
     if (call.ast.fn_expr != node) return .{ .unknown = .comptime_dependent };
-    return switch (try self.literalDeclaration(file, node, try self.memberName(tree.tokenSlice(tree.nodeMainToken(node))))) {
+    const name = try self.memberName(tree.tokenSlice(tree.nodeMainToken(node)));
+    return switch (try self.literalDeclaration(file, node, name)) {
         .decl => |found| self.declaration(found),
         .none => .{ .unknown = .unsupported },
-        .unknown => .{ .unknown = .comptime_dependent },
+        // A place a build picks whose parts declare it apart (`wide.Atomic(T)`, `aegis.Atomic(T)`
+        // or a split cell of its own, each with its `init`): each part's, one of them.
+        .unknown => |why| if (why != .unsupported) .{ .unknown = .comptime_dependent } else switch (try self.literalDeclarations(file, node, name)) {
+            .decls => |found| blk: {
+                if (found.len == 0) break :blk .{ .unknown = .unsupported };
+                const each = try self.gpa.alloc(Value, found.len);
+                for (found, each) |decl, *out| out.* = try self.declaration(decl);
+                break :blk self.choose(each);
+            },
+            .unknown => .{ .unknown = .comptime_dependent },
+        },
     };
 }
 
@@ -1955,6 +1968,8 @@ fn fieldType(self: *Facts, of: Value, field_name: ?[]const u8) ResolveError!Valu
                 if (part == .primitive) continue;
                 if (field_name) |name| if (part == .container and self.lacks(part.container, name)) continue;
                 const one = try self.fieldType(part, field_name);
+                // A part of no field at all is one more such build.
+                if (one == .unknown and one.unknown == .absent) continue;
                 if (one == .unknown) return one;
                 try each.append(self.gpa, one);
             }
@@ -2117,7 +2132,25 @@ fn fieldTypes(self: *Facts, container: Container) ResolveError!Value {
         if (field.ast.type_expr == .none) continue;
         try each.append(self.gpa, try typeOf(self, try self.memberOf(container, .{ .file = container.file, .index = @fromBackingInt(@intCast(i)) }), {}));
     }
-    if (each.items.len == 0) return .{ .unknown = .unsupported };
+    // A tuple's fields (`struct { ?E, usize }`) declare no name: each is its type, with a made
+    // container's bindings (as `heldFields` reads them).
+    const node = model.scopes[@backingInt(container.scope)].node;
+    if (node != .root) {
+        const tree = self.syntaxOf(container.file);
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (tree.fullContainerDecl(&buffer, node)) |full| for (full.ast.members) |item| {
+            const field = model.containerField(tree, item) orelse continue;
+            if (!field.ast.tuple_like) continue;
+            const type_node = field.ast.type_expr.unwrap() orelse continue;
+            try each.append(self.gpa, if (container.made_by) |made| blk: {
+                const bound = try self.substituted(container.file, type_node, made);
+                break :blk if (bound == .unknown) bound else try self.madeWithin(bound, container, made);
+            } else try self.resolve(container.file, type_node));
+        };
+    }
+    // No field at all: `field_types` is empty, and code reading one of them (`[0]`, under a
+    // length test) is compiled in no build.
+    if (each.items.len == 0) return .{ .unknown = .absent };
     return self.choose(each.items);
 }
 
@@ -2217,6 +2250,11 @@ fn memberValue(self: *Facts, lhs: Value, name: []const u8) ResolveError!Value {
     if (lhs == .pointer and lhs.pointer.child.* == .literal) return self.literalField(lhs.pointer.child.literal, name);
     if (lhs == .pointer and lhs.pointer.child.* == .alternatives) return self.memberOfChoice(lhs.pointer.child.alternatives, name);
     if (lhs == .alternatives) return self.memberOfChoice(lhs.alternatives, name);
+    // A value of a type `@Struct` or `@Tuple` builds: whichever field the name is, it holds one
+    // of the types the list gives (the names are computed as it compiles; a build reading one it
+    // lacks does not compile). The type itself declares nothing.
+    const built: ?Reified = if (lhs == .reified) lhs.reified else if (lhs == .pointer and lhs.pointer.child.* == .reified) lhs.pointer.child.reified else null;
+    if (built) |b| return if (b.value) self.instance(b.fields.*) else .{ .unknown = .unresolved };
     const container = switch (lhs) {
         .container, .instance => |c| c,
         .pointer => |p| switch (p.child.*) {
@@ -2297,10 +2335,18 @@ fn memberOfChoice(self: *Facts, choices: []const Value, name: []const u8) Resolv
         .array => if (!std.mem.eql(u8, name, "len")) continue else try kept.append(self.gpa, try self.memberValue(choice, name)),
         // A type that declares no such member, likewise.
         .container, .instance => |c| if (self.lacks(c, name)) continue else try kept.append(self.gpa, try self.memberValue(choice, name)),
-        .pointer => |to| switch (to.child.*) {
-            .container, .instance => |c| if (self.lacks(c, name)) continue else try kept.append(self.gpa, try self.memberValue(choice, name)),
-            .alternatives => try kept.append(self.gpa, try self.memberValue(choice, name)),
-            else => try kept.append(self.gpa, try self.memberValue(choice, name)),
+        .pointer => |to| {
+            // A slice has only its `len` and `ptr`; a pointer to a number, an optional or an error
+            // union no member at all; a pointer to an array only its length.
+            const sequence_member = std.mem.eql(u8, name, "len") or std.mem.eql(u8, name, "ptr");
+            if (to.size == .slice and to.decided and !sequence_member) continue;
+            switch (to.child.*) {
+                .container, .instance => |c| if (self.lacks(c, name)) continue else try kept.append(self.gpa, try self.memberValue(choice, name)),
+                .primitive, .scalar, .optional, .error_union => if (to.size == .slice and sequence_member) try kept.append(self.gpa, try self.memberValue(choice, name)) else continue,
+                .array => if (std.mem.eql(u8, name, "len")) try kept.append(self.gpa, try self.memberValue(choice, name)) else continue,
+                .alternatives => try kept.append(self.gpa, try self.memberValue(choice, name)),
+                else => try kept.append(self.gpa, try self.memberValue(choice, name)),
+            }
         },
         .alternatives => try kept.append(self.gpa, try self.memberValue(choice, name)),
         // Information on a type of another kind than the one read (`@typeInfo(@TypeOf(
@@ -2420,7 +2466,9 @@ fn storedFunctions(self: *Facts, container: Container, name: []const u8) Resolve
     defer _ = self.storing.remove(field);
     const wide = self.wide;
     const found = try self.storesOf(container, field);
-    if (!self.wideSince(wide)) try self.stored.put(self.gpa, field, found);
+    // A cycle is the answer of a query in progress, kept by no memo (`resolve`).
+    const cyclic = if (found) |value| holdsCycle(value, 0) else false;
+    if (!self.wideSince(wide) and !cyclic) try self.stored.put(self.gpa, field, found);
     return found;
 }
 
@@ -4608,10 +4656,11 @@ fn madeEnv(self: *Facts, made: *const Made) ResolveError!*const Env {
         spelling.* = try self.spelledIn(outer_env, made.file, param);
         const changed = try self.passedOnChanged(made.function, position);
         value.* = !changed and try self.valueIn(outer_env, made.file, param, 0);
-        arg.* = if (changed)
-            .{ .unknown = .comptime_dependent }
-        else
-            try self.boundArgument(if (outer_env) |env| try self.resolveIn(env, made.file, param) else try self.resolve(made.file, param));
+        arg.* = if (changed) .{ .unknown = .comptime_dependent } else bound: {
+            const argument = if (outer_env) |env| try self.resolveIn(env, made.file, param) else try self.resolve(made.file, param);
+            // Made through the function itself, as `bindTo` reads it: generic, the reading kept.
+            break :bound if (throughItself(argument)) .{ .unknown = .generic } else try self.boundArgument(argument);
+        };
         t.* = if (changed) null else self.truth(outer_env, made.file, param);
     }
     return self.keptReading(.{ .function = made.function, .args = args, .depth = if (outer_env) |e| e.depth +| 1 else 0, .nested = if (outer_env) |e| e.nested else 0, .truths = truths, .outer = self.enclosingReading(outer_env, made.function), .spelled = spelled, .values = values });
@@ -4735,10 +4784,85 @@ fn indexed(self: *Facts, value: Value, _: void) ResolveError!Value {
         },
         // A tuple of no type of its own, named (`inline for (kinds) |kind|`): one of its parts.
         .literal => |literal| self.choose(try self.literalParts(literal)),
-        .alternatives => self.map(value, {}, indexed),
+        // A choice (an `anytype` tuple's element over every binding): each part Zig indexes. A
+        // part it refuses to (an integer, a struct's value) is a binding in which this code does
+        // not compile, left out, as `payload` leaves out a part with no such wrapper.
+        .alternatives => |parts| blk: {
+            var kept: std.ArrayList(Value) = .empty;
+            for (parts) |part| if (!try self.unindexable(part)) try kept.append(self.gpa, try self.indexed(part, {}));
+            if (kept.items.len == 0) break :blk .{ .unknown = .absent };
+            break :blk self.choose(kept.items);
+        },
         .unknown => value,
         else => .{ .unknown = .unsupported },
     };
+}
+
+/// Whether Zig refuses `value[i]` whatever `i` is: a value of a type that is no array,
+/// pointer to many or tuple (an integer, an optional, an error union, a struct's or a union's
+/// value), or a type itself.
+fn unindexable(self: *Facts, value: Value) ResolveError!bool {
+    return switch (value) {
+        .primitive, .optional, .error_union, .error_set, .function, .container, .fn_type => true,
+        .instance => |c| !self.tupleType(c),
+        else => false,
+    };
+}
+
+/// Whether a container is a tuple (`struct { u32, u8 }`): its fields declare no name.
+fn tupleType(self: *Facts, container: Container) bool {
+    const model = &self.project.at(container.file).model;
+    const node = model.scopes[@backingInt(container.scope)].node;
+    if (node == .root) return false;
+    const tree = self.syntaxOf(container.file);
+    var buffer: [2]Ast.Node.Index = undefined;
+    const full = tree.fullContainerDecl(&buffer, node) orelse return false;
+    if (tree.tokenTag(full.ast.main_token) != .keyword_struct) return false;
+    for (full.ast.members) |item| {
+        const field = model.containerField(tree, item) orelse continue;
+        return field.ast.tuple_like;
+    }
+    return false;
+}
+
+/// The one instance among a choice's parts (through a pointer) whose type declares `decl`, the
+/// value a method so called is called on. Null where none or several do.
+fn declaringInstance(self: *const Facts, parts: []const Value, decl: Decl) ?Container {
+    const scope = self.project.at(decl.file).model.declarations[@backingInt(decl.index)].scope;
+    var found: ?Container = null;
+    for (parts) |part| {
+        const c = switch (part) {
+            .instance => |c| c,
+            .pointer => |p| if (p.child.* == .instance) p.child.instance else continue,
+            else => continue,
+        };
+        if (c.file != decl.file or c.scope != scope) continue;
+        if (found != null) return null;
+        found = c;
+    }
+    return found;
+}
+
+/// The type of a tuple's field at `position`, with a made container's bindings (as
+/// `heldFields` reads it); unsupported past its last.
+fn tupleFieldType(self: *Facts, container: Container, position: usize) ResolveError!Value {
+    const model = &self.project.at(container.file).model;
+    const tree = self.syntaxOf(container.file);
+    var buffer: [2]Ast.Node.Index = undefined;
+    const full = tree.fullContainerDecl(&buffer, model.scopes[@backingInt(container.scope)].node) orelse return .{ .unknown = .unsupported };
+    var at: usize = 0;
+    for (full.ast.members) |item| {
+        const field = model.containerField(tree, item) orelse continue;
+        if (at != position) {
+            at += 1;
+            continue;
+        }
+        const type_node = field.ast.type_expr.unwrap() orelse return .{ .unknown = .unsupported };
+        const made = container.made_by orelse return self.resolve(container.file, type_node);
+        const bound = try self.substituted(container.file, type_node, made);
+        return if (bound == .unknown) bound else self.madeWithin(bound, container, made);
+    }
+    return .{ .unknown = .unsupported };
 }
 
 /// A slice of `value`: a pointer to an array's elements, or to what the slice or pointer
@@ -5183,15 +5307,39 @@ fn switchPayload(self: *Facts, env: ?*const Env, file: Project.FileId, case_node
     const whole = tree.fullSwitch(parent) orelse return .{ .unknown = .unsupported };
     const subject = try self.resolveIn(env, file, whole.ast.condition);
     // A switch on type information (`@typeInfo(T)`) captures the part its prong names, of
-    // each type a choice of them gives.
+    // each type a choice of them gives. Zig analyses a prong only for a type of a kind it names,
+    // an `inline` prong of several kinds once for each (`inline .@"struct", .@"union" => |i|`):
+    // a type of another known kind is a build of the prong Zig does not analyse, left out; one
+    // of a kind not known is each kind the prong names. An `else` prong's, or one naming a kind
+    // other than by a literal, is a part whose types are not read.
     if (reflectedInfo(subject)) {
         const each: []const Value = if (subject == .alternatives) subject.alternatives else &.{subject};
-        const parts = try self.gpa.alloc(Value, each.len);
-        for (each, parts) |one, *part| part.* = if (full.ast.values.len != 1 or tree.nodeTag(full.ast.values[0]) != .enum_literal)
-            .{ .reflected = .{ .of = one.reflected.of, .at = .part } }
-        else
-            try self.reflectedMember(one.reflected, try self.memberName(tree.tokenSlice(tree.nodeMainToken(full.ast.values[0]))));
-        return self.choose(parts);
+        var named: std.ArrayList([]const u8) = .empty;
+        for (full.ast.values) |item| {
+            if (tree.nodeTag(item) != .enum_literal) {
+                named.clearRetainingCapacity();
+                break;
+            }
+            try named.append(self.gpa, try self.memberName(tree.tokenSlice(tree.nodeMainToken(item))));
+        }
+        var parts: std.ArrayList(Value) = .empty;
+        for (each) |one| {
+            if (named.items.len == 0) {
+                try parts.append(self.gpa, .{ .reflected = .{ .of = one.reflected.of, .at = .part } });
+                continue;
+            }
+            // An array may be a vector, which reads as one (`takenProng`).
+            const array = one.reflected.of.* == .array;
+            const kind = if (array) null else try self.kindOfType(one.reflected.of.*);
+            for (named.items) |wanted| {
+                if (kind) |known| if (!std.mem.eql(u8, known, wanted)) continue;
+                if (array and !std.mem.eql(u8, wanted, "array") and !std.mem.eql(u8, wanted, "vector")) continue;
+                try parts.append(self.gpa, try self.reflectedMember(one.reflected, wanted));
+            }
+        }
+        // No type the subject may be is of a kind the prong names: Zig compiles it in no build.
+        if (parts.items.len == 0) return .{ .unknown = .absent };
+        return self.choose(parts.items);
     }
     // A pointer's target resolves as its type: a dereferenced subject is a container here.
     const container = switch (subject) {
@@ -5609,9 +5757,10 @@ pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
         const wide = self.wide;
         const met = self.open_met;
         const value = try self.captured(null, decl);
-        // Kept as `resolve` keeps, and an unknown only where it met no query in progress
-        // (`open_met`): one that did is asked again.
-        if (self.remaining != 0 and !self.wideSince(wide) and (value != .unknown or self.open_met == met)) try self.captures.put(self.gpa, key, value);
+        // Kept as `resolve` keeps, never holding a cycle (type information read off a `T` in
+        // progress, `|i|` of `switch (@typeInfo(T))`), and an unknown only where it met no query
+        // in progress (`open_met`): one that did is asked again.
+        if (self.remaining != 0 and !self.wideSince(wide) and !holdsCycle(value, 0) and (value != .unknown or self.open_met == met)) try self.captures.put(self.gpa, key, value);
         return value;
     }
     if (declaration_record.kind == .field) {
@@ -6960,6 +7109,8 @@ pub fn literalDeclarations(self: *Facts, file: Project.FileId, node: Ast.Node.In
         break :called if (call.ast.fn_expr == node) parent else null;
     };
     const place = try self.literalType(file, call_node orelse node);
+    // A place that does not resolve: why it does not.
+    if (place == .unknown) return .{ .unknown = place.unknown };
     if (place != .alternatives) return .{ .unknown = .unsupported };
     var parts: std.ArrayList(Value) = .empty;
     for (place.alternatives) |part| {
@@ -7248,7 +7399,11 @@ fn elementOf(self: *Facts, base: Value, tree: *const Ast, index_node: Ast.Node.I
                 // code takes: Zig refuses the index where it would.
                 if (one == .reflected) {
                     try mapped.append(self.gpa, (try self.reflectedElement(one.reflected, tree, index_node)) orelse continue);
-                } else try mapped.append(self.gpa, try self.elementOf(one, tree, index_node));
+                } else if (!try self.unindexable(one)) {
+                    // A part Zig refuses to index is a binding in which this code does not
+                    // compile (`indexed`).
+                    try mapped.append(self.gpa, try self.elementOf(one, tree, index_node));
+                }
             }
             // No function of the choice has the parameter: Zig compiles this code in no build.
             if (mapped.items.len == 0) return .{ .unknown = .absent };
@@ -7327,14 +7482,22 @@ fn reflectedMember(self: *Facts, r: Reflected, name: []const u8) ResolveError!Va
                     const kind = try self.kindOfType(part) orelse return unsupported;
                     if (!std.mem.eql(u8, kind, wanted)) continue;
                     const one = try self.reflectedMember(.{ .of = try self.boxed(part), .at = r.at }, name);
+                    // A part with nothing there (no field) is one no build reads it of.
+                    if (one == .unknown and one.unknown == .absent) continue;
                     if (one == .unknown) return one;
                     try kept.append(self.gpa, one);
                 }
-                if (kept.items.len == 0) return unsupported;
+                // No part of this kind, or none with it: the prong is compiled in no build.
+                if (kept.items.len == 0) return .{ .unknown = .absent };
                 return self.choose(kept.items);
             }
             const container = self.reflectedContainer(r) orelse return if (r.of.* == .unknown) r.of.* else unsupported;
-            if (std.mem.eql(u8, name, "field_types") and r.at != .enumeration) return try self.pointerTo(try self.fieldTypes(container), .slice);
+            if (std.mem.eql(u8, name, "field_types") and r.at != .enumeration) {
+                const types = try self.fieldTypes(container);
+                // None (a struct of no field): the slice is empty, absent for a choice to leave out.
+                if (types == .unknown) return types;
+                return try self.pointerTo(types, .slice);
+            }
             if (std.mem.eql(u8, name, "field_values") and r.at == .enumeration) return try self.pointerTo(.scalar, .slice);
             if (std.mem.eql(u8, name, "is_tuple") and r.at == .structure) return .scalar;
             if (std.mem.eql(u8, name, "tag_type") and r.at != .structure) return self.tagType(container, r.at == .tagged);
@@ -7724,26 +7887,36 @@ fn evaluateCall(self: *Facts, env: ?*const Env, file: Project.FileId, call: Ast.
         const parts = valueParts(&receiver);
         var some = false;
         var every = true;
+        var called_on: std.ArrayList(Value) = .empty;
         for (parts) |part| {
             const one = switch (part) {
                 .instance => true,
                 .pointer => |p| p.child.* == .instance,
                 .alternatives => return .{ .unknown = .unsupported }, // a choice, never a part (valueParts): not known
+                // Zig calls no method on an optional or an error union (aegis's
+                // `fromIoDuration(d, .exact)`, a value or an error union of one as the conversion
+                // can fail): a build in which this call does not compile.
+                .optional, .error_union => continue,
                 else => false,
             };
             if (one) some = true else every = false;
+            try called_on.append(self.gpa, part);
         }
         if (some and !every) return .{ .unknown = .unsupported };
         const on_value = some;
         if (on_value) {
-            try args.append(self.gpa, receiver);
+            const on: Value = if (called_on.items.len == parts.len) receiver else try self.choose(called_on.items);
+            try args.append(self.gpa, if (throughItself(on)) .{ .unknown = .generic } else on);
             try truths.append(self.gpa, null);
             try spelled.append(self.gpa, null);
             try values.append(self.gpa, try self.valueIn(env, file, tree.nodeData(call.ast.fn_expr).node_and_token[0], 0));
         }
     }
     for (call.ast.params) |arg| {
-        try args.append(self.gpa, try self.boundArgument(try self.resolveIn(env, file, arg)));
+        // A binding made through the function itself (a recursive type walker's `T`, read
+        // inside its own reading) is generic, as `bindTo` binds it: the reading is kept.
+        const argument = try self.resolveIn(env, file, arg);
+        try args.append(self.gpa, if (throughItself(argument)) .{ .unknown = .generic } else try self.boundArgument(argument));
         try truths.append(self.gpa, self.truth(env, file, arg));
         try spelled.append(self.gpa, try self.spelledIn(env, file, arg));
         try values.append(self.gpa, try self.valueIn(env, file, arg, 0));
@@ -12865,20 +13038,44 @@ pub const calls = struct {
                         .unknown => |why| return .{ .unknown = why },
                         // An error union or a number has no member a name reads: the call
                         // compiles only where the holder is another of the choice (`Wrapped(E,
-                        // T)`, `T` where `E` is empty), as `memberOfChoice` reads one.
-                        .error_union, .primitive, .scalar => continue,
+                        // T)`, `T` where `E` is empty), as `memberOfChoice` reads one. Nor has
+                        // an optional, an array, or a pointer past the one a call goes through
+                        // (`words.at(i)` where `Words` is `[]const u64` in one build).
+                        .error_union, .primitive, .scalar, .optional, .array, .pointer => continue,
                         else => return .{ .unknown = .unsupported },
                     };
                     // An instance of a type that declares no such member, likewise.
                     if (facts.lacks(container, name)) continue;
                     const decl = facts.member(container, name) orelse return .{ .unknown = .unresolved };
-                    if (facts.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind != .function) return .{ .unknown = .unsupported };
+                    if (!try method(facts, decl)) return .{ .unknown = .unsupported };
                     held = true;
                 }
             }
             if (!held) return .{ .unknown = .unresolved };
             return .{ .bound = holder };
         }
+        return boundOne(facts, env, file, callee, holder, value);
+    }
+
+    /// Whether a member is a method: a function, or a constant whose value is one or a choice of
+    /// them only (aegis's `pub const deinit = if (with_io) deinitIo else deinitPlain`).
+    fn method(facts: *Facts, decl: Facts.Decl) Error!bool {
+        switch (facts.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind) {
+            .function => return true,
+            .variable => {},
+            else => return false,
+        }
+        return switch (try facts.declaration(decl)) {
+            .function => true,
+            .alternatives => |parts| for (parts) |part| {
+                if (part != .function) break false;
+            } else true,
+            else => false,
+        };
+    }
+
+    /// `bound` of one holder, `value`.
+    fn boundOne(facts: *Facts, env: ?*const Facts.Env, file: Project.FileId, callee: Ast.Node.Index, holder: Ast.Node.Index, value: Facts.Value) Error!Receiver {
         // A field holds what it is given, and a call through it binds nothing.
         const decl = switch (try memberNamed(facts, env, file, callee, value)) {
             .decl => |d| d,
@@ -12975,7 +13172,8 @@ pub const calls = struct {
 
     /// Whether a callee is a function value held where the program has its target only as it
     /// runs: a field read (`x.f`, `@field(x, "f")`), a parameter, or a `var`, through
-    /// parentheses, `.*`, `.?`, `try`, and an `orelse`'s or a `catch`'s value. A `const` is what
+    /// parentheses, `.*`, `.?`, `try`, an `orelse`'s or a `catch`'s value, and a capture of one
+    /// (`if (s.vtable.link) |link|`). A `const` is what
     /// its initializer is: a field it reads is erased, functions it names are not
     /// (`const f = h.elicit orelse return` reads a field; a call's result is neither).
     fn erasedCallee(facts: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: usize) Error!bool {
@@ -13006,7 +13204,10 @@ pub const calls = struct {
                 if (owner.tokenTag(variable.ast.mut_token) == .keyword_var) return true;
                 return erasedCallee(facts, decl.file, variable.ast.init_node.unwrap() orelse return false, depth + 1);
             },
-            .function, .capture, .field => return false,
+            // A capture holds what its source does (`if (s.vtable.link) |link|`, `if
+            // (params.Comb) |Comb|`): a field's value is erased as the field is.
+            .capture => return erasedCallee(facts, decl.file, facts.captureSource(decl.file, record) orelse return false, depth + 1),
+            .function, .field => return false,
         }
     }
 
@@ -13576,7 +13777,9 @@ fn literalFieldType(self: *Facts, whole: Value, name: []const u8) ResolveError!V
         .alternatives => |each| {
             var typed: std.ArrayList(Value) = .empty;
             for (each) |one| {
-                if (one == .primitive and std.mem.eql(u8, one.primitive, "noreturn")) continue;
+                // A literal with a field coerces to no primitive (`noreturn`, or the `void` a
+                // build has in its place: `parts: if (identifiers) ?Within else void`).
+                if (one == .primitive) continue;
                 if (self.lacksMember(one, name)) continue;
                 try typed.append(self.gpa, one);
             }
@@ -13638,6 +13841,12 @@ fn placeType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
             // An untyped tuple's element (`const batched = .{ .{ .run = f } }`) takes no type
             // from it: an anonymous literal, as the tuple is.
             .unknown, .scalar => whole,
+            // A tuple type's (`struct { Io.File.Handle, Direction }`): its field at the
+            // element's position.
+            .container, .instance => |c| if (!self.tupleType(c)) .{ .unknown = .unsupported } else blk: {
+                const position = std.mem.findScalar(Ast.Node.Index, array.ast.elements, node) orelse break :blk .{ .unknown = .unsupported };
+                break :blk self.tupleFieldType(c, position);
+            },
             .alternatives => .{ .unknown = .unsupported },
             else => .{ .unknown = .unsupported },
         };
@@ -13741,7 +13950,9 @@ fn operatorPlace(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
         },
         // Operands Zig gives no result type: a negation's, a complement's, what is dereferenced,
         // unwrapped, read a field of, indexed or sliced, an index or a bound, and a statement.
-        .bool_not, .negation, .negation_wrap, .bit_not, .deref, .unwrap_optional, .field_access, .array_access, .slice_open, .slice, .slice_sentinel, .block_two, .block_two_semicolon, .block, .block_semicolon => return .scalar,
+        // A concatenation's operands too (`.{ .{ .run = f } } ++ more`): each
+        // is a value of its own, as an untyped tuple is.
+        .bool_not, .negation, .negation_wrap, .bit_not, .deref, .unwrap_optional, .field_access, .array_access, .slice_open, .slice, .slice_sentinel, .block_two, .block_two_semicolon, .block, .block_semicolon, .array_cat => return .scalar,
         else => return null,
     }
 }
@@ -13815,8 +14026,12 @@ fn parameterType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
                 .function => |function| try self.functionParameter(function, position + receiver),
                 .fn_type => |key| try self.fnTypeParameter(key, position),
                 .pointer => |inner| if (inner.child.* == .fn_type) try self.fnTypeParameter(inner.child.fn_type, position) else return .{ .unknown = .unsupported },
+                // The `void` a build has in a function's place (`c.ioctl` where a system has
+                // none): a build in which the call does not compile.
+                .primitive => continue,
                 else => return .{ .unknown = .unsupported },
             });
+            if (each.items.len == 0) return .{ .unknown = .absent };
             return self.choose(each.items);
         }
         return .{ .unknown = .unsupported };
@@ -13830,10 +14045,12 @@ fn parameterType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
             .instance => |c| c,
             .pointer => |p| switch (p.child.*) {
                 .instance => |c| c,
-                .alternatives => null,
+                .alternatives => |parts| self.declaringInstance(parts, decl),
                 else => null,
             },
-            .alternatives => null,
+            // A holder a build picks (`observed: if (builtin.is_test) Atomic(Count) else void`):
+            // the call compiles where it is a value of the type declaring the method.
+            .alternatives => |parts| self.declaringInstance(parts, decl),
             else => null,
         };
         if (container) |c| {
