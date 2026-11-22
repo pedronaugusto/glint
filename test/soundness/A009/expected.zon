@@ -1,6 +1,6 @@
 .{
-    // A009 is a rule aegis declares (its lint_rules, read from the pinned aegis): sites it reports
-    // and ones it must not, inside the seam the case declares. Its other rows hold none.
-    .no_hole = .{ .assignment, .destructure, .capture, .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .memory, .branch },
-    .no_twin = .{ .assignment, .destructure, .capture, .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .memory, .branch },
+    // A009 is a rule aegis declares (its lint_rules, read from the pinned aegis): an input source
+    // reached through each way its receiver is held, outside a declared input seam, and the same
+    // receiver's output made the same way; and the sources a declared seam holds.
+    .open = .{},
 }
