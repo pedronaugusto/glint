@@ -5,4 +5,8 @@
     // A field's type is evaluated as the program compiles, where no statement runs: no deferred
     // statement and no memory a load or store moves reaches it.
     .na = .{ .deferred, .memory },
+    .open = .{
+        // review b9: a handle held by value in a tuple's field, which has no name
+        "field/b9-tuple_field/hole.zig",
+    },
 }

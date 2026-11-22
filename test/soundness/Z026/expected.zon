@@ -1,4 +1,10 @@
 .{
+    .open = .{
+        // review b9: a handler `return {}`, a bare return with the void value written, is empty
+        "jump/b9-return_void_value/hole.zig",
+        // review b9: a handler `break :blk {}` to its own label, a bare break with the void value written, is empty
+        "jump/b9-break_void_value/hole.zig",
+    },
     .na = .{
         // Zig refuses `_ = err` ("error set is discarded"); an error stored is kept, not dropped.
         .assignment,
