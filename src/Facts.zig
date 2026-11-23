@@ -5982,7 +5982,7 @@ pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
                 // Types live only as the program compiles: values its stores do not show (a
                 // list grown by itself in a loop, `types = types ++ .{L}`) are what evaluating
                 // the code computes, which glint does not run.
-                const given = (try self.givenValues(decl)) orelse return .{ .unknown = if (declared_types) .comptime_dependent else .unresolved };
+                const given = (try self.givenValues(decl)) orelse return .{ .unknown = .comptime_dependent };
                 return self.choose(given);
             }
             if (!callable(initial)) return initial;
