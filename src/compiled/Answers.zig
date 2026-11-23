@@ -102,9 +102,8 @@ fn typeValue(facts: *Facts, c: *const Compiled, ty: u32, depth: u8) Facts.Resolv
     }
 }
 
-/// The program's container the compilation's type `ty` is: the one declared on its line, or for
-/// an instance (a type function's result, which names no line) the innermost container
-/// holding its declarations.
+/// The program's container the compilation's type `ty` is: the one declared on its line, or a
+/// file's own. Null for an instance of a type function, which names no line.
 fn containerOf(facts: *Facts, c: *const Compiled, ty: u32) Facts.ResolveError!?Facts.Container {
     const file = c.fileOf(ty);
     if (file == Compiled.none) return null;
@@ -122,22 +121,9 @@ fn containerOf(facts: *Facts, c: *const Compiled, ty: u32) Facts.ResolveError!?F
     }
     // A file's own structure.
     if (c.file_structs.get(file)) |s| if (s == ty) return .{ .file = project_file, .scope = model.root() };
-    // An instance: the innermost container holding one of its declarations' lines.
-    const decls = c.decls.getPtr(ty) orelse return null;
-    for (decls.values()) |list| for (list.items) |d| {
-        const place = c.placeOf(d) orelse continue;
-        var best: ?Model.Scope.Id = null;
-        var best_first: u32 = 0;
-        for (model.scopes, 0..) |s, i| {
-            if (s.kind != .container) continue;
-            const first = lineOf(tree, s.first);
-            if (first <= place.line and place.line <= lineOf(tree, s.last) and first >= best_first) {
-                best = @fromBackingInt(@intCast(i)); // safe: scopes are counted in u32
-                best_first = first;
-            }
-        }
-        if (best) |scope| return .{ .file = project_file, .scope = scope };
-    };
+    // A type function's instance: its container is the one the function returns, but a value of
+    // it read as that container alone would lose the arguments it was made with; its members'
+    // types are the compilation's to answer (`Compiled.member`), not yet asked here.
     return null;
 }
 
