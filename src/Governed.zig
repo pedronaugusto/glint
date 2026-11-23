@@ -217,6 +217,9 @@ pub fn sitesLeaving(self: *Context, governed: []const Governed, out: *std.ArrayL
                 // method of its own: the binding reaches one only through an alias its type
                 // declares, which is that alias's site.
                 if (why == .generic and tag == .field_access and methodCall(self, node) and free(self, governed, spelled)) continue;
+                // An enum or decl literal whose place glint does not read (`@prefetch`'s
+                // `.{ .rw = .write }`) spells nothing under a ban (docs/design.md).
+                if (tag == .enum_literal) continue;
                 try unread.append(self.allocator, .{ .node = node, .why = why });
                 continue;
             },
