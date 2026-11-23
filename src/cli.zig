@@ -1,5 +1,6 @@
 //! Filesystem front end for explicit inputs. No globs, build execution or hidden cache.
 const std = @import("std");
+const Compiled = @import("compiled/Compiled.zig");
 const Project = @import("Project.zig");
 const Rule = @import("Rule.zig");
 const Report = @import("Report.zig");
@@ -355,6 +356,7 @@ pub const Arguments = struct {
     package: []const []const u8 = &.{},
     files_from: []const []const u8 = &.{},
     input_directory: []const []const u8 = &.{},
+    compiled: []const []const u8 = &.{},
     pub const spec: ensign.Spec(@This()) = .{
         .name = "glint",
         .version = release.version,
@@ -384,6 +386,7 @@ pub const Arguments = struct {
             .package = .{ .value_name = "NAME=DIR", .section = "Inputs", .help = "The package whose files a directory holds, repeated" },
             .files_from = .{ .value_name = "FILE", .hint = .file, .section = "Inputs", .help = "A file naming files to check under this directory, one a line, repeated" },
             .input_directory = .{ .value_name = "DIR", .hint = .directory, .hidden = true, .help = "A directory the caller's build reads; never a selection of files" },
+            .compiled = .{ .value_name = "BINARY", .hint = .file, .section = "Inputs", .help = "A test root the package's build compiled with Zig's self-hosted x86_64 backend (-fno-llvm -fno-lld), its files named relative to this directory, repeated: a local's or parameter's type is what its DWARF gives, and one of a function no binary holds is not reached" },
         },
         // A run of some rules sees only what they cover: it never names an older escape.
         .conflicts = &.{&.{ .only, .reviewed }},
@@ -649,6 +652,24 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, wri
     return status;
 }
 
+/// The compiled root at `path` (`--compiled`), its files named under `package_root`. One that
+/// cannot be read whole as an x86_64 ELF holding Zig's DWARF is refused, saying why.
+fn readCompiled(gpa: std.mem.Allocator, io: std.Io, path: []const u8, package_root: []const u8, problems: *std.Io.Writer) !Compiled {
+    const dwarf = read: {
+        const binary = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| break :read err;
+        defer binary.close(io);
+        break :read Compiled.Dwarf.read(gpa, io, binary);
+    } catch |err| switch (err) {
+        error.OutOfMemory, error.Canceled => |e| return e,
+        else => {
+            try problems.print("glint: --compiled {s}: not read as an x86_64 ELF with Zig's DWARF ({t}); build it with -fno-llvm -fno-lld\n", .{ path, err });
+            try problems.flush();
+            return error.InvalidArguments;
+        },
+    };
+    return Compiled.init(gpa, dwarf, package_root);
+}
+
 fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer, problems: *std.Io.Writer, record: *Result.Record, project_rules: []const RuleContext.Rule, store: ?*Project.Store) !u8 {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -709,7 +730,17 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     try resolve(a, &configured, all);
     record.outcome = .tool_failure;
     const config = configured.config;
-    var report = try Runner.run(gpa, &project, .{ .config = config, .project_rules = project_rules, .io = io });
+    // The compiled roots, each read whole before the run: a file that is no such binary is refused.
+    var compiled_roots: std.ArrayList(Compiled) = .empty;
+    defer for (compiled_roots.items) |*root| root.deinit();
+    if (arguments.compiled.len > 0) {
+        const package_root = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", a);
+        try compiled_roots.ensureTotalCapacity(a, arguments.compiled.len);
+        for (arguments.compiled) |path| compiled_roots.appendAssumeCapacity(try readCompiled(gpa, io, path, package_root, problems));
+    }
+    const compiled = try a.alloc(*const Compiled, compiled_roots.items.len);
+    for (compiled, compiled_roots.items) |*slot, *root| slot.* = root;
+    var report = try Runner.run(gpa, &project, .{ .config = config, .project_rules = project_rules, .io = io, .compiled = compiled });
     defer report.deinit();
     record.outcome = .output_failure;
     var rendered: std.Io.Writer.Allocating = .init(a);

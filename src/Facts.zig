@@ -4,10 +4,16 @@ const std = @import("std");
 const aegis = @import("aegis");
 const Project = @import("Project.zig");
 const Model = @import("Model.zig");
+const Compiled = @import("compiled/Compiled.zig");
+const answers = @import("compiled/Answers.zig");
 const Ast = std.zig.Ast;
 const Facts = @This();
 
 project: *const Project,
+/// What the program's compiled roots established (`compiled/Compiled.zig`), one per root and
+/// target: a local's or parameter's type is what they gave it, and one of a function none holds
+/// is not reached. None given: the types are read from the source.
+compiled: []const *const Compiled = &.{},
 /// An arena's: nothing Facts makes is freed one by one, and a memo replaced once the analysis
 /// is built (`dropMemos`) is left to it, never freed while a query up the stack may hold it.
 gpa: std.mem.Allocator,
@@ -245,6 +251,9 @@ pub const Unknown = enum {
     zig_own,
     erased_callee,
     external,
+    /// Code no compiled root holds (`compiled`): a function no root's build reaches, or one only
+    /// another target's build compiles, so the compiler established nothing of it.
+    not_reached,
 
     /// What an unknown means to a ban (`RuleContext.unknownAt`). `failure`: glint's own, on code
     /// the run holds whole (a file it cannot parse, an import no mapping names, a reference it
@@ -253,12 +262,12 @@ pub const Unknown = enum {
     /// ban covers resolved callees and types: a value only an instantiation or the build decides
     /// (`generic`, `comptime_dependent`, `zig_own`), a name computed as it compiles
     /// (`computed_import`), code this build does not compile (`absent`), bytes a build step makes
-    /// (`external`), a function value a field, a parameter or a var holds (`erased_callee`).
-    /// Counted per rule, never a verdict.
+    /// (`external`), a function value a field, a parameter or a var holds (`erased_callee`), code
+    /// no compiled root holds (`not_reached`). Counted per rule, never a verdict.
     pub fn meaning(self: Unknown) enum { failure, outside } {
         return switch (self) {
             .invalid_front_end, .unresolved, .missing_mapping, .cycle, .budget, .unsupported => .failure,
-            .generic, .comptime_dependent, .zig_own, .computed_import, .absent, .external, .erased_callee => .outside,
+            .generic, .comptime_dependent, .zig_own, .computed_import, .absent, .external, .erased_callee, .not_reached => .outside,
         };
     }
 };
@@ -626,7 +635,7 @@ fn holderOutside(self: *Facts, file: Project.FileId, access: Ast.Node.Index) Res
     if (tree.nodeTag(access) != .field_access) return true;
     return switch (try self.resolve(file, tree.nodeData(access).node_and_token[0])) {
         .unknown => |why| switch (why) {
-            .invalid_front_end, .missing_mapping, .computed_import, .generic, .external => true,
+            .invalid_front_end, .missing_mapping, .computed_import, .generic, .external, .not_reached => true,
             .unresolved, .comptime_dependent, .cycle, .budget, .unsupported, .absent, .zig_own, .erased_callee => false,
         },
         .alternatives => false, // a choice of known values (`choose` keeps no unknown in one): each in the run
@@ -5875,6 +5884,10 @@ pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
     const declaration_record = model.declarations[@backingInt(decl.index)];
     const tree = &self.project.at(decl.file).file.tree;
     if (declaration_record.kind == .function) return .{ .function = decl };
+    // A function's local or parameter: the type the compiled instances gave it, where given.
+    if (declaration_record.kind == .parameter or declaration_record.kind == .capture or declaration_record.kind == .variable) {
+        if (try answers.local(self, decl)) |value| return value;
+    }
     if (declaration_record.kind == .parameter) {
         if (try self.settledByCalls(decl)) |position| return self.boundByCallers(decl, position);
         const value = try self.resolve(decl.file, declaration_record.node);
@@ -7434,7 +7447,7 @@ const Instances = struct { of: std.AutoHashMapUnmanaged(InstanceKey, Value) = .e
 
 /// A value of the type `value` names. What holds another value is mapped once, by the box or the
 /// choice that holds it: it is kept for the run, and read as a value again and again.
-fn instance(self: *Facts, value: Value) ResolveError!Value {
+pub fn instance(self: *Facts, value: Value) ResolveError!Value {
     const key: InstanceKey = switch (value) {
         .container => |c| return .{ .instance = c },
         .reified => |built| return .{ .reified = .{ .fields = built.fields, .value = true, .names = built.names } },

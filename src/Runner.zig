@@ -1,5 +1,6 @@
 //! Selected rules share one frozen project and one fact resolver.
 const std = @import("std");
+const Compiled = @import("compiled/Compiled.zig");
 const Project = @import("Project.zig");
 const Facts = @import("Facts.zig");
 const rules = @import("Rule.zig");
@@ -59,6 +60,9 @@ pub const Options = struct {
     /// a canceled run is `Canceled`. Null: none is asked, and a canceller
     /// waits for the whole project.
     io: ?std.Io = null,
+    /// What the program's compiled roots established (`Facts.compiled`); none: the types are read
+    /// from the source.
+    compiled: []const *const Compiled = &.{},
 };
 pub const FileConfig = struct { file: Project.FileId, config: rules.Config };
 
@@ -75,7 +79,7 @@ pub fn run(gpa: std.mem.Allocator, project: *const Project, options: Options) Ru
         if (@backingInt(setting.file) >= project.count()) return error.InvalidHandle;
         for (options.files[0..i]) |earlier| if (setting.file == earlier.file) return error.InvalidSelection;
     }
-    var runner: Runner = .{ .a = a, .project = project, .config = config, .base = config, .files = options.files, .facts = .{ .project = project, .gpa = a, .backing = gpa, .remaining = config.fact_budget } };
+    var runner: Runner = .{ .a = a, .project = project, .config = config, .base = config, .files = options.files, .facts = .{ .project = project, .gpa = a, .backing = gpa, .remaining = config.fact_budget, .compiled = options.compiled } };
     defer runner.facts.deinit();
     // The caller's rules, then those the project's packages declare (`PackageRules.table`).
     const declared = try declaredRules(&runner.facts);
