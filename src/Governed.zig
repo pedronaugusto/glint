@@ -359,7 +359,49 @@ pub fn handedToStd(self: *Context, node: Ast.Node.Index, types: []const Facts.Co
             }
         }
     }
-    return if (unknown) |why| .{ .unknown = why } else .no;
+    if (unknown) |why| return .{ .unknown = why };
+    return namedMaker(self, node, call, types);
+}
+
+/// std's declarations that forge or reflect a value from the type they are named (main,
+/// 2026-11-23): a governed type, or a value of it, among their arguments is a finding. A
+/// container a type is stored in (`ArrayList(T)`, a hash map) is none of them.
+const makers = [_]struct { []const u8, []const u8 }{
+    .{ "mem.zeroes", "a value of zeroed bytes, made by none of the type's code" },
+    .{ "mem.zeroInit", "a value built field by field from a literal" },
+    .{ "mem.bytesToValue", "a value copied out of bytes" },
+    .{ "mem.bytesAsValue", "bytes read in place as a value" },
+    .{ "mem.bytesAsSlice", "bytes read in place as values" },
+    .{ "mem.sliceAsBytes", "the values' own bytes" },
+    .{ "mem.asBytes", "the value's own bytes" },
+    .{ "meta.fields", "the type's fields by reflection" },
+    .{ "meta.fieldInfo", "one field's information by reflection" },
+    .{ "meta.FieldEnum", "an enum of the field names" },
+    .{ "meta.fieldNames", "the field names" },
+    .{ "meta.tags", "the tags by reflection" },
+    .{ "meta.Tag", "the tag type by reflection" },
+};
+
+/// Whether the call is to one of `makers` and names a governed type or value among its
+/// arguments as written.
+fn namedMaker(self: *Context, node: Ast.Node.Index, call: Facts.calls.Call, types: []const Facts.Container) Context.Error!Reflected {
+    const tree = &self.project.at(self.file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const full = tree.fullCall(&buffer, node) orelse return .no;
+    for (full.ast.params) |arg| {
+        if (madeType(try self.facts.resolve(self.file, arg), types) != null) break;
+    } else return .no;
+    const callee = switch (call.callee) {
+        .function => |function| function,
+        .choice => |each| if (each.len != 0) each[0] else return .no,
+        .any => return .no,
+    };
+    for (makers) |maker| switch (try mayCallStd(self, node, maker[0])) {
+        .yes => return .{ .yes = callee },
+        .no => {},
+        .unknown => |why| return .{ .unknown = why },
+    };
+    return .no;
 }
 
 /// Whether `function`'s parameter at `position` is written `anytype`, or typed by the name of

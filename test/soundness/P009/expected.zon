@@ -1,4 +1,6 @@
 .{
-    .no_hole = .{ .assignment, .deferred, .jump, .inline_loop, .branch },
-    .no_twin = .{ .assignment, .jump, .inline_loop, .branch },
+    // P009 reads what its statement shows (src/Escapes.zig): the rows a statement alone cannot
+    // show have no case.
+    .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .deferred, .jump, .inline_loop, .operator, .conversion, .unwrap, .aggregate, .branch },
+    .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .jump, .inline_loop, .operator, .conversion, .unwrap, .aggregate, .branch },
 }
