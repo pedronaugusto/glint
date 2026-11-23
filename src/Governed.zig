@@ -317,63 +317,91 @@ fn isField(self: *Context, g: Governed) bool {
     return false;
 }
 
-/// Whether the call at `node` hands a value of one of `types` (or a pointer to one, through
-/// optionals and error unions) to a std function at a parameter written `anytype` or typed by
-/// one of that function's own `comptime` type parameters (`value: T`): fmt's, json's, hash's,
-/// mem's and testing's, which read what they are given by its type. A tuple or struct written in
-/// place there (`.{ secret }`) hands each of its elements. Nothing in the callee's body is read: a
-/// governed value goes through its type's exits (`expose()`, an `id.Context`). The callee is
-/// given; unknown where an argument handed so may be one and its type is not known.
+/// Whether the call at `node` is to one of std's declarations named below (`readers`,
+/// `makers`) and names a governed type or value among its arguments as written (a value of one
+/// of `types`, or a pointer to one, through optionals and error unions; a tuple or struct
+/// written in place there, `.{ secret }`, by its elements). Any other std call is none: an
+/// allocator's `free`, a list's `append`, `ArrayList(T)`. Nothing in the callee's body is read.
+/// The callee is given; unknown where such a call is handed an argument whose type is unknown.
 pub const Reflected = union(enum) { no, yes: Facts.Decl, unknown: Facts.Unknown };
-pub fn handedToStd(self: *Context, node: Ast.Node.Index, types: []const Facts.Container) Context.Error!Reflected {
+pub fn namedStd(self: *Context, node: Ast.Node.Index, types: []const Facts.Container) Context.Error!Reflected {
     if (types.len == 0) return .no;
-    const call = (try Facts.calls.at(self.facts, self.file, node)) orelse return .no;
-    const callees: []const Facts.Decl = switch (call.callee) {
-        .function => |function| &.{function},
-        .choice => |each| each,
-        .any => return .no,
-    };
-    const args = switch (call.args) {
-        .known => |known| known,
-        .unknown => return .no,
-    };
     const tree = &self.project.at(self.file).file.tree;
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    const full = tree.fullCall(&call_buffer, node) orelse return .no;
+    var governed = false;
     var unknown: ?Facts.Unknown = null;
-    for (callees) |callee| {
-        if (!try self.facts.standard(callee.file)) continue;
-        for (args, 0..) |arg, position| {
-            if (!reflectingParameter(self, callee, position)) continue;
-            var buffer: [2]Ast.Node.Index = undefined;
-            const written = Facts.ungrouped(tree, arg);
-            const one = [_]Ast.Node.Index{arg};
-            const parts: []const Ast.Node.Index = if (tree.fullStructInit(&buffer, written)) |literal|
-                (if (literal.ast.type_expr == .none) literal.ast.fields else &one)
-            else if (tree.fullArrayInit(&buffer, written)) |literal|
-                (if (literal.ast.type_expr == .none) literal.ast.elements else &one)
-            else
-                &one;
-            for (parts) |part| {
-                const value = try self.facts.resolve(self.file, part);
-                if (madeType(value, types) != null) return .{ .yes = callee };
-                if (unknownIn(value)) |why| unknown = why;
-            }
+    for (full.ast.params) |arg| {
+        var buffer: [2]Ast.Node.Index = undefined;
+        const written = Facts.ungrouped(tree, arg);
+        const one = [_]Ast.Node.Index{arg};
+        const parts: []const Ast.Node.Index = if (tree.fullStructInit(&buffer, written)) |literal|
+            (if (literal.ast.type_expr == .none) literal.ast.fields else &one)
+        else if (tree.fullArrayInit(&buffer, written)) |literal|
+            (if (literal.ast.type_expr == .none) literal.ast.elements else &one)
+        else
+            &one;
+        for (parts) |part| {
+            const value = try self.facts.resolve(self.file, part);
+            if (madeType(value, types) != null) governed = true;
+            if (unknownIn(value)) |why| unknown = why;
         }
     }
-    if (unknown) |why| return .{ .unknown = why };
-    return namedMaker(self, node, call, types);
+    if (!governed and unknown == null) return .no;
+    const call = (try Facts.calls.at(self.facts, self.file, node)) orelse return .no;
+    const callee = switch (call.callee) {
+        .function => |function| function,
+        .choice => |each| if (each.len != 0) each[0] else return .no,
+        .any => return .no,
+    };
+    for ([_][]const Named{ &readers, &makers }) |table| for (table) |entry| switch (try mayCallStd(self, node, entry[0])) {
+        .yes => return if (governed) .{ .yes = callee } else .{ .unknown = unknown.? },
+        .no => {},
+        .unknown => |why| return .{ .unknown = why },
+    };
+    return .no;
 }
 
+/// A std declaration by its path under `std`, and why A001 names it.
+const Named = struct { []const u8, []const u8 };
+
+/// std's declarations that read a value's fields or bytes (main, 2026-11-23): a governed value
+/// given to one is a finding.
+const readers = [_]Named{
+    .{ "fmt.allocPrint", "formats each argument by its type's fields" },
+    .{ "fmt.allocPrintSentinel", "formats each argument by its type's fields" },
+    .{ "fmt.bufPrint", "formats each argument by its type's fields" },
+    .{ "fmt.bufPrintSentinel", "formats each argument by its type's fields" },
+    .{ "fmt.count", "formats each argument by its type's fields" },
+    .{ "fmt.comptimePrint", "formats each argument by its type's fields" },
+    .{ "debug.print", "formats each argument by its type's fields" },
+    .{ "Io.Writer.print", "formats each argument by its type's fields" },
+    .{ "json.Stringify.value", "writes the value field by field" },
+    .{ "json.Stringify.valueAlloc", "writes the value field by field" },
+    .{ "json.Stringify.write", "writes the value field by field" },
+    .{ "zon.stringify.serialize", "writes the value field by field" },
+    .{ "zon.stringify.serializeMaxDepth", "writes the value field by field" },
+    .{ "zon.stringify.serializeArbitraryDepth", "writes the value field by field" },
+    .{ "zon.Serializer.value", "writes the value field by field" },
+    .{ "hash.autoHash", "hashes the value's fields" },
+    .{ "hash.autoHashStrat", "hashes the value's fields" },
+    .{ "testing.expectEqual", "compares the values field by field" },
+    .{ "testing.expectEqualDeep", "compares the values field by field" },
+    .{ "mem.eql", "compares the values' bytes" },
+    .{ "mem.asBytes", "the value's own bytes" },
+    .{ "mem.sliceAsBytes", "the values' own bytes" },
+    .{ "mem.toBytes", "the value's own bytes" },
+    .{ "meta.eql", "compares the values field by field" },
+};
+
 /// std's declarations that forge or reflect a value from the type they are named (main,
-/// 2026-11-23): a governed type, or a value of it, among their arguments is a finding. A
-/// container a type is stored in (`ArrayList(T)`, a hash map) is none of them.
-const makers = [_]struct { []const u8, []const u8 }{
+/// 2026-11-23): a governed type, or a value of it, among their arguments is a finding.
+const makers = [_]Named{
     .{ "mem.zeroes", "a value of zeroed bytes, made by none of the type's code" },
     .{ "mem.zeroInit", "a value built field by field from a literal" },
     .{ "mem.bytesToValue", "a value copied out of bytes" },
     .{ "mem.bytesAsValue", "bytes read in place as a value" },
     .{ "mem.bytesAsSlice", "bytes read in place as values" },
-    .{ "mem.sliceAsBytes", "the values' own bytes" },
-    .{ "mem.asBytes", "the value's own bytes" },
     .{ "meta.fields", "the type's fields by reflection" },
     .{ "meta.fieldInfo", "one field's information by reflection" },
     .{ "meta.FieldEnum", "an enum of the field names" },
@@ -381,55 +409,6 @@ const makers = [_]struct { []const u8, []const u8 }{
     .{ "meta.tags", "the tags by reflection" },
     .{ "meta.Tag", "the tag type by reflection" },
 };
-
-/// Whether the call is to one of `makers` and names a governed type or value among its
-/// arguments as written.
-fn namedMaker(self: *Context, node: Ast.Node.Index, call: Facts.calls.Call, types: []const Facts.Container) Context.Error!Reflected {
-    const tree = &self.project.at(self.file).file.tree;
-    var buffer: [1]Ast.Node.Index = undefined;
-    const full = tree.fullCall(&buffer, node) orelse return .no;
-    for (full.ast.params) |arg| {
-        if (madeType(try self.facts.resolve(self.file, arg), types) != null) break;
-    } else return .no;
-    const callee = switch (call.callee) {
-        .function => |function| function,
-        .choice => |each| if (each.len != 0) each[0] else return .no,
-        .any => return .no,
-    };
-    for (makers) |maker| switch (try mayCallStd(self, node, maker[0])) {
-        .yes => return .{ .yes = callee },
-        .no => {},
-        .unknown => |why| return .{ .unknown = why },
-    };
-    return .no;
-}
-
-/// Whether `function`'s parameter at `position` is written `anytype`, or typed by the name of
-/// one of its own `comptime` parameters (`comptime T: type, value: T`).
-fn reflectingParameter(self: *Context, function: Facts.Decl, position: usize) bool {
-    const tree = &self.project.at(function.file).file.tree;
-    var buffer: [1]Ast.Node.Index = undefined;
-    const proto = tree.fullFnProto(&buffer, self.project.at(function.file).model.declarations[@backingInt(function.index)].node) orelse return false;
-    var parameters = proto.iterate(tree);
-    var k: usize = 0;
-    const parameter = while (parameters.next()) |each| : (k += 1) {
-        if (k == position) break each;
-    } else return false;
-    if (parameter.anytype_ellipsis3) |token| return tree.tokenTag(token) == .keyword_anytype;
-    const written = parameter.type_expr orelse return false;
-    if (tree.nodeTag(written) != .identifier) return false;
-    const spelled = tree.tokenSlice(tree.nodeMainToken(written));
-    var all = proto.iterate(tree);
-    while (all.next()) |each| {
-        const comptime_token = each.comptime_noalias orelse continue;
-        if (tree.tokenTag(comptime_token) != .keyword_comptime) continue;
-        const name = each.name_token orelse continue;
-        const kind = each.type_expr orelse continue;
-        if (tree.nodeTag(kind) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(kind)), "type")) continue;
-        if (std.mem.eql(u8, tree.tokenSlice(name), spelled)) return true;
-    }
-    return false;
-}
 
 /// The one of `types` a value is, or points at, through optionals and error unions; of a
 /// choice, the first a part of it is (the build that takes that part makes it).

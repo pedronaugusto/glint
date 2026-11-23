@@ -1066,14 +1066,14 @@ test "A013's drop-in fix leaves an alias used other than by a call, and its site
     try std.testing.expectEqualStrings(shadowed, try dropInFixed(arena.allocator(), shadowed, 1));
 }
 
-test "a governed value handed to a std function's anytype parameter is a finding, its body unread (8e)" {
-    // A ban reads the construct: std's `bytes(v: anytype)` and `same(v: anytype)` each take the
-    // governed value by its type, whatever their bodies do with it.
+test "a governed value given to a std reader A001 names is a finding, another std function none, neither body read (8e)" {
+    // A ban reads the construct by declaration: std's `mem.asBytes` is a reader A001 names, `same`
+    // is none, whatever their bodies do with the value.
     const P = glint.Project;
     const program =
         \\const gov = @import("gov");
         \\const std = @import("std");
-        \\pub fn f(c: *const gov.Counted) *const [8]u8 { return std.mem.bytes(c); }
+        \\pub fn f(c: *const gov.Counted) *const [8]u8 { return std.mem.asBytes(c); }
         \\pub fn g(c: gov.Counted) gov.Counted { return std.mem.same(c); }
     ;
     const inputs = [_]P.Input{
@@ -1084,7 +1084,7 @@ test "a governed value handed to a std function's anytype parameter is a finding
         , .selected = false, .package = "gov", .fingerprint = 7 },
         .{ .name = "std.zig", .bytes = "pub const mem = @import(\"mem.zig\");", .selected = false },
         .{ .name = "mem.zig", .bytes =
-        \\pub fn bytes(v: anytype) *const [8]u8 { return if (true) (@ptrCast(v)) else unreachable; }
+        \\pub fn asBytes(v: anytype) *const [8]u8 { return if (true) (@ptrCast(v)) else unreachable; }
         \\pub fn same(v: anytype) @TypeOf(v) { return if (true) (v) else v; }
         , .selected = false },
     };
@@ -1099,8 +1099,8 @@ test "a governed value handed to a std function's anytype parameter is a finding
     config.package_defaults = true;
     var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer report.deinit();
-    try std.testing.expectEqual(@as(usize, 2), report.diagnostics.len); // safe: the two calls
-    try std.testing.expect(std.mem.find(u8, report.diagnostics[0].message, "bytes") != null);
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: the reader's call alone
+    try std.testing.expect(std.mem.find(u8, report.diagnostics[0].message, "asBytes") != null);
 }
 
 test "Z012 with no exported root stated says nothing of file-level public declarations (8f)" {

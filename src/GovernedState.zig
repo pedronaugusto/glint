@@ -122,8 +122,8 @@ pub fn check(c: *Context, definition: Rule.Definition) Context.Error!void {
         const entry = ofContainer(all, found) orelse all[0];
         try c.at(definition.id, token, try c.allocator.print("{s} over {s}: its state is {s}'s alone; use the type's own makers and API", .{ name, typeName(c, entry), entry.package.name }));
     }
-
-    // A governed value handed to a std function that takes it by its type (`anytype`, or `x: T`
+    // A governed type or value named to one of std's readers or makers of a value (fmt, json, zon,
+    // hash, testing, mem, meta: `Governed.namedStd`, one table each).
     // of its own `comptime T: type`): fmt, json, hash, mem, testing (`Governed.handedToStd`).
     for (tree.nodes.items(.tag), 0..) |tag, raw| {
         switch (tag) {
@@ -134,7 +134,7 @@ pub fn check(c: *Context, definition: Rule.Definition) Context.Error!void {
         const token = tree.nodeMainToken(node);
         if (c.inTest(token)) continue;
         const at = tree.firstToken(node);
-        const callee = switch (try Governed.handedToStd(c, node, types.items)) {
+        const callee = switch (try Governed.namedStd(c, node, types.items)) {
             .yes => |callee| callee,
             .no => continue,
             .unknown => |why| {
@@ -144,7 +144,7 @@ pub fn check(c: *Context, definition: Rule.Definition) Context.Error!void {
         };
         if ((try reported.getOrPut(c.allocator, at)).found_existing) continue;
         const named = c.project.at(callee.file).model.declarations[@backingInt(callee.index)].name;
-        try c.at(definition.id, at, try c.allocator.print("{s} takes a governed value by its type: its state is {s}'s alone; hand it the type's exposed value or use its exits", .{ named, all[0].package.name }));
+        try c.at(definition.id, at, try c.allocator.print("{s} reads or makes a governed value by its type: its state is {s}'s alone; hand it the type's exposed value or use its exits", .{ named, all[0].package.name }));
     }
 }
 
