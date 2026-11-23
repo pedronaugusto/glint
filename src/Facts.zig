@@ -5001,7 +5001,15 @@ fn sliced(self: *Facts, value: Value, _: void) ResolveError!Value {
         .unknown => .{ .pointer = .{ .child = try self.boxed(value), .size = .slice } },
         // A string literal's bytes stay plain bytes.
         .scalar => value,
-        .alternatives => self.map(value, {}, sliced),
+        // A choice: each part Zig slices. A part it refuses to, as it refuses to index it
+        // (`void` of `if (diagnostics) [32]Held else void`), is a build in which this code does
+        // not compile, left out, as `indexed` leaves it out.
+        .alternatives => |parts| blk: {
+            var kept: std.ArrayList(Value) = .empty;
+            for (parts) |part| if (!try self.unindexable(part)) try kept.append(self.gpa, try self.sliced(part, {}));
+            if (kept.items.len == 0) break :blk .{ .unknown = .absent };
+            break :blk self.choose(kept.items);
+        },
         else => .{ .unknown = .unsupported },
     };
 }
