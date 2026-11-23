@@ -7729,6 +7729,12 @@ fn reflectedMember(self: *Facts, r: Reflected, name: []const u8) ResolveError!Va
                 if (kept.items.len == 0) return .{ .unknown = .absent };
                 return self.choose(kept.items);
             }
+            // A tuple literal's type (`@TypeOf(.{ file })`, an `anytype` binding's): its parts'.
+            if (r.of.* == .literal and r.at == .structure and std.mem.eql(u8, name, "field_types")) {
+                const parts = try self.literalParts(r.of.literal);
+                if (parts.len == 0) return .{ .unknown = .absent };
+                return try self.pointerTo(try self.map(try self.choose(parts), {}, typeOf), .slice);
+            }
             const container = self.reflectedContainer(r) orelse return if (r.of.* == .unknown) r.of.* else unsupported;
             if (std.mem.eql(u8, name, "field_types") and r.at != .enumeration) {
                 const types = try self.fieldTypes(container);
