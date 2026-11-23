@@ -192,6 +192,12 @@ pub fn fileOf(c: *const Compiled, start: u32) u32 {
     return none;
 }
 
+/// Whether `name` is one Zig gives a file's own structure: a module-qualified path, never an
+/// instance's arguments or a function's anonymous structure.
+fn fileStructName(name: []const u8) bool {
+    return name.len != 0 and std.mem.findScalar(u8, name, '(') == null and std.mem.find(u8, name, "__struct_") == null;
+}
+
 fn build(c: *Compiled, root: []const u8) error{OutOfMemory}!void {
     const gpa = c.gpa;
     const e = c.dwarf.entries.slice();
@@ -219,9 +225,11 @@ fn build(c: *Compiled, root: []const u8) error{OutOfMemory}!void {
         const i: u32 = @intCast(i_usize); // safe: entries are counted in u32
         switch (kinds[i]) {
             .structure, .@"union", .enumeration => {
-                // A file's structure names its file and no line; a module's root is the one the
-                // module's entry encloses under the module's name.
-                if (e.items(.line)[i] == 0 and e.items(.zig_parent)[i] == none and files[i] != none) {
+                // A file's structure names its file and no line, under a dotted path: a type
+                // function's instance (`Keyed(.x)`) and a function's anonymous structure
+                // (`initialGroups__struct_4146`) name their file and no line too. A module's root
+                // is the one the module's entry encloses under the module's name.
+                if (e.items(.line)[i] == 0 and e.items(.zig_parent)[i] == none and files[i] != none and fileStructName(names[i])) {
                     _ = try c.file_structs.getOrPutValue(gpa, files[i], i);
                     const p = parents[i];
                     if (p != none and kinds[p] == .module and std.mem.eql(u8, names[p], names[i])) _ = try c.module_roots.getOrPutValue(gpa, names[i], i);
