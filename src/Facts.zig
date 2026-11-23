@@ -1783,7 +1783,8 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
     if (std.mem.eql(u8, name, "@Int")) return self.intType(env, file, args);
     // An enum type built from names and values: it holds no value but its tag.
     if (std.mem.eql(u8, name, "@Enum")) return .{ .primitive = "@Enum" };
-    if (std.mem.eql(u8, name, "@FieldType") and args.len == 2) return self.fieldType(try self.resolveIn(env, file, args[0]), try self.nameIn(env, file, args[1], 0));
+    // A field a computation names (`@FieldType(Io.VTable, name)`) is computed as it compiles.
+    if (std.mem.eql(u8, name, "@FieldType") and args.len == 2) return comptimeComputed(try self.fieldType(try self.resolveIn(env, file, args[0]), try self.nameIn(env, file, args[1], 0)));
     if (std.mem.eql(u8, name, "@TypeOf") and args.len == 1) return self.map(try self.resolveIn(env, file, args[0]), {}, typeOf);
     // `@call(modifier, f, args)`: what calling `f` gives, as its result type reads.
     if (std.mem.eql(u8, name, "@call") and args.len == 3) {
@@ -4883,6 +4884,12 @@ fn payload(self: *Facts, value: Value, wrapper: std.meta.Tag(Value)) ResolveErro
     };
 }
 
+/// What glint does not read of a type a computation gives (`unsupported`) is the computation's,
+/// which evaluating the code decides: `comptime_dependent`.
+fn comptimeComputed(value: Value) Value {
+    return if (value == .unknown and value.unknown == .unsupported) .{ .unknown = .comptime_dependent } else value;
+}
+
 /// Whether a value is a number: a scalar, a value of a primitive type, or a choice of them
 /// (`if (c) cipher.nonceLength() else 0`).
 fn numeric(value: Value) bool {
@@ -5503,6 +5510,9 @@ fn switchPayload(self: *Facts, env: ?*const Env, file: Project.FileId, case_node
         .unknown => return subject,
         // A number, a boolean or an error: the capture is the subject's value.
         .scalar, .primitive, .error_set => return subject,
+        // A value of a type `@Union` builds: whichever field the prong takes holds one of the
+        // types its list gives, as a member of it does (`memberValue`).
+        .reified => |built| return if (built.value) self.instance(built.fields.*) else .{ .unknown = .unsupported },
         // A subject a build picks (`impl: Impl`, a union per system): the prong's capture of
         // each, one of them.
         .alternatives => |parts| {
@@ -8980,7 +8990,9 @@ fn boundByCallers(self: *Facts, parameter: Decl, position: usize) ResolveError!V
         // A binding made through the function itself (`formOf(@typeInfo(T).optional.child)`
         // in `formOf`), or one past the budget: the calls' bindings are not all read, so the
         // parameter is what it is without them, a generic position each binding decides.
-        if ((value == .unknown and value.unknown == .budget) or throughItself(value)) return .{ .unknown = .generic };
+        // So is a binding glint does not read (a tuple a VTable's dispatch builds for `args:
+        // anytype`): each binding decides what the parameter is.
+        if (value == .unknown or throughItself(value)) return .{ .unknown = .generic };
         try values.append(self.gpa, value);
     }
     // No call the build compiles binds it: whatever binding is made decides.
