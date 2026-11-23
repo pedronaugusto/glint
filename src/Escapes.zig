@@ -24,8 +24,11 @@
 //! is a pointer, which Zig dereferences on access. Nothing inside `comptime` or in a function
 //! returning `type` counts, where frames are comptime memory. A store the function undoes does
 //! not outlive the call: a `defer` that assigns the target again (a registration cleared) on
-//! every exit. Aliases are followed within the function, through a `const`'s value and every
-//! value a `var` is given. A clean run never certifies lifetimes.
+//! every exit, or one that names the local (it may unlink the address: not certain). A callee
+//! keeps what it stores of the pointer itself; what it reads through the pointer
+//! is the pointed memory's (`e.next = out.*` keeps what `room` holds, not `&room`). Aliases are
+//! followed within the function, through a `const`'s value and every value a `var` is given. A
+//! clean run never certifies lifetimes.
 const std = @import("std");
 const Context = @import("RuleContext.zig");
 const Model = @import("Model.zig");
@@ -96,7 +99,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         if (stored) |target| if (!try self.outlives(target)) continue;
         const reached = try self.escaping(operand, function);
         if (reached == .none) continue;
-        if (stored) |target| if (try self.restored(function, target, node)) continue;
+        if (stored) |target| if (try self.restored(function, target, node) or self.unlinked(function, node, reached)) continue;
         const local = switch (reached) {
             .none => unreachable, // unreachable: left above
             .local => |d| d,
@@ -427,9 +430,11 @@ const Walk = struct {
         return .{ .functions = functions, .args = args, .receiver = found.receiver == .bound };
     }
 
-    /// What a callee does with an argument, as Facts reads its body: returns it, or stores it
-    /// into the memory another parameter points at.
-    const Use = union(enum) { result: usize, param: struct { into: usize, from: usize } };
+    /// What a callee does with an argument, as Facts reads its body: returns it, stores it or
+    /// what is read through it into the memory another parameter points at (`param`), or stores
+    /// it alone there (`pointer`).
+    const Use = union(enum) { result: usize, param: Between, pointer: Between };
+    const Between = struct { into: usize, from: usize };
 
     /// Whether every function of a call does so, certainly (P009 reports only what it shows).
     fn every(self: Walk, functions: []const Facts.Decl, use: Use) Context.Error!bool {
@@ -437,6 +442,7 @@ const Walk = struct {
             const does = switch (use) {
                 .result => |from| try self.c.facts.returnsAddress(function, from, false),
                 .param => |p| try self.c.facts.storesAddress(function, p.into, p.from),
+                .pointer => |p| try self.c.facts.storesPointer(function, p.into, p.from),
             };
             if (does != true) return false;
         }
@@ -494,11 +500,10 @@ const Walk = struct {
                     break :blk points == .local and points.local == d;
                 };
                 if (!held) continue;
-                for (read.args, 0..) |arg, from| {
+                for (read.args, 0..) |_, from| {
                     if (from == into) continue;
-                    const reached = try self.escaping(arg, function);
-                    if (reached != .local or reached.local == d) continue;
-                    if (try self.every(read.functions, .{ .param = .{ .into = into, .from = from } })) return reached;
+                    const reached = try self.carried(read, .{ .into = into, .from = from }, function);
+                    if (reached == .local and reached.local != d) return reached;
                 }
             }
         }
@@ -554,15 +559,39 @@ const Walk = struct {
         const read = (try self.callOf(call)) orelse return null;
         for (read.args, 0..) |arg, from| {
             const reached = try self.escaping(arg, function);
-            if (reached != .local) continue;
-            const out: Handed = .{ .local = reached.local, .argument = arg };
-            if (try self.everyStoresGlobally(read.functions, from)) return out;
+            if (reached == .local and try self.everyStoresGlobally(read.functions, from)) return .{ .local = reached.local, .argument = arg };
             for (read.args, 0..) |holder, into| {
                 if (into == from or !try self.outlivingPointer(holder)) continue;
-                if (try self.every(read.functions, .{ .param = .{ .into = into, .from = from } })) return out;
+                const kept = try self.carried(read, .{ .into = into, .from = from }, function);
+                if (kept == .local) return .{ .local = kept.local, .argument = arg };
             }
         }
         return null;
+    }
+
+    /// The local a call keeps a pointer into, in the memory its argument at `into` points at, of
+    /// what it is handed at `from`: the argument's own pointer, where every callee stores it
+    /// there; else the pointer the local it is the address of holds (`&room` of `var room =
+    /// buf`), where every callee stores what it reads through the argument (`e.next =
+    /// out.*`). A value read through a pointer is the pointed memory's, never the pointer
+    /// (std.mem.swap of `&j`, review b9 C2 and C3).
+    fn carried(self: Walk, read: Called, between: Between, function: Ast.Node.Index) Context.Error!Reached {
+        const arg = read.args[between.from];
+        const reached = try self.escaping(arg, function);
+        if (reached == .local and try self.every(read.functions, .{ .pointer = between })) return reached;
+        const loaded = try self.loadedThrough(arg, function);
+        if (loaded == .local and try self.every(read.functions, .{ .param = between })) return loaded;
+        return .none;
+    }
+
+    /// The local what is read through `arg` reaches: of `&x`, `x`'s own name being the place,
+    /// what `x` holds. Any other pointer's memory is not followed: none.
+    fn loadedThrough(self: Walk, arg: Ast.Node.Index, function: Ast.Node.Index) Context.Error!Reached {
+        const node = Facts.ungrouped(self.tree, arg);
+        if (self.tree.nodeTag(node) != .address_of) return .none;
+        const inner = Facts.ungrouped(self.tree, self.tree.nodeData(node).node);
+        if (self.tree.nodeTag(inner) != .identifier or self.own(inner, function) == null) return .none;
+        return self.escaping(inner, function);
     }
 
     /// A local's address a call hands out, and the argument that carries it.
@@ -812,6 +841,37 @@ const Walk = struct {
                 const written = site.target orelse continue;
                 if (try Facts.accesses.samePlace(self.c.facts, self.c.file, written, target) == .yes) return true;
             };
+        }
+        return false;
+    }
+
+    /// Whether a `defer` of `function` that runs after the store names the local: one that may
+    /// unlink its address before the frame goes (`while (link.* != &waiter) ...; link.* =
+    /// waiter.next;`, aegis Condition's waiter, review b9 C1). Hygiene reports only what is
+    /// certain, and such an escape is not.
+    fn unlinked(self: Walk, function: Ast.Node.Index, store: Ast.Node.Index, reached: Reached) bool {
+        const local = switch (reached) {
+            .local => |d| d,
+            .none => return false,
+        };
+        const tree = self.tree;
+        const later = self.deferring(store);
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .@"defer") continue;
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            if (self.enclosing(node) != function) continue;
+            if (later) |made| if (!self.runsAfter(node, made)) continue;
+            const deferred = tree.nodeData(node).node;
+            const opens = tree.firstToken(deferred);
+            const closes = tree.lastToken(deferred);
+            for (tree.nodes.items(.tag), 0..) |named, k| {
+                if (named != .identifier) continue;
+                const identifier: Ast.Node.Index = @fromBackingInt(@intCast(k));
+                const at = tree.nodeMainToken(identifier);
+                if (at < opens or at > closes) continue;
+                const reference = self.model.reference(identifier) orelse continue;
+                if (reference.declaration == local) return true;
+            }
         }
         return false;
     }

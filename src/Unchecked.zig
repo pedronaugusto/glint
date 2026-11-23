@@ -202,6 +202,7 @@ fn lengthless(c: *Context, rule: Rule) Context.Error!void {
         };
         const token = tree.nodeMainToken(node);
         if (c.inTest(token) or !try atRuntime(c, node)) continue;
+        if (prefetched(c, tree, node)) continue;
         const value = try c.facts.resolve(c.file, operand);
         const size: Facts.Size = if (try slicePointer(c, tree, operand)) .many else switch (value) {
             // A null size is a slicing's (a slice or a pointer to an array, never lengthless), or
@@ -220,6 +221,29 @@ fn lengthless(c: *Context, rule: Rule) Context.Error!void {
         if (size != .many and size != .c) continue;
         try c.at(rule, token, try c.allocator.print("{s} a {s} pointer, which carries no length to check", .{ what, if (size == .many) "many-item" else "C" }));
     }
+}
+
+/// Whether the address `node` gives (`p + 16`, or `p[i]`'s by `&p[i]`) is only `@prefetch`'s
+/// pointer, past parentheses: a hint to the cache that reads and writes nothing, so no memory is
+/// reached through it (warp's hash tables' `@prefetch(&table[h], ...)`).
+fn prefetched(c: *Context, tree: *const Ast, node: Ast.Node.Index) bool {
+    const model = &c.project.at(c.file).model;
+    var at = node;
+    var parent = model.parentOf(at) orelse return false;
+    while (tree.nodeTag(parent) == .grouped_expression) : (parent = model.parentOf(at) orelse return false) at = parent;
+    if (tree.nodeTag(node) == .array_access) {
+        if (tree.nodeTag(parent) != .address_of) return false;
+        at = parent;
+        parent = model.parentOf(at) orelse return false;
+        while (tree.nodeTag(parent) == .grouped_expression) : (parent = model.parentOf(at) orelse return false) at = parent;
+    } else switch (tree.nodeTag(node)) {
+        .add, .sub, .add_wrap, .sub_wrap => {},
+        else => return false,
+    }
+    if (!Facts.isBuiltin(tree, parent, "@prefetch")) return false;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = Facts.builtinArgs(tree, parent, &buffer);
+    return args.len != 0 and args[0] == at;
 }
 
 /// Whether `node` is a slice's `.ptr`, its many-item pointer (`b.ptr + 1`), past parentheses.

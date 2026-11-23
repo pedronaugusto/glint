@@ -1424,6 +1424,9 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
             const lhs = try self.resolve(file, operands[0]);
             if (lhs == .scalar or lhs == .primitive) return .scalar;
             if (lhs == .unknown) return lhs;
+            // Arithmetic on an array is a vector's (`@Vector` reads as an array of its lanes):
+            // a vector of the same lanes.
+            if (lhs == .array) return lhs;
             if (lhs == .pointer and (tree.nodeTag(node) == .add or tree.nodeTag(node) == .sub)) {
                 const rhs = try self.resolve(file, operands[1]);
                 if (rhs == .scalar or rhs == .primitive) return lhs;
@@ -2308,8 +2311,10 @@ fn memberValue(self: *Facts, lhs: Value, name: []const u8) ResolveError!Value {
             },
             else => return sequence(lhs, name),
         },
-        // An array's one member is its length, a number.
-        .array => return if (std.mem.eql(u8, name, "len")) .scalar else .{ .unknown = .unresolved },
+        // An array's one member is its length, a number; a value read as a scalar has a member
+        // only where it is a string literal (`prefix.len` of `const prefix = "holder "`), whose
+        // length is a number too.
+        .array, .scalar => return if (std.mem.eql(u8, name, "len")) .scalar else .{ .unknown = .unresolved },
         // An enum Zig makes (a `union(enum)`'s tag type, `@Enum`'s) declares only its tags: a
         // member is one of them, a value with no store.
         .primitive => |made| return if (std.mem.eql(u8, made, "@Enum")) .scalar else .{ .unknown = .unresolved },
@@ -4892,7 +4897,9 @@ fn indexed(self: *Facts, value: Value, _: void) ResolveError!Value {
     return switch (value) {
         .array => |inner| inner.*,
         .pointer => |inner| switch (inner.child.*) {
-            .array => |elements| elements.*,
+            // A pointer to one array (or a slicing's, indexed alike): its element. A slice or a
+            // many-item pointer of arrays: an array (`[]const [2]u21`'s element is `[2]u21`).
+            .array => |elements| if (inner.size == null or inner.size == .one) elements.* else inner.child.*,
             .literal => |literal| self.choose(try self.literalParts(literal)),
             .alternatives => inner.child.*,
             else => inner.child.*,
@@ -6440,10 +6447,12 @@ const OwnStores = struct {
         const Key = struct { Decl, Into, usize };
     };
 
-    /// Where a value goes: memory a parameter points at, or the function's result, read
-    /// `reaching` or not (`Own.reaching`).
+    /// Where a value goes: memory a parameter points at (`param`, what is read through the
+    /// value too; `pointer`, the value alone), or the function's result, read `reaching` or not
+    /// (`Own.reaching`).
     const Into = union(enum) {
         param: usize,
+        pointer: usize,
         result: bool,
     };
 };
@@ -6464,6 +6473,15 @@ const OwnStores = struct {
 /// dropped and read again.
 pub fn storesAddress(self: *Facts, function: Decl, into: usize, from: usize) ResolveError!?bool {
     return self.ownReading(function, .{ .param = into }, from);
+}
+
+/// Whether `function` may store, into the memory its parameter at `into` points at, the value
+/// its parameter at `from` (another) holds, or a part of it held by value: never a value read
+/// through a pointer it holds (`e.next = out.*`, std.mem.swap's `a.* = b.*`), which is the
+/// pointed memory's, not the pointer. Null where it cannot tell, as `storesAddress`.
+pub fn storesPointer(self: *Facts, function: Decl, into: usize, from: usize) ResolveError!?bool {
+    std.debug.assert(into != from);
+    return self.ownReading(function, .{ .pointer = into }, from);
 }
 
 /// What each `return` of `function`'s own body gives (not a function's declared inside it), in
@@ -6552,13 +6570,14 @@ fn findOwnStores(self: *Facts, function: Decl, into: OwnStores.Into, from: usize
     const last = tree.lastToken(body);
     const reaching = switch (into) {
         .param => |at| from != at,
+        .pointer => false,
         .result => |all| all,
     };
     const own: Own = .{ .facts = self, .function = function, .whole = whole, .position = switch (into) {
-        .param => |at| at,
+        .param, .pointer => |at| at,
         .result => from,
     } };
-    const given: Own = .{ .facts = self, .function = function, .whole = whole, .position = from, .reaching = reaching };
+    const given: Own = .{ .facts = self, .function = function, .whole = whole, .position = from, .reaching = reaching, .pointer = into == .pointer };
     var out: ?bool = false;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
@@ -6623,6 +6642,9 @@ const Own = struct {
     /// What memory the parameter reaches holds counts too: memory not the stored one, which the
     /// caller may have filled with any address.
     reaching: bool = false,
+    /// The value followed is another parameter's own (`storesPointer`): a callee it is handed to
+    /// is read the same way.
+    pointer: bool = false,
 
     const depth_limit = 16;
 
@@ -6853,7 +6875,10 @@ const Own = struct {
                 const value = try given.argument(call, from, held, 0);
                 if (value == false) continue;
                 if (call.callee == .any) return null;
-                for (functions) |function| out = anyOf(out, bothOf(bothOf(into, value), try o.facts.storesAddress(function, at, from)));
+                for (functions) |function| {
+                    const kept = if (given.pointer and at != from) try o.facts.storesPointer(function, at, from) else try o.facts.storesAddress(function, at, from);
+                    out = anyOf(out, bothOf(bothOf(into, value), kept));
+                }
                 if (out == true) return true;
             }
         }

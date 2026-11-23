@@ -2,13 +2,6 @@
     .open = .{
         // review 6 precision: a call through a function-pointer field whose only stored function writes whole
         // review 6 precision: the safe holder of a function-pointer field
-        // review b9 precision: integer arithmetic P007 cannot read, each an incomplete run: a
-        // literal's length plus an integer (airlock src/Lock.zig:177), chained vector wrapping sums
-        // (warp src/kernels/arm_dotprod.zig:40), an array alias's element incremented (xenoglyph
-        // src/properties.zig:353)
-        "operator/b9-literal_len_sum/twin.zig",
-        "operator/b9-vector_wrap_chain/twin.zig",
-        "assignment/b9-array_element_increment/twin.zig",
     },
     // The rows whose holes were the interface-recovery idiom's (a copy of the interface field
     // behind `@alignCast(@fieldParentPtr(...))`), which P007 does not read (glint-0.8-shape,

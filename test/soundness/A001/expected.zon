@@ -2,12 +2,4 @@
     // A001 is a rule aegis declares (its lint_rules, read from the pinned aegis): a touch of a
     // governed type's internal field, through each way the holder reaches it, and the same
     // value through the type's own API.
-    .open = .{
-        // review b9: a governed value handed to std.zon's serializer, read field by field
-        "call/b9-zon_serialize/hole.zig",
-        // review b9 precision: std functions that take a governed type but read no field of it
-        // (sort by the caller's comparator, findScalar's ==), and plain integers printed with {d}
-        // (an incomplete run): lookout, almanac and visor fail on these at a0928dd
-        "call/b9-sort_own_comparator/twin.zig",
-    },
 }
