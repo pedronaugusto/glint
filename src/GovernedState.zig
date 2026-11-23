@@ -123,9 +123,8 @@ pub fn check(c: *Context, definition: Rule.Definition) Context.Error!void {
         try c.at(definition.id, token, try c.allocator.print("{s} over {s}: its state is {s}'s alone; use the type's own makers and API", .{ name, typeName(c, entry), entry.package.name }));
     }
 
-    // A library's reflective functions over a governed type: one that makes it from what the
-    // caller hands it (`std.mem.zeroes(T)`, `std.mem.bytesToValue(T, b)`), or reads whatever
-    // it is handed (`std.mem.asBytes(&t)`, `std.meta.fields(T)`).
+    // A governed value handed to a std function that takes it by its type (`anytype`, or `x: T`
+    // of its own `comptime T: type`): fmt, json, hash, mem, testing (`Governed.handedToStd`).
     for (tree.nodes.items(.tag), 0..) |tag, raw| {
         switch (tag) {
             .call, .call_comma, .call_one, .call_one_comma => {},
@@ -135,24 +134,17 @@ pub fn check(c: *Context, definition: Rule.Definition) Context.Error!void {
         const token = tree.nodeMainToken(node);
         if (c.inTest(token)) continue;
         const at = tree.firstToken(node);
-        const made = try Governed.madeByCall(c, node, types.items);
-        const callee = switch (made) {
+        const callee = switch (try Governed.handedToStd(c, node, types.items)) {
             .yes => |callee| callee,
-            .no, .unknown => switch (try Governed.reflectedByCall(c, node, types.items)) {
-                .yes => |callee| callee,
-                .no => {
-                    if (made == .unknown and ban and !(try reported.getOrPut(c.allocator, at)).found_existing) try c.unknownAt(definition.id, at, made.unknown);
-                    continue;
-                },
-                .unknown => |why| {
-                    if (ban and !(try reported.getOrPut(c.allocator, at)).found_existing) try c.unknownAt(definition.id, at, if (made == .unknown) made.unknown else why);
-                    continue;
-                },
+            .no => continue,
+            .unknown => |why| {
+                if (ban and !(try reported.getOrPut(c.allocator, at)).found_existing) try c.unknownAt(definition.id, at, why);
+                continue;
             },
-        } orelse continue;
+        };
         if ((try reported.getOrPut(c.allocator, at)).found_existing) continue;
         const named = c.project.at(callee.file).model.declarations[@backingInt(callee.index)].name;
-        try c.at(definition.id, at, try c.allocator.print("{s} reads or makes a governed type by reflection: its state is {s}'s alone; use the type's own makers and API", .{ named, all[0].package.name }));
+        try c.at(definition.id, at, try c.allocator.print("{s} takes a governed value by its type: its state is {s}'s alone; hand it the type's exposed value or use its exits", .{ named, all[0].package.name }));
     }
 }
 

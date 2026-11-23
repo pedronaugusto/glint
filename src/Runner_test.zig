@@ -1066,12 +1066,9 @@ test "A013's drop-in fix leaves an alias used other than by a call, and its site
     try std.testing.expectEqualStrings(shadowed, try dropInFixed(arena.allocator(), shadowed, 1));
 }
 
-test "a library's reflective call read through a parenthesized result in a branch, without a crash (8e)" {
-    // Governed.returnsCast reads a std `return` through grouping, `if` branches and the calls it
-    // hands a parameter to: a grouped expression's data is its node and its parenthesis token, never a
-    // bare node (riverrun's `bay dev fix` panicked there). `bytes` returns the governed value it is
-    // handed cast to bytes, through `(@ptrCast(v))` in a branch: a finding; `same` hands back what
-    // it was given, grouped: none.
+test "a governed value handed to a std function's anytype parameter is a finding, its body unread (8e)" {
+    // A ban reads the construct: std's `bytes(v: anytype)` and `same(v: anytype)` each take the
+    // governed value by its type, whatever their bodies do with it.
     const P = glint.Project;
     const program =
         \\const gov = @import("gov");
@@ -1102,7 +1099,7 @@ test "a library's reflective call read through a parenthesized result in a branc
     config.package_defaults = true;
     var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
     defer report.deinit();
-    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: view's call alone
+    try std.testing.expectEqual(@as(usize, 2), report.diagnostics.len); // safe: the two calls
     try std.testing.expect(std.mem.find(u8, report.diagnostics[0].message, "bytes") != null);
 }
 
