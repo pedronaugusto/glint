@@ -1404,9 +1404,9 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         .@"switch", .switch_comma, .@"if" => if (try self.branches(null, file, node)) |value| return value,
         .block, .block_semicolon, .block_two, .block_two_semicolon => {
             if (try self.breaks(null, file, node)) |value| return value;
-            // `{}`: void's one value, as a value of a primitive type is that type.
-            var buffer: [2]Ast.Node.Index = undefined;
-            if (tree.blockStatements(&buffer, node)) |statements| if (statements.len == 0) return .{ .primitive = "void" };
+            // A block with no label gives no value of its own: `void` (`{}` its one value), or
+            // `noreturn` where it never completes (a prong `{ c._exit(127); }`), left out by a peer.
+            if (!blockLabeled(tree, node)) return .{ .primitive = "void" };
         },
         .for_simple, .@"for", .while_simple, .while_cont, .@"while" => if (try self.loopValue(file, node)) |value| return value,
         .grouped_expression => return self.resolve(file, tree.nodeData(node).node_and_token[0]),
@@ -1422,7 +1422,7 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         .add, .add_wrap, .add_sat, .sub, .sub_wrap, .sub_sat => {
             const operands = tree.nodeData(node).node_and_node;
             const lhs = try self.resolve(file, operands[0]);
-            if (lhs == .scalar or lhs == .primitive) return .scalar;
+            if (numeric(lhs)) return .scalar;
             if (lhs == .unknown) return lhs;
             // Arithmetic on an array is a vector's (`@Vector` reads as an array of its lanes):
             // a vector of the same lanes.
@@ -4883,9 +4883,27 @@ fn payload(self: *Facts, value: Value, wrapper: std.meta.Tag(Value)) ResolveErro
     };
 }
 
+/// Whether a value is a number: a scalar, a value of a primitive type, or a choice of them
+/// (`if (c) cipher.nonceLength() else 0`).
+fn numeric(value: Value) bool {
+    if (value == .alternatives) {
+        for (value.alternatives) |part| if (!numeric(part)) return false;
+        return true;
+    }
+    return value == .scalar or value == .primitive;
+}
+
+/// Whether a block is written with a label (`blk: { ... }`).
+fn blockLabeled(tree: *const Ast, block: Ast.Node.Index) bool {
+    const brace = tree.nodeMainToken(block);
+    return brace >= 2 and tree.tokenTag(brace - 1) == .colon and tree.tokenTag(brace - 2) == .identifier;
+}
+
 fn pointee(self: *Facts, value: Value, _: void) ResolveError!Value {
     return switch (value) {
         .pointer => |inner| inner.child.*,
+        // A string literal's bytes (`"chroncdx".*`): plain bytes, as its slice and element are.
+        .scalar => .scalar,
         .alternatives => self.map(value, {}, pointee),
         .unknown => value,
         else => .{ .unknown = .unsupported },
