@@ -444,91 +444,34 @@ test "Z006 leaves a type std's type function gives alone; a labeled block's valu
     , 0);
 }
 
-test "P009's walk finds each value's reach once, and is charged to the file's fact budget" {
-    // Each local's pointer handed, with every other's, to a call that stores one through the
-    // other: every name is met again through every call. A walk that found each value afresh
-    // re-read the function past any time; found once, it is a resolution each.
-    const width = 12;
-    const wide = comptime blk: {
-        @setEvalBranchQuota(100_000);
-        var body: []const u8 = "fn keep(into: **u32, from: *u32) void {\n    into.* = from;\n}\npub fn f() u32 {\n";
-        for (0..width) |i| body = body ++ std.fmt.comptimePrint("    var a{d}: u32 = {d};\n    var p{d}: *u32 = &a{d};\n", .{ i, i, i, i });
-        for (0..width) |i| for (0..width) |j| if (i != j) {
-            body = body ++ std.fmt.comptimePrint("    keep(&p{d}, p{d});\n", .{ i, j });
-        };
-        break :blk body ++ "    return p0.*;\n}\n";
-    };
-    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = wide }}, &.{}, .{});
-    defer project.deinit();
-    const walked = try leastBudget(&project, .P009);
-    // Its least budget past what reading the file alone takes is the walk's: one each at least
-    // for the locals it finds reaches of.
-    const read = try leastBudget(&project, .Z013);
-    try std.testing.expect(walked >= read + width);
-    // Short of it, the run is refused as short of budget: a named refusal, never a run that does
-    // not end.
-    var report = try glint.run(std.testing.allocator, &project, .{ .config = .{ .enabled = .empty, .selections = &.{.{ .rule = .P009, .level = .report }}, .fact_budget = walked - 1 } });
-    defer report.deinit();
-    try std.testing.expect(!report.complete);
-    const named = for (report.errors) |e| {
-        if (std.mem.find(u8, e.why, "fact budget") != null) break true;
-    } else false;
-    try std.testing.expect(named);
-}
-
-/// The least fact budget a run of `rule` alone over `project` completes in, found by halving.
-fn leastBudget(project: *glint.Project, rule: glint.Rule) !usize {
-    var low: usize = 0;
-    var high: usize = 100_000;
-    while (low + 1 < high) {
-        const middle = low + (high - low) / 2;
-        var report = try glint.run(std.testing.allocator, project, .{ .config = .{ .enabled = .empty, .selections = &.{.{ .rule = rule, .level = .report }}, .fact_budget = middle } });
-        defer report.deinit();
-        if (report.complete) high = middle else low = middle;
-    }
-    return high;
-}
-
-test "P009 finds a pointer into the frame carried out of the call" {
+test "P009 finds a pointer into the frame its statement carries out of the call" {
+    // Returned: an array local's slice, a local's address or its part's.
     try expect(.P009, "pub fn f(n: usize) []u8 { var buf: [16]u8 = undefined; buf[0] = 1; return buf[0..n]; }", 1);
-    try expect(.P009, "pub fn f() *u32 { var x: u32 = 1; x += 1; const out = &x; return out; }", 1);
-    try expect(.P009, "const R = struct { s: []u8 }; pub fn f(n: usize) R { var buf: [8]u8 = undefined; buf[0] = 1; return .{ .s = buf[0..n] }; }", 1);
-    // A const of a run-time value, a local whose type only its value gives, a var alias and an
-    // alias of an alias. (Stores into another object's field or a global are no longer A014's:
-    // the 0.8 cut keeps the certain return shape.)
-    try expect(.P009, "pub fn f(x: u8) []const u8 { const buf = [_]u8{ x, 1 }; return buf[0..]; }", 1);
     try expect(.P009, "pub fn f(n: usize) []u8 { var buf = [_]u8{ 0, 0, 0, 0 }; buf[0] = 1; return buf[0..n]; }", 1);
-    try expect(.P009, "pub fn f() *u32 { var x: u32 = 1; x += 1; var p: *u32 = undefined; p = &x; return p; }", 1);
-    try expect(.P009, "pub fn f() *u32 { var x: u32 = 1; x += 1; const a = &x; const b = a; return b; }", 1);
-    // Stored by a destructure into a `var` alias that is returned.
-    try expect(.P009, "pub fn f() *u32 { var x: u32 = 1; x += 1; var p: *u32 = undefined; p, _ = .{ &x, 0 }; return p; }", 1);
-    // A slice of a pointer local points where the pointer does: into a local array it was
-    // given, and nowhere in the frame where it is made from an integer, its type unresolved (a
-    // generic's `@TypeOf(slice.ptr)`, relic-b's warp c.zig:774).
-    try expect(.P009, "pub fn f(n: u8) []u8 { var buf: [4]u8 = .{ n, n, n, n }; buf[0] = 1; const p: [*]u8 = &buf; return p[0..2]; }", 1);
-    try expect(.P009, "fn m(s: anytype, at: usize) @TypeOf(s) { const p: @TypeOf(s.ptr) = @ptrFromInt(at); return p[0..s.len]; } pub fn f(x: anytype) void { _ = m(x, 8); }", 0);
-    try expect(.P009, "fn m(s: anytype, at: usize) @TypeOf(s) { const p: @TypeOf(s.ptr) = @ptrCast(@alignCast(@as(*u8, @ptrFromInt(at)))); return p[0..s.len]; } pub fn f(x: anytype) void { _ = m(x, 8); }", 0);
+    try expect(.P009, "const S = struct { v: u32 = 0 }; pub fn f() *u32 { var s: S = .{}; s.v += 1; return &s.v; }", 1);
+    // Stored straight into a global, through a parameter, or by @atomicStore.
+    try expect(.P009, "var g: ?*u32 = null; pub fn f() void { var x: u32 = 1; x += 1; g = &x; }", 1);
+    try expect(.P009, "const T = struct { cur: ?*u32 = null }; pub fn f(t: *T) void { var x: u32 = 1; x += 1; t.cur = &x; }", 1);
+    try expect(.P009, "var g: ?*u32 = null; pub fn f() void { var x: u32 = 1; x += 1; @atomicStore(?*u32, &g, &x, .release); }", 1);
 }
 
-test "P009 leaves static storage, pointers, copies and a store a defer clears on every exit alone" {
+test "P009 follows nothing: aliases, pointer locals, constants, comptime frames and undone stores are left alone" {
+    // An alias is a copy the statement does not show.
+    try expect(.P009, "pub fn f() *u32 { var x: u32 = 1; x += 1; const out = &x; return out; }", 0);
+    try expect(.P009, "pub fn f() *u32 { var x: u32 = 1; x += 1; var p: *u32 = undefined; p = &x; return p; }", 0);
+    // A const, a pointer local's place, a value returned whole.
     try expect(.P009, "pub fn f() []const u8 { const table = [_]u8{ 1, 2 }; return table[0..]; }", 0);
-    // A const whose value is a comptime expression, or inline calls on a comptime parameter, is
-    // compiled in (shakedown's edge values).
-    try expect(.P009, "inline fn top(comptime T: type) T { return 7; } pub fn f(comptime T: type) []const T { const high = top(T); const out = [_]T{ 0, high, -high, high / 2 }; return &out; }", 0);
-    try expect(.P009, "fn top(comptime T: type) T { return 7; } pub fn f(comptime T: type) []const T { const high = top(T); const out = [_]T{ 0, high }; return &out; }", 1);
-    try expect(.P009, "pub fn f(comptime T: type) []const T { const out = comptime [_]T{ 0, @as(T, 1) + 1 }; return &out; }", 0);
-    try expect(.P009, "pub fn f() []const u8 { comptime { var buf: [2]u8 = .{ 1, 2 }; buf[0] = 3; const out = buf; return &out; } }", 0);
-    try expect(.P009, "pub fn Make(comptime n: usize) type { var x: [n]u8 = undefined; x[0] = 1; _ = &x; return struct {}; }", 0);
     try expect(.P009, "const N = struct { v: u32 }; pub fn f(head: *N) *u32 { var node: *N = head; node.v += 1; return &node.v; }", 0);
     try expect(.P009, "pub fn f(items: []u8) []u8 { var s: []u8 = items; s = s[1..]; return s[0..1]; }", 0);
     try expect(.P009, "pub fn f() [4]u8 { var buf: [4]u8 = undefined; buf[0] = 1; return buf; }", 0);
+    // Comptime frames.
+    try expect(.P009, "pub fn f() []const u8 { comptime { var buf: [2]u8 = .{ 1, 2 }; buf[0] = 3; return &buf; } }", 0);
+    try expect(.P009, "pub fn Make(comptime n: usize) type { var x: [n]u8 = undefined; x[0] = 1; _ = &x; return struct {}; }", 0);
+    // A store a defer clears on every exit, however spelled, or one a defer names the local of.
     try expect(.P009, "const T = struct { cur: ?*u32 = null }; pub fn f(t: *T) void { var x: u32 = 1; x += 1; t.cur = &x; defer t.cur = null; }", 0);
-    try expect(.P009, "pub fn f() u32 { var x: u32 = 1; var p: *u32 = undefined; p = &x; p.* += 1; return x; }", 0);
     try expect(.P009, "const T = struct { cur: ?*u32 = null }; pub fn f(t: *T) void { var x: u32 = 1; x += 1; t.cur = &x; defer { t.cur = null; } }", 0);
-    // Twins: a destructure that stores no pointer into the frame, and the clear spelled
-    // otherwise, naming the same memory.
-    try expect(.P009, "const T = struct { p: ?*u32 = null }; pub fn f(t: *T, y: *u32) void { var x: u32 = 1; x += 1; t.p, _ = .{ y, x }; }", 0);
     try expect(.P009, "const T = struct { cur: ?*u32 = null }; pub fn f(t: *T) void { var x: u32 = 1; x += 1; t.cur = &x; defer (t).cur = null; }", 0);
+    try expect(.P009, "const W = struct { next: ?*W = null }; const L = struct { first: ?*W = null }; pub fn f(l: *L) void { var w: W = .{ .next = l.first }; l.first = &w; defer { var link = &l.first; while (link.* != &w) link = &link.*.?.next; link.* = w.next; } }", 0);
 }
 
 test "P008 finds identifying integers of one type meeting, not other integers" {
