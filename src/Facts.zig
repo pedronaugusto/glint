@@ -4995,7 +4995,13 @@ fn tupleFieldType(self: *Facts, container: Container, position: usize) ResolveEr
 fn sliced(self: *Facts, value: Value, _: void) ResolveError!Value {
     return switch (value) {
         .array => self.pointerTo(value, null),
-        .pointer => |p| .{ .pointer = .{ .child = p.child, .size = null } },
+        // A slice of a slice or a many-item pointer holds its elements, a slice of them (or a
+        // pointer to an array of them, indexed alike): `err[0..n]` of a `[][4]f32` is `[][4]f32`,
+        // its element a `[4]f32`, not a pointer to one array.
+        .pointer => |p| .{ .pointer = .{ .child = p.child, .size = if (p.size) |size| switch (size) {
+            .slice, .many, .c => .slice,
+            .one => null,
+        } else null } },
         // Whatever is sliced, the slice is one (or a pointer to an array, of a length the
         // program compiles in): its `.len` is its count, its elements what it holds.
         .unknown => .{ .pointer = .{ .child = try self.boxed(value), .size = .slice } },
