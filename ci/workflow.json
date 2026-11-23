@@ -11,6 +11,6 @@
     "aarch64-macos"
   ],
   "shards": {
-    "riscv64": 3
+    "riscv64": { "min": 3 }
   }
 }
