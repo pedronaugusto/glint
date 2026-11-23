@@ -34,6 +34,7 @@ pub fn dev(b: *std.Build, tools: type) void {
     const filter = b.option([]const u8, "test-filter", "Select tests by name");
     const soundness_jobs = b.option(usize, "soundness-jobs", "The workers the soundness suite judges its cases on (default: one per CPU)") orelse 0;
     const soundness_rules = b.option([]const u8, "soundness-rules", "The rules whose soundness cases alone run, by comma (default: every rule's)");
+    const soundness_compiled = b.option(bool, "soundness-compiled", "Judge each soundness case with its x86_64 compilation's DWARF (glint --compiled), each case compiled first") orelse false;
     const package = b.dependency("glint", .{ .target = target, .optimize = optimize });
     const p = package.builder;
     const module = package.module("glint");
@@ -112,6 +113,7 @@ pub fn dev(b: *std.Build, tools: type) void {
     soundness_run.addFileArg2(aegis_dependency.path("src/root.zig"), .{});
     soundness_run.addArg(b.fmt("{d}", .{soundness_jobs}));
     if (soundness_rules) |list| soundness_run.addArg(list);
+    if (soundness_compiled) soundness_run.addArg("--compiled");
     test_step.dependOn(&soundness_run.step);
     const soundness_tests = b.addTest(.{ .root_module = soundness.root_module });
     test_step.dependOn(&b.addRunArtifact(soundness_tests).step);

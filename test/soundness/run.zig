@@ -33,9 +33,14 @@
 //! its own; Zig's cache (`.zig-cache` in the run's directory, the package root) keeps what has
 //! not changed.
 //!
-//! Usage: soundness SUITE ZIG ZIG_LIB AEGIS_ROOT JOBS [RULES]: ZIG the compiler; JOBS the
-//! workers (0, one per CPU); RULES the rules whose cases alone run, by comma (none, every
-//! rule's).
+//! With `--compiled`, each case is judged as glint reads a package whose build compiled it
+//! (`glint --compiled`): its file, and its `before.zig`, compiled apart with Zig's self-hosted
+//! x86_64 backend first, and their DWARF handed to glint, so a type is what the compiler gave it.
+//! A file Zig refuses for x86_64 fails the run at its path.
+//!
+//! Usage: soundness SUITE ZIG ZIG_LIB AEGIS_ROOT JOBS [RULES] [--compiled]: ZIG the compiler;
+//! JOBS the workers (0, one per CPU); RULES the rules whose cases alone run, by comma (none,
+//! every rule's).
 const std = @import("std");
 const builtin = @import("builtin");
 const glint = @import("glint");
@@ -83,13 +88,19 @@ pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
     const io = init.io;
     const args = try init.minimal.args.toSlice(a);
-    if (args.len != 6 and args.len != 7) return error.Usage;
+    if (args.len < 6) return error.Usage;
     const suite_path, const lib, const aegis = .{ args[1], args[3], args[4] };
     const tools: Tools = .{ .zig = args[2], .lib = lib, .aegis = aegis, .cache = ".zig-cache" };
     const jobs_asked = try std.fmt.parseInt(usize, args[5], 10);
     var selected: std.ArrayList([]const u8) = .empty;
-    if (args.len == 7) {
-        var each = std.mem.tokenizeScalar(u8, args[6], ',');
+    var compiled_facts = false;
+    for (args[6..]) |arg| {
+        if (std.mem.eql(u8, arg, "--compiled")) {
+            compiled_facts = true;
+            continue;
+        }
+        if (selected.items.len != 0) return error.Usage;
+        var each = std.mem.tokenizeScalar(u8, arg, ',');
         while (each.next()) |rule| try selected.append(a, rule);
     }
     var suite = try std.Io.Dir.cwd().openDir(io, suite_path, .{ .iterate = true });
@@ -161,7 +172,7 @@ pub fn main(init: std.process.Init) !void {
     try compiled(a, init.gpa, io, tools, suite_path, columns.items, jobs.items, &refusals, w);
 
     const verdicts = try a.alloc(anyerror!Verdict, jobs.items.len);
-    var pool: Pool = .{ .jobs = jobs.items, .columns = columns.items, .verdicts = verdicts, .lib = lib, .aegis = aegis };
+    var pool: Pool = .{ .jobs = jobs.items, .columns = columns.items, .verdicts = verdicts, .lib = lib, .aegis = aegis, .compiled = if (compiled_facts) tools else null };
     const memory: ?u64 = std.process.totalSystemMemory() catch null;
     const workers = fitted(jobs_asked, std.Thread.getCpuCount() catch 1, jobs.items.len, memory);
     var group: std.Io.Group = .init;
@@ -173,8 +184,17 @@ pub fn main(init: std.process.Init) !void {
         if (peak > ceiling) try w.print("the suite's peak resident memory is {d} MiB at {d} workers, past its ceiling of {d} MiB: a run keeps memory it should give back\n", .{ peak >> 20, workers, ceiling >> 20 });
     }
     for (jobs.items, verdicts) |job, result| {
-        const verdict = try result;
         const column = &columns.items[job.column];
+        // A file Zig refuses for x86_64 has no compiled facts to judge it by; it was named where
+        // refused (`compiledCase`).
+        const verdict = result catch |err| switch (err) {
+            error.CompiledRefused => {
+                column.failing += 1;
+                try w.print("{s}/{s}: not judged: no x86_64 compilation of it\n", .{ column.rule, job.path });
+                continue;
+            },
+            else => |e| return e,
+        };
         // A case Zig refuses is no program, so it passes nothing; it was named where refused.
         const compiles = !refusals.contains(job.absolute) and !(if (job.before) |before| refusals.contains(before) else false);
         // A hole outside its rule's scope is the one hole that must be clean: one flagged is in
@@ -355,16 +375,22 @@ fn compiled(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, tools: Too
 /// same cases the same way. Nothing is emitted; the arguments go in a response file, as they
 /// are many.
 fn compile(a: std.mem.Allocator, io: std.Io, tools: Tools, kind: []const u8, files: []const CaseFile) !std.process.RunResult {
-    var random: [8]u8 = undefined;
-    io.random(&random);
-    const scratch = try std.Io.Dir.path.join(a, &.{ tools.cache, "tmp", try std.fmt.allocPrint(a, "soundness-{s}-{s}", .{ std.Io.Dir.path.stem(kind), &std.fmt.bytesToHex(&random, .lower) }) });
+    const scratch = try scratchDir(a, io, tools, std.Io.Dir.path.stem(kind));
+    defer std.Io.Dir.cwd().deleteTree(io, scratch) catch {}; // The scratch is the run's own; one left behind is litter, not a verdict.
+    return program(a, io, tools, scratch, std.Io.Dir.path.stem(kind), &.{ "-fno-emit-bin", "-target", "aarch64-macos", "-lc" }, files);
+}
+
+/// `files` compiled as one program in `scratch` with `target`'s arguments (the target, what is
+/// emitted): each file its own module with aegis and its case's stubs and module, under a root
+/// whose comptime blocks reference each file's public declarations. The arguments go in a
+/// response file, as they are many.
+fn program(a: std.mem.Allocator, io: std.Io, tools: Tools, scratch: []const u8, name: []const u8, target: []const []const u8, files: []const CaseFile) !std.process.RunResult {
     const cwd = std.Io.Dir.cwd();
-    try cwd.createDirPath(io, scratch);
-    defer cwd.deleteTree(io, scratch) catch {}; // The scratch is the run's own; one left behind is litter, not a verdict.
     var root: std.Io.Writer.Allocating = .init(a);
     try root.writer.writeAll("const std = @import(\"std\");\n");
     var arguments: std.ArrayList([]const u8) = .empty;
-    try arguments.appendSlice(a, &.{ "-fno-emit-bin", "-target", "aarch64-macos", "-lc", "--name", try std.fmt.allocPrint(a, "soundness-{s}", .{std.Io.Dir.path.stem(kind)}), "--zig-lib-dir", tools.lib, "--cache-dir", tools.cache });
+    try arguments.appendSlice(a, target);
+    try arguments.appendSlice(a, &.{ "--name", try std.fmt.allocPrint(a, "soundness-{s}", .{name}), "--zig-lib-dir", tools.lib, "--cache-dir", tools.cache });
     for (files, 0..) |_, index| try arguments.appendSlice(a, &.{ "--dep", try std.fmt.allocPrint(a, "case{d}", .{index}) });
     const root_path = try std.Io.Dir.path.join(a, &.{ scratch, "cases.zig" });
     try arguments.append(a, try std.fmt.allocPrint(a, "-Mroot={s}", .{root_path}));
@@ -536,6 +562,9 @@ const Pool = struct {
     verdicts: []anyerror!Verdict,
     lib: []const u8,
     aegis: []const u8,
+    /// Set: each case is judged with what its program's compilation established
+    /// (`--compiled`), its program compiled first (`compiledCase`).
+    compiled: ?Tools = null,
     next: std.atomic.Value(usize) = .init(0),
 
     fn work(pool: *Pool, gpa: std.mem.Allocator, io: std.Io) void {
@@ -545,10 +574,59 @@ const Pool = struct {
             const index = pool.next.fetchAdd(1, .monotonic);
             if (index >= pool.jobs.len) return;
             const job = pool.jobs[index];
-            pool.verdicts[index] = judge(gpa, io, &store, pool.columns[job.column].rule, pool.lib, pool.aegis, job);
+            pool.verdicts[index] = pool.judgeOne(gpa, io, &store, job);
         }
     }
+
+    fn judgeOne(pool: *Pool, gpa: std.mem.Allocator, io: std.Io, store: *glint.Project.Store, job: Job) !Verdict {
+        const rule = pool.columns[job.column].rule;
+        const tools = pool.compiled orelse return judge(gpa, io, store, rule, pool.lib, pool.aegis, job, &.{});
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const scratch = try scratchDir(a, io, tools, "case");
+        defer std.Io.Dir.cwd().deleteTree(io, scratch) catch {}; // The scratch is the case's own; one left behind is litter, not a verdict.
+        var objects: std.ArrayList([]const u8) = .empty;
+        try objects.append(a, try compiledCase(a, io, tools, scratch, job.path, job.absolute));
+        if (job.before) |before| try objects.append(a, try compiledCase(a, io, tools, scratch, job.path, before));
+        return judge(gpa, io, store, rule, pool.lib, pool.aegis, job, objects.items);
+    }
 };
+
+/// A new directory of the run's own under the cache's `tmp`, named for `what`.
+fn scratchDir(a: std.mem.Allocator, io: std.Io, tools: Tools, what: []const u8) ![]const u8 {
+    var random: [8]u8 = undefined;
+    io.random(&random);
+    const scratch = try std.Io.Dir.path.join(a, &.{ tools.cache, "tmp", try std.fmt.allocPrint(a, "soundness-{s}-{s}", .{ what, &std.fmt.bytesToHex(&random, .lower) }) });
+    try std.Io.Dir.cwd().createDirPath(io, scratch);
+    return scratch;
+}
+
+/// A case's file (`hole.zig`, `twin.zig`, or its `before.zig`, each compiled apart as the
+/// suite's compile check compiles them, since a file beside them both import may belong to one
+/// module of a compilation alone) compiled with Zig's self-hosted x86_64 backend, its DWARF
+/// what glint reads (`--compiled`): the file a module with aegis and its case's stubs and
+/// module, under a root that references its public declarations. The object's path; a file
+/// Zig refuses for x86_64 is `error.CompiledRefused`, written with Zig's first error.
+fn compiledCase(a: std.mem.Allocator, io: std.Io, tools: Tools, scratch: []const u8, case: []const u8, absolute: []const u8) ![]const u8 {
+    const stem = std.Io.Dir.path.stem(absolute);
+    const object = try std.Io.Dir.path.join(a, &.{ scratch, try std.fmt.allocPrint(a, "{s}.o", .{stem}) });
+    const target = [_][]const u8{ "-target", "x86_64-linux", "-fno-llvm", "-fno-lld", "-lc", try std.fmt.allocPrint(a, "-femit-bin={s}", .{object}) };
+    const sub = try std.Io.Dir.path.join(a, &.{ scratch, stem });
+    try std.Io.Dir.cwd().createDirPath(io, sub);
+    const result = try program(a, io, tools, sub, stem, &target, &.{.{ .name = case, .absolute = absolute }});
+    const failed = switch (result.term) {
+        .exited => |code| code != 0,
+        else => true,
+    };
+    if (failed) {
+        var blocks = Blocks{ .lines = std.mem.splitScalar(u8, result.stderr, '\n') };
+        const first = if (blocks.next()) |block| block.first else result.stderr;
+        std.debug.print("{s}: {s} does not compile for x86_64 with the self-hosted backend: {s}\n", .{ case, std.Io.Dir.path.basename(absolute), first });
+        return error.CompiledRefused;
+    }
+    return object;
+}
 
 /// The `expected.zon` of `rule`'s directory.
 fn expectedOf(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, suite: std.Io.Dir, rule: []const u8) !Expected {
@@ -572,7 +650,7 @@ fn caseFile(a: std.mem.Allocator, io: std.Io, rule_dir: std.Io.Dir, suite_path: 
 
 /// What glint says of the case's file under `rule` alone, with the case's policy if it has one,
 /// after its `before.zig` if it has one, whose own findings and coverage are not read.
-fn judge(gpa: std.mem.Allocator, io: std.Io, store: *glint.Project.Store, rule: []const u8, lib: []const u8, aegis: []const u8, job: Job) !Verdict {
+fn judge(gpa: std.mem.Allocator, io: std.Io, store: *glint.Project.Store, rule: []const u8, lib: []const u8, aegis: []const u8, job: Job, compiled_objects: []const []const u8) !Verdict {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -582,6 +660,7 @@ fn judge(gpa: std.mem.Allocator, io: std.Io, store: *glint.Project.Store, rule: 
     var args: std.ArrayList([]const u8) = .empty;
     try args.appendSlice(a, &.{ "glint", "--only", rule, "--zig-lib-path", lib, "--module", module });
     if (job.policy) |config| try args.appendSlice(a, &.{ "--config", config });
+    for (compiled_objects) |object| try args.appendSlice(a, &.{ "--compiled", object });
     if (job.before) |before| try args.append(a, before);
     const own = try moduleFiles(a, io, std.Io.Dir.path.dirname(job.absolute) orelse ".");
     for (own) |file| if (std.mem.eql(u8, std.Io.Dir.path.basename(file), "module.zig")) try args.appendSlice(a, &.{ "--module", try std.fmt.allocPrint(a, "module={s}", .{file}), "--exported", file });
