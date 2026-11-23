@@ -322,7 +322,9 @@ fn isField(self: *Context, g: Governed) bool {
 /// of `types`, or a pointer to one, through optionals and error unions; a tuple or struct
 /// written in place there, `.{ secret }`, by its elements). A row that takes the type it reads
 /// first (`mem.eql(u8, a, b)`, `mem.zeroes(T)`) is decided by that type alone: its other
-/// arguments are values or bytes of it. Any other std call is none: an allocator's `free`, a
+/// arguments are values or bytes of it. A print row reads a literal format's placeholders: an
+/// argument of the tuple after it printed only by `{f}` (its type's own `format`) or `{*}` (its
+/// address) is read by none of std's code (main, 2026-11-23). Any other std call is none: an allocator's `free`, a
 /// list's `append`, `ArrayList(T)`. Nothing in the callee's body is read. The callee is given;
 /// unknown where such a call is handed an argument whose type is unknown.
 pub const Reflected = union(enum) { no, yes: Facts.Decl, unknown: Facts.Unknown };
@@ -331,9 +333,11 @@ pub fn namedStd(self: *Context, node: Ast.Node.Index, types: []const Facts.Conta
     const tree = &self.project.at(self.file).file.tree;
     var call_buffer: [1]Ast.Node.Index = undefined;
     const full = tree.fullCall(&call_buffer, node) orelse return .no;
-    // What every argument names, and what the first does.
+    // What every argument names, what the first does, and what a print reads past `{f}`.
     var all: Seen = .{};
     var first: Seen = .{};
+    var printed: Seen = .{};
+    const format = try Format.of(self, tree, full.ast.params);
     for (full.ast.params, 0..) |arg, at| {
         var buffer: [2]Ast.Node.Index = undefined;
         const written = Facts.ungrouped(tree, arg);
@@ -344,11 +348,14 @@ pub fn namedStd(self: *Context, node: Ast.Node.Index, types: []const Facts.Conta
             (if (literal.ast.type_expr == .none) literal.ast.elements else &one)
         else
             &one;
-        for (parts) |part| {
+        const tuple = parts.ptr != &one and tree.fullStructInit(&buffer, written) == null;
+        for (parts, 0..) |part, element| {
             const value = try self.facts.resolve(self.file, part);
             const seen: Seen = .{ .governed = madeType(value, types) != null, .unknown = unknownIn(value) };
             all.join(seen);
             if (at == 0) first.join(seen);
+            const own = if (format) |f| tuple and at == f.args and f.ownFormat(element) else false;
+            if (!own) printed.join(seen);
         }
     }
     if (!all.governed and all.unknown == null) return .no;
@@ -360,7 +367,11 @@ pub fn namedStd(self: *Context, node: Ast.Node.Index, types: []const Facts.Conta
     };
     for ([_][]const Named{ &readers, &makers }) |table| for (table) |entry| switch (try mayCallStd(self, node, entry[0])) {
         .yes => {
-            const seen = if (entry[1] == .type) first else all;
+            const seen = switch (entry[1]) {
+                .type => first,
+                .values => all,
+                .print => printed,
+            };
             if (seen.governed) return .{ .yes = callee };
             return if (seen.unknown) |why| .{ .unknown = why } else .no;
         },
@@ -373,7 +384,62 @@ pub fn namedStd(self: *Context, node: Ast.Node.Index, types: []const Facts.Conta
 /// A std declaration by its path under `std`, what of its arguments it reads (`.type`: the type
 /// named first, the others its values or bytes; `.values`: every argument), and why A001 names
 /// it.
-const Named = struct { []const u8, enum { values, type }, []const u8 };
+const Named = struct { []const u8, enum { values, type, print }, []const u8 };
+
+/// A print's literal format string: the placeholders it writes, each with the argument it
+/// prints (null where named, `{[name]}`) and its specifier.
+const Format = struct {
+    /// Which parameter is the tuple of arguments: the one after the format.
+    args: usize,
+    placeholders: []const Placeholder,
+    const Placeholder = struct { argument: ?usize, specifier: []const u8 };
+
+    /// The first parameter written as a string literal, read as a format; null where none is.
+    fn of(self: *Context, tree: *const Ast, params: []const Ast.Node.Index) Context.Error!?Format {
+        const at = for (params, 0..) |param, i| {
+            if (tree.nodeTag(Facts.ungrouped(tree, param)) == .string_literal) break i;
+        } else return null;
+        const text = std.zig.string_literal.parseAlloc(self.allocator, tree.tokenSlice(tree.nodeMainToken(Facts.ungrouped(tree, params[at])))) catch return null;
+        var placeholders: std.ArrayList(Placeholder) = .empty;
+        var next: usize = 0;
+        var i: usize = 0;
+        while (i < text.len) : (i += 1) {
+            if (text[i] != '{') continue;
+            if (i + 1 < text.len and text[i + 1] == '{') {
+                i += 1;
+                continue;
+            }
+            const close = std.mem.findScalarPos(u8, text, i, '}') orelse return null;
+            const head = text[i + 1 .. std.mem.findScalarPos(u8, text[0..close], i, ':') orelse close];
+            i = close;
+            var digits: usize = 0;
+            while (digits < head.len and std.ascii.isDigit(head[digits])) digits += 1;
+            if (head.len != 0 and head[0] == '[') {
+                try placeholders.append(self.allocator, .{ .argument = null, .specifier = "" });
+            } else if (digits != 0) {
+                const argument = std.fmt.parseInt(usize, head[0..digits], 10) catch return null;
+                try placeholders.append(self.allocator, .{ .argument = argument, .specifier = head[digits..] });
+            } else {
+                try placeholders.append(self.allocator, .{ .argument = next, .specifier = head });
+                next += 1;
+            }
+        }
+        return .{ .args = at + 1, .placeholders = placeholders.items };
+    }
+
+    /// Whether the tuple's argument `element` is printed, and only by `{f}` or `{*}`. A named
+    /// placeholder leaves no argument known.
+    fn ownFormat(format: Format, element: usize) bool {
+        var printed = false;
+        for (format.placeholders) |placeholder| {
+            const argument = placeholder.argument orelse return false;
+            if (argument != element) continue;
+            if (!std.mem.eql(u8, placeholder.specifier, "f") and !std.mem.eql(u8, placeholder.specifier, "*")) return false;
+            printed = true;
+        }
+        return printed;
+    }
+};
 
 /// Whether arguments name a governed value or type, or one whose type is unknown.
 const Seen = struct {
@@ -388,14 +454,14 @@ const Seen = struct {
 /// std's declarations that read a value's fields or bytes (main, 2026-11-23): a governed value
 /// given to one is a finding.
 const readers = [_]Named{
-    .{ "fmt.allocPrint", .values, "formats each argument by its type's fields" },
-    .{ "fmt.allocPrintSentinel", .values, "formats each argument by its type's fields" },
-    .{ "fmt.bufPrint", .values, "formats each argument by its type's fields" },
-    .{ "fmt.bufPrintSentinel", .values, "formats each argument by its type's fields" },
-    .{ "fmt.count", .values, "formats each argument by its type's fields" },
-    .{ "fmt.comptimePrint", .values, "formats each argument by its type's fields" },
-    .{ "debug.print", .values, "formats each argument by its type's fields" },
-    .{ "Io.Writer.print", .values, "formats each argument by its type's fields" },
+    .{ "fmt.allocPrint", .print, "formats each argument by its type's fields" },
+    .{ "fmt.allocPrintSentinel", .print, "formats each argument by its type's fields" },
+    .{ "fmt.bufPrint", .print, "formats each argument by its type's fields" },
+    .{ "fmt.bufPrintSentinel", .print, "formats each argument by its type's fields" },
+    .{ "fmt.count", .print, "formats each argument by its type's fields" },
+    .{ "fmt.comptimePrint", .print, "formats each argument by its type's fields" },
+    .{ "debug.print", .print, "formats each argument by its type's fields" },
+    .{ "Io.Writer.print", .print, "formats each argument by its type's fields" },
     .{ "json.Stringify.value", .values, "writes the value field by field" },
     .{ "json.Stringify.valueAlloc", .values, "writes the value field by field" },
     .{ "json.Stringify.write", .values, "writes the value field by field" },

@@ -317,13 +317,15 @@ fn reportBare(c: *Context, definition: Rule.Definition, entry: Entry, token: Ast
 }
 
 /// What `value`, an exit's bare result, is given to past parentheses, where that loses its checks:
-/// arithmetic, a comparison or a narrowing cast; null for anything else.
+/// checked arithmetic, a comparison or a narrowing cast; null for anything else.
 fn bareUse(c: *Context, tree: *const Ast, model: *const Model, value: Ast.Node.Index) Context.Error!?[]const u8 {
     var parent = model.parentOf(value) orelse return null;
     while (tree.nodeTag(parent) == .grouped_expression) parent = model.parentOf(parent) orelse return null;
     return switch (tree.nodeTag(parent)) {
-        .add, .sub, .mul, .div, .mod, .shl, .shr, .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .shl_sat, .bit_and, .bit_or, .bit_xor, .negation, .negation_wrap, .bit_not => "arithmetic",
-        .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat, .assign_bit_and, .assign_bit_or, .assign_bit_xor => "arithmetic",
+        // The arithmetic Zig checks. Bits, shifts and wrapping or saturating arithmetic check
+        // nothing to lose, and a type has no operation of its own for them (a parity bit, a
+        // wheel's slot of a raw instant).
+        .add, .sub, .mul, .div, .mod, .negation, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => "arithmetic",
         .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => "a comparison",
         else => {
             const builtin = Facts.builtinName(tree, parent) orelse return null;

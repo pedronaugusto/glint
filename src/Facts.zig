@@ -1465,7 +1465,7 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
                 else => .{ .unknown = .unsupported },
             };
         },
-        .error_set_decl, .merge_error_sets => return .error_set,
+        .error_set_decl, .merge_error_sets, .error_value => return .error_set, // `error.Name`: a value of one
         .enum_literal => return self.declarationLiteral(file, node),
         .number_literal, .string_literal, .multiline_string_literal, .char_literal => return .scalar,
         else => {},
