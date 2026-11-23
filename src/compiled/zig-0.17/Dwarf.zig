@@ -955,3 +955,8 @@ test "a file cut anywhere, or not ELF, is refused whole" {
         } else |_| {}
     }
 }
+
+/// The test sample, for the index's tests (`Compiled.zig`).
+pub const sampleForTests = sample;
+/// A test's bytes read through a file, for the index's tests.
+pub const readBytesForTests = readBytes;

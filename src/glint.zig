@@ -34,7 +34,7 @@ test {
     _ = @import("Runner.zig");
     _ = Fix;
     _ = @import("Facts.zig");
-    _ = @import("compiled/zig-0.17/Dwarf.zig");
+    _ = @import("compiled/Compiled.zig");
     _ = @import("PackageRules.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("breadth_test.zig");
