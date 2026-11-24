@@ -762,7 +762,8 @@ const Builder = struct {
 /// An ELF file holding a DWARF 5 unit: a file struct `s` (file 0) declaring a struct `List`
 /// (line 3) with a member `len` of type `usize`, a method `first` (line 5, ZIG_parent `List`,
 /// with code) whose comptime parameter `n` is a `usize` and whose local `x`, inside a lexical
-/// block, is a `usize`, and a declaration `width` whose line is `List`'s plus 7.
+/// block, is a `usize`, and a declaration `width` whose line is `List`'s plus 7; an instance
+/// `Box(u32)` (line 9) with a member `value` of type `usize` and a method `get` returning one.
 fn sample(gpa: std.mem.Allocator) ![]u8 {
     var abbrev: Builder = .{ .gpa = gpa };
     defer abbrev.deinit();
@@ -778,6 +779,7 @@ fn sample(gpa: std.mem.Allocator) ![]u8 {
         .{ TAG.lexical_block, true, &.{} },
         .{ TAG.variable, false, &.{ .{ AT.name, FORM.string }, .{ AT.type, FORM.ref4 } } },
         .{ TAG.constant, false, &.{ .{ AT.name, FORM.string }, .{ AT.ZIG_parent, FORM.ref4 }, .{ AT.ZIG_relative_decl, FORM.ref4 }, .{ AT.ZIG_decl_line_relative, FORM.sdata } } },
+        .{ TAG.subprogram, false, &.{ .{ AT.name, FORM.string }, .{ AT.ZIG_parent, FORM.ref4 }, .{ AT.type, FORM.ref4 } } },
     };
     for (abbrevs, 1..) |a, code| {
         try abbrev.u(code);
@@ -821,6 +823,7 @@ fn sample(gpa: std.mem.Allocator) ![]u8 {
     try info.u(0); // end of List
     // A type function's instance: Zig names it with its arguments, at the line of the
     // structure the function returns.
+    const box_at: u32 = @intCast(info.bytes.items.len); // safe: a test's few bytes
     try info.u(4);
     try info.str("s.Box(u32)");
     try info.int(u32, file_at);
@@ -829,6 +832,11 @@ fn sample(gpa: std.mem.Allocator) ![]u8 {
     try info.str("value");
     try info.int(u32, usize_at);
     try info.u(0); // end of Box(u32)
+    // Its method, in the instance: what it returns.
+    try info.u(11);
+    try info.str("get");
+    try info.int(u32, box_at);
+    try info.int(u32, usize_at);
     try info.u(6);
     try info.str("first");
     try info.int(u32, list_at);

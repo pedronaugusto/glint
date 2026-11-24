@@ -14,7 +14,32 @@ pub const Type = union(enum) {
     primitive: []const u8,
     pointer: struct { size: std.builtin.Type.Pointer.Size, child: *const Type },
     container: struct { file: Project.FileId, scope: Model.Scope.Id },
+    /// A type function's instance (`Checked(u32)`): the container its function returns, which
+    /// alone would lose the arguments it was made with, and the compilation's own entry for it,
+    /// whose members' and methods' types `member` and `result` answer with those arguments.
+    instance: Instance,
 };
+
+pub const Instance = struct {
+    file: Project.FileId,
+    scope: Model.Scope.Id,
+    compiled: *const Compiled,
+    entry: u32,
+};
+
+/// The type the compilation gives `of`'s field `name`, read with its arguments; null where it
+/// has no such field or its type is not read from the compilation yet.
+pub fn member(gpa: std.mem.Allocator, project: *const Project, of: Instance, name: []const u8) error{OutOfMemory}!?Type {
+    const t = of.compiled.member(of.entry, name) orelse return null;
+    return typeOf(gpa, project, of.compiled, t, 0);
+}
+
+/// The type `of`'s function `name` returns, as the compilation gives it, read with its
+/// arguments; null where it has no such function or its result's type is not read yet.
+pub fn result(gpa: std.mem.Allocator, project: *const Project, of: Instance, name: []const u8) error{OutOfMemory}!?Type {
+    const t = of.compiled.result(of.entry, name) orelse return null;
+    return typeOf(gpa, project, of.compiled, t, 0);
+}
 
 /// What the compiled roots give a local or parameter: not reached (roots are given and none
 /// holds its function), or the types its function's compiled instances give it, each once.
@@ -58,6 +83,8 @@ fn same(a: Type, b: Type) bool {
         .primitive => |name| b == .primitive and std.mem.eql(u8, name, b.primitive),
         .pointer => |pointer| b == .pointer and pointer.size == b.pointer.size and same(pointer.child.*, b.pointer.child.*),
         .container => |container| b == .container and container.file == b.container.file and container.scope == b.container.scope,
+        // One instance is one entry of one compilation: Zig makes one type per function and arguments.
+        .instance => |inst| b == .instance and inst.compiled == b.instance.compiled and inst.entry == b.instance.entry,
     };
 }
 
@@ -124,15 +151,12 @@ fn pointerTo(gpa: std.mem.Allocator, child: Type, size: std.builtin.Type.Pointer
 }
 
 /// The program's container the compilation's type `ty` is: the one declared on its line, or a
-/// file's own. Null for an instance of a type function: Zig names it with its arguments, at the
-/// line its every instance shares, the line of the container the function returns, and a value
-/// of it read as that container alone would lose the arguments it was made with. Its members'
-/// types are the compilation's to answer (`Compiled.member`), not yet asked here, so the AST
-/// answers it.
+/// file's own. A type function's instance is named with its arguments, at the line its every
+/// instance shares, the line of the container the function returns: it is that container with
+/// the compilation's entry (`Type.instance`), whose members' types carry the arguments.
 fn containerOf(project: *const Project, c: *const Compiled, ty: u32) ?Type {
     const file = c.fileOf(ty);
     if (file == Compiled.none) return null;
-    if (c.instance(ty)) return null;
     const project_file = projectFile(project, c.paths.keys()[file]) orelse return null;
     const source = project.at(project_file);
     const model = &source.model;
@@ -141,7 +165,10 @@ fn containerOf(project: *const Project, c: *const Compiled, ty: u32) ?Type {
         if (c.files[c.origin(ty)] == Compiled.none or c.dwarf.entries.items(.line)[c.origin(ty)] != 0) {
             for (model.scopes, 0..) |s, i| {
                 if (s.kind != .container) continue;
-                if (lineOf(tree, s.first) == place.line) return .{ .container = .{ .file = project_file, .scope = @fromBackingInt(@intCast(i)) } }; // safe: scopes are counted in u32
+                if (lineOf(tree, s.first) != place.line) continue;
+                const scope: Model.Scope.Id = @fromBackingInt(@intCast(i)); // safe: scopes are counted in u32
+                if (c.instance(ty)) return .{ .instance = .{ .file = project_file, .scope = scope, .compiled = c, .entry = ty } };
+                return .{ .container = .{ .file = project_file, .scope = scope } };
             }
         }
     }

@@ -5891,7 +5891,7 @@ fn compiledLocal(self: *Facts, decl: Decl) ResolveError!?Value {
     };
     var values: std.ArrayList(Value) = .empty;
     for (types) |t| {
-        const value = try self.instance(try self.compiledType(t));
+        const value = try self.instance((try self.compiledType(t)) orelse return null);
         for (values.items) |seen| {
             if (sameValue(seen, value)) break;
         } else try values.append(self.gpa, value);
@@ -5904,11 +5904,14 @@ fn compiledLocal(self: *Facts, decl: Decl) ResolveError!?Value {
 }
 
 /// The value of a type the compilation gives (`compiled/Answers.zig`), as Facts holds a type.
-fn compiledType(self: *Facts, t: answers.Type) ResolveError!Value {
+/// Null for a type function's instance, whose members Facts does not yet read from the
+/// compilation (`answers.member`, `answers.result`): the source answers it.
+fn compiledType(self: *Facts, t: answers.Type) ResolveError!?Value {
     return switch (t) {
         .primitive => |name| .{ .primitive = name },
-        .pointer => |pointer| try self.pointerTo(try self.compiledType(pointer.child.*), pointer.size),
+        .pointer => |pointer| try self.pointerTo((try self.compiledType(pointer.child.*)) orelse return null, pointer.size),
         .container => |container| .{ .container = .{ .file = container.file, .scope = container.scope } },
+        .instance => null,
     };
 }
 
