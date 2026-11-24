@@ -101,6 +101,7 @@ const Job = struct {
 
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
+    const gpa = judging(init.gpa);
     const io = init.io;
     const args = try init.minimal.args.toSlice(a);
     if (args.len != 6 and args.len != 7) return error.Usage;
@@ -125,7 +126,7 @@ pub fn main(init: std.process.Init) !void {
     for (rules) |rule| {
         if (selected.items.len != 0 and !contains(selected.items, rule)) continue;
         const column = try columns.addOne(a);
-        column.* = .{ .rule = rule, .expected = try expectedOf(a, init.gpa, io, suite, rule) };
+        column.* = .{ .rule = rule, .expected = try expectedOf(a, gpa, io, suite, rule) };
         var open: std.StringHashMapUnmanaged(void) = .empty;
         for (column.expected.open) |path| try open.put(a, path, {});
         var outside: std.StringHashMapUnmanaged(void) = .empty;
@@ -194,20 +195,21 @@ pub fn main(init: std.process.Init) !void {
 
     // The case files Zig refuses, by their path.
     var refusals: std.StringHashMapUnmanaged(void) = .empty;
-    try compiled(a, init.gpa, io, tools, suite_path, columns.items, share, &refusals, w);
+    try compiled(a, gpa, io, tools, suite_path, columns.items, share, &refusals, w);
 
     const verdicts = try a.alloc(anyerror!Verdict, share.len);
     const seconds = try a.alloc(u64, share.len);
     var pool: Pool = .{ .jobs = share, .columns = columns.items, .verdicts = verdicts, .nanoseconds = seconds, .lib = lib, .aegis = aegis };
     const memory: ?u64 = std.process.totalSystemMemory() catch null;
-    const workers = fitted(jobs_asked, std.Thread.getCpuCount() catch 1, share.len, memory);
+    const workers = fitted(jobs_asked, std.Thread.getCpuCount() catch 1, share.len, memory, resident_eighths);
     var group: std.Io.Group = .init;
     defer group.cancel(io);
-    for (0..workers) |_| try group.concurrent(io, Pool.work, .{ &pool, init.gpa, io });
+    for (0..workers) |_| try group.concurrent(io, Pool.work, .{ &pool, gpa, io });
     try group.await(io);
-    if (peakResident()) |peak| {
-        const ceiling = held_ceiling + workers * worker_ceiling;
-        if (peak > ceiling) try w.print("the suite's peak resident memory is {d} MiB at {d} workers, past its ceiling of {d} MiB: a run keeps memory it should give back\n", .{ peak >> 20, workers, ceiling >> 20 });
+    const peak = peakResident();
+    const ceiling = resident(held_ceiling + @as(u64, workers) * worker_ceiling, resident_eighths);
+    if (peak) |held| {
+        if (held > ceiling) try w.print("the suite's peak resident memory is {d} MiB at {d} workers, past its ceiling of {d} MiB: a run keeps memory it should give back\n", .{ held >> 20, workers, ceiling >> 20 });
     }
     // Each case's time, for the durations record (preflight's `profile` folds it): its share of
     // the run's time, what it took over the workers that ran beside it, so a column's cases sum
@@ -287,6 +289,7 @@ pub fn main(init: std.process.Init) !void {
         if (column.outside != 0) try o.print(" {s} {d}", .{ column.rule, column.outside });
     }
     try o.print("\n{d} cases, {d} open, {d} outside, {d} cells empty; a cell is holes+twins, . none yet, - none possible\n", .{ share.len, failing, beyond, empty });
+    if (peak) |held| try o.print("peak resident memory {d} MiB at {d} workers, its ceiling {d} MiB\n", .{ held >> 20, workers, ceiling >> 20 });
     try o.flush();
     if (failures.written().len != 0) {
         std.debug.print("{s}", .{failures.written()});
@@ -301,11 +304,37 @@ pub fn main(init: std.process.Init) !void {
 /// machine that runs it. Measured on aarch64-macos, ReleaseSafe (11-03): 2970 MiB at 4 workers,
 /// 11547 MiB at 16, so about 715 MiB a worker and 110 MiB beside them; the ceilings keep two
 /// fifths more a worker.
-const worker_ceiling: usize = 1024 << 20;
-const held_ceiling: usize = 512 << 20;
+/// Both are what the run holds; what is resident beside it is the build's (`resident`).
+const worker_ceiling: u64 = 1024 << 20;
+const held_ceiling: u64 = 512 << 20;
 /// What one worker holds at its peak, its store holding std's models: about 460 MiB, near 610 at
 /// its most (Zig 0.17, measured cold). The pool is fitted to it.
 const worker_resident: u64 = 640 << 20;
+
+/// What is resident for each byte the run holds, in eighths of a byte, by the build's
+/// sanitizer: the byte alone without one. Under ThreadSanitizer, beside the byte its shadow
+/// (four 4-byte cells for each 8 bytes: 2 bytes a byte) and its metadata (4 bytes for each 8:
+/// half a byte), 3.5 times what is held. Measured 11-24 at one worker over 428 cases: 1508 MiB
+/// sanitized, 485 plain.
+const resident_eighths: u64 = if (builtin.sanitize_thread) 28 else 8;
+
+/// What is resident for `held` bytes held, at `eighths` (`resident_eighths`).
+fn resident(held: u64, eighths: u64) u64 {
+    return held / 8 * eighths;
+}
+
+/// The allocator a run judges its cases with: the build's own (`init.gpa`), and under
+/// ThreadSanitizer the C allocator, which the sanitizer's runtime provides. The build's own in a
+/// safe mode is std's SafeAllocator over std's page allocator, which maps each allocation at an
+/// address not mapped before (it hints past its last mapping on Linux and macOS), and the
+/// sanitizer keeps the shadow of every address the run touched resident after the run unmaps
+/// it: the suite's resident memory grew with all it ever allocated, where what it held stayed
+/// flat (11-24, one worker: the plain build held 470 MiB over 428 cases, the sanitized one
+/// grew 95 MiB a second to 12 GiB; release run 45306552339, 5594 MiB at 4 workers). The
+/// sanitizer's allocator reuses its addresses and their shadow.
+fn judging(own: std.mem.Allocator) std.mem.Allocator {
+    return if (builtin.sanitize_thread) std.heap.c_allocator else own;
+}
 
 /// The workers a run judges its cases on: those asked, else one per CPU, never more than the
 /// cases, and, unasked, no more than the machine's memory holds beside what the run keeps. A
@@ -313,26 +342,31 @@ const worker_resident: u64 = 640 << 20;
 /// memory and its kernel killed the suite (release run 44562800622). Unasked on a machine whose
 /// memory is not known (`memory` null: its system does not say, or the query failed), one: no
 /// more than any machine holds, never none.
-fn fitted(asked: usize, cpus: usize, cases: usize, memory: ?u64) usize {
+/// What each holds is resident at `eighths` (`resident_eighths`).
+fn fitted(asked: usize, cpus: usize, cases: usize, memory: ?u64, eighths: u64) usize {
     var workers = @min(if (asked != 0) asked else cpus, @max(cases, 1));
     if (asked == 0) {
         const total = memory orelse return 1;
-        const room = total -| held_ceiling;
-        workers = @min(workers, @max(1, std.math.cast(usize, room / worker_resident) orelse workers));
+        const room = total -| resident(held_ceiling, eighths);
+        workers = @min(workers, @max(1, std.math.cast(usize, room / resident(worker_resident, eighths)) orelse workers));
     }
     return @max(workers, 1);
 }
 
 test "the pool is fitted to the machine's memory unless the workers are asked" {
-    try std.testing.expectEqual(@as(usize, 2), fitted(0, 4, 629, 2 << 30));
-    try std.testing.expectEqual(@as(usize, 4), fitted(0, 4, 629, 64 << 30));
-    try std.testing.expectEqual(@as(usize, 1), fitted(0, 4, 629, null));
-    try std.testing.expectEqual(@as(usize, 1), fitted(0, 64, 629, null));
-    try std.testing.expectEqual(@as(usize, 1), fitted(0, 4, 629, 0));
-    try std.testing.expectEqual(@as(usize, 3), fitted(3, 4, 629, null));
-    try std.testing.expectEqual(@as(usize, 1), fitted(0, 4, 629, 600 << 20));
-    try std.testing.expectEqual(@as(usize, 4), fitted(4, 8, 629, 2 << 30));
-    try std.testing.expectEqual(@as(usize, 3), fitted(0, 8, 3, 64 << 30));
+    try std.testing.expectEqual(@as(usize, 2), fitted(0, 4, 629, 2 << 30, 8));
+    try std.testing.expectEqual(@as(usize, 4), fitted(0, 4, 629, 64 << 30, 8));
+    try std.testing.expectEqual(@as(usize, 1), fitted(0, 4, 629, null, 8));
+    try std.testing.expectEqual(@as(usize, 1), fitted(0, 64, 629, null, 8));
+    try std.testing.expectEqual(@as(usize, 1), fitted(0, 4, 629, 0, 8));
+    try std.testing.expectEqual(@as(usize, 3), fitted(3, 4, 629, null, 8));
+    try std.testing.expectEqual(@as(usize, 1), fitted(0, 4, 629, 600 << 20, 8));
+    try std.testing.expectEqual(@as(usize, 4), fitted(4, 8, 629, 2 << 30, 8));
+    try std.testing.expectEqual(@as(usize, 3), fitted(0, 8, 3, 64 << 30, 8));
+    // Under ThreadSanitizer each worker's 640 MiB is 2240 resident, and the 512 beside them 1792.
+    try std.testing.expectEqual(@as(usize, 6), fitted(0, 16, 629, 16 << 30, 28));
+    try std.testing.expectEqual(@as(usize, 4), fitted(0, 4, 629, 16 << 30, 28));
+    try std.testing.expectEqual(@as(usize, 1), fitted(0, 4, 629, 2 << 30, 28));
 }
 
 /// This process's peak resident memory in bytes, null where its system does not say.
