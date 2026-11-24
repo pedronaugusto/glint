@@ -24,7 +24,7 @@ pub fn local(facts: *Facts, decl: Facts.Decl) Facts.ResolveError!?Facts.Value {
     var values: std.ArrayList(Facts.Value) = .empty;
     var held = false;
     for (facts.compiled) |c| {
-        const file = c.fileId(source.input.name) orelse continue;
+        const file = (try c.fileId(source.input.name)) orelse continue;
         const place: Compiled.Place = .{ .file = file, .line = line };
         if (!c.holds(place)) continue;
         held = true;

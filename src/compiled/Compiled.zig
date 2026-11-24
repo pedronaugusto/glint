@@ -14,6 +14,8 @@ pub const none = Dwarf.none;
 
 gpa: std.mem.Allocator,
 dwarf: Dwarf,
+/// The package's directory, absolute, resolved: the paths under it are named relative to it.
+root: []const u8,
 /// Each file's path, relative to the package's root where it is under it, by id.
 paths: std.array_hash_map.String(void),
 /// Each entry's file, by id into `paths`; `none` where it names none.
@@ -47,9 +49,15 @@ pub const Names = std.array_hash_map.String(std.ArrayList(u32));
 /// Indexes `dwarf`, which it then owns. `root` is the package's directory, absolute: a file
 /// under it is named relative to it.
 pub fn init(gpa: std.mem.Allocator, dwarf: Dwarf, root: []const u8) error{OutOfMemory}!Compiled {
+    const resolved_root = std.fs.path.resolveAllocPosix(gpa, &.{root}) catch |err| {
+        var owned = dwarf;
+        owned.deinit(gpa);
+        return err;
+    };
     var c: Compiled = .{
         .gpa = gpa,
         .dwarf = dwarf,
+        .root = resolved_root,
         .paths = .empty,
         .files = &.{},
         .functions = .empty,
@@ -62,7 +70,7 @@ pub fn init(gpa: std.mem.Allocator, dwarf: Dwarf, root: []const u8) error{OutOfM
         .inlined = .empty,
     };
     errdefer c.deinit();
-    try c.build(root);
+    try c.build();
     return c;
 }
 
@@ -84,6 +92,7 @@ pub fn deinit(c: *Compiled) void {
     c.containers.deinit(gpa);
     c.inlined.deinit(gpa);
     c.dwarf.deinit(gpa);
+    gpa.free(c.root);
 }
 
 fn freeNames(gpa: std.mem.Allocator, names: *Names) void {
@@ -92,9 +101,15 @@ fn freeNames(gpa: std.mem.Allocator, names: *Names) void {
 }
 
 /// The id of `path`, as glint names the file, or null where no entry names it.
-pub fn fileId(c: *const Compiled, path: []const u8) ?u32 {
-    const index = c.paths.getIndex(path) orelse return null;
-    return @intCast(index); // safe: paths are counted in u32, as `files` holds them
+/// The id of the file at `path`: relative to the package's root as the compilation's are named,
+/// or absolute, resolved and named relative to the root where it is under it.
+pub fn fileId(c: *const Compiled, path: []const u8) error{OutOfMemory}!?u32 {
+    if (c.paths.getIndex(path)) |index| return @intCast(index); // safe: paths are counted in u32, as `files` holds them
+    if (!std.fs.path.isAbsolutePosix(path)) return null;
+    const resolved = try std.fs.path.resolveAllocPosix(c.gpa, &.{path});
+    defer c.gpa.free(resolved);
+    const index = c.paths.getIndex(relative(c.root, resolved)) orelse return null;
+    return @intCast(index); // safe: as above
 }
 
 /// The entry `offset` refers to, by index; null for none or one not kept.
@@ -198,7 +213,7 @@ fn fileStructName(name: []const u8) bool {
     return name.len != 0 and std.mem.findScalar(u8, name, '(') == null and std.mem.find(u8, name, "__struct_") == null;
 }
 
-fn build(c: *Compiled, root: []const u8) error{OutOfMemory}!void {
+fn build(c: *Compiled) error{OutOfMemory}!void {
     const gpa = c.gpa;
     const e = c.dwarf.entries.slice();
     const count = e.len;
@@ -214,7 +229,12 @@ fn build(c: *Compiled, root: []const u8) error{OutOfMemory}!void {
         const got = try per_unit.getOrPut(gpa, key);
         if (!got.found_existing) {
             got.value_ptr.* = none;
-            if (c.dwarf.path(unit, file)) |p| got.value_ptr.* = try c.intern(relative(root, p));
+            if (c.dwarf.path(unit, file)) |p| {
+                // A module's path may climb (`.zig-cache/bay/../../src`): named as resolved.
+                const resolved = try std.fs.path.resolveAllocPosix(gpa, &.{p});
+                defer gpa.free(resolved);
+                got.value_ptr.* = try c.intern(relative(c.root, resolved));
+            }
         }
         f.* = got.value_ptr.*;
     }
@@ -333,7 +353,10 @@ test "a sample's declarations, instances, locals, members and container declarat
     const d = try Dwarf.readBytesForTests(bytes);
     var c = try init(gpa, d, "/pkg");
     defer c.deinit();
-    const file = c.fileId("src/s.zig").?;
+    const file = (try c.fileId("src/s.zig")).?;
+    // An input named absolute, or climbing, is the same file under the root.
+    try std.testing.expectEqual(file, (try c.fileId("/pkg/src/s.zig")).?);
+    try std.testing.expectEqual(file, (try c.fileId("/pkg/x/../src/s.zig")).?);
     try std.testing.expect(c.compiled(.{ .file = file, .line = 5 }));
     try std.testing.expect(!c.compiled(.{ .file = file, .line = 6 }));
     const n = try c.localTypes(gpa, .{ .file = file, .line = 5 }, "n");
@@ -350,5 +373,6 @@ test "a sample's declarations, instances, locals, members and container declarat
     try std.testing.expectEqualStrings("first", c.dwarf.entries.items(.name)[c.declaration(list, "first").?]);
     const s = c.file_structs.get(file).?;
     try std.testing.expectEqualStrings("width", c.dwarf.entries.items(.name)[c.declaration(s, "width").?]);
-    try std.testing.expectEqual(@as(?u32, null), c.fileId("other.zig"));
+    try std.testing.expectEqual(@as(?u32, null), try c.fileId("other.zig"));
+    try std.testing.expectEqual(@as(?u32, null), try c.fileId("/elsewhere/src/s.zig"));
 }
