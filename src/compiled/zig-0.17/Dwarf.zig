@@ -52,6 +52,9 @@ pub const Kind = enum(u8) {
     base,
     subroutine,
     inlined,
+    /// A declaration whose value is another's: a type alias, a function or namespace alias,
+    /// an import (`const std = @import("std")`).
+    imported,
 
     fn of(tag: u64) ?Kind {
         return switch (tag) {
@@ -77,6 +80,7 @@ pub const Kind = enum(u8) {
             Tag.base_type => .base,
             Tag.subroutine_type => .subroutine,
             Tag.inlined_subroutine => .inlined,
+            Tag.imported_declaration => .imported,
             else => null,
         };
     }
@@ -849,7 +853,7 @@ const Builder = struct {
 /// block, is a `usize`, and a declaration `width` whose line is `List`'s plus 7; an instance
 /// `Box(u32)` (line 9) with a member `value` of type `usize` and a method `get` returning one;
 /// a tagged union `Shape` (line 11) whose variant part holds its tag and the fields `circle`
-/// and `square`.
+/// and `square`; and `alias`, a declaration of `s` whose value is another's.
 fn sample(gpa: std.mem.Allocator) ![]u8 {
     var abbrev: Builder = .{ .gpa = gpa };
     defer abbrev.deinit();
@@ -869,6 +873,7 @@ fn sample(gpa: std.mem.Allocator) ![]u8 {
         .{ Tag.union_type, true, &.{ .{ Attribute.name, Form.string }, .{ Attribute.ZIG_parent, Form.ref4 }, .{ Attribute.decl_line, Form.udata } } },
         .{ Tag.variant_part, true, &.{.{ Attribute.discr, Form.ref4 }} },
         .{ Tag.variant, true, &.{.{ Attribute.discr_value, Form.udata }} },
+        .{ Tag.imported_declaration, false, &.{ .{ Attribute.name, Form.string }, .{ Attribute.ZIG_parent, Form.ref4 } } },
     };
     for (abbrevs, 1..) |a, code| {
         try abbrev.u(code);
@@ -966,6 +971,10 @@ fn sample(gpa: std.mem.Allocator) ![]u8 {
     try info.int(u32, file_at);
     try info.int(u32, list_at);
     try info.s(7);
+    // An alias: Zig names the declaration and its container, its value another's.
+    try info.u(15);
+    try info.str("alias");
+    try info.int(u32, file_at);
     try info.u(0); // end of s
     try info.u(0); // end of unit
     info.patch32(0, @intCast(info.bytes.items.len - 4)); // safe: a test's few bytes

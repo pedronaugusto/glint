@@ -421,6 +421,8 @@ test "a sample's declarations, instances, locals, members and container declarat
     try std.testing.expectEqualStrings("usize", c.dwarf.entries.items(.name)[c.member(shape, "circle").?]);
     try std.testing.expectEqualStrings("usize", c.dwarf.entries.items(.name)[c.member(shape, "square").?]);
     try std.testing.expectEqual(@as(?u32, null), c.member(shape, "tag"));
+    // An alias is a declaration of its container, as any other.
+    try std.testing.expect(c.declaration(c.file_structs.get(file).?, "alias") != null);
     const s = c.file_structs.get(file).?;
     try std.testing.expectEqualStrings("width", c.dwarf.entries.items(.name)[c.declaration(s, "width").?]);
     try std.testing.expectEqual(@as(?u32, null), try c.fileId("other.zig"));
