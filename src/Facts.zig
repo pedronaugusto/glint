@@ -1413,9 +1413,9 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         .@"switch", .switch_comma, .@"if" => if (try self.branches(null, file, node)) |value| return value,
         .block, .block_semicolon, .block_two, .block_two_semicolon => {
             if (try self.breaks(null, file, node)) |value| return value;
-            // `{}`: void's one value, as a value of a primitive type is that type.
-            var buffer: [2]Ast.Node.Index = undefined;
-            if (tree.blockStatements(&buffer, node)) |statements| if (statements.len == 0) return .{ .primitive = "void" };
+            // A block with no label gives no value of its own: `void` (`{}` its one value), or
+            // `noreturn` where it never completes (a prong `{ c._exit(127); }`), left out by a peer.
+            if (!blockLabeled(tree, node)) return .{ .primitive = "void" };
         },
         .for_simple, .@"for", .while_simple, .while_cont, .@"while" => if (try self.loopValue(file, node)) |value| return value,
         .grouped_expression => return self.resolve(file, tree.nodeData(node).node_and_token[0]),
@@ -1431,7 +1431,7 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         .add, .add_wrap, .add_sat, .sub, .sub_wrap, .sub_sat => {
             const operands = tree.nodeData(node).node_and_node;
             const lhs = try self.resolve(file, operands[0]);
-            if (lhs == .scalar or lhs == .primitive) return .scalar;
+            if (numeric(lhs)) return .scalar;
             if (lhs == .unknown) return lhs;
             // Arithmetic on an array is a vector's (`@Vector` reads as an array of its lanes):
             // a vector of the same lanes.
@@ -1474,7 +1474,7 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
                 else => .{ .unknown = .unsupported },
             };
         },
-        .error_set_decl, .merge_error_sets => return .error_set,
+        .error_set_decl, .merge_error_sets, .error_value => return .error_set, // `error.Name`: a value of one
         .enum_literal => return self.declarationLiteral(file, node),
         .number_literal, .string_literal, .multiline_string_literal, .char_literal => return .scalar,
         else => {},
@@ -1792,7 +1792,8 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
     if (std.mem.eql(u8, name, "@Int")) return self.intType(env, file, args);
     // An enum type built from names and values: it holds no value but its tag.
     if (std.mem.eql(u8, name, "@Enum")) return .{ .primitive = "@Enum" };
-    if (std.mem.eql(u8, name, "@FieldType") and args.len == 2) return self.fieldType(try self.resolveIn(env, file, args[0]), try self.nameIn(env, file, args[1], 0));
+    // A field a computation names (`@FieldType(Io.VTable, name)`) is computed as it compiles.
+    if (std.mem.eql(u8, name, "@FieldType") and args.len == 2) return comptimeComputed(try self.fieldType(try self.resolveIn(env, file, args[0]), try self.nameIn(env, file, args[1], 0)));
     if (std.mem.eql(u8, name, "@TypeOf") and args.len == 1) return self.map(try self.resolveIn(env, file, args[0]), {}, typeOf);
     // `@call(modifier, f, args)`: what calling `f` gives, as its result type reads.
     if (std.mem.eql(u8, name, "@call") and args.len == 3) {
@@ -4892,9 +4893,33 @@ fn payload(self: *Facts, value: Value, wrapper: std.meta.Tag(Value)) ResolveErro
     };
 }
 
+/// What glint does not read of a type a computation gives (`unsupported`) is the computation's,
+/// which evaluating the code decides: `comptime_dependent`.
+fn comptimeComputed(value: Value) Value {
+    return if (value == .unknown and value.unknown == .unsupported) .{ .unknown = .comptime_dependent } else value;
+}
+
+/// Whether a value is a number: a scalar, a value of a primitive type, or a choice of them
+/// (`if (c) cipher.nonceLength() else 0`).
+fn numeric(value: Value) bool {
+    if (value == .alternatives) {
+        for (value.alternatives) |part| if (!numeric(part)) return false;
+        return true;
+    }
+    return value == .scalar or value == .primitive;
+}
+
+/// Whether a block is written with a label (`blk: { ... }`).
+fn blockLabeled(tree: *const Ast, block: Ast.Node.Index) bool {
+    const brace = tree.nodeMainToken(block);
+    return brace >= 2 and tree.tokenTag(brace - 1) == .colon and tree.tokenTag(brace - 2) == .identifier;
+}
+
 fn pointee(self: *Facts, value: Value, _: void) ResolveError!Value {
     return switch (value) {
         .pointer => |inner| inner.child.*,
+        // A string literal's bytes (`"chroncdx".*`): plain bytes, as its slice and element are.
+        .scalar => .scalar,
         .alternatives => self.map(value, {}, pointee),
         .unknown => value,
         else => .{ .unknown = .unsupported },
@@ -5494,6 +5519,9 @@ fn switchPayload(self: *Facts, env: ?*const Env, file: Project.FileId, case_node
         .unknown => return subject,
         // A number, a boolean or an error: the capture is the subject's value.
         .scalar, .primitive, .error_set => return subject,
+        // A value of a type `@Union` builds: whichever field the prong takes holds one of the
+        // types its list gives, as a member of it does (`memberValue`).
+        .reified => |built| return if (built.value) self.instance(built.fields.*) else .{ .unknown = .unsupported },
         // A subject a build picks (`impl: Impl`, a union per system): the prong's capture of
         // each, one of them.
         .alternatives => |parts| {
@@ -6003,7 +6031,7 @@ pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
                 // Types live only as the program compiles: values its stores do not show (a
                 // list grown by itself in a loop, `types = types ++ .{L}`) are what evaluating
                 // the code computes, which glint does not run.
-                const given = (try self.givenValues(decl)) orelse return .{ .unknown = if (declared_types) .comptime_dependent else .unresolved };
+                const given = (try self.givenValues(decl)) orelse return .{ .unknown = .comptime_dependent };
                 return self.choose(given);
             }
             if (!callable(initial)) return initial;
@@ -7750,6 +7778,12 @@ fn reflectedMember(self: *Facts, r: Reflected, name: []const u8) ResolveError!Va
                 if (kept.items.len == 0) return .{ .unknown = .absent };
                 return self.choose(kept.items);
             }
+            // A tuple literal's type (`@TypeOf(.{ file })`, an `anytype` binding's): its parts'.
+            if (r.of.* == .literal and r.at == .structure and std.mem.eql(u8, name, "field_types")) {
+                const parts = try self.literalParts(r.of.literal);
+                if (parts.len == 0) return .{ .unknown = .absent };
+                return try self.pointerTo(try self.map(try self.choose(parts), {}, typeOf), .slice);
+            }
             const container = self.reflectedContainer(r) orelse return if (r.of.* == .unknown) r.of.* else unsupported;
             if (std.mem.eql(u8, name, "field_types") and r.at != .enumeration) {
                 const types = try self.fieldTypes(container);
@@ -9011,7 +9045,9 @@ fn boundByCallers(self: *Facts, parameter: Decl, position: usize) ResolveError!V
         // A binding made through the function itself (`formOf(@typeInfo(T).optional.child)`
         // in `formOf`), or one past the budget: the calls' bindings are not all read, so the
         // parameter is what it is without them, a generic position each binding decides.
-        if ((value == .unknown and value.unknown == .budget) or throughItself(value)) return .{ .unknown = .generic };
+        // So is a binding glint does not read (a tuple a VTable's dispatch builds for `args:
+        // anytype`): each binding decides what the parameter is.
+        if (value == .unknown or throughItself(value)) return .{ .unknown = .generic };
         try values.append(self.gpa, value);
     }
     // No call the build compiles binds it: whatever binding is made decides.

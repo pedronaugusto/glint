@@ -217,6 +217,9 @@ pub fn sitesLeaving(self: *Context, governed: []const Governed, out: *std.ArrayL
                 // method of its own: the binding reaches one only through an alias its type
                 // declares, which is that alias's site.
                 if (why == .generic and tag == .field_access and methodCall(self, node) and free(self, governed, spelled)) continue;
+                // An enum or decl literal whose place glint does not read (`@prefetch`'s
+                // `.{ .rw = .write }`) spells nothing under a ban (docs/design.md).
+                if (tag == .enum_literal) continue;
                 try unread.append(self.allocator, .{ .node = node, .why = why });
                 continue;
             },
@@ -320,18 +323,25 @@ fn isField(self: *Context, g: Governed) bool {
 /// Whether the call at `node` is to one of std's declarations named below (`readers`,
 /// `makers`) and names a governed type or value among its arguments as written (a value of one
 /// of `types`, or a pointer to one, through optionals and error unions; a tuple or struct
-/// written in place there, `.{ secret }`, by its elements). Any other std call is none: an
-/// allocator's `free`, a list's `append`, `ArrayList(T)`. Nothing in the callee's body is read.
-/// The callee is given; unknown where such a call is handed an argument whose type is unknown.
+/// written in place there, `.{ secret }`, by its elements). A row that takes the type it reads
+/// first (`mem.eql(u8, a, b)`, `mem.zeroes(T)`) is decided by that type alone: its other
+/// arguments are values or bytes of it. A print row reads a literal format's placeholders: an
+/// argument of the tuple after it printed only by `{f}` (its type's own `format`) or `{*}` (its
+/// address) is read by none of std's code (main, 2026-11-23). Any other std call is none: an allocator's `free`, a
+/// list's `append`, `ArrayList(T)`. Nothing in the callee's body is read. The callee is given;
+/// unknown where such a call is handed an argument whose type is unknown.
 pub const Reflected = union(enum) { no, yes: Facts.Decl, unknown: Facts.Unknown };
 pub fn namedStd(self: *Context, node: Ast.Node.Index, types: []const Facts.Container) Context.Error!Reflected {
     if (types.len == 0) return .no;
     const tree = &self.project.at(self.file).file.tree;
     var call_buffer: [1]Ast.Node.Index = undefined;
     const full = tree.fullCall(&call_buffer, node) orelse return .no;
-    var governed = false;
-    var unknown: ?Facts.Unknown = null;
-    for (full.ast.params) |arg| {
+    // What every argument names, what the first does, and what a print reads past `{f}`.
+    var all: Seen = .{};
+    var first: Seen = .{};
+    var printed: Seen = .{};
+    const format = try Format.of(self, tree, full.ast.params);
+    for (full.ast.params, 0..) |arg, at| {
         var buffer: [2]Ast.Node.Index = undefined;
         const written = Facts.ungrouped(tree, arg);
         const one = [_]Ast.Node.Index{arg};
@@ -341,13 +351,17 @@ pub fn namedStd(self: *Context, node: Ast.Node.Index, types: []const Facts.Conta
             (if (literal.ast.type_expr == .none) literal.ast.elements else &one)
         else
             &one;
-        for (parts) |part| {
+        const tuple = parts.ptr != &one and tree.fullStructInit(&buffer, written) == null;
+        for (parts, 0..) |part, element| {
             const value = try self.facts.resolve(self.file, part);
-            if (madeType(value, types) != null) governed = true;
-            if (unknownIn(value)) |why| unknown = why;
+            const seen: Seen = .{ .governed = madeType(value, types) != null, .unknown = unknownIn(value) };
+            all.join(seen);
+            if (at == 0) first.join(seen);
+            const own = if (format) |f| tuple and at == f.args and f.ownFormat(element) else false;
+            if (!own) printed.join(seen);
         }
     }
-    if (!governed and unknown == null) return .no;
+    if (!all.governed and all.unknown == null) return .no;
     const call = (try Facts.calls.at(self.facts, self.file, node)) orelse return .no;
     const callee = switch (call.callee) {
         .function => |function| function,
@@ -355,59 +369,134 @@ pub fn namedStd(self: *Context, node: Ast.Node.Index, types: []const Facts.Conta
         .any => return .no,
     };
     for ([_][]const Named{ &readers, &makers }) |table| for (table) |entry| switch (try mayCallStd(self, node, entry[0])) {
-        .yes => return if (governed) .{ .yes = callee } else .{ .unknown = unknown.? },
+        .yes => {
+            const seen = switch (entry[1]) {
+                .type => first,
+                .values => all,
+                .print => printed,
+            };
+            if (seen.governed) return .{ .yes = callee };
+            return if (seen.unknown) |why| .{ .unknown = why } else .no;
+        },
         .no => {},
         .unknown => |why| return .{ .unknown = why },
     };
     return .no;
 }
 
-/// A std declaration by its path under `std`, and why A001 names it.
-const Named = struct { []const u8, []const u8 };
+/// A std declaration by its path under `std`, what of its arguments it reads (`.type`: the type
+/// named first, the others its values or bytes; `.values`: every argument), and why A001 names
+/// it.
+const Named = struct { []const u8, enum { values, type, print }, []const u8 };
+
+/// A print's literal format string: the placeholders it writes, each with the argument it
+/// prints (null where named, `{[name]}`) and its specifier.
+const Format = struct {
+    /// Which parameter is the tuple of arguments: the one after the format.
+    args: usize,
+    placeholders: []const Placeholder,
+    const Placeholder = struct { argument: ?usize, specifier: []const u8 };
+
+    /// The first parameter written as a string literal, read as a format; null where none is.
+    fn of(self: *Context, tree: *const Ast, params: []const Ast.Node.Index) Context.Error!?Format {
+        const at = for (params, 0..) |param, i| {
+            if (tree.nodeTag(Facts.ungrouped(tree, param)) == .string_literal) break i;
+        } else return null;
+        const text = std.zig.string_literal.parseAlloc(self.allocator, tree.tokenSlice(tree.nodeMainToken(Facts.ungrouped(tree, params[at])))) catch return null;
+        var placeholders: std.ArrayList(Placeholder) = .empty;
+        var next: usize = 0;
+        var i: usize = 0;
+        while (i < text.len) : (i += 1) {
+            if (text[i] != '{') continue;
+            if (i + 1 < text.len and text[i + 1] == '{') {
+                i += 1;
+                continue;
+            }
+            const close = std.mem.findScalarPos(u8, text, i, '}') orelse return null;
+            const head = text[i + 1 .. std.mem.findScalarPos(u8, text[0..close], i, ':') orelse close];
+            i = close;
+            var digits: usize = 0;
+            while (digits < head.len and std.ascii.isDigit(head[digits])) digits += 1;
+            if (head.len != 0 and head[0] == '[') {
+                try placeholders.append(self.allocator, .{ .argument = null, .specifier = "" });
+            } else if (digits != 0) {
+                const argument = std.fmt.parseInt(usize, head[0..digits], 10) catch return null;
+                try placeholders.append(self.allocator, .{ .argument = argument, .specifier = head[digits..] });
+            } else {
+                try placeholders.append(self.allocator, .{ .argument = next, .specifier = head });
+                next += 1;
+            }
+        }
+        return .{ .args = at + 1, .placeholders = placeholders.items };
+    }
+
+    /// Whether the tuple's argument `element` is printed, and only by `{f}` or `{*}`. A named
+    /// placeholder leaves no argument known.
+    fn ownFormat(format: Format, element: usize) bool {
+        var printed = false;
+        for (format.placeholders) |placeholder| {
+            const argument = placeholder.argument orelse return false;
+            if (argument != element) continue;
+            if (!std.mem.eql(u8, placeholder.specifier, "f") and !std.mem.eql(u8, placeholder.specifier, "*")) return false;
+            printed = true;
+        }
+        return printed;
+    }
+};
+
+/// Whether arguments name a governed value or type, or one whose type is unknown.
+const Seen = struct {
+    governed: bool = false,
+    unknown: ?Facts.Unknown = null,
+    fn join(seen: *Seen, other: Seen) void {
+        seen.governed = seen.governed or other.governed;
+        if (other.unknown) |why| seen.unknown = why;
+    }
+};
 
 /// std's declarations that read a value's fields or bytes (main, 2026-11-23): a governed value
 /// given to one is a finding.
 const readers = [_]Named{
-    .{ "fmt.allocPrint", "formats each argument by its type's fields" },
-    .{ "fmt.allocPrintSentinel", "formats each argument by its type's fields" },
-    .{ "fmt.bufPrint", "formats each argument by its type's fields" },
-    .{ "fmt.bufPrintSentinel", "formats each argument by its type's fields" },
-    .{ "fmt.count", "formats each argument by its type's fields" },
-    .{ "fmt.comptimePrint", "formats each argument by its type's fields" },
-    .{ "debug.print", "formats each argument by its type's fields" },
-    .{ "Io.Writer.print", "formats each argument by its type's fields" },
-    .{ "json.Stringify.value", "writes the value field by field" },
-    .{ "json.Stringify.valueAlloc", "writes the value field by field" },
-    .{ "json.Stringify.write", "writes the value field by field" },
-    .{ "zon.stringify.serialize", "writes the value field by field" },
-    .{ "zon.stringify.serializeMaxDepth", "writes the value field by field" },
-    .{ "zon.stringify.serializeArbitraryDepth", "writes the value field by field" },
-    .{ "zon.Serializer.value", "writes the value field by field" },
-    .{ "hash.autoHash", "hashes the value's fields" },
-    .{ "hash.autoHashStrat", "hashes the value's fields" },
-    .{ "testing.expectEqual", "compares the values field by field" },
-    .{ "testing.expectEqualDeep", "compares the values field by field" },
-    .{ "mem.eql", "compares the values' bytes" },
-    .{ "mem.asBytes", "the value's own bytes" },
-    .{ "mem.sliceAsBytes", "the values' own bytes" },
-    .{ "mem.toBytes", "the value's own bytes" },
-    .{ "meta.eql", "compares the values field by field" },
+    .{ "fmt.allocPrint", .print, "formats each argument by its type's fields" },
+    .{ "fmt.allocPrintSentinel", .print, "formats each argument by its type's fields" },
+    .{ "fmt.bufPrint", .print, "formats each argument by its type's fields" },
+    .{ "fmt.bufPrintSentinel", .print, "formats each argument by its type's fields" },
+    .{ "fmt.count", .print, "formats each argument by its type's fields" },
+    .{ "fmt.comptimePrint", .print, "formats each argument by its type's fields" },
+    .{ "debug.print", .print, "formats each argument by its type's fields" },
+    .{ "Io.Writer.print", .print, "formats each argument by its type's fields" },
+    .{ "json.Stringify.value", .values, "writes the value field by field" },
+    .{ "json.Stringify.valueAlloc", .values, "writes the value field by field" },
+    .{ "json.Stringify.write", .values, "writes the value field by field" },
+    .{ "zon.stringify.serialize", .values, "writes the value field by field" },
+    .{ "zon.stringify.serializeMaxDepth", .values, "writes the value field by field" },
+    .{ "zon.stringify.serializeArbitraryDepth", .values, "writes the value field by field" },
+    .{ "zon.Serializer.value", .values, "writes the value field by field" },
+    .{ "hash.autoHash", .values, "hashes the value's fields" },
+    .{ "hash.autoHashStrat", .values, "hashes the value's fields" },
+    .{ "testing.expectEqual", .values, "compares the values field by field" },
+    .{ "testing.expectEqualDeep", .values, "compares the values field by field" },
+    .{ "mem.eql", .type, "compares two slices of the type named first, element by element" },
+    .{ "mem.asBytes", .values, "the value's own bytes" },
+    .{ "mem.sliceAsBytes", .values, "the values' own bytes" },
+    .{ "mem.toBytes", .values, "the value's own bytes" },
+    .{ "meta.eql", .values, "compares the values field by field" },
 };
 
 /// std's declarations that forge or reflect a value from the type they are named (main,
 /// 2026-11-23): a governed type, or a value of it, among their arguments is a finding.
 const makers = [_]Named{
-    .{ "mem.zeroes", "a value of zeroed bytes, made by none of the type's code" },
-    .{ "mem.zeroInit", "a value built field by field from a literal" },
-    .{ "mem.bytesToValue", "a value copied out of bytes" },
-    .{ "mem.bytesAsValue", "bytes read in place as a value" },
-    .{ "mem.bytesAsSlice", "bytes read in place as values" },
-    .{ "meta.fields", "the type's fields by reflection" },
-    .{ "meta.fieldInfo", "one field's information by reflection" },
-    .{ "meta.FieldEnum", "an enum of the field names" },
-    .{ "meta.fieldNames", "the field names" },
-    .{ "meta.tags", "the tags by reflection" },
-    .{ "meta.Tag", "the tag type by reflection" },
+    .{ "mem.zeroes", .type, "a value of zeroed bytes, made by none of the type's code" },
+    .{ "mem.zeroInit", .type, "a value built field by field from a literal" },
+    .{ "mem.bytesToValue", .type, "a value copied out of bytes" },
+    .{ "mem.bytesAsValue", .type, "bytes read in place as a value" },
+    .{ "mem.bytesAsSlice", .type, "bytes read in place as values" },
+    .{ "meta.fields", .type, "the type's fields by reflection" },
+    .{ "meta.fieldInfo", .type, "one field's information by reflection" },
+    .{ "meta.FieldEnum", .type, "an enum of the field names" },
+    .{ "meta.fieldNames", .type, "the field names" },
+    .{ "meta.tags", .type, "the tags by reflection" },
+    .{ "meta.Tag", .type, "the tag type by reflection" },
 };
 
 /// The one of `types` a value is, or points at, through optionals and error unions; of a

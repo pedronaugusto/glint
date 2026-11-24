@@ -9,8 +9,5 @@
     "aarch64-windows-gnu",
     "x86_64-macos",
     "aarch64-macos"
-  ],
-  "shards": {
-    "riscv64": 3
-  }
+  ]
 }
