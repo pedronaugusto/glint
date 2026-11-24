@@ -191,6 +191,7 @@ fn readSections(gpa: std.mem.Allocator, io: std.Io, file: std.Io.File) Error!Sec
     const names = try readSection(gpa, io, file, length, table, shentsize, shstrndx);
     defer gpa.free(names);
     var found: [5]?[]u8 = .{ null, null, null, null, null };
+    var found_at: [5]u16 = undefined;
     errdefer for (found) |bytes| if (bytes) |b| gpa.free(b);
     const wanted = [5][]const u8{ ".debug_info", ".debug_abbrev", ".debug_str", ".debug_line", ".debug_line_str" };
     for (0..shnum) |index| {
@@ -198,16 +199,99 @@ fn readSections(gpa: std.mem.Allocator, io: std.Io, file: std.Io.File) Error!Sec
         const name_offset = std.mem.readInt(u32, entry[0..4], .little);
         if (name_offset >= names.len) return error.InvalidDebugInfo;
         const name = std.mem.sliceTo(names[name_offset..], 0);
-        for (wanted, &found) |want, *slot| {
+        for (wanted, &found, &found_at) |want, *slot, *slot_at| {
             if (!std.mem.eql(u8, name, want)) continue;
             if (slot.* != null) return error.InvalidDebugInfo;
             slot.* = try readSection(gpa, io, file, length, table, shentsize, @intCast(index)); // safe: below shnum, a u16
+            slot_at.* = @intCast(index); // safe: below shnum, a u16
+        }
+    }
+    // A relocatable object (`build-obj`) leaves the offsets its DWARF names between sections (a
+    // unit's line program, a string) to its relocations: the bytes hold zero, as Zig's
+    // self-hosted backend writes them. A linked binary has none to apply.
+    for (0..shnum) |index| {
+        const entry = table[index * shentsize ..][0..64];
+        if (std.mem.readInt(u32, entry[4..8], .little) != section_rela) continue;
+        const target = std.mem.readInt(u32, entry[44..48], .little);
+        const symbols = std.mem.readInt(u32, entry[40..44], .little);
+        for ([_]usize{ 0, 3 }) |slot| {
+            const bytes = found[slot] orelse continue;
+            if (target != found_at[slot]) continue;
+            if (symbols >= shnum) return error.InvalidDebugInfo;
+            const rela = try readSection(gpa, io, file, length, table, shentsize, @intCast(index)); // safe: below shnum, a u16
+            defer gpa.free(rela);
+            const symtab = try readSection(gpa, io, file, length, table, shentsize, @intCast(symbols)); // safe: below shnum, checked above
+            defer gpa.free(symtab);
+            try relocate(bytes, rela, symtab);
         }
     }
     const info = found[0] orelse return error.MissingSection;
     const abbrev = found[1] orelse return error.MissingSection;
     const line = found[3] orelse return error.MissingSection;
     return .{ .info = info, .abbrev = abbrev, .str = found[2] orelse try gpa.alloc(u8, 0), .line = line, .line_str = found[4] orelse try gpa.alloc(u8, 0) };
+}
+
+const section_rela = 4;
+const rela_size = 24;
+const symbol_size = 24;
+const r_x86_64_64 = 1;
+const r_x86_64_32 = 10;
+const r_x86_64_32s = 11;
+
+/// Applies `rela`'s relocations to `bytes`, each the symbol's value (in `symtab`) plus its
+/// addend, written at its offset: x86_64's absolute 64-bit, 32-bit and signed 32-bit ones, the
+/// kinds the DWARF's offsets and addresses take. Another kind relocates nothing this reads (a
+/// location expression's code address) and is left. A relocation out of `bytes`, of a symbol
+/// `symtab` lacks, or whose value does not fit its width refuses the file.
+fn relocate(bytes: []u8, rela: []const u8, symtab: []const u8) Error!void {
+    if (rela.len % rela_size != 0 or symtab.len % symbol_size != 0) return error.InvalidDebugInfo;
+    var next: usize = 0;
+    while (next < rela.len) : (next += rela_size) {
+        const offset = std.mem.readInt(u64, rela[next..][0..8], .little);
+        const info = std.mem.readInt(u64, rela[next + 8 ..][0..8], .little);
+        const addend = std.mem.readInt(i64, rela[next + 16 ..][0..8], .little);
+        const kind: u32 = @truncate(info); // safe: an ELF64 relocation's type is its info's low 32 bits
+        const width: usize = switch (kind) {
+            r_x86_64_64 => 8,
+            r_x86_64_32, r_x86_64_32s => 4,
+            else => continue,
+        };
+        const symbol = info >> 32;
+        if (symbol >= symtab.len / symbol_size) return error.InvalidDebugInfo;
+        if (offset > bytes.len or width > bytes.len - offset) return error.InvalidDebugInfo;
+        const value_at = @as(usize, @intCast(symbol)) * symbol_size + 8; // safe: below the table's length, checked above
+        const symbol_value = std.mem.readInt(u64, symtab[value_at..][0..8], .little);
+        const value = @as(i128, symbol_value) + addend;
+        const place = bytes[@intCast(offset)..][0..width]; // safe: within bytes, checked above
+        switch (kind) {
+            r_x86_64_64 => std.mem.writeInt(u64, place[0..8], std.math.cast(u64, value) orelse return error.InvalidDebugInfo, .little),
+            r_x86_64_32 => std.mem.writeInt(u32, place[0..4], std.math.cast(u32, value) orelse return error.InvalidDebugInfo, .little),
+            else => std.mem.writeInt(i32, place[0..4], std.math.cast(i32, value) orelse return error.InvalidDebugInfo, .little),
+        }
+    }
+}
+
+test "a relocatable object's offsets are its relocations' symbol values plus addends" {
+    var bytes: [12]u8 = @splat(0);
+    // Symbol 1's value is 0x10: a section symbol's is 0, a function's its offset.
+    var symtab: [2 * symbol_size]u8 = @splat(0);
+    std.mem.writeInt(u64, symtab[symbol_size + 8 ..][0..8], 0x10, .little);
+    var rela: [2 * rela_size]u8 = @splat(0);
+    // A 32-bit offset at 0 to symbol 0 plus 0x31 (a line string), a 64-bit address at 4 to symbol 1 plus 2.
+    std.mem.writeInt(u64, rela[8..16], r_x86_64_32, .little);
+    std.mem.writeInt(i64, rela[16..24], 0x31, .little);
+    std.mem.writeInt(u64, rela[rela_size..][0..8], 4, .little);
+    std.mem.writeInt(u64, rela[rela_size + 8 ..][0..8], (1 << 32) | r_x86_64_64, .little);
+    std.mem.writeInt(i64, rela[rela_size + 16 ..][0..8], 2, .little);
+    try relocate(&bytes, &rela, &symtab);
+    try std.testing.expectEqual(@as(u32, 0x31), std.mem.readInt(u32, bytes[0..4], .little));
+    try std.testing.expectEqual(@as(u64, 0x12), std.mem.readInt(u64, bytes[4..12], .little));
+    // One past the bytes, or of a symbol the table lacks, refuses the file.
+    std.mem.writeInt(u64, rela[0..8], 9, .little);
+    try std.testing.expectError(error.InvalidDebugInfo, relocate(&bytes, &rela, &symtab));
+    std.mem.writeInt(u64, rela[0..8], 0, .little);
+    std.mem.writeInt(u64, rela[8..16], (2 << 32) | r_x86_64_32, .little);
+    try std.testing.expectError(error.InvalidDebugInfo, relocate(&bytes, &rela, &symtab));
 }
 
 fn readSection(gpa: std.mem.Allocator, io: std.Io, file: std.Io.File, length: u64, table: []const u8, shentsize: u16, index: u16) Error![]u8 {

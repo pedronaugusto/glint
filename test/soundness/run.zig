@@ -377,17 +377,33 @@ fn compiled(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, tools: Too
 fn compile(a: std.mem.Allocator, io: std.Io, tools: Tools, kind: []const u8, files: []const CaseFile) !std.process.RunResult {
     const scratch = try scratchDir(a, io, tools, std.Io.Dir.path.stem(kind));
     defer std.Io.Dir.cwd().deleteTree(io, scratch) catch {}; // The scratch is the run's own; one left behind is litter, not a verdict.
-    return program(a, io, tools, scratch, std.Io.Dir.path.stem(kind), &.{ "-fno-emit-bin", "-target", "aarch64-macos", "-lc" }, files);
+    return program(a, io, tools, scratch, std.Io.Dir.path.stem(kind), &.{ "-fno-emit-bin", "-target", "aarch64-macos", "-lc" }, files, .declarations);
 }
 
 /// `files` compiled as one program in `scratch` with `target`'s arguments (the target, what is
 /// emitted): each file its own module with aegis and its case's stubs and module, under a root
-/// whose comptime blocks reference each file's public declarations. The arguments go in a
-/// response file, as they are many.
-fn program(a: std.mem.Allocator, io: std.Io, tools: Tools, scratch: []const u8, name: []const u8, target: []const []const u8, files: []const CaseFile) !std.process.RunResult {
+/// whose comptime blocks reference each file's public declarations, and with `.members` the
+/// public declarations of the containers they are, a few deep: a public type's methods are
+/// compiled so, as a program calling them compiles them, where a reference to the type alone
+/// compiles none of them (a compiled run reads a site only in code the compiler holds). The
+/// arguments go in a response file, as they are many.
+fn program(a: std.mem.Allocator, io: std.Io, tools: Tools, scratch: []const u8, name: []const u8, target: []const []const u8, files: []const CaseFile, reach: enum { declarations, members }) !std.process.RunResult {
     const cwd = std.Io.Dir.cwd();
     var root: std.Io.Writer.Allocating = .init(a);
     try root.writer.writeAll("const std = @import(\"std\");\n");
+    if (reach == .members) try root.writer.writeAll(
+        \\fn reach(comptime T: type, comptime depth: u8) void {
+        \\    inline for (comptime std.meta.declarations(T)) |name| {
+        \\        if (@TypeOf(@field(T, name)) != type) {
+        \\            _ = &@field(T, name);
+        \\        } else if (depth > 0) switch (@typeInfo(@field(T, name))) {
+        \\            .@"struct", .@"union", .@"enum", .@"opaque" => reach(@field(T, name), depth - 1),
+        \\            else => {},
+        \\        };
+        \\    }
+        \\}
+        \\
+    );
     var arguments: std.ArrayList([]const u8) = .empty;
     try arguments.appendSlice(a, target);
     try arguments.appendSlice(a, &.{ "--name", try std.fmt.allocPrint(a, "soundness-{s}", .{name}), "--zig-lib-dir", tools.lib, "--cache-dir", tools.cache });
@@ -404,7 +420,10 @@ fn program(a: std.mem.Allocator, io: std.Io, tools: Tools, scratch: []const u8, 
         }
         // Each file's references in a comptime block of its own, with the quota a file of many
         // declarations takes.
-        try root.writer.print("comptime {{\n    @setEvalBranchQuota(100_000);\n    for (std.meta.declarations(@import(\"case{d}\"))) |name| _ = &@field(@import(\"case{d}\"), name);\n}}\n", .{ index, index });
+        switch (reach) {
+            .declarations => try root.writer.print("comptime {{\n    @setEvalBranchQuota(100_000);\n    for (std.meta.declarations(@import(\"case{d}\"))) |name| _ = &@field(@import(\"case{d}\"), name);\n}}\n", .{ index, index }),
+            .members => try root.writer.print("comptime {{\n    @setEvalBranchQuota(1_000_000);\n    reach(@import(\"case{d}\"), 3);\n}}\n", .{index}),
+        }
         try arguments.appendSlice(a, &.{ "--dep", "aegis", try std.fmt.allocPrint(a, "-Mcase{d}={s}", .{ index, file.absolute }) });
     }
     for (stubs.items, 0..) |stub, index| try arguments.appendSlice(a, &.{ "--dep", "aegis", try std.fmt.allocPrint(a, "-Mstub{d}={s}", .{ index, stub }) });
@@ -614,7 +633,7 @@ fn compiledCase(a: std.mem.Allocator, io: std.Io, tools: Tools, scratch: []const
     const target = [_][]const u8{ "-target", "x86_64-linux", "-fno-llvm", "-fno-lld", "-lc", try std.fmt.allocPrint(a, "-femit-bin={s}", .{object}) };
     const sub = try std.Io.Dir.path.join(a, &.{ scratch, stem });
     try std.Io.Dir.cwd().createDirPath(io, sub);
-    const result = try program(a, io, tools, sub, stem, &target, &.{.{ .name = case, .absolute = absolute }});
+    const result = try program(a, io, tools, sub, stem, &target, &.{.{ .name = case, .absolute = absolute }}, .members);
     const failed = switch (result.term) {
         .exited => |code| code != 0,
         else => true,

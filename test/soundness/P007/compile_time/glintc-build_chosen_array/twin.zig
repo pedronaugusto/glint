@@ -2,7 +2,7 @@
 // slice is compiled only where it is the array, and its element's fields are read (aegis's
 // Order, review b9).
 const builtin = @import("builtin");
-const diagnostics = builtin.mode == .Debug;
+const diagnostics = builtin.mode == .debug;
 const Held = struct { owner: *const anyopaque, rank: usize };
 pub const Context = struct {
     stack: if (diagnostics) [32]Held else void = if (diagnostics) undefined else {},
