@@ -78,6 +78,87 @@ pub fn local(gpa: std.mem.Allocator, project: *const Project, compiled: []const 
     return .{ .types = types.items };
 }
 
+/// Whether the compiled roots analyzed a declaration of a container: Zig emits an entry for
+/// every container declaration it analyzed, whatever its kind (a `constant` or `variable`, an
+/// `imported_declaration` for an alias or import, a structure, union or enumeration, a
+/// `subprogram`, even for a type function or one called only at compile time), under its
+/// container (`ZIG_parent`), and none for one it never analyzed.
+pub const Reach = enum { held, not_reached };
+
+/// Whether the compiled roots analyzed the container declaration `index` of `file`: held where
+/// one emits it; not reached where none does (none holding the file is none emitting it, as for
+/// `local`). Null where no root is given, where the declaration is no container's, or where a
+/// root's entry for its container is not found: a container inside a function (each instance
+/// has its own) or one whose own declaration is emitted but whose entry is not read.
+pub fn declared(project: *const Project, compiled: []const *const Compiled, file: Project.FileId, index: Model.Declaration.Id) error{OutOfMemory}!?Reach {
+    if (compiled.len == 0) return null;
+    const source = project.at(file);
+    const model = &source.model;
+    const tree = &source.file.tree;
+    const record = model.declarations[@backingInt(index)];
+    if (record.kind != .variable and record.kind != .function) return null;
+    switch (model.scopes[@backingInt(record.scope)].kind) {
+        .file, .container => {},
+        else => return null,
+    }
+    var unknown = false;
+    for (compiled) |c| {
+        const compiled_file = (try c.fileId(source.input.name)) orelse continue;
+        const reach = reachIn(c, model, tree, compiled_file, record.scope, record.name, 0) orelse {
+            unknown = true;
+            continue;
+        };
+        if (reach == .held) return .held;
+    }
+    if (unknown) return null;
+    return .not_reached;
+}
+
+/// Whether root `c` emits the declaration `name` of container `scope`. A container with no
+/// entry of its own is not compiled where its own declaration is not.
+fn reachIn(c: *const Compiled, model: *const Model, tree: *const Ast, file: u32, scope: Model.Scope.Id, name: []const u8, depth: u8) ?Reach {
+    if (depth > 32) return null;
+    if (containerEntry(c, model, tree, file, scope)) |container| return if (c.declaration(container, name) != null) .held else .not_reached;
+    const outer = containerDeclaration(model, scope) orelse return null;
+    const record = model.declarations[@backingInt(outer)];
+    return switch (reachIn(c, model, tree, file, record.scope, record.name, depth + 1) orelse return null) {
+        .held => null,
+        .not_reached => .not_reached,
+    };
+}
+
+/// Root `c`'s entry for container `scope`: the file's own structure, or the container declared
+/// on its line. Null for a container inside a function, whose every instance has an entry of
+/// its own, and where none is found.
+fn containerEntry(c: *const Compiled, model: *const Model, tree: *const Ast, file: u32, scope: Model.Scope.Id) ?u32 {
+    const s = model.scopes[@backingInt(scope)];
+    if (s.kind == .file) return c.file_structs.get(file);
+    if (s.kind != .container) return null;
+    var at = s.parent;
+    while (at) |id| : (at = model.scopes[@backingInt(id)].parent) {
+        switch (model.scopes[@backingInt(id)].kind) {
+            .file, .container => {},
+            else => return null,
+        }
+    }
+    return c.containers.get(.{ .file = file, .line = lineOf(tree, s.first) });
+}
+
+/// The declaration whose value is the container `scope` (`const Inner = struct { ... }`), in
+/// the scope around it; null for any other container.
+fn containerDeclaration(model: *const Model, scope: Model.Scope.Id) ?Model.Declaration.Id {
+    const s = model.scopes[@backingInt(scope)];
+    if (s.kind != .container) return null;
+    const outer = s.parent orelse return null;
+    const holder = model.parentOf(s.node) orelse return null;
+    var names = model.scopes[@backingInt(outer)].names.valueIterator();
+    while (names.next()) |id| {
+        const record = model.declarations[@backingInt(id.*)];
+        if (record.kind == .variable and record.node == holder) return id.*;
+    }
+    return null;
+}
+
 fn same(a: Type, b: Type) bool {
     return switch (a) {
         .primitive => |name| b == .primitive and std.mem.eql(u8, name, b.primitive),
@@ -181,4 +262,59 @@ fn containerOf(project: *const Project, c: *const Compiled, ty: u32) ?Type {
 fn projectFile(project: *const Project, path: []const u8) ?Project.FileId {
     for (project.sources) |*source| if (std.mem.eql(u8, source.input.name, path)) return source.id;
     return null;
+}
+
+test "a container declaration no compiled root emits is not reached; one it emits is held" {
+    const gpa = std.testing.allocator;
+    const bytes = try Compiled.Dwarf.sampleForTests(gpa);
+    defer gpa.free(bytes);
+    var c = try Compiled.init(gpa, try Compiled.Dwarf.readBytesForTests(bytes), "/pkg");
+    defer c.deinit();
+    // Lines as the sample declares them: List at 3, its method first at 5, Box(u32) at 9, width
+    // at 10, Shape at 11; Gone, at 12, has no entry.
+    const source =
+        \\// s
+        \\const std = @import("std");
+        \\pub const List = struct {
+        \\    len: usize,
+        \\    pub fn first(n: usize) usize { return n; }
+        \\    pub fn second() void {}
+        \\};
+        \\pub const unused: u32 = 1;
+        \\fn Make(comptime T: type) type { return struct { pub const inside: T = 0; }; }
+        \\pub const width: u32 = 7;
+        \\pub const Shape = union(enum) { circle: usize, square: usize };
+        \\pub const Gone = struct { pub const deep: u8 = 0; };
+        \\pub const alias = List;
+        \\
+    ;
+    var project = try Project.init(gpa, &.{.{ .name = "src/s.zig", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    const file = try project.fileAt(0);
+    const model = &project.at(file).model;
+    const roots: []const *const Compiled = &.{&c};
+    const Case = struct { []const u8, ?Reach };
+    for ([_]Case{
+        .{ "width", .held },
+        .{ "alias", .held },
+        .{ "first", .held },
+        .{ "second", .not_reached },
+        .{ "unused", .not_reached },
+        .{ "std", .not_reached },
+        // A container no root emits: what it declares is not reached either.
+        .{ "deep", .not_reached },
+        // A container a function returns: each instance has its own entry.
+        .{ "inside", null },
+        // A function's parameter is no container's declaration.
+        .{ "n", null },
+    }) |case| {
+        const index = for (model.declarations, 0..) |record, i| {
+            if (std.mem.eql(u8, record.name, case[0])) break @as(Model.Declaration.Id, @fromBackingInt(@intCast(i))); // safe: a test's few declarations
+        } else return error.TestUnexpectedResult;
+        std.testing.expectEqual(case[1], try declared(&project, roots, file, index)) catch |err| {
+            std.debug.print("{s}\n", .{case[0]});
+            return err;
+        };
+    }
+    try std.testing.expectEqual(@as(?Reach, null), try declared(&project, &.{}, file, @fromBackingInt(0)));
 }
