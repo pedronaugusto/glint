@@ -182,7 +182,7 @@ fn governedIn(c: *Context, node: Ast.Node.Index, name: []const u8, cast: bool, t
     const operand = if (std.mem.eql(u8, name, "@fieldParentPtr")) null else if (cast) innermost(tree, args[args.len - 1]) else args[0];
     var unknown: ?Facts.Unknown = null;
     if (operand) |each| {
-        const value = try c.facts.resolve(c.file, each);
+        const value = try c.resolveIn(c.file, each);
         if (madeType(value, types)) |found| return .{ .found = found };
         unknown = Governed.unknownIn(value);
     }
@@ -332,7 +332,7 @@ fn bareUse(c: *Context, tree: *const Ast, model: *const Model, value: Ast.Node.I
             if (!std.mem.eql(u8, builtin, "@intCast") and !std.mem.eql(u8, builtin, "@truncate")) return null;
             // Only a cast into a type that cannot hold every value of the exit's: a widening
             // loses nothing, and a width either side's build decides is not read (hygiene).
-            const from = intType(try c.facts.resolve(c.file, value)) orelse return null;
+            const from = intType(try c.resolveIn(c.file, value)) orelse return null;
             const into = intType(try c.facts.castTypeIn(null, c.file, parent)) orelse return null;
             if (holdsAll(into, from)) return null;
             return "a narrowing cast";

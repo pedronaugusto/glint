@@ -272,7 +272,7 @@ pub fn fieldBuiltin(tree: *const Ast, node: Ast.Node.Index) ?FieldBuiltin {
 /// What a field builtin's holder is: its holder's value, or for `@fieldParentPtr` what the
 /// pointer its place gives it points at (`Facts.castTypeIn`).
 pub fn fieldHolder(self: *Context, node: Ast.Node.Index, by: FieldBuiltin) Context.Error!Facts.Value {
-    if (by.holder) |holder| return self.facts.resolve(self.file, holder);
+    if (by.holder) |holder| return self.resolveIn(self.file, holder);
     const made = try self.facts.castTypeIn(null, self.file, node);
     return if (made == .pointer) made.pointer.child.* else made;
 }
@@ -353,7 +353,7 @@ pub fn namedStd(self: *Context, node: Ast.Node.Index, types: []const Facts.Conta
             &one;
         const tuple = parts.ptr != &one and tree.fullStructInit(&buffer, written) == null;
         for (parts, 0..) |part, element| {
-            const value = try self.facts.resolve(self.file, part);
+            const value = try self.resolveIn(self.file, part);
             const seen: Seen = .{ .governed = madeType(value, types) != null, .unknown = unknownIn(value) };
             all.join(seen);
             if (at == 0) first.join(seen);
@@ -813,7 +813,7 @@ fn reach(self: *Context, node: Ast.Node.Index, tag: Ast.Node.Tag, spelled: []con
         .none, .unknown => {},
     }
     if (tag == .identifier) {
-        const value = try self.facts.resolve(self.file, node);
+        const value = try self.resolveIn(self.file, node);
         return if (value == .unknown) .{ .unknown = value.unknown } else .{ .decls = &.{} };
     }
     const tree = &self.project.at(self.file).file.tree;
@@ -821,7 +821,7 @@ fn reach(self: *Context, node: Ast.Node.Index, tag: Ast.Node.Tag, spelled: []con
         var buffer: [2]Ast.Node.Index = undefined;
         break :blk Facts.builtinArgs(tree, node, &buffer)[0];
     };
-    const receiver = try self.facts.resolve(self.file, receiver_node);
+    const receiver = try self.resolveIn(self.file, receiver_node);
     if (receiver == .unknown) return if (try refuted(self, node, tag, spelled, governed)) .{ .decls = &.{} } else .{ .unknown = receiver.unknown };
     var options: std.ArrayList(Facts.Container) = .empty;
     try containers(self, receiver, &options);

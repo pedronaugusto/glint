@@ -28,7 +28,7 @@ pub fn count(context: *Context) Context.Error!Counts {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
-        const value = try context.facts.resolve(context.file, call.ast.fn_expr);
+        const value = try context.resolveIn(context.file, call.ast.fn_expr);
         // std's by std's contract, at its path; a replacement by the declaration a package names.
         const kind: ?Kind = if (value != .function) null else if (try Governed.stdCall(context, node, "debug.assert") == .yes) .std_assert else if (among(replacements, value.function)) .replacement else null;
         if (kind) |k| {

@@ -62,7 +62,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         if (std.mem.eql(u8, name, "@field")) {
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, node, &buffer);
-            if (args.len == 2) switch (try namespaceBinding(c, try c.facts.resolve(c.file, args[0]))) {
+            if (args.len == 2) switch (try namespaceBinding(c, try c.resolveIn(c.file, args[0]))) {
                 .binding => |binding| try c.at(rule, token, try c.allocator.print("std.{s}: a raw binding past std's checked layer; only at the package's seam", .{binding})),
                 .none => {},
                 .unknown => |why| try c.unknownAt(rule, token, why),
@@ -115,7 +115,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
             // decide; anything else (a build's choice) glint does not read, and says so.
             var root = args[0];
             while (tree.nodeTag(root) == .field_access) root = tree.nodeData(root).node_and_token[0];
-            const value = try c.facts.resolve(c.file, args[0]);
+            const value = try c.resolveIn(c.file, args[0]);
             try c.unknownAt(rule, token, if (c.facts.comptimeParameter(c.file, root)) .generic else if (value == .unknown) value.unknown else .unsupported);
         }
     }
@@ -151,7 +151,7 @@ fn ownerRecovery(c: *Context, tree: *const Ast, node: Ast.Node.Index, name: []co
     if (!std.mem.eql(u8, name, "@ptrCast")) return false;
     var operand = only(tree, node) orelse return false;
     if (std.mem.eql(u8, Facts.builtinName(tree, operand) orelse "", "@alignCast")) operand = only(tree, operand) orelse return false;
-    var from = try c.facts.resolve(c.file, operand);
+    var from = try c.resolveIn(c.file, operand);
     if (from == .optional) from = from.optional.*;
     if (from != .pointer or from.pointer.size != .one) return false;
     if (from.pointer.child.* != .primitive or !std.mem.eql(u8, from.pointer.child.primitive, "anyopaque")) return false;
@@ -203,7 +203,7 @@ fn lengthless(c: *Context, rule: Rule) Context.Error!void {
         const token = tree.nodeMainToken(node);
         if (c.inTest(token) or !try atRuntime(c, node)) continue;
         if (prefetched(c, tree, node)) continue;
-        const value = try c.facts.resolve(c.file, operand);
+        const value = try c.resolveIn(c.file, operand);
         const size: Facts.Size = if (try slicePointer(c, tree, operand)) .many else switch (value) {
             // A null size is a slicing's (a slice or a pointer to an array, never lengthless), or
             // one only a binding decides: no pass.
@@ -253,7 +253,7 @@ fn slicePointer(c: *Context, tree: *const Ast, written: Ast.Node.Index) Context.
     if (tree.nodeTag(node) != .field_access) return false;
     const object, const field = tree.nodeData(node).node_and_token;
     if (!std.mem.eql(u8, tree.tokenSlice(field), "ptr")) return false;
-    var value = try c.facts.resolve(c.file, object);
+    var value = try c.resolveIn(c.file, object);
     if (value == .pointer and value.pointer.size == .one) value = value.pointer.child.*;
     if (value == .pointer and value.pointer.size == .slice) return true;
     // A name whose declaration writes a slice type (`b: []const u8`), where the value is not read.
@@ -297,7 +297,7 @@ fn rawBindings(c: *Context, rule: Rule) Context.Error!void {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(raw));
         const member = tree.nodeData(node).node_and_token[1];
         if (c.inTest(member)) continue;
-        switch (try namespaceBinding(c, try c.facts.resolve(c.file, tree.nodeData(node).node_and_token[0]))) {
+        switch (try namespaceBinding(c, try c.resolveIn(c.file, tree.nodeData(node).node_and_token[0]))) {
             .binding => |binding| try c.at(rule, member, try c.allocator.print("std.{s}: a raw binding past std's checked layer; only at the package's seam", .{binding})),
             .none => {},
             .unknown => |why| try c.unknownAt(rule, member, why),

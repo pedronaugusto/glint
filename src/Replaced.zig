@@ -207,7 +207,7 @@ fn typeComparison(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     // Zig compares a type only with a type: one operand that is one makes the comparison one of
     // types, the other a type too, where it does not resolve (`K.SecretKey` of a comptime `K`).
     const lhs, const rhs = tree.nodeData(parent).node_and_node;
-    for ([_]Ast.Node.Index{ lhs, rhs }) |operand| switch (try c.facts.resolve(c.file, operand)) {
+    for ([_]Ast.Node.Index{ lhs, rhs }) |operand| switch (try c.resolveIn(c.file, operand)) {
         .container => return true,
         else => {},
     };
@@ -305,7 +305,7 @@ fn heldSites(c: *Context, definition: Rule.Definition, ban: bool, all: []const E
         if (field.ast.tuple_like and !inStruct(c, tree, node)) continue;
         const written = field.ast.type_expr.unwrap() orelse continue;
         const token = if (field.ast.tuple_like) tree.firstToken(written) else field.ast.main_token;
-        const value = try c.facts.resolve(c.file, written);
+        const value = try c.resolveIn(c.file, written);
         for (indexes) |index| {
             const entry = all[index];
             for (entry.replacement.declarations()) |target| {

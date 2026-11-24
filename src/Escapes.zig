@@ -129,7 +129,7 @@ const Walk = struct {
     /// (`array`, an array). A local in code no compiled root holds is no pass: its site is
     /// counted not reached (`Context.unknownAt`).
     fn held(self: Walk, identifier: Ast.Node.Index, array: bool) Context.Error!bool {
-        const value = try self.c.facts.resolve(self.c.file, identifier);
+        const value = try self.c.resolveIn(self.c.file, identifier);
         return switch (value) {
             .array => true,
             .instance, .scalar, .literal, .optional, .error_union => !array,

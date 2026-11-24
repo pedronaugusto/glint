@@ -604,9 +604,9 @@ fn syntaxRules(self: *Context) RunError!void {
             if (tree.nodeTag(expr) == .error_set_decl and !names.isPascalCase(name)) try self.at(.Z014, decl.token, "named error set should use TitleCase");
             // Only Z006 needs value-kind facts. Unknown facts are coverage, never spelling guesses.
             if ((self.config.has(.Z006) and !names.isSnakeCase(name)) or (self.config.has(.Z032) and names.acronymIssue(name))) {
-                var value = try self.facts.resolve(self.file, expr);
+                var value = try self.resolveIn(self.file, expr);
                 if (v.ast.type_node.unwrap()) |type_node| {
-                    const declared_type = try self.facts.resolve(self.file, type_node);
+                    const declared_type = try self.resolveIn(self.file, type_node);
                     if (declared_type == .unknown) {
                         value = declared_type;
                     } else if (!(declared_type == .primitive and std.mem.eql(u8, declared_type.primitive, "type")) and value != .function) {
@@ -719,7 +719,7 @@ fn typeParameter(self: *Context, node: Ast.Node.Index) RunError!bool {
 
 /// Whether `node` of `file` is the type `type`, by what it resolves to (an alias of it too).
 fn namesType(self: *Context, file: Project.FileId, node: Ast.Node.Index) RunError!bool {
-    const value = try self.facts.resolve(file, node);
+    const value = try self.resolveIn(file, node);
     var each: Facts.Join = .{};
     for (Facts.valueParts(&value)) |part| each.add(part, switch (part) {
         .primitive => |name| std.mem.eql(u8, name, "type"),
@@ -787,7 +787,7 @@ fn unmappedImports(self: *Context) RunError!void {
         var b: [2]Ast.Node.Index = undefined;
         const args = Facts.builtinArgs(tree, node, &b);
         if (args.len != 1 or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import")) continue;
-        const value = try self.facts.resolve(self.file, node);
+        const value = try self.resolveIn(self.file, node);
         // Zig's own per-build file, and a module whose bytes a build step makes (external): no gap.
         if (value != .unknown or value.unknown == .zig_own or value.unknown == .external) continue;
         if (underBranch(tree, model, node)) continue;

@@ -44,7 +44,7 @@ fn unsigned(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!b
     if (tree.nodeTag(at) == .field_access) {
         const holder, const name = tree.nodeData(at).node_and_token;
         if (!std.mem.eql(u8, tree.tokenSlice(name), "len")) return false;
-        return switch (try c.facts.resolve(c.file, holder)) {
+        return switch (try c.resolveIn(c.file, holder)) {
             .array => true,
             .pointer => |p| p.size == .slice or p.child.* == .array,
             else => false,

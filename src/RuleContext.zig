@@ -65,9 +65,23 @@ pub const Rule = struct { definition: rules.Definition, check: *const fn (*RuleC
 pub fn source(self: *const RuleContext) Project.QueryError!Project.Handle {
     return self.project.handle(self.file);
 }
-/// Same-run declaration/type resolver. Unknown values carry their missing fact.
+/// Same-run declaration/type resolver. Unknown values carry their missing fact. With compiled
+/// roots, a site in code none of them holds is not reached (`Facts.Unknown.not_reached`): the
+/// compiler established nothing there, and the source does not stand in for it. A syntactic
+/// rule asks no such question, so it reads every file, reached or not.
 pub fn resolve(self: *RuleContext, node: Project.NodeId) Error!Facts.Value {
-    return self.facts.resolve(self.file, try self.project.node(try self.source(), node));
+    return self.resolveIn(self.file, try self.project.node(try self.source(), node));
+}
+
+/// `resolve`, of a node of `file`.
+pub fn resolveIn(self: *RuleContext, file: Project.FileId, node: Ast.Node.Index) Error!Facts.Value {
+    if (self.facts.compiled.len != 0) {
+        const tree = &self.project.at(file).file.tree;
+        if (try answers.site(self.project, self.facts.compiled, file, tree.firstToken(node))) |reach| {
+            if (reach == .not_reached) return .{ .unknown = .not_reached };
+        }
+    }
+    return self.facts.resolve(file, node);
 }
 /// Whether `decl`'s parameters, past the first `skip` (a method's receiver), can take the
 /// arguments of `call` (written in the checked file), by what Zig allows: as many, none a
@@ -181,13 +195,6 @@ pub fn emitFixed(self: *RuleContext, rule: rules.Rule, start: u32, end: u32, mes
         if (span.start > span.end or span.end > (try self.project.source(target)).len) return error.InvalidHandle;
     }
     for (fix) |e| if (e.start > e.end or e.end > bytes.len) return error.InvalidHandle;
-    // A site in code no compiled root holds is no finding: counted apart, as not reached.
-    if (self.facts.compiled.len != 0) {
-        const tree = try self.project.syntax(try self.source());
-        if (try answers.site(self.project, self.facts.compiled, self.file, tokenAt(tree, start))) |reach| {
-            if (reach == .not_reached) return self.sink.not_reached(self.sink, rule, start);
-        }
-    }
     // Rules may retain no temporary message storage in the report: the sink copies it.
     return self.sink.diagnostic(self.sink, rule, start, end, message, related, fix);
 }
@@ -278,16 +285,4 @@ pub fn atDefinitionFixed(self: *RuleContext, rule: rules.Rule, token: std.zig.As
     const site_tree = try self.project.syntax(try self.source());
     const site = site_tree.tokenToSpan(token);
     try self.emitFixed(rule, site.start, site.end, message, &related, fix);
-}
-
-/// The token that begins at or most nearly before byte `start` of `tree`'s source.
-fn tokenAt(tree: *const Ast, start: u32) Ast.TokenIndex {
-    const starts = tree.tokens.items(.start);
-    var low: usize = 0;
-    var high: usize = starts.len;
-    while (high - low > 1) {
-        const middle = low + (high - low) / 2;
-        if (starts[middle] <= start) low = middle else high = middle;
-    }
-    return @intCast(low); // safe: a tree counts its tokens in u32
 }

@@ -92,7 +92,7 @@ fn kindOf(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!?Ki
     const last = tree.lastToken(node);
     const spelled = tree.source[tree.tokenStart(first) .. tree.tokenStart(last) + tree.tokenSlice(last).len];
     // An optional id is the id's integer where it is one (`parent_id: ?u32, child_id: ?u32`).
-    var value = try c.facts.resolve(c.file, node);
+    var value = try c.resolveIn(c.file, node);
     while (value == .optional) value = value.optional.*;
     switch (value) {
         .unknown, .reflected => return .{ .spelled = spelled, .unknown = true },
@@ -193,7 +193,7 @@ fn reachedFrom(c: *Context, tree: *const Ast, model: *const Model, out: []const 
                 const proto = tree.fullFnProto(&buffer, parent).?;
                 if (tree.nodeData(parent).node_and_node[1] == child) {
                     const result = proto.ast.return_type.unwrap() orelse return false;
-                    const value = try c.facts.resolve(c.file, result);
+                    const value = try c.resolveIn(c.file, result);
                     if (value != .primitive or !std.mem.eql(u8, value.primitive, "type")) return false;
                 }
                 break :name proto.name_token orelse continue;
