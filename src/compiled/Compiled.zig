@@ -178,6 +178,17 @@ pub fn member(c: *const Compiled, container: u32, name: []const u8) ?u32 {
     return if (list.items.len > 0) list.items[0] else null;
 }
 
+/// The type `container`'s function `name` returns, by the entry Zig gives the function in that
+/// container (an instance's method in its instance) or its origin's; null where it has no such
+/// function or the compilation names no type for its result.
+pub fn result(c: *const Compiled, container: u32, name: []const u8) ?u32 {
+    const function = c.declaration(container, name) orelse return null;
+    const e = c.dwarf.entries.slice();
+    if (e.items(.kind)[function] != .subprogram) return null;
+    if (c.dwarf.at(e.items(.type)[function])) |t| return t;
+    return c.dwarf.at(e.items(.type)[c.origin(function)]);
+}
+
 /// `container`'s declaration `name`, or null where it declares none the compilation emitted.
 pub fn declaration(c: *const Compiled, container: u32, name: []const u8) ?u32 {
     const names = c.decls.getPtr(container) orelse return null;
@@ -382,6 +393,9 @@ test "a sample's declarations, instances, locals, members and container declarat
     const box = c.containers.get(.{ .file = file, .line = 9 }).?;
     try std.testing.expect(c.instance(box));
     try std.testing.expectEqualStrings("usize", c.dwarf.entries.items(.name)[c.member(box, "value").?]);
+    try std.testing.expectEqualStrings("usize", c.dwarf.entries.items(.name)[c.result(box, "get").?]);
+    try std.testing.expectEqual(@as(?u32, null), c.result(box, "value"));
+    try std.testing.expectEqual(@as(?u32, null), c.result(box, "put"));
     const s = c.file_structs.get(file).?;
     try std.testing.expectEqualStrings("width", c.dwarf.entries.items(.name)[c.declaration(s, "width").?]);
     try std.testing.expectEqual(@as(?u32, null), try c.fileId("other.zig"));
