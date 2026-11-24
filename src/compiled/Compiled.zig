@@ -276,8 +276,8 @@ fn build(c: *Compiled) error{OutOfMemory}!void {
                     _ = try c.containers.getOrPutValue(gpa, place, i);
                 };
             },
-            .member => if (parents[i] != none and names[i].len != 0) {
-                if (c.dwarf.at(e.items(.type)[i])) |t| try add(gpa, &c.members, parents[i], names[i], t);
+            .member => if (names[i].len != 0) if (fieldOwner(kinds, parents, i)) |owner| {
+                if (c.dwarf.at(e.items(.type)[i])) |t| try add(gpa, &c.members, owner, names[i], t);
             },
             .subprogram => {
                 const o = c.origin(i);
@@ -323,6 +323,26 @@ fn build(c: *Compiled) error{OutOfMemory}!void {
         if (name.len == 0) continue;
         try add(gpa, &c.decls, zp, name, i);
     }
+}
+
+/// The structure or union whose field the member `index` is: its parent, or for a tagged
+/// union's field, the union its variant (`variant_part`, `variant`) is in. Null for the
+/// discriminant a variant part names (the tag, which no field of the program's is) and for a
+/// member of anything else.
+fn fieldOwner(kinds: []const Dwarf.Kind, parents: []const u32, index: u32) ?u32 {
+    var at = parents[index];
+    if (at == none) return null;
+    if (kinds[at] == .variant_part) return null;
+    if (kinds[at] == .variant) {
+        const part = parents[at];
+        if (part == none or kinds[part] != .variant_part) return null;
+        at = parents[part];
+        if (at == none) return null;
+    }
+    return switch (kinds[at]) {
+        .structure, .@"union" => at,
+        else => null,
+    };
 }
 
 /// The nearest function or inlined call enclosing `start`, by index, `start` among them.
@@ -396,6 +416,11 @@ test "a sample's declarations, instances, locals, members and container declarat
     try std.testing.expectEqualStrings("usize", c.dwarf.entries.items(.name)[c.result(box, "get").?]);
     try std.testing.expectEqual(@as(?u32, null), c.result(box, "value"));
     try std.testing.expectEqual(@as(?u32, null), c.result(box, "put"));
+    // A tagged union's fields are its own, through its variant part; its tag is no field.
+    const shape = c.containers.get(.{ .file = file, .line = 11 }).?;
+    try std.testing.expectEqualStrings("usize", c.dwarf.entries.items(.name)[c.member(shape, "circle").?]);
+    try std.testing.expectEqualStrings("usize", c.dwarf.entries.items(.name)[c.member(shape, "square").?]);
+    try std.testing.expectEqual(@as(?u32, null), c.member(shape, "tag"));
     const s = c.file_structs.get(file).?;
     try std.testing.expectEqualStrings("width", c.dwarf.entries.items(.name)[c.declaration(s, "width").?]);
     try std.testing.expectEqual(@as(?u32, null), try c.fileId("other.zig"));
