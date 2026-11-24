@@ -114,6 +114,60 @@ pub fn declared(project: *const Project, compiled: []const *const Compiled, file
     return .not_reached;
 }
 
+/// Whether the compiled roots compiled the code at `token` of `file`: held where a root holds
+/// the function around it, or, outside every function, emits the container declaration around
+/// it (`declared`); not reached where none does. A struct inside a function (a generic's) is
+/// held as that function is, and a test as its block is. Null where no root is given or the
+/// place is not read: a finding there stands.
+pub fn site(project: *const Project, compiled: []const *const Compiled, file: Project.FileId, token: Ast.TokenIndex) error{OutOfMemory}!?Reach {
+    if (compiled.len == 0) return null;
+    const source = project.at(file);
+    const model = &source.model;
+    const tree = &source.file.tree;
+    var at: ?Model.Scope.Id = model.scopeOf(token);
+    while (at) |id| : (at = model.scopes[@backingInt(id)].parent) {
+        switch (model.scopes[@backingInt(id)].kind) {
+            .function, .@"test" => {
+                const owner = functionNode(model, tree, id) orelse return null;
+                return try heldAt(compiled, source.input.name, lineOf(tree, tree.firstToken(owner)));
+            },
+            .file => break,
+            else => {},
+        }
+    }
+    const decl = containerDeclarationAt(model, tree, token) orelse return null;
+    return declared(project, compiled, file, decl);
+}
+
+/// Whether a root holds the function declared on `line` of the file named `name`.
+fn heldAt(compiled: []const *const Compiled, name: []const u8, line: u32) error{OutOfMemory}!Reach {
+    for (compiled) |c| {
+        const compiled_file = (try c.fileId(name)) orelse continue;
+        if (c.holds(.{ .file = compiled_file, .line = line })) return .held;
+    }
+    return .not_reached;
+}
+
+/// The innermost declaration of a file or container (a constant, variable or function) whose
+/// node spans `token`.
+fn containerDeclarationAt(model: *const Model, tree: *const Ast, token: Ast.TokenIndex) ?Model.Declaration.Id {
+    var best: ?Model.Declaration.Id = null;
+    var width: Ast.TokenIndex = std.math.maxInt(Ast.TokenIndex);
+    for (model.declarations, 0..) |record, i| {
+        if (record.kind != .variable and record.kind != .function) continue;
+        switch (model.scopes[@backingInt(record.scope)].kind) {
+            .file, .container => {},
+            else => continue,
+        }
+        const first = tree.firstToken(record.node);
+        const last = tree.lastToken(record.node);
+        if (token < first or token > last or last - first >= width) continue;
+        width = last - first;
+        best = @fromBackingInt(@intCast(i)); // safe: declarations are counted in u32, as their ids are
+    }
+    return best;
+}
+
 /// Whether root `c` emits the declaration `name` of container `scope`. A container with no
 /// entry of its own is not compiled where its own declaration is not.
 fn reachIn(c: *const Compiled, model: *const Model, tree: *const Ast, file: u32, scope: Model.Scope.Id, name: []const u8, depth: u8) ?Reach {

@@ -233,6 +233,8 @@ pub fn main(init: std.process.Init) !void {
     const recorder = try timings.Recorder.init(io, init.minimal.environ, if (runner_options.timings) |stem| try std.fmt.allocPrint(a, "{s}-cases", .{stem}) else null, record_column);
     defer recorder.deinit(io);
     try recorder.begin(io);
+    // The cases not reached, named under their count.
+    var unreached_cases: std.ArrayList([]const u8) = .empty;
     for (share, verdicts, names, seconds) |job, result, name, elapsed| {
         const column = &columns.items[job.column];
         // A file Zig refuses for x86_64 has no compiled facts to judge it by; it was named where
@@ -251,6 +253,7 @@ pub fn main(init: std.process.Init) !void {
         // there, by design, and says so; the plain suite judges it.
         if (verdict == .not_reached) {
             column.not_reached += 1;
+            try unreached_cases.append(a, try std.fmt.allocPrint(a, "{s}/{s}", .{ column.rule, job.path }));
             continue;
         }
         // A hole outside its rule's scope is the one hole that must be clean: one flagged is in
@@ -324,6 +327,7 @@ pub fn main(init: std.process.Init) !void {
     if (unreached != 0) {
         try o.writeAll("\nnot reached:");
         for (columns.items) |column| if (column.not_reached != 0) try o.print(" {s} {d}", .{ column.rule, column.not_reached });
+        for (unreached_cases.items) |case| try o.print("\n  {s}", .{case});
     }
     try o.print("\n{d} cases, {d} open, {d} outside, {d} not reached, {d} cells empty; a cell is holes+twins, . none yet, - none possible\n", .{ share.len, failing, beyond, unreached, empty });
     if (peak) |held| try o.print("peak resident memory {d} MiB at {d} workers, its ceiling {d} MiB\n", .{ held >> 20, workers, ceiling >> 20 });

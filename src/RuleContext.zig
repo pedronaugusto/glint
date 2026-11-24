@@ -3,6 +3,7 @@ const std = @import("std");
 const Project = @import("Project.zig");
 const Ast = std.zig.Ast;
 const Facts = @import("Facts.zig");
+const answers = @import("compiled/Answers.zig");
 const Model = @import("Model.zig");
 const rules = @import("Rule.zig");
 const Report = @import("Report.zig");
@@ -180,6 +181,13 @@ pub fn emitFixed(self: *RuleContext, rule: rules.Rule, start: u32, end: u32, mes
         if (span.start > span.end or span.end > (try self.project.source(target)).len) return error.InvalidHandle;
     }
     for (fix) |e| if (e.start > e.end or e.end > bytes.len) return error.InvalidHandle;
+    // A site in code no compiled root holds is no finding: counted apart, as not reached.
+    if (self.facts.compiled.len != 0) {
+        const tree = try self.project.syntax(try self.source());
+        if (try answers.site(self.project, self.facts.compiled, self.file, tokenAt(tree, start))) |reach| {
+            if (reach == .not_reached) return self.sink.not_reached(self.sink, rule, start);
+        }
+    }
     // Rules may retain no temporary message storage in the report: the sink copies it.
     return self.sink.diagnostic(self.sink, rule, start, end, message, related, fix);
 }
@@ -270,4 +278,16 @@ pub fn atDefinitionFixed(self: *RuleContext, rule: rules.Rule, token: std.zig.As
     const site_tree = try self.project.syntax(try self.source());
     const site = site_tree.tokenToSpan(token);
     try self.emitFixed(rule, site.start, site.end, message, &related, fix);
+}
+
+/// The token that begins at or most nearly before byte `start` of `tree`'s source.
+fn tokenAt(tree: *const Ast, start: u32) Ast.TokenIndex {
+    const starts = tree.tokens.items(.start);
+    var low: usize = 0;
+    var high: usize = starts.len;
+    while (high - low > 1) {
+        const middle = low + (high - low) / 2;
+        if (starts[middle] <= start) low = middle else high = middle;
+    }
+    return @intCast(low); // safe: a tree counts its tokens in u32
 }
