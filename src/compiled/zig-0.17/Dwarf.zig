@@ -846,7 +846,10 @@ const Builder = struct {
 /// An ELF file holding a DWARF 5 unit: a file struct `s` (file 0) declaring a struct `List`
 /// (line 3) with a member `len` of type `usize`, a method `first` (line 5, ZIG_parent `List`,
 /// with code) whose comptime parameter `n` is a `usize` and whose local `x`, inside a lexical
-/// block, is a `usize`, and a declaration `width` whose line is `List`'s plus 7.
+/// block, is a `usize`, and a declaration `width` whose line is `List`'s plus 7; an instance
+/// `Box(u32)` (line 9) with a member `value` of type `usize` and a method `get` returning one;
+/// a tagged union `Shape` (line 11) whose variant part holds its tag and the fields `circle`
+/// and `square`.
 fn sample(gpa: std.mem.Allocator) ![]u8 {
     var abbrev: Builder = .{ .gpa = gpa };
     defer abbrev.deinit();
@@ -862,6 +865,10 @@ fn sample(gpa: std.mem.Allocator) ![]u8 {
         .{ Tag.lexical_block, true, &.{} },
         .{ Tag.variable, false, &.{ .{ Attribute.name, Form.string }, .{ Attribute.type, Form.ref4 } } },
         .{ Tag.constant, false, &.{ .{ Attribute.name, Form.string }, .{ Attribute.ZIG_parent, Form.ref4 }, .{ Attribute.ZIG_relative_decl, Form.ref4 }, .{ Attribute.ZIG_decl_line_relative, Form.sdata } } },
+        .{ Tag.subprogram, false, &.{ .{ Attribute.name, Form.string }, .{ Attribute.ZIG_parent, Form.ref4 }, .{ Attribute.type, Form.ref4 } } },
+        .{ Tag.union_type, true, &.{ .{ Attribute.name, Form.string }, .{ Attribute.ZIG_parent, Form.ref4 }, .{ Attribute.decl_line, Form.udata } } },
+        .{ Tag.variant_part, true, &.{.{ Attribute.discr, Form.ref4 }} },
+        .{ Tag.variant, true, &.{.{ Attribute.discr_value, Form.udata }} },
     };
     for (abbrevs, 1..) |a, code| {
         try abbrev.u(code);
@@ -905,6 +912,7 @@ fn sample(gpa: std.mem.Allocator) ![]u8 {
     try info.u(0); // end of List
     // A type function's instance: Zig names it with its arguments, at the line of the
     // structure the function returns.
+    const box_at: u32 = @intCast(info.bytes.items.len); // safe: a test's few bytes
     try info.u(4);
     try info.str("s.Box(u32)");
     try info.int(u32, file_at);
@@ -913,6 +921,32 @@ fn sample(gpa: std.mem.Allocator) ![]u8 {
     try info.str("value");
     try info.int(u32, usize_at);
     try info.u(0); // end of Box(u32)
+    // Its method, in the instance: what it returns.
+    try info.u(11);
+    try info.str("get");
+    try info.int(u32, box_at);
+    try info.int(u32, usize_at);
+    // A tagged union: its tag, the discriminant of its variant part, and a field in each variant.
+    try info.u(12);
+    try info.str("s.Shape");
+    try info.int(u32, file_at);
+    try info.u(11);
+    const part_at: u32 = @intCast(info.bytes.items.len); // safe: a test's few bytes
+    try info.u(13);
+    try info.int(u32, part_at + 5); // the tag, the part's first child: its code and reference before it
+    try info.u(5);
+    try info.str("tag");
+    try info.int(u32, usize_at);
+    for ([_][]const u8{ "circle", "square" }, 0..) |field, value| {
+        try info.u(14);
+        try info.u(value);
+        try info.u(5);
+        try info.str(field);
+        try info.int(u32, usize_at);
+        try info.u(0); // end of the variant
+    }
+    try info.u(0); // end of the variant part
+    try info.u(0); // end of Shape
     try info.u(6);
     try info.str("first");
     try info.int(u32, list_at);
