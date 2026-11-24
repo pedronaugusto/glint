@@ -207,6 +207,13 @@ pub fn fileOf(c: *const Compiled, start: u32) u32 {
     return none;
 }
 
+/// Whether a container is a type function's instance (`Checked(u32)`, `Keyed(.x)`): Zig names
+/// one with the arguments it was made with, and declares it at the line of the structure the
+/// function returns, which every instance of it shares.
+pub fn instance(c: *const Compiled, container: u32) bool {
+    return std.mem.findScalar(u8, c.dwarf.entries.items(.name)[container], '(') != null;
+}
+
 /// Whether `name` is one Zig gives a file's own structure: a module-qualified path, never an
 /// instance's arguments or a function's anonymous structure.
 fn fileStructName(name: []const u8) bool {
@@ -371,6 +378,10 @@ test "a sample's declarations, instances, locals, members and container declarat
     try std.testing.expectEqualStrings("usize", c.dwarf.entries.items(.name)[c.member(list, "len").?]);
     try std.testing.expectEqual(@as(?u32, null), c.member(list, "cap"));
     try std.testing.expectEqualStrings("first", c.dwarf.entries.items(.name)[c.declaration(list, "first").?]);
+    try std.testing.expect(!c.instance(list));
+    const box = c.containers.get(.{ .file = file, .line = 9 }).?;
+    try std.testing.expect(c.instance(box));
+    try std.testing.expectEqualStrings("usize", c.dwarf.entries.items(.name)[c.member(box, "value").?]);
     const s = c.file_structs.get(file).?;
     try std.testing.expectEqualStrings("width", c.dwarf.entries.items(.name)[c.declaration(s, "width").?]);
     try std.testing.expectEqual(@as(?u32, null), try c.fileId("other.zig"));

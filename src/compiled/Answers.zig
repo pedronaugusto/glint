@@ -103,7 +103,7 @@ fn typeValue(facts: *Facts, c: *const Compiled, ty: u32, depth: u8) Facts.Resolv
 }
 
 /// The program's container the compilation's type `ty` is: the one declared on its line, or a
-/// file's own. Null for an instance of a type function, which names no line.
+/// file's own. Null for an instance of a type function, whose arguments that container lacks.
 fn containerOf(facts: *Facts, c: *const Compiled, ty: u32) Facts.ResolveError!?Facts.Container {
     const file = c.fileOf(ty);
     if (file == Compiled.none) return null;
@@ -111,6 +111,12 @@ fn containerOf(facts: *Facts, c: *const Compiled, ty: u32) Facts.ResolveError!?F
     const source = facts.project.at(project_file);
     const model = &source.model;
     const tree = &source.file.tree;
+    // A type function's instance: its container is the one the function returns, at the line
+    // every instance shares, but a value of it read as that container alone would lose the
+    // arguments it was made with (aegis's `Checked(u32)`, read as the bare `Checked` structure,
+    // hid its narrowing casts from A004). Its members' types are the compilation's to answer
+    // (`Compiled.member`), not yet asked here, so the source's reading stands.
+    if (c.instance(ty)) return null;
     if (c.placeOf(ty)) |place| {
         if (c.files[c.origin(ty)] == Compiled.none or c.dwarf.entries.items(.line)[c.origin(ty)] != 0) {
             for (model.scopes, 0..) |s, i| {
@@ -121,9 +127,6 @@ fn containerOf(facts: *Facts, c: *const Compiled, ty: u32) Facts.ResolveError!?F
     }
     // A file's own structure.
     if (c.file_structs.get(file)) |s| if (s == ty) return .{ .file = project_file, .scope = model.root() };
-    // A type function's instance: its container is the one the function returns, but a value of
-    // it read as that container alone would lose the arguments it was made with; its members'
-    // types are the compilation's to answer (`Compiled.member`), not yet asked here.
     return null;
 }
 

@@ -819,6 +819,16 @@ fn sample(gpa: std.mem.Allocator) ![]u8 {
     try info.str("len");
     try info.int(u32, usize_at);
     try info.u(0); // end of List
+    // A type function's instance: Zig names it with its arguments, at the line of the
+    // structure the function returns.
+    try info.u(4);
+    try info.str("s.Box(u32)");
+    try info.int(u32, file_at);
+    try info.u(9);
+    try info.u(5);
+    try info.str("value");
+    try info.int(u32, usize_at);
+    try info.u(0); // end of Box(u32)
     try info.u(6);
     try info.str("first");
     try info.int(u32, list_at);
