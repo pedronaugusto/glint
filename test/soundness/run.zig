@@ -717,6 +717,7 @@ const Pool = struct {
         defer std.Io.Dir.cwd().deleteTree(io, scratch) catch {}; // The scratch is the case's own; one left behind is litter, not a verdict.
         var objects: std.ArrayList([]const u8) = .empty;
         try objects.append(a, try compiledCase(a, io, tools, scratch, job.path, job.absolute));
+        try objects.append(a, try compiledTests(a, io, tools, scratch, job.path, job.absolute));
         if (job.before) |before| try objects.append(a, try compiledCase(a, io, tools, scratch, job.path, before));
         return judge(gpa, io, store, rule, pool.lib, pool.aegis, job, objects.items);
     }
@@ -752,6 +753,34 @@ fn compiledCase(a: std.mem.Allocator, io: std.Io, tools: Tools, scratch: []const
         var blocks = Blocks{ .lines = std.mem.splitScalar(u8, result.stderr, '\n') };
         const first = if (blocks.next()) |block| block.first else result.stderr;
         std.debug.print("{s}: {s} does not compile for x86_64 with the self-hosted backend: {s}\n", .{ case, std.Io.Dir.path.basename(absolute), first });
+        return error.CompiledRefused;
+    }
+    return object;
+}
+
+/// A case's file compiled as its tests are, the file the root module of a test object, so its
+/// `test` blocks are compiled as a test root's are where glint lints one (`--compiled`): its
+/// DWARF beside the file's own object's (`compiledCase`). The object's path; a file Zig refuses
+/// so is `error.CompiledRefused`, written with Zig's first error.
+fn compiledTests(a: std.mem.Allocator, io: std.Io, tools: Tools, scratch: []const u8, case: []const u8, absolute: []const u8) ![]const u8 {
+    const stem = std.Io.Dir.path.stem(absolute);
+    const object = try std.Io.Dir.path.join(a, &.{ scratch, try std.fmt.allocPrint(a, "{s}-tests.o", .{stem}) });
+    var arguments: std.ArrayList([]const u8) = .empty;
+    try arguments.appendSlice(a, &.{ tools.zig, "test-obj", "--test-no-exec", "-target", "x86_64-linux", "-fno-llvm", "-fno-lld", "-lc", try std.fmt.allocPrint(a, "-femit-bin={s}", .{object}), "--name", try std.fmt.allocPrint(a, "soundness-{s}-tests", .{stem}), "--zig-lib-dir", tools.lib, "--cache-dir", tools.cache });
+    const stubs = try stubsOf(a, io, std.Io.Dir.path.dirname(absolute) orelse ".");
+    for (stubs, 0..) |stub, index| try arguments.appendSlice(a, &.{ "--dep", try std.fmt.allocPrint(a, "{s}=stub{d}", .{ std.Io.Dir.path.stem(stub), index }) });
+    try arguments.appendSlice(a, &.{ "--dep", "aegis", try std.fmt.allocPrint(a, "-Mroot={s}", .{absolute}) });
+    for (stubs, 0..) |stub, index| try arguments.appendSlice(a, &.{ "--dep", "aegis", try std.fmt.allocPrint(a, "-Mstub{d}={s}", .{ index, stub }) });
+    try arguments.append(a, try std.fmt.allocPrint(a, "-Maegis={s}", .{tools.aegis}));
+    const result = try std.process.run(a, io, .{ .argv = arguments.items, .stdout_limit = .limited(64 * 1024 * 1024), .stderr_limit = .limited(64 * 1024 * 1024) });
+    const failed = switch (result.term) {
+        .exited => |code| code != 0,
+        else => true,
+    };
+    if (failed) {
+        var blocks = Blocks{ .lines = std.mem.splitScalar(u8, result.stderr, '\n') };
+        const first = if (blocks.next()) |block| block.first else result.stderr;
+        std.debug.print("{s}: {s} does not compile as tests for x86_64 with the self-hosted backend: {s}\n", .{ case, std.Io.Dir.path.basename(absolute), first });
         return error.CompiledRefused;
     }
     return object;
