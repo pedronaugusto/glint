@@ -490,6 +490,88 @@ fn small(value: Value) error{InvalidDebugInfo}!u32 {
     };
 }
 
+/// What one entry's attributes say beyond the entry itself: a line relative to another's, and,
+/// for a unit, its line program and directory.
+const Read = struct {
+    line_relative: ?i64 = null,
+    call_relative: ?i64 = null,
+    stmt_list: ?u64 = null,
+    unit_dir: ?[]const u8 = null,
+
+    /// Reads one attribute of an entry of `kind` into `entry`, or into `read`.
+    fn attribute(read: *Read, entry: *Entry, kind: Kind, attribute_name: u64, value: Value) Error!void {
+        switch (attribute_name) {
+            Attribute.name => if (value == .string) {
+                entry.name = value.string;
+            },
+            Attribute.type => if (value == .reference) {
+                entry.type = try offset32(value.reference);
+            },
+            Attribute.ZIG_parent => if (value == .reference) {
+                entry.zig_parent = try offset32(value.reference);
+            },
+            Attribute.abstract_origin => if (value == .reference) {
+                entry.abstract_origin = try offset32(value.reference);
+            },
+            Attribute.specification => if (value == .reference) {
+                entry.specification = try offset32(value.reference);
+            },
+            Attribute.ZIG_relative_decl => if (value == .reference) {
+                entry.relative_decl = try offset32(value.reference);
+            },
+            Attribute.decl_file => entry.file = if (value == .unsigned) try small(value) else none,
+            Attribute.decl_line => entry.line = try small(value),
+            Attribute.decl_column => entry.column = try small(value),
+            Attribute.call_line => entry.call_line = try small(value),
+            Attribute.call_column => entry.call_column = try small(value),
+            Attribute.ZIG_decl_line_relative => read.line_relative = signedOf(value),
+            Attribute.ZIG_call_line_relative => read.call_relative = signedOf(value),
+            Attribute.low_pc => entry.code = value != .none,
+            Attribute.const_expr => entry.comptime_known = value == .flag and value.flag,
+            Attribute.declaration => entry.declaration = value == .flag and value.flag,
+            Attribute.stmt_list => if (kind == .unit and value == .unsigned) {
+                read.stmt_list = value.unsigned;
+            },
+            Attribute.comp_dir => if (kind == .unit and value == .string) {
+                read.unit_dir = value.string;
+            },
+            else => {},
+        }
+    }
+};
+
+/// A unit's header, read from its start: its format, where it ends and its abbreviations' table.
+fn unitHeader(c: *Cursor) Error!struct { format: Format, end: usize, abbrev_offset: u64 } {
+    const info_len = c.bytes.len;
+    const unit_start = c.at;
+    var length: u64 = try c.fixed(u32);
+    var offset_size: u8 = 4;
+    if (length == 0xffff_ffff) {
+        length = try c.fixed(u64);
+        offset_size = 8;
+    }
+    if (length > info_len - c.at) return error.InvalidDebugInfo;
+    const end = c.at + @as(usize, @intCast(length)); // safe: at most what is left, checked above
+    const version = try c.fixed(u16);
+    var address_size: u8 = undefined;
+    var abbrev_offset: u64 = undefined;
+    if (version >= 5) {
+        const unit_type = try c.byte();
+        address_size = try c.byte();
+        abbrev_offset = try c.sized(offset_size);
+        switch (unit_type) {
+            std.dwarf.UT.compile, std.dwarf.UT.partial => {},
+            std.dwarf.UT.skeleton, std.dwarf.UT.split_compile => try c.skip(8),
+            std.dwarf.UT.type, std.dwarf.UT.split_type => try c.skip(8 + @as(u64, offset_size)),
+            else => return error.InvalidDebugInfo,
+        }
+    } else if (version >= 2) {
+        abbrev_offset = try c.sized(offset_size);
+        address_size = try c.byte();
+    } else return error.InvalidDebugInfo;
+    return .{ .format = .{ .offset_size = offset_size, .address_size = address_size, .unit_start = unit_start, .version = version }, .end = end, .abbrev_offset = abbrev_offset };
+}
+
 fn decode(d: *Dwarf, gpa: std.mem.Allocator) Error!void {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -511,33 +593,11 @@ fn decode(d: *Dwarf, gpa: std.mem.Allocator) Error!void {
     var c: Cursor = .{ .bytes = info, .at = 0 };
     if (info.len >= none) return error.InvalidDebugInfo;
     while (c.at < info.len) {
-        const unit_start = c.at;
-        var length: u64 = try c.fixed(u32);
-        var offset_size: u8 = 4;
-        if (length == 0xffff_ffff) {
-            length = try c.fixed(u64);
-            offset_size = 8;
-        }
-        if (length > info.len - c.at) return error.InvalidDebugInfo;
-        const unit_end = c.at + @as(usize, @intCast(length)); // safe: at most what is left, checked above
-        const version = try c.fixed(u16);
-        var address_size: u8 = undefined;
-        var abbrev_offset: u64 = undefined;
-        if (version >= 5) {
-            const unit_type = try c.byte();
-            address_size = try c.byte();
-            abbrev_offset = try c.sized(offset_size);
-            switch (unit_type) {
-                std.dwarf.UT.compile, std.dwarf.UT.partial => {},
-                std.dwarf.UT.skeleton, std.dwarf.UT.split_compile => try c.skip(8),
-                std.dwarf.UT.type, std.dwarf.UT.split_type => try c.skip(8 + @as(u64, offset_size)),
-                else => return error.InvalidDebugInfo,
-            }
-        } else if (version >= 2) {
-            abbrev_offset = try c.sized(offset_size);
-            address_size = try c.byte();
-        } else return error.InvalidDebugInfo;
-        const format: Format = .{ .offset_size = offset_size, .address_size = address_size, .unit_start = unit_start, .version = version };
+        const header = try unitHeader(&c);
+        const format = header.format;
+        const offset_size = format.offset_size;
+        const unit_end = header.end;
+        const abbrev_offset = header.abbrev_offset;
         const table = blk: {
             const got = try tables.getOrPut(arena, abbrev_offset);
             if (!got.found_existing) got.value_ptr.* = try readTable(arena, d.sections.abbrev, abbrev_offset);
@@ -560,49 +620,17 @@ fn decode(d: *Dwarf, gpa: std.mem.Allocator) Error!void {
             const abbrev = table.get(code) orelse return error.InvalidDebugInfo;
             const kind = Kind.of(abbrev.tag);
             var entry: Entry = .{ .kind = kind orelse .unit, .parent = if (stack.items.len > 0) stack.items[stack.items.len - 1] else none, .unit = unit_index, .name = "" };
-            var line_relative: ?i64 = null;
-            var call_relative: ?i64 = null;
+            var read: Read = .{};
             for (abbrev.specs) |spec| {
                 const value = try d.readValue(&unit_c, spec.form, spec.implicit, format);
-                if (kind == null) continue;
-                switch (spec.attribute) {
-                    Attribute.name => if (value == .string) {
-                        entry.name = value.string;
-                    },
-                    Attribute.type => if (value == .reference) {
-                        entry.type = try offset32(value.reference);
-                    },
-                    Attribute.ZIG_parent => if (value == .reference) {
-                        entry.zig_parent = try offset32(value.reference);
-                    },
-                    Attribute.abstract_origin => if (value == .reference) {
-                        entry.abstract_origin = try offset32(value.reference);
-                    },
-                    Attribute.specification => if (value == .reference) {
-                        entry.specification = try offset32(value.reference);
-                    },
-                    Attribute.ZIG_relative_decl => if (value == .reference) {
-                        entry.relative_decl = try offset32(value.reference);
-                    },
-                    Attribute.decl_file => entry.file = if (value == .unsigned) try small(value) else none,
-                    Attribute.decl_line => entry.line = try small(value),
-                    Attribute.decl_column => entry.column = try small(value),
-                    Attribute.call_line => entry.call_line = try small(value),
-                    Attribute.call_column => entry.call_column = try small(value),
-                    Attribute.ZIG_decl_line_relative => line_relative = signedOf(value),
-                    Attribute.ZIG_call_line_relative => call_relative = signedOf(value),
-                    Attribute.low_pc => entry.code = value != .none,
-                    Attribute.const_expr => entry.comptime_known = value == .flag and value.flag,
-                    Attribute.declaration => entry.declaration = value == .flag and value.flag,
-                    Attribute.stmt_list => if (kind == .unit and value == .unsigned) {
-                        stmt_list = value.unsigned;
-                    },
-                    Attribute.comp_dir => if (kind == .unit and value == .string) {
-                        unit_dir = value.string;
-                    },
-                    else => {},
-                }
+                if (kind) |known| try read.attribute(&entry, known, spec.attribute, value);
             }
+            if (entry.kind == .unit) {
+                if (read.stmt_list) |list| stmt_list = list;
+                if (read.unit_dir) |dir| unit_dir = dir;
+            }
+            const line_relative = read.line_relative;
+            const call_relative = read.call_relative;
             var kept: u32 = none;
             if (kind) |_| {
                 kept = aegis.int.narrow(u32, d.entries.len) orelse return error.InvalidDebugInfo;
@@ -841,16 +869,10 @@ const Builder = struct {
     }
 };
 
-/// An ELF file holding a DWARF 5 unit: a file struct `s` (file 0) declaring a struct `List`
-/// (line 3) with a member `len` of type `usize`, a method `first` (line 5, ZIG_parent `List`,
-/// with code) whose comptime parameter `n` is a `usize` and whose local `x`, inside a lexical
-/// block, is a `usize`, and a declaration `width` whose line is `List`'s plus 7; an instance
-/// `Box(u32)` (line 9) with a member `value` of type `usize` and a method `get` returning one;
-/// a tagged union `Shape` (line 11) whose variant part holds its tag and the fields `circle`
-/// and `square`; and `alias`, a declaration of `s` whose value is another's.
-fn sample(gpa: std.mem.Allocator) ![]u8 {
+/// The sample's abbreviations, by code from 1, as the entries `sample` writes use them.
+fn sampleAbbrev(gpa: std.mem.Allocator) !Builder {
     var abbrev: Builder = .{ .gpa = gpa };
-    defer abbrev.deinit();
+    errdefer abbrev.deinit();
     const Attr = struct { u64, u64 };
     const abbrevs = [_]struct { u64, bool, []const Attr }{
         .{ Tag.compile_unit, true, &.{ .{ Attribute.name, Form.string }, .{ Attribute.stmt_list, Form.sec_offset }, .{ Attribute.comp_dir, Form.string } } },
@@ -881,6 +903,19 @@ fn sample(gpa: std.mem.Allocator) ![]u8 {
         try abbrev.u(0);
     }
     try abbrev.u(0);
+    return abbrev;
+}
+
+/// An ELF file holding a DWARF 5 unit: a file struct `s` (file 0) declaring a struct `List`
+/// (line 3) with a member `len` of type `usize`, a method `first` (line 5, ZIG_parent `List`,
+/// with code) whose comptime parameter `n` is a `usize` and whose local `x`, inside a lexical
+/// block, is a `usize`, and a declaration `width` whose line is `List`'s plus 7; an instance
+/// `Box(u32)` (line 9) with a member `value` of type `usize` and a method `get` returning one;
+/// a tagged union `Shape` (line 11) whose variant part holds its tag and the fields `circle`
+/// and `square`; and `alias`, a declaration of `s` whose value is another's.
+fn sample(gpa: std.mem.Allocator) ![]u8 {
+    var abbrev = try sampleAbbrev(gpa);
+    defer abbrev.deinit();
 
     var info: Builder = .{ .gpa = gpa };
     defer info.deinit();
@@ -973,8 +1008,16 @@ fn sample(gpa: std.mem.Allocator) ![]u8 {
     try info.u(0); // end of unit
     info.patch32(0, @intCast(info.bytes.items.len - 4)); // safe: a test's few bytes
 
-    var line: Builder = .{ .gpa = gpa };
+    var line = try sampleLine(gpa);
     defer line.deinit();
+    return elfOf(gpa, info.bytes.items, abbrev.bytes.items, line.bytes.items);
+}
+
+/// The sample's line program: directories `/pkg` and `src`, files `s.zig` (in `src`) and
+/// `other.zig`.
+fn sampleLine(gpa: std.mem.Allocator) !Builder {
+    var line: Builder = .{ .gpa = gpa };
+    errdefer line.deinit();
     try line.int(u32, 0); // length, patched
     try line.int(u16, 5);
     try line.bytes.append(gpa, 8);
@@ -1000,8 +1043,13 @@ fn sample(gpa: std.mem.Allocator) ![]u8 {
     try line.u(0);
     line.patch32(0, @intCast(line.bytes.items.len - 4)); // safe: a test's few bytes
 
+    return line;
+}
+
+/// An ELF file holding the sections `info`, `abbrev` and `line`, as `.debug_*`.
+fn elfOf(gpa: std.mem.Allocator, info: []const u8, abbrev: []const u8, line: []const u8) ![]u8 {
     const names = "\x00.shstrtab\x00.debug_info\x00.debug_abbrev\x00.debug_line\x00";
-    const contents = [_]struct { u32, []const u8 }{ .{ 1, names }, .{ 11, info.bytes.items }, .{ 23, abbrev.bytes.items }, .{ 37, line.bytes.items } };
+    const contents = [_]struct { u32, []const u8 }{ .{ 1, names }, .{ 11, info }, .{ 23, abbrev }, .{ 37, line } };
     var elf: Builder = .{ .gpa = gpa };
     defer elf.deinit();
     try elf.bytes.appendSlice(gpa, &.{ 0x7f, 'E', 'L', 'F', 2, 1, 1, 0 });
