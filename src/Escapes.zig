@@ -25,7 +25,7 @@ const Ast = std.zig.Ast;
 pub fn check(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
-    const self: Walk = .{ .c = c, .tree = tree, .model = model };
+    const self: Walk = .{ .c = c, .rule = rule, .tree = tree, .model = model };
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         // What leaves the statement, and the place it is stored into (none for a return).
@@ -61,6 +61,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
 
 const Walk = struct {
     c: *Context,
+    rule: Rule,
     tree: *const Ast,
     model: *const Model,
 
@@ -125,12 +126,17 @@ const Walk = struct {
     }
 
     /// Whether the local's value is held in its own memory: its type is known and no pointer
-    /// (`array`, an array).
+    /// (`array`, an array). A local in code no compiled root holds is no pass: its site is
+    /// counted not reached (`Context.unknownAt`).
     fn held(self: Walk, identifier: Ast.Node.Index, array: bool) Context.Error!bool {
         const value = try self.c.facts.resolve(self.c.file, identifier);
         return switch (value) {
             .array => true,
             .instance, .scalar, .literal, .optional, .error_union => !array,
+            .unknown => |why| {
+                if (why == .not_reached) try self.c.unknownAt(self.rule, self.tree.nodeMainToken(identifier), why);
+                return false;
+            },
             else => false,
         };
     }

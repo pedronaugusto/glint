@@ -56,7 +56,10 @@ const Expected = struct {
 };
 
 const Role = enum { hole, twin };
-const Verdict = enum { flagged, refused, clean };
+/// What glint says of a case: a finding of its rule, a run error, nothing; or, with compiled
+/// roots, that its rule read a site in code no root compiles (`not_reached`): neither a finding
+/// nor a pass, counted apart.
+const Verdict = enum { flagged, refused, clean, not_reached };
 
 /// A row's cases under one rule.
 const Cell = struct { holes: usize = 0, twins: usize = 0 };
@@ -69,6 +72,8 @@ const Column = struct {
     failing: usize = 0,
     /// Its holes on the `outside` list.
     outside: usize = 0,
+    /// Its cases whose sites no compiled root holds (`Verdict.not_reached`).
+    not_reached: usize = 0,
 };
 
 /// A case to judge, and what its verdict is read against.
@@ -197,6 +202,12 @@ pub fn main(init: std.process.Init) !void {
         };
         // A case Zig refuses is no program, so it passes nothing; it was named where refused.
         const compiles = !refusals.contains(job.absolute) and !(if (job.before) |before| refusals.contains(before) else false);
+        // A case in code no compiled root holds is not reached: the compiled run reads nothing
+        // there, by design, and says so; the plain suite judges it.
+        if (verdict == .not_reached) {
+            column.not_reached += 1;
+            continue;
+        }
         // A hole outside its rule's scope is the one hole that must be clean: one flagged is in
         // the scope now, and the list says so no longer.
         if (job.outside) {
@@ -261,7 +272,13 @@ pub fn main(init: std.process.Init) !void {
         beyond += column.outside;
         if (column.outside != 0) try o.print(" {s} {d}", .{ column.rule, column.outside });
     }
-    try o.print("\n{d} cases, {d} open, {d} outside, {d} cells empty; a cell is holes+twins, . none yet, - none possible\n", .{ jobs.items.len, failing, beyond, empty });
+    var unreached: usize = 0;
+    for (columns.items) |column| unreached += column.not_reached;
+    if (unreached != 0) {
+        try o.writeAll("\nnot reached:");
+        for (columns.items) |column| if (column.not_reached != 0) try o.print(" {s} {d}", .{ column.rule, column.not_reached });
+    }
+    try o.print("\n{d} cases, {d} open, {d} outside, {d} not reached, {d} cells empty; a cell is holes+twins, . none yet, - none possible\n", .{ jobs.items.len, failing, beyond, unreached, empty });
     try o.flush();
     if (failures.written().len != 0) {
         std.debug.print("{s}", .{failures.written()});
@@ -700,11 +717,20 @@ fn judge(gpa: std.mem.Allocator, io: std.Io, store: *glint.Project.Store, rule: 
 /// What a run's text output and exit status say of the case: flagged where `rule` finds
 /// anything outside `before`; else refused where glint writes a run error of any file but
 /// `before`, a malformed suppression, or, without `before`, says the run is incomplete (status
-/// 2); else clean.
+/// 2); else not reached where the report counts `rule`'s sites not reached; else clean.
 fn verdictOf(output: []const u8, status: u8, rule: []const u8, before: ?[]const u8) Verdict {
     var verdict: Verdict = .clean;
+    var unreached = false;
     var lines = std.mem.splitScalar(u8, output, '\n');
     while (lines.next()) |line| {
+        const not_reached = "not reached: sites in code no compiled root holds: ";
+        if (std.mem.startsWith(u8, line, not_reached)) {
+            var counts = std.mem.splitSequence(u8, line[not_reached.len..], ", ");
+            while (counts.next()) |count| if (std.mem.startsWith(u8, count, rule) and std.mem.startsWith(u8, count[rule.len..], " ")) {
+                unreached = true;
+            };
+            continue;
+        }
         if (before) |path| if (about(line, rule, path) or about(line, "error", path) or about(line, "suppression", path)) continue;
         if (std.mem.startsWith(u8, line, rule) and std.mem.startsWith(u8, line[rule.len..], ": ")) return .flagged;
         if (std.mem.startsWith(u8, line, "error: ")) verdict = .refused;
@@ -712,7 +738,17 @@ fn verdictOf(output: []const u8, status: u8, rule: []const u8, before: ?[]const 
     }
     // An incomplete run no line explains is the case's, where no `before` is there to be it.
     if (verdict == .clean and status == 2 and before == null) return .refused;
+    if (verdict == .clean and unreached) return .not_reached;
     return verdict;
+}
+
+test "a case whose rule's sites no compiled root holds is not reached, unless a finding or a run error says more" {
+    const line = "not reached: sites in code no compiled root holds: A004 1, P009 2\n";
+    try std.testing.expectEqual(Verdict.not_reached, verdictOf(line, 0, "P009", null));
+    try std.testing.expectEqual(Verdict.clean, verdictOf(line, 0, "P00", null));
+    try std.testing.expectEqual(Verdict.clean, verdictOf(line, 0, "A001", null));
+    try std.testing.expectEqual(Verdict.flagged, verdictOf("P009: /s/case.zig:3:5: a slice of the frame\n" ++ line, 1, "P009", null));
+    try std.testing.expectEqual(Verdict.refused, verdictOf("error: /s/case.zig: x\n" ++ line, 2, "P009", null));
 }
 
 test "a case's verdict: a run error of its files refuses it" {

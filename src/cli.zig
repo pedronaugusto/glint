@@ -675,13 +675,19 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, wri
     return status;
 }
 
-/// The compiled root at `path` (`--compiled`), its files named under `package_root`. One that
-/// cannot be read whole as an x86_64 ELF holding Zig's DWARF is refused, saying why.
+/// The most a compiled root may hold, read whole: a package's test binary with its DWARF, in
+/// Debug, is tens to hundreds of MiB.
+const compiled_limit: u64 = 4 << 30;
+
+/// The compiled root at `path` (`--compiled`), its files named under `package_root`. Read whole
+/// here, at the command line's input seam, its bytes input until the DWARF reader has parsed
+/// them; the reader keeps the sections it reads, and the bytes go. One that cannot be read whole
+/// as an x86_64 ELF holding Zig's DWARF, or is past `compiled_limit`, is refused, saying why.
 fn readCompiled(gpa: std.mem.Allocator, io: std.Io, path: []const u8, package_root: []const u8, problems: *std.Io.Writer) !Compiled {
     const dwarf = read: {
-        const binary = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| break :read err;
-        defer binary.close(io);
-        break :read Compiled.Dwarf.read(gpa, io, binary);
+        const bytes = aegis.own.readFile(io, std.Io.Dir.cwd(), path, gpa, .fromRaw(compiled_limit)) catch |err| break :read err;
+        defer gpa.free(bytes);
+        break :read aegis.input.Untrusted([]const u8).init(bytes).parse(gpa, Compiled.Dwarf.parse);
     } catch |err| switch (err) {
         error.OutOfMemory, error.Canceled => |e| return e,
         else => {

@@ -26,7 +26,7 @@ units: []const Unit,
 /// call's (`ZIG_call_line_relative`): read as offsets from that entry's line (`relative`).
 relative_lines: usize,
 
-pub const Error = error{ InvalidDebugInfo, NotElf64, CompressedSection, MissingSection, OutOfMemory } || std.Io.File.ReadPositionalError || std.Io.File.LengthError;
+pub const Error = error{ InvalidDebugInfo, NotElf64, CompressedSection, MissingSection, OutOfMemory };
 
 /// What an entry is, as glint reads it.
 pub const Kind = enum(u8) {
@@ -129,9 +129,11 @@ const Sections = struct {
     line_str: []const u8,
 };
 
-/// Reads `file`'s DWARF. `gpa` holds everything the result names, freed by `deinit`.
-pub fn read(gpa: std.mem.Allocator, io: std.Io, file: std.Io.File) Error!Dwarf {
-    var sections = try readSections(gpa, io, file);
+/// The DWARF of the ELF binary `bytes`, the caller's input read whole (glint's input seam reads
+/// the file; this parses it). `gpa` holds everything the result names, copied out of `bytes`
+/// and freed by `deinit`: `bytes` may go once this returns.
+pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) Error!Dwarf {
+    var sections = try readSections(gpa, bytes);
     errdefer freeSections(gpa, &sections);
     var dwarf: Dwarf = .{ .sections = sections, .entries = .empty, .offsets = &.{}, .units = &.{}, .relative_lines = 0 };
     errdefer dwarf.entries.deinit(gpa);
@@ -173,26 +175,22 @@ pub fn path(dwarf: *const Dwarf, unit: u32, index: u32) ?[]const u8 {
 
 const section_compressed = 0x800;
 
-fn readSections(gpa: std.mem.Allocator, io: std.Io, file: std.Io.File) Error!Sections {
-    var header: [64]u8 = undefined;
-    if (try file.readPositionalAll(io, &header, 0) != header.len) return error.NotElf64;
+fn readSections(gpa: std.mem.Allocator, bytes: []const u8) Error!Sections {
+    if (bytes.len < 64) return error.NotElf64;
+    const header = bytes[0..64];
     if (!std.mem.eql(u8, header[0..4], "\x7fELF") or header[4] != 2 or header[5] != 1) return error.NotElf64;
     const shoff = std.mem.readInt(u64, header[0x28..0x30], .little);
     const shentsize = std.mem.readInt(u16, header[0x3a..0x3c], .little);
     const shnum = std.mem.readInt(u16, header[0x3c..0x3e], .little);
     const shstrndx = std.mem.readInt(u16, header[0x3e..0x40], .little);
     if (shentsize < 64 or shnum == 0 or shstrndx >= shnum) return error.InvalidDebugInfo;
-    const length = try file.length(io);
     const table_len = std.math.mul(u64, shentsize, shnum) catch return error.InvalidDebugInfo;
-    if (shoff > length or table_len > length - shoff) return error.InvalidDebugInfo;
-    const table = try gpa.alloc(u8, @intCast(table_len)); // safe: at most the file's length, checked above
-    defer gpa.free(table);
-    if (try file.readPositionalAll(io, table, shoff) != table.len) return error.InvalidDebugInfo;
-    const names = try readSection(gpa, io, file, length, table, shentsize, shstrndx);
-    defer gpa.free(names);
+    if (shoff > bytes.len or table_len > bytes.len - shoff) return error.InvalidDebugInfo;
+    const table = bytes[@intCast(shoff)..][0..@intCast(table_len)]; // safe: within bytes, checked above
+    const names = try sectionIn(bytes, table, shentsize, shstrndx);
     var found: [5]?[]u8 = .{ null, null, null, null, null };
     var found_at: [5]u16 = undefined;
-    errdefer for (found) |bytes| if (bytes) |b| gpa.free(b);
+    errdefer for (found) |held| if (held) |b| gpa.free(b);
     const wanted = [5][]const u8{ ".debug_info", ".debug_abbrev", ".debug_str", ".debug_line", ".debug_line_str" };
     for (0..shnum) |index| {
         const entry = table[index * shentsize ..][0..64];
@@ -202,7 +200,7 @@ fn readSections(gpa: std.mem.Allocator, io: std.Io, file: std.Io.File) Error!Sec
         for (wanted, &found, &found_at) |want, *slot, *slot_at| {
             if (!std.mem.eql(u8, name, want)) continue;
             if (slot.* != null) return error.InvalidDebugInfo;
-            slot.* = try readSection(gpa, io, file, length, table, shentsize, @intCast(index)); // safe: below shnum, a u16
+            slot.* = try gpa.dupe(u8, try sectionIn(bytes, table, shentsize, @intCast(index))); // safe: below shnum, a u16
             slot_at.* = @intCast(index); // safe: below shnum, a u16
         }
     }
@@ -215,14 +213,12 @@ fn readSections(gpa: std.mem.Allocator, io: std.Io, file: std.Io.File) Error!Sec
         const target = std.mem.readInt(u32, entry[44..48], .little);
         const symbols = std.mem.readInt(u32, entry[40..44], .little);
         for ([_]usize{ 0, 3 }) |slot| {
-            const bytes = found[slot] orelse continue;
+            const section = found[slot] orelse continue;
             if (target != found_at[slot]) continue;
             if (symbols >= shnum) return error.InvalidDebugInfo;
-            const rela = try readSection(gpa, io, file, length, table, shentsize, @intCast(index)); // safe: below shnum, a u16
-            defer gpa.free(rela);
-            const symtab = try readSection(gpa, io, file, length, table, shentsize, @intCast(symbols)); // safe: below shnum, checked above
-            defer gpa.free(symtab);
-            try relocate(bytes, rela, symtab);
+            const rela = try sectionIn(bytes, table, shentsize, @intCast(index)); // safe: below shnum, a u16
+            const symtab = try sectionIn(bytes, table, shentsize, @intCast(symbols)); // safe: below shnum, checked above
+            try relocate(section, rela, symtab);
         }
     }
     const info = found[0] orelse return error.MissingSection;
@@ -294,17 +290,15 @@ test "a relocatable object's offsets are its relocations' symbol values plus add
     try std.testing.expectError(error.InvalidDebugInfo, relocate(&bytes, &rela, &symtab));
 }
 
-fn readSection(gpa: std.mem.Allocator, io: std.Io, file: std.Io.File, length: u64, table: []const u8, shentsize: u16, index: u16) Error![]u8 {
+/// The bytes of section `index` of `table`, within `bytes`.
+fn sectionIn(bytes: []const u8, table: []const u8, shentsize: u16, index: u16) Error![]const u8 {
     const entry = table[@as(usize, index) * shentsize ..][0..64];
     const flags = std.mem.readInt(u64, entry[8..16], .little);
     if (flags & section_compressed != 0) return error.CompressedSection;
     const offset = std.mem.readInt(u64, entry[24..32], .little);
     const size = std.mem.readInt(u64, entry[32..40], .little);
-    if (offset > length or size > length - offset) return error.InvalidDebugInfo;
-    const bytes = try gpa.alloc(u8, @intCast(size)); // safe: at most the file's length, checked above
-    errdefer gpa.free(bytes);
-    if (try file.readPositionalAll(io, bytes, offset) != bytes.len) return error.InvalidDebugInfo;
-    return bytes;
+    if (offset > bytes.len or size > bytes.len - offset) return error.InvalidDebugInfo;
+    return bytes[@intCast(offset)..][0..@intCast(size)]; // safe: within bytes, checked above
 }
 
 fn freeSections(gpa: std.mem.Allocator, sections: *Sections) void {
@@ -1025,13 +1019,7 @@ fn sample(gpa: std.mem.Allocator) ![]u8 {
 }
 
 fn readBytes(bytes: []const u8) Error!Dwarf {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    tmp.dir.writeFile(io, .{ .sub_path = "binary", .data = bytes }) catch return error.InvalidDebugInfo;
-    const file = tmp.dir.openFile(io, "binary", .{}) catch return error.InvalidDebugInfo;
-    defer file.close(io);
-    return read(std.testing.allocator, io, file);
+    return parse(std.testing.allocator, bytes);
 }
 
 fn find(d: *const Dwarf, name: []const u8) ?u32 {
