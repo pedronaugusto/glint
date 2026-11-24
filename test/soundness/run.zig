@@ -33,12 +33,32 @@
 //! its own; Zig's cache (`.zig-cache` in the run's directory, the package root) keeps what has
 //! not changed.
 //!
+//! A run judges its shard of the cases (`PREFLIGHT_SHARD`, `i/n`; none, all), split as preflight
+//! splits a test binary's tests, by each case's seconds in the durations record, and records each
+//! case's time (`soundness/<rule>/<row>/<case>/<file>`) for preflight's `profile` to fold into it:
+//! a guest the whole suite outlasts (FreeBSD's, release run 45273561514) runs it in shards the
+//! planner sizes by that record.
+//!
 //! Usage: soundness SUITE ZIG ZIG_LIB AEGIS_ROOT JOBS [RULES]: ZIG the compiler; JOBS the
 //! workers (0, one per CPU); RULES the rules whose cases alone run, by comma (none, every
 //! rule's).
 const std = @import("std");
 const builtin = @import("builtin");
 const glint = @import("glint");
+// preflight's runner modules: the suite is compiled by the development build alone, whose
+// preflight gives them to the test module it shares with the suite's tests (`soundness_tests`).
+const runner_options = @import("preflight_runner_options");
+const order = @import("preflight_order");
+const timings = @import("preflight_timings");
+
+/// The durations record's column the cases are weighed by and recorded under: preflight's for
+/// the build's system and mode (`-Doptimize`, `soundness_options.mode`), where `order.key` is
+/// the suite binary's own, built in `-Dsoundness-optimize`'s mode.
+const record_column = column: {
+    const suffix = if (builtin.sanitize_thread) "-tsan" else "";
+    const own = "-" ++ @tagName(builtin.optimize) ++ suffix;
+    break :column order.key[0 .. order.key.len - own.len] ++ "-" ++ @tagName(@import("soundness_options").mode) ++ suffix;
+};
 const Row = glint.Constructs.Row;
 
 /// A rule's `expected.zon`.
@@ -156,14 +176,31 @@ pub fn main(init: std.process.Init) !void {
         while (beyond.next()) |path| try w.print("{s}/{s}: on {s}/expected.zon's outside list, and no such hole\n", .{ rule, path.*, rule });
     }
 
+    // The run's share of the cases: `PREFLIGHT_SHARD`'s (`i/n`; none, all of them), split as
+    // preflight splits a test binary's tests, by each case's seconds in the build's column of
+    // the durations record, each case named apart from every test.
+    var environment = try init.minimal.environ.createMap(a);
+    const shard = try order.Shard.parse(environment.get("PREFLIGHT_SHARD") orelse "");
+    const all_names = try a.alloc([]const u8, jobs.items.len);
+    for (jobs.items, all_names) |job, *name| name.* = try std.fmt.allocPrint(a, "soundness/{s}/{s}", .{ columns.items[job.column].rule, job.path });
+    const weights = try order.weigh(a, if (shard.count > 1 and runner_options.durations.len > 0) runner_options.durations else "{}", all_names, record_column);
+    const assigned = try order.assign(a, all_names, weights, shard);
+    const share = try a.alloc(Job, assigned.len);
+    const names = try a.alloc([]const u8, assigned.len);
+    for (assigned, share, names) |index, *job, *name| {
+        job.* = jobs.items[index];
+        name.* = all_names[index];
+    }
+
     // The case files Zig refuses, by their path.
     var refusals: std.StringHashMapUnmanaged(void) = .empty;
-    try compiled(a, init.gpa, io, tools, suite_path, columns.items, jobs.items, &refusals, w);
+    try compiled(a, init.gpa, io, tools, suite_path, columns.items, share, &refusals, w);
 
-    const verdicts = try a.alloc(anyerror!Verdict, jobs.items.len);
-    var pool: Pool = .{ .jobs = jobs.items, .columns = columns.items, .verdicts = verdicts, .lib = lib, .aegis = aegis };
+    const verdicts = try a.alloc(anyerror!Verdict, share.len);
+    const seconds = try a.alloc(u64, share.len);
+    var pool: Pool = .{ .jobs = share, .columns = columns.items, .verdicts = verdicts, .nanoseconds = seconds, .lib = lib, .aegis = aegis };
     const memory: ?u64 = std.process.totalSystemMemory() catch null;
-    const workers = fitted(jobs_asked, std.Thread.getCpuCount() catch 1, jobs.items.len, memory);
+    const workers = fitted(jobs_asked, std.Thread.getCpuCount() catch 1, share.len, memory);
     var group: std.Io.Group = .init;
     defer group.cancel(io);
     for (0..workers) |_| try group.concurrent(io, Pool.work, .{ &pool, init.gpa, io });
@@ -172,7 +209,13 @@ pub fn main(init: std.process.Init) !void {
         const ceiling = held_ceiling + workers * worker_ceiling;
         if (peak > ceiling) try w.print("the suite's peak resident memory is {d} MiB at {d} workers, past its ceiling of {d} MiB: a run keeps memory it should give back\n", .{ peak >> 20, workers, ceiling >> 20 });
     }
-    for (jobs.items, verdicts) |job, result| {
+    // Each case's time, for the durations record (preflight's `profile` folds it): its share of
+    // the run's time, what it took over the workers that ran beside it, so a column's cases sum
+    // to the run's length. A file of its own beside the tests' (whose run begins theirs afresh).
+    const recorder = try timings.Recorder.init(io, init.minimal.environ, if (runner_options.timings) |stem| try std.fmt.allocPrint(a, "{s}-cases", .{stem}) else null, record_column);
+    defer recorder.deinit(io);
+    try recorder.begin(io);
+    for (share, verdicts, names, seconds) |job, result, name, elapsed| {
         const verdict = try result;
         const column = &columns.items[job.column];
         // A case Zig refuses is no program, so it passes nothing; it was named where refused.
@@ -181,6 +224,7 @@ pub fn main(init: std.process.Init) !void {
         // the scope now, and the list says so no longer.
         if (job.outside) {
             column.outside += 1;
+            try recorder.record(io, name, elapsed / workers, if (compiles and verdict == .clean) "pass" else "fail");
             if (compiles and verdict != .clean) try w.print("{s}/{s}: {t}, and on {s}/expected.zon's outside list: in the rule's scope now; take it off\n", .{ column.rule, job.path, verdict, column.rule });
             continue;
         }
@@ -189,6 +233,7 @@ pub fn main(init: std.process.Init) !void {
             .twin => verdict == .clean,
         };
         if (!passes) column.failing += 1;
+        try recorder.record(io, name, elapsed / workers, if (passes) "pass" else "fail");
         if (passes and job.listed) try w.print("{s}/{s}: passes now; take it off {s}/expected.zon's open list\n", .{ column.rule, job.path, column.rule });
         if (!passes and !job.listed and compiles) try w.print("{s}/{s}: {t}, where a {t} must be {s}\n", .{ column.rule, job.path, verdict, job.role, if (job.role == .hole) "flagged or refused" else "clean" });
     }
@@ -241,7 +286,7 @@ pub fn main(init: std.process.Init) !void {
         beyond += column.outside;
         if (column.outside != 0) try o.print(" {s} {d}", .{ column.rule, column.outside });
     }
-    try o.print("\n{d} cases, {d} open, {d} outside, {d} cells empty; a cell is holes+twins, . none yet, - none possible\n", .{ jobs.items.len, failing, beyond, empty });
+    try o.print("\n{d} cases, {d} open, {d} outside, {d} cells empty; a cell is holes+twins, . none yet, - none possible\n", .{ share.len, failing, beyond, empty });
     try o.flush();
     if (failures.written().len != 0) {
         std.debug.print("{s}", .{failures.written()});
@@ -265,20 +310,26 @@ const worker_resident: u64 = 640 << 20;
 /// The workers a run judges its cases on: those asked, else one per CPU, never more than the
 /// cases, and, unasked, no more than the machine's memory holds beside what the run keeps. A
 /// machine of 2 GiB (preflight's riscv64 and FreeBSD guests) runs two, where four ran it out of
-/// memory and its kernel killed the suite (release run 44562800622).
+/// memory and its kernel killed the suite (release run 44562800622). Unasked on a machine whose
+/// memory is not known (`memory` null: its system does not say, or the query failed), one: no
+/// more than any machine holds, never none.
 fn fitted(asked: usize, cpus: usize, cases: usize, memory: ?u64) usize {
     var workers = @min(if (asked != 0) asked else cpus, @max(cases, 1));
-    if (asked == 0) if (memory) |total| {
+    if (asked == 0) {
+        const total = memory orelse return 1;
         const room = total -| held_ceiling;
         workers = @min(workers, @max(1, std.math.cast(usize, room / worker_resident) orelse workers));
-    };
+    }
     return @max(workers, 1);
 }
 
 test "the pool is fitted to the machine's memory unless the workers are asked" {
     try std.testing.expectEqual(@as(usize, 2), fitted(0, 4, 629, 2 << 30));
     try std.testing.expectEqual(@as(usize, 4), fitted(0, 4, 629, 64 << 30));
-    try std.testing.expectEqual(@as(usize, 4), fitted(0, 4, 629, null));
+    try std.testing.expectEqual(@as(usize, 1), fitted(0, 4, 629, null));
+    try std.testing.expectEqual(@as(usize, 1), fitted(0, 64, 629, null));
+    try std.testing.expectEqual(@as(usize, 1), fitted(0, 4, 629, 0));
+    try std.testing.expectEqual(@as(usize, 3), fitted(3, 4, 629, null));
     try std.testing.expectEqual(@as(usize, 1), fitted(0, 4, 629, 600 << 20));
     try std.testing.expectEqual(@as(usize, 4), fitted(4, 8, 629, 2 << 30));
     try std.testing.expectEqual(@as(usize, 3), fitted(0, 8, 3, 64 << 30));
@@ -534,6 +585,8 @@ const Pool = struct {
     jobs: []const Job,
     columns: []const Column,
     verdicts: []anyerror!Verdict,
+    /// Each case's time to judge.
+    nanoseconds: []u64,
     lib: []const u8,
     aegis: []const u8,
     next: std.atomic.Value(usize) = .init(0),
@@ -545,7 +598,9 @@ const Pool = struct {
             const index = pool.next.fetchAdd(1, .monotonic);
             if (index >= pool.jobs.len) return;
             const job = pool.jobs[index];
+            const start: std.Io.Clock.Timestamp = .now(io, .awake);
             pool.verdicts[index] = judge(gpa, io, &store, pool.columns[job.column].rule, pool.lib, pool.aegis, job);
+            pool.nanoseconds[index] = @intCast(start.untilNow(io).raw.nanoseconds);
         }
     }
 };

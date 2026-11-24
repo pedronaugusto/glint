@@ -80,11 +80,15 @@ pub fn dev(b: *std.Build, tools: type) void {
     };
     // The heavy roots' aegis is the one their glint imports, so that a value of one is a value
     // of the other; aegis's source tree they read as data is the same files whatever the mode.
+    // Their shakedown is built in their mode too: shakedown imports aegis, and one built in
+    // `-Doptimize`'s mode brings that mode's aegis, a second module of aegis's root file, which
+    // a root that reaches shakedown (the hardened runner's quarantine) refuses (release run
+    // 45273561514).
     const heavy_imports = [_]std.Build.Module.Import{
         .{ .name = "aegis", .module = unit_module.import_table.get("aegis") orelse @panic("glint's module imports aegis") },
         .{ .name = "glint", .module = unit_module },
         .{ .name = "aegis_sources", .module = aegisSources(b, p, unit_module, aegis_dependency, target, harness) },
-        .{ .name = "shakedown", .module = shakedown },
+        .{ .name = "shakedown", .module = b.dependency("shakedown", .{ .target = target, .optimize = unit_optimize }).module("shakedown") },
     };
     // The first root is light, the others heavy.
     for ([_][]const u8{ "src/tests.zig", "src/test_danger.zig", "src/test_pack.zig" }, 0..) |root, index| {
@@ -105,6 +109,12 @@ pub fn dev(b: *std.Build, tools: type) void {
         .optimize = soundness_optimize,
         .imports = &.{.{ .name = "glint", .module = soundness_package.module("glint") }},
     }) });
+    // The column of the durations record the suite's cases are weighed by and recorded under:
+    // the build's own (its system and `-Doptimize`'s mode), as its tests', not the suite's
+    // binary's, whose mode is `-Dsoundness-optimize`'s.
+    const soundness_options = b.addOptions();
+    soundness_options.addOption(std.lang.Optimize, "mode", optimize);
+    soundness.root_module.addOptions("soundness_options", soundness_options);
     const soundness_run = b.addRunArtifact(soundness);
     soundness_run.addDirectoryArg2(p.path("test/soundness"), .{});
     soundness_run.addFileArg2(.zig_exe, .{});
@@ -112,6 +122,10 @@ pub fn dev(b: *std.Build, tools: type) void {
     soundness_run.addFileArg2(aegis_dependency.path("src/root.zig"), .{});
     soundness_run.addArg(b.fmt("{d}", .{soundness_jobs}));
     if (soundness_rules) |list| soundness_run.addArg(list);
+    // The run reads its share of the cases from `PREFLIGHT_SHARD` when it runs, never from the
+    // build's configuration, which Zig 0.17 caches with what it read then (preflight's
+    // record.zig). The step is never cached: it captures no output and writes no output file,
+    // so Zig runs it every time (Maker/Step/Run.zig, `.infer_from_args`).
     test_step.dependOn(&soundness_run.step);
     const soundness_tests = b.addTest(.{ .root_module = soundness.root_module });
     test_step.dependOn(&b.addRunArtifact(soundness_tests).step);
