@@ -8,9 +8,9 @@
 //! whole. Lexical blocks are read through: an entry's parent is its nearest entry kept.
 const std = @import("std");
 const aegis = @import("aegis");
-const TAG = std.dwarf.TAG;
-const AT = std.dwarf.AT;
-const FORM = std.dwarf.FORM;
+const Tag = std.dwarf.TAG;
+const Attribute = std.dwarf.AT;
+const Form = std.dwarf.FORM;
 const Dwarf = @This();
 
 /// The sections' bytes, owned: names point into them.
@@ -55,28 +55,28 @@ pub const Kind = enum(u8) {
 
     fn of(tag: u64) ?Kind {
         return switch (tag) {
-            TAG.compile_unit => .unit,
-            TAG.module => .module,
-            TAG.subprogram => .subprogram,
-            TAG.formal_parameter => .parameter,
-            TAG.variable => .variable,
-            TAG.constant => .constant,
-            TAG.ZIG_comptime_value => .comptime_value,
-            TAG.member => .member,
-            TAG.structure_type => .structure,
-            TAG.union_type => .@"union",
-            TAG.enumeration_type => .enumeration,
-            TAG.enumerator => .enumerator,
-            TAG.variant_part => .variant_part,
-            TAG.variant => .variant,
-            TAG.pointer_type => .pointer,
-            TAG.const_type => .@"const",
-            TAG.volatile_type => .@"volatile",
-            TAG.typedef => .typedef,
-            TAG.array_type => .array,
-            TAG.base_type => .base,
-            TAG.subroutine_type => .subroutine,
-            TAG.inlined_subroutine => .inlined,
+            Tag.compile_unit => .unit,
+            Tag.module => .module,
+            Tag.subprogram => .subprogram,
+            Tag.formal_parameter => .parameter,
+            Tag.variable => .variable,
+            Tag.constant => .constant,
+            Tag.ZIG_comptime_value => .comptime_value,
+            Tag.member => .member,
+            Tag.structure_type => .structure,
+            Tag.union_type => .@"union",
+            Tag.enumeration_type => .enumeration,
+            Tag.enumerator => .enumerator,
+            Tag.variant_part => .variant_part,
+            Tag.variant => .variant,
+            Tag.pointer_type => .pointer,
+            Tag.const_type => .@"const",
+            Tag.volatile_type => .@"volatile",
+            Tag.typedef => .typedef,
+            Tag.array_type => .array,
+            Tag.base_type => .base,
+            Tag.subroutine_type => .subroutine,
+            Tag.inlined_subroutine => .inlined,
             else => null,
         };
     }
@@ -183,7 +183,7 @@ fn readSections(gpa: std.mem.Allocator, io: std.Io, file: std.Io.File) Error!Sec
     const shstrndx = std.mem.readInt(u16, header[0x3e..0x40], .little);
     if (shentsize < 64 or shnum == 0 or shstrndx >= shnum) return error.InvalidDebugInfo;
     const length = try file.length(io);
-    const table_len = (aegis.int.Checked(u64).init(shentsize).mul(shnum) catch return error.InvalidDebugInfo).raw();
+    const table_len = std.math.mul(u64, shentsize, shnum) catch return error.InvalidDebugInfo;
     if (shoff > length or table_len > length - shoff) return error.InvalidDebugInfo;
     const table = try gpa.alloc(u8, @intCast(table_len)); // safe: at most the file's length, checked above
     defer gpa.free(table);
@@ -415,7 +415,7 @@ fn readTable(arena: std.mem.Allocator, abbrev: []const u8, offset: u64) Error!Ta
         while (true) {
             const attribute = try c.uleb();
             const form = try c.uleb();
-            const implicit: i64 = if (form == FORM.implicit_const) try c.sleb() else 0;
+            const implicit: i64 = if (form == Form.implicit_const) try c.sleb() else 0;
             if (attribute == 0 and form == 0) break;
             if (specs.items.len == max_specs) return error.InvalidDebugInfo;
             try specs.append(arena, .{ .attribute = attribute, .form = form, .implicit = implicit });
@@ -433,44 +433,44 @@ const Format = struct { offset_size: u8, address_size: u8, unit_start: u64, vers
 fn readValue(d: *const Dwarf, c: *Cursor, form_in: u64, implicit: i64, format: Format) Error!Value {
     var form = form_in;
     var hops: u8 = 0;
-    while (form == FORM.indirect) : (hops += 1) {
+    while (form == Form.indirect) : (hops += 1) {
         if (hops == 8) return error.InvalidDebugInfo;
         form = try c.uleb();
     }
     return switch (form) {
-        FORM.addr => .{ .unsigned = try c.sized(format.address_size) },
-        FORM.data1, FORM.ref1, FORM.flag, FORM.strx1, FORM.addrx1 => readPlain(form, try c.byte(), format),
-        FORM.data2, FORM.ref2, FORM.strx2, FORM.addrx2 => readPlain(form, try c.fixed(u16), format),
-        FORM.strx3, FORM.addrx3 => readPlain(form, try c.fixed(u24), format),
-        FORM.data4, FORM.ref4, FORM.ref_sup4, FORM.strx4, FORM.addrx4 => readPlain(form, try c.fixed(u32), format),
-        FORM.data8, FORM.ref8, FORM.ref_sig8, FORM.ref_sup8 => readPlain(form, try c.fixed(u64), format),
-        FORM.data16 => blk: {
+        Form.addr => .{ .unsigned = try c.sized(format.address_size) },
+        Form.data1, Form.ref1, Form.flag, Form.strx1, Form.addrx1 => readPlain(form, try c.byte(), format),
+        Form.data2, Form.ref2, Form.strx2, Form.addrx2 => readPlain(form, try c.fixed(u16), format),
+        Form.strx3, Form.addrx3 => readPlain(form, try c.fixed(u24), format),
+        Form.data4, Form.ref4, Form.ref_sup4, Form.strx4, Form.addrx4 => readPlain(form, try c.fixed(u32), format),
+        Form.data8, Form.ref8, Form.ref_sig8, Form.ref_sup8 => readPlain(form, try c.fixed(u64), format),
+        Form.data16 => blk: {
             try c.skip(16);
             break :blk .none;
         },
-        FORM.udata, FORM.ref_udata, FORM.strx, FORM.addrx, FORM.loclistx, FORM.rnglistx => readPlain(form, try c.uleb(), format),
-        FORM.sdata => .{ .signed = try c.sleb() },
-        FORM.implicit_const => .{ .signed = implicit },
-        FORM.flag_present => .{ .flag = true },
-        FORM.string => .{ .string = try c.cString() },
-        FORM.strp => .{ .string = try stringAt(d.sections.str, try c.sized(format.offset_size)) },
-        FORM.line_strp => .{ .string = try stringAt(d.sections.line_str, try c.sized(format.offset_size)) },
-        FORM.ref_addr => .{ .reference = try c.sized(if (format.version <= 2) format.address_size else format.offset_size) },
-        FORM.sec_offset, FORM.strp_sup, FORM.GNU_strp_alt, FORM.GNU_ref_alt => .{ .unsigned = try c.sized(format.offset_size) },
-        FORM.block1 => skipBlock(c, try c.byte()),
-        FORM.block2 => skipBlock(c, try c.fixed(u16)),
-        FORM.block4 => skipBlock(c, try c.fixed(u32)),
-        FORM.block, FORM.exprloc => skipBlock(c, try c.uleb()),
+        Form.udata, Form.ref_udata, Form.strx, Form.addrx, Form.loclistx, Form.rnglistx => readPlain(form, try c.uleb(), format),
+        Form.sdata => .{ .signed = try c.sleb() },
+        Form.implicit_const => .{ .signed = implicit },
+        Form.flag_present => .{ .flag = true },
+        Form.string => .{ .string = try c.cString() },
+        Form.strp => .{ .string = try stringAt(d.sections.str, try c.sized(format.offset_size)) },
+        Form.line_strp => .{ .string = try stringAt(d.sections.line_str, try c.sized(format.offset_size)) },
+        Form.ref_addr => .{ .reference = try c.sized(if (format.version <= 2) format.address_size else format.offset_size) },
+        Form.sec_offset, Form.strp_sup, Form.GNU_strp_alt, Form.GNU_ref_alt => .{ .unsigned = try c.sized(format.offset_size) },
+        Form.block1 => skipBlock(c, try c.byte()),
+        Form.block2 => skipBlock(c, try c.fixed(u16)),
+        Form.block4 => skipBlock(c, try c.fixed(u32)),
+        Form.block, Form.exprloc => skipBlock(c, try c.uleb()),
         else => error.InvalidDebugInfo,
     };
 }
 
 fn readPlain(form: u64, raw: u64, format: Format) Value {
     return switch (form) {
-        FORM.ref1, FORM.ref2, FORM.ref4, FORM.ref8, FORM.ref_udata => .{ .reference = format.unit_start +% raw },
-        FORM.flag => .{ .flag = raw != 0 },
+        Form.ref1, Form.ref2, Form.ref4, Form.ref8, Form.ref_udata => .{ .reference = format.unit_start +% raw },
+        Form.flag => .{ .flag = raw != 0 },
         // An index into tables this reader does not hold: what it names is not read.
-        FORM.strx, FORM.strx1, FORM.strx2, FORM.strx3, FORM.strx4, FORM.ref_sig8, FORM.ref_sup4, FORM.ref_sup8 => .none,
+        Form.strx, Form.strx1, Form.strx2, Form.strx3, Form.strx4, Form.ref_sig8, Form.ref_sup4, Form.ref_sup8 => .none,
         else => .{ .unsigned = raw },
     };
 }
@@ -568,38 +568,38 @@ fn decode(d: *Dwarf, gpa: std.mem.Allocator) Error!void {
                 const value = try d.readValue(&unit_c, spec.form, spec.implicit, format);
                 if (kind == null) continue;
                 switch (spec.attribute) {
-                    AT.name => if (value == .string) {
+                    Attribute.name => if (value == .string) {
                         entry.name = value.string;
                     },
-                    AT.type => if (value == .reference) {
+                    Attribute.type => if (value == .reference) {
                         entry.type = try offset32(value.reference);
                     },
-                    AT.ZIG_parent => if (value == .reference) {
+                    Attribute.ZIG_parent => if (value == .reference) {
                         entry.zig_parent = try offset32(value.reference);
                     },
-                    AT.abstract_origin => if (value == .reference) {
+                    Attribute.abstract_origin => if (value == .reference) {
                         entry.abstract_origin = try offset32(value.reference);
                     },
-                    AT.specification => if (value == .reference) {
+                    Attribute.specification => if (value == .reference) {
                         entry.specification = try offset32(value.reference);
                     },
-                    AT.ZIG_relative_decl => if (value == .reference) {
+                    Attribute.ZIG_relative_decl => if (value == .reference) {
                         entry.relative_decl = try offset32(value.reference);
                     },
-                    AT.decl_file => entry.file = if (value == .unsigned) try small(value) else none,
-                    AT.decl_line => entry.line = try small(value),
-                    AT.decl_column => entry.column = try small(value),
-                    AT.call_line => entry.call_line = try small(value),
-                    AT.call_column => entry.call_column = try small(value),
-                    AT.ZIG_decl_line_relative => line_relative = signedOf(value),
-                    AT.ZIG_call_line_relative => call_relative = signedOf(value),
-                    AT.low_pc => entry.code = value != .none,
-                    AT.const_expr => entry.comptime_known = value == .flag and value.flag,
-                    AT.declaration => entry.declaration = value == .flag and value.flag,
-                    AT.stmt_list => if (kind == .unit and value == .unsigned) {
+                    Attribute.decl_file => entry.file = if (value == .unsigned) try small(value) else none,
+                    Attribute.decl_line => entry.line = try small(value),
+                    Attribute.decl_column => entry.column = try small(value),
+                    Attribute.call_line => entry.call_line = try small(value),
+                    Attribute.call_column => entry.call_column = try small(value),
+                    Attribute.ZIG_decl_line_relative => line_relative = signedOf(value),
+                    Attribute.ZIG_call_line_relative => call_relative = signedOf(value),
+                    Attribute.low_pc => entry.code = value != .none,
+                    Attribute.const_expr => entry.comptime_known = value == .flag and value.flag,
+                    Attribute.declaration => entry.declaration = value == .flag and value.flag,
+                    Attribute.stmt_list => if (kind == .unit and value == .unsigned) {
                         stmt_list = value.unsigned;
                     },
-                    AT.comp_dir => if (kind == .unit and value == .string) {
+                    Attribute.comp_dir => if (kind == .unit and value == .string) {
                         unit_dir = value.string;
                     },
                     else => {},
@@ -667,7 +667,7 @@ fn enclosingFunction(d: *const Dwarf, start: u32) ?u32 {
 
 // --- line programs' file tables ----------------------------------------------------------------
 
-const LNCT = std.dwarf.LNCT;
+const LineContent = std.dwarf.LNCT;
 
 /// The file table of the line program at `offset`: index 0 is the unit's own file from
 /// DWARF 5, nothing before it.
@@ -749,26 +749,26 @@ fn readEntries(gpa: std.mem.Allocator, s: Sections, c: *Cursor, offset_size: u8,
         var dir_index: u64 = 0;
         for (formats[0..format_count]) |f| {
             const v: Value = switch (f.form) {
-                FORM.string => .{ .string = try c.cString() },
-                FORM.line_strp => .{ .string = try stringAt(s.line_str, try c.sized(offset_size)) },
-                FORM.strp => .{ .string = try stringAt(s.str, try c.sized(offset_size)) },
-                FORM.udata => .{ .unsigned = try c.uleb() },
-                FORM.data1 => .{ .unsigned = try c.byte() },
-                FORM.data2 => .{ .unsigned = try c.fixed(u16) },
-                FORM.data4 => .{ .unsigned = try c.fixed(u32) },
-                FORM.data8 => .{ .unsigned = try c.fixed(u64) },
-                FORM.data16 => blk: {
+                Form.string => .{ .string = try c.cString() },
+                Form.line_strp => .{ .string = try stringAt(s.line_str, try c.sized(offset_size)) },
+                Form.strp => .{ .string = try stringAt(s.str, try c.sized(offset_size)) },
+                Form.udata => .{ .unsigned = try c.uleb() },
+                Form.data1 => .{ .unsigned = try c.byte() },
+                Form.data2 => .{ .unsigned = try c.fixed(u16) },
+                Form.data4 => .{ .unsigned = try c.fixed(u32) },
+                Form.data8 => .{ .unsigned = try c.fixed(u64) },
+                Form.data16 => blk: {
                     try c.skip(16);
                     break :blk .none;
                 },
-                FORM.block => skipBlock(c, try c.uleb()) catch return error.InvalidDebugInfo,
+                Form.block => skipBlock(c, try c.uleb()) catch return error.InvalidDebugInfo,
                 else => return error.InvalidDebugInfo,
             };
             switch (f.content) {
-                LNCT.path => if (v == .string) {
+                LineContent.path => if (v == .string) {
                     name = v.string;
                 },
-                LNCT.directory_index => if (v == .unsigned) {
+                LineContent.directory_index => if (v == .unsigned) {
                     dir_index = v.unsigned;
                 },
                 else => {},
@@ -789,15 +789,15 @@ fn readEntries(gpa: std.mem.Allocator, s: Sections, c: *Cursor, offset_size: u8,
 
 /// `name` in `dir` in `base`, normalized: whichever is absolute starts it.
 fn joinedIn(gpa: std.mem.Allocator, base: []const u8, dir: []const u8, name: []const u8) error{OutOfMemory}![]u8 {
-    if (std.fs.path.isAbsolute(name)) return std.fs.path.resolvePosix(gpa, &.{name});
+    if (std.fs.path.isAbsolute(name)) return std.fs.path.resolveAllocPosix(gpa, &.{name});
     if (base.len == 0) return joined(gpa, dir, name);
-    return std.fs.path.resolvePosix(gpa, &.{ base, dir, name });
+    return std.fs.path.resolveAllocPosix(gpa, &.{ base, dir, name });
 }
 
 /// `dir` joined to `name`, normalized; `name` alone where it is absolute.
 fn joined(gpa: std.mem.Allocator, dir: []const u8, name: []const u8) error{OutOfMemory}![]u8 {
-    if (std.fs.path.isAbsolute(name) or dir.len == 0) return std.fs.path.resolvePosix(gpa, &.{name});
-    return std.fs.path.resolvePosix(gpa, &.{ dir, name });
+    if (std.fs.path.isAbsolute(name) or dir.len == 0) return std.fs.path.resolveAllocPosix(gpa, &.{name});
+    return std.fs.path.resolveAllocPosix(gpa, &.{ dir, name });
 }
 
 // --- tests -------------------------------------------------------------------------------------
@@ -852,16 +852,16 @@ fn sample(gpa: std.mem.Allocator) ![]u8 {
     defer abbrev.deinit();
     const Attr = struct { u64, u64 };
     const abbrevs = [_]struct { u64, bool, []const Attr }{
-        .{ TAG.compile_unit, true, &.{ .{ AT.name, FORM.string }, .{ AT.stmt_list, FORM.sec_offset }, .{ AT.comp_dir, FORM.string } } },
-        .{ TAG.base_type, false, &.{.{ AT.name, FORM.string }} },
-        .{ TAG.structure_type, true, &.{ .{ AT.name, FORM.string }, .{ AT.decl_file, FORM.udata } } },
-        .{ TAG.structure_type, true, &.{ .{ AT.name, FORM.string }, .{ AT.ZIG_parent, FORM.ref4 }, .{ AT.decl_line, FORM.udata } } },
-        .{ TAG.member, false, &.{ .{ AT.name, FORM.string }, .{ AT.type, FORM.ref4 } } },
-        .{ TAG.subprogram, true, &.{ .{ AT.name, FORM.string }, .{ AT.ZIG_parent, FORM.ref4 }, .{ AT.decl_line, FORM.udata }, .{ AT.low_pc, FORM.addr } } },
-        .{ TAG.formal_parameter, false, &.{ .{ AT.name, FORM.string }, .{ AT.type, FORM.ref4 }, .{ AT.const_expr, FORM.flag_present } } },
-        .{ TAG.lexical_block, true, &.{} },
-        .{ TAG.variable, false, &.{ .{ AT.name, FORM.string }, .{ AT.type, FORM.ref4 } } },
-        .{ TAG.constant, false, &.{ .{ AT.name, FORM.string }, .{ AT.ZIG_parent, FORM.ref4 }, .{ AT.ZIG_relative_decl, FORM.ref4 }, .{ AT.ZIG_decl_line_relative, FORM.sdata } } },
+        .{ Tag.compile_unit, true, &.{ .{ Attribute.name, Form.string }, .{ Attribute.stmt_list, Form.sec_offset }, .{ Attribute.comp_dir, Form.string } } },
+        .{ Tag.base_type, false, &.{.{ Attribute.name, Form.string }} },
+        .{ Tag.structure_type, true, &.{ .{ Attribute.name, Form.string }, .{ Attribute.decl_file, Form.udata } } },
+        .{ Tag.structure_type, true, &.{ .{ Attribute.name, Form.string }, .{ Attribute.ZIG_parent, Form.ref4 }, .{ Attribute.decl_line, Form.udata } } },
+        .{ Tag.member, false, &.{ .{ Attribute.name, Form.string }, .{ Attribute.type, Form.ref4 } } },
+        .{ Tag.subprogram, true, &.{ .{ Attribute.name, Form.string }, .{ Attribute.ZIG_parent, Form.ref4 }, .{ Attribute.decl_line, Form.udata }, .{ Attribute.low_pc, Form.addr } } },
+        .{ Tag.formal_parameter, false, &.{ .{ Attribute.name, Form.string }, .{ Attribute.type, Form.ref4 }, .{ Attribute.const_expr, Form.flag_present } } },
+        .{ Tag.lexical_block, true, &.{} },
+        .{ Tag.variable, false, &.{ .{ Attribute.name, Form.string }, .{ Attribute.type, Form.ref4 } } },
+        .{ Tag.constant, false, &.{ .{ Attribute.name, Form.string }, .{ Attribute.ZIG_parent, Form.ref4 }, .{ Attribute.ZIG_relative_decl, Form.ref4 }, .{ Attribute.ZIG_decl_line_relative, Form.sdata } } },
     };
     for (abbrevs, 1..) |a, code| {
         try abbrev.u(code);
@@ -946,16 +946,16 @@ fn sample(gpa: std.mem.Allocator) ![]u8 {
     try line.bytes.appendSlice(gpa, &.{ 1, 1, 1, 0xfb, 14, 13 });
     try line.bytes.appendSlice(gpa, &.{ 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1 });
     try line.bytes.append(gpa, 1); // directory formats
-    try line.u(LNCT.path);
-    try line.u(FORM.string);
+    try line.u(LineContent.path);
+    try line.u(Form.string);
     try line.u(2);
     try line.str("/pkg");
     try line.str("src");
     try line.bytes.append(gpa, 2); // file formats
-    try line.u(LNCT.path);
-    try line.u(FORM.string);
-    try line.u(LNCT.directory_index);
-    try line.u(FORM.udata);
+    try line.u(LineContent.path);
+    try line.u(Form.string);
+    try line.u(LineContent.directory_index);
+    try line.u(Form.udata);
     try line.u(2);
     try line.str("s.zig");
     try line.u(1);
