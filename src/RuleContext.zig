@@ -48,6 +48,10 @@ pub const Sink = struct {
     /// A site of the rule at the offset that is outside its language (`Facts.Unknown.meaning`):
     /// counted per rule, never a finding. A sink that counts nothing drops it.
     outside: *const fn (*Sink, rules.Rule, u32) Error!void = countsNothing,
+    /// A site of the rule at the offset in code no compiled root holds
+    /// (`Facts.Unknown.not_reached`): counted per rule apart from `outside`, never a finding.
+    /// A sink that counts nothing drops it.
+    not_reached: *const fn (*Sink, rules.Rule, u32) Error!void = countsNothing,
 
     fn suppressesNothing(_: *Sink, _: rules.Rule, _: u32) bool {
         return false;
@@ -208,12 +212,14 @@ pub fn refuse(self: *RuleContext, why: []const u8) Error!void {
 /// A ban's site where a fact it reads is unknown (`why`), never a pass and never a finding. Where
 /// the unknown is glint's own failure the run is incomplete: a run error names the rule, the
 /// place and the reason, so the gate fails by name. Where it is outside the ban's language (a
-/// generic position, `Facts.Unknown.meaning`) the site is counted for the rule in the report.
-/// Hygiene stays silent on an unknown and never calls this.
+/// generic position, `Facts.Unknown.meaning`) the site is counted for the rule in the report, and
+/// a site in code no compiled root holds is counted apart, as not reached. Hygiene stays silent
+/// on an unknown and never calls this.
 pub fn unknownAt(self: *RuleContext, rule: rules.Rule, token: Ast.TokenIndex, why: Facts.Unknown) Error!void {
     const tree = try self.project.syntax(try self.source());
     if (token >= tree.tokens.len) return error.InvalidHandle;
     const start = tree.tokenStart(token);
+    if (why == .not_reached) return self.sink.not_reached(self.sink, rule, start);
     switch (why.meaning()) {
         .outside => return self.sink.outside(self.sink, rule, start),
         .failure => {

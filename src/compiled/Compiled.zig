@@ -172,6 +172,12 @@ pub fn strip(c: *const Compiled, ty: u32, deref: bool) u32 {
 }
 
 /// The type of `container`'s member `name`, or null where it has none.
+/// Whether the container entry `container` is an instance of a type function: Zig names one
+/// with its arguments (`List(u32)`), at the line every instance of the function shares.
+pub fn instance(c: *const Compiled, container: u32) bool {
+    return std.mem.findScalar(u8, c.dwarf.entries.items(.name)[container], '(') != null;
+}
+
 pub fn member(c: *const Compiled, container: u32, name: []const u8) ?u32 {
     const names = c.members.getPtr(container) orelse return null;
     const list = names.getPtr(name) orelse return null;

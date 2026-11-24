@@ -36,7 +36,7 @@ suppressed: usize = 0,
 hidden: std.AutoHashMapUnmanaged(struct { usize, rules.Rule }, Report.Diagnostic) = .empty,
 stale: std.ArrayList(Report.Stale) = .empty,
 /// Where the rules' findings come in; each callback gets the runner back from it.
-sink: Context.Sink = .{ .diagnostic = sinkDiagnostic, .refuse = sinkRefuse, .config = sinkConfig, .suppresses = sinkSuppresses, .outside = sinkOutside },
+sink: Context.Sink = .{ .diagnostic = sinkDiagnostic, .refuse = sinkRefuse, .config = sinkConfig, .suppresses = sinkSuppresses, .outside = sinkOutside, .not_reached = sinkNotReached },
 malformed: std.ArrayList(Report.Malformed) = .empty,
 complete: bool = true,
 definitions: []const rules.Definition = &.{},
@@ -47,8 +47,23 @@ file: Project.FileId = undefined,
 seam_sites: std.AutoHashMapUnmanaged(struct { usize, rules.Rule }, usize) = .empty,
 /// Each site a rule found outside its language (`Context.unknownAt`), once, and how many each
 /// rule found.
-outside_sites: std.AutoHashMapUnmanaged(struct { Project.FileId, rules.Rule, u32 }, void) = .empty,
-outside_counts: std.array_hash_map.Auto(rules.Rule, usize) = .empty,
+outside: Sites = .{},
+/// Each site a rule read in code no compiled root holds (`Facts.Unknown.not_reached`), once, and
+/// how many each rule found.
+not_reached: Sites = .{},
+
+/// Sites of rules, each counted once (`count`), and how many each rule has.
+const Sites = struct {
+    seen: std.AutoHashMapUnmanaged(struct { Project.FileId, rules.Rule, u32 }, void) = .empty,
+    counts: std.array_hash_map.Auto(rules.Rule, usize) = .empty,
+
+    fn count(sites: *Sites, a: std.mem.Allocator, file: Project.FileId, rule: rules.Rule, start: u32) error{OutOfMemory}!void {
+        if ((try sites.seen.getOrPut(a, .{ file, rule, start })).found_existing) return;
+        const counted = try sites.counts.getOrPut(a, rule);
+        if (!counted.found_existing) counted.value_ptr.* = 0;
+        counted.value_ptr.* += 1;
+    }
+};
 
 pub const RunError = Suppression.ParseError || Context.Error || std.Io.Cancelable;
 pub const Options = struct {
@@ -178,8 +193,9 @@ pub fn run(gpa: std.mem.Allocator, project: *const Project, options: Options) Ru
     // after the copy would be lost with the arena's earlier state.
     const seams = try runner.seamCounts(config);
     const test_inputs = try testInputCounts(a, project, config);
-    const outside = try runner.outsideCounts();
-    return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .errors = runner.errors.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale.items.len, .stale = runner.stale.items, .malformed = runner.malformed.items, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null, .seams = seams, .test_inputs = test_inputs, .outside = outside };
+    const outside = try runner.byName(&runner.outside);
+    const not_reached = try runner.byName(&runner.not_reached);
+    return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .errors = runner.errors.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale.items.len, .stale = runner.stale.items, .malformed = runner.malformed.items, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null, .seams = seams, .test_inputs = test_inputs, .outside = outside, .not_reached = not_reached };
 }
 
 /// Each seam of `config` with the sites it held per rule; stale where every rule it names ran
@@ -376,17 +392,19 @@ fn sinkSuppresses(sink: *Context.Sink, rule: rules.Rule, start: u32) bool {
 /// A site of `rule` at `start` of the current file outside its language: counted once.
 fn sinkOutside(sink: *Context.Sink, rule: rules.Rule, start: u32) Context.Error!void {
     const runner: *Runner = @fieldParentPtr("sink", sink);
-    if ((try runner.outside_sites.getOrPut(runner.a, .{ runner.file, rule, start })).found_existing) return;
-    const count = try runner.outside_counts.getOrPut(runner.a, rule);
-    if (!count.found_existing) count.value_ptr.* = 0;
-    count.value_ptr.* += 1;
+    try runner.outside.count(runner.a, runner.file, rule, start);
 }
-/// The sites each rule found outside its language, by the rule's name.
-fn outsideCounts(runner: *const Runner) error{OutOfMemory}![]const Report.RuleSites {
-    const counts = try runner.a.alloc(Report.RuleSites, runner.outside_counts.count());
-    for (runner.outside_counts.keys(), runner.outside_counts.values(), counts) |rule, sites, *count| {
+/// A site of `rule` at `start` of the current file in code no compiled root holds: counted once.
+fn sinkNotReached(sink: *Context.Sink, rule: rules.Rule, start: u32) Context.Error!void {
+    const runner: *Runner = @fieldParentPtr("sink", sink);
+    try runner.not_reached.count(runner.a, runner.file, rule, start);
+}
+/// How many of `sites` each rule has, by the rule's name.
+fn byName(runner: *const Runner, sites: *const Sites) error{OutOfMemory}![]const Report.RuleSites {
+    const counts = try runner.a.alloc(Report.RuleSites, sites.counts.count());
+    for (sites.counts.keys(), sites.counts.values(), counts) |rule, held, *count| {
         const named = rules.definition(rule, runner.definitions) orelse unreachable; // safe: a rule that ran is defined.
-        count.* = .{ .name = named.name, .sites = sites };
+        count.* = .{ .name = named.name, .sites = held };
     }
     std.mem.sort(Report.RuleSites, counts, {}, struct {
         fn less(_: void, a: Report.RuleSites, b: Report.RuleSites) bool {

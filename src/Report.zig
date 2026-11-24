@@ -31,6 +31,10 @@ test_inputs: []const TestInputCount = &.{},
 /// build decides (a generic position, `Facts.Unknown.meaning`). Never a finding and never a
 /// pass: the scope its table row states, counted.
 outside: []const RuleSites = &.{},
+/// Per ban, the sites in code no compiled root holds (`Facts.Unknown.not_reached`): a function
+/// no root's build reaches, so the compiler established nothing there. Never a finding and never
+/// a pass, counted apart from `outside`.
+not_reached: []const RuleSites = &.{},
 
 /// A seam, where it is and why, the sites it held per rule, and whether it is stale: its rules
 /// all ran and it held none.
@@ -148,6 +152,11 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
                 for (self.outside, 0..) |rule, i| try writer.print("{s}{s} {d}", .{ if (i == 0) "" else ", ", rule.name, rule.sites });
                 try writer.writeByte('\n');
             }
+            if (self.not_reached.len != 0) {
+                try writer.writeAll("not reached: sites in code no compiled root holds: ");
+                for (self.not_reached, 0..) |rule, i| try writer.print("{s}{s} {d}", .{ if (i == 0) "" else ", ", rule.name, rule.sites });
+                try writer.writeByte('\n');
+            }
             if (self.metrics) |metrics| try textMetrics(writer, metrics);
         },
         .json => {
@@ -177,6 +186,8 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
             try std.json.Stringify.value(self.test_inputs, .{}, writer);
             try writer.writeAll(",\"outside\":");
             try std.json.Stringify.value(self.outside, .{}, writer);
+            try writer.writeAll(",\"not_reached\":");
+            try std.json.Stringify.value(self.not_reached, .{}, writer);
             if (self.metrics) |metrics| {
                 try writer.writeAll(",\"metrics\":{");
                 try jsonCounts(writer, metrics.total);

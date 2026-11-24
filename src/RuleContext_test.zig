@@ -49,6 +49,38 @@ test "G2 compiled project rules share metadata rendering and written site suppre
     try std.testing.expectEqual(@as(usize, 1), gated.diagnostics.len); // safe: one gate finding.
     for (report.diagnostics) |diagnostic| try std.testing.expect(diagnostic.level != .gate);
 }
+/// Reads each public declaration's name in code no compiled root holds, and the next token as
+/// only an instantiation decides.
+fn unreached(context: *glint.RuleContext) glint.RuleContext.Error!void {
+    const h = try context.source();
+    for (try context.project.declarations(h)) |decl| if (decl.public) {
+        try context.unknownAt(own, decl.token, .not_reached);
+        try context.unknownAt(own, decl.token + 1, .generic);
+    };
+}
+test "a site no compiled root holds is counted not reached per rule, apart from the sites outside" {
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "pub const a = 1;\npub const b = 2;\nconst c = 3;" }}, &.{}, .{});
+    defer project.deinit();
+    const counting: glint.ProjectRule = .{ .definition = rule.definition, .check = unreached };
+    var report = try glint.run(std.testing.allocator, &project, .{ .config = configuration(.gate), .project_rules = &.{counting} });
+    defer report.deinit();
+    // Neither a finding nor a run error: the run is complete, each site counted once by kind.
+    try std.testing.expect(report.complete);
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 1), report.not_reached.len);
+    try std.testing.expectEqualStrings("CUSTOM_API", report.not_reached[0].name);
+    try std.testing.expectEqual(@as(usize, 2), report.not_reached[0].sites);
+    try std.testing.expectEqual(@as(usize, 1), report.outside.len);
+    try std.testing.expectEqual(@as(usize, 2), report.outside[0].sites);
+    var text: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer text.deinit();
+    try report.write(&text.writer, &project, .text);
+    try std.testing.expect(std.mem.find(u8, text.written(), "not reached: sites in code no compiled root holds: CUSTOM_API 2\n") != null);
+    var json: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json.deinit();
+    try report.write(&json.writer, &project, .json);
+    try std.testing.expect(std.mem.find(u8, json.written(), "\"not_reached\":[{\"name\":\"CUSTOM_API\",\"sites\":2}]") != null);
+}
 /// Reaches each public declaration three times with one cause, its related place a different
 /// token each time but the last, and once with another cause.
 fn repeating(context: *glint.RuleContext) glint.RuleContext.Error!void {

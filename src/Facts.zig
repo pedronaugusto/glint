@@ -5879,6 +5879,39 @@ fn returnedTemplate(self: *Facts, decl: Decl, returned: Ast.Node.Index) ResolveE
     return value;
 }
 
+/// The value of the local or parameter `decl` as the compiled roots give it
+/// (`compiled/Answers.zig`): a value of each type their instances give it, `alternatives` where
+/// they differ. Unknown (`not_reached`) where roots are given and none holds its function; null
+/// where they do not answer it, and the source does.
+fn compiledLocal(self: *Facts, decl: Decl) ResolveError!?Value {
+    const answer = (try answers.local(self.gpa, self.project, self.compiled, decl.file, decl.index)) orelse return null;
+    const types = switch (answer) {
+        .not_reached => return .{ .unknown = .not_reached },
+        .types => |types| types,
+    };
+    var values: std.ArrayList(Value) = .empty;
+    for (types) |t| {
+        const value = try self.instance(try self.compiledType(t));
+        for (values.items) |seen| {
+            if (sameValue(seen, value)) break;
+        } else try values.append(self.gpa, value);
+    }
+    return switch (values.items.len) {
+        0 => null,
+        1 => values.items[0],
+        else => .{ .alternatives = values.items },
+    };
+}
+
+/// The value of a type the compilation gives (`compiled/Answers.zig`), as Facts holds a type.
+fn compiledType(self: *Facts, t: answers.Type) ResolveError!Value {
+    return switch (t) {
+        .primitive => |name| .{ .primitive = name },
+        .pointer => |pointer| try self.pointerTo(try self.compiledType(pointer.child.*), pointer.size),
+        .container => |container| .{ .container = .{ .file = container.file, .scope = container.scope } },
+    };
+}
+
 pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
     const model = &self.project.at(decl.file).model;
     const declaration_record = model.declarations[@backingInt(decl.index)];
@@ -5886,7 +5919,7 @@ pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
     if (declaration_record.kind == .function) return .{ .function = decl };
     // A function's local or parameter: the type the compiled instances gave it, where given.
     if (declaration_record.kind == .parameter or declaration_record.kind == .capture or declaration_record.kind == .variable) {
-        if (try answers.local(self, decl)) |value| return value;
+        if (try self.compiledLocal(decl)) |value| return value;
     }
     if (declaration_record.kind == .parameter) {
         if (try self.settledByCalls(decl)) |position| return self.boundByCallers(decl, position);
