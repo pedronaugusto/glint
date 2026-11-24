@@ -6,7 +6,7 @@ const std = @import("std");
 const Ast = std.zig.Ast;
 const Model = @import("../Model.zig");
 const Project = @import("../Project.zig");
-const Compiled = @import("Compiled.zig");
+const Compiled = @import("../Compiled.zig");
 
 /// A type as the compilation gives it: a primitive, a pointer to one of these, or a container
 /// the program declares (a file's own structure, or one declared on its line).

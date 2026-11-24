@@ -4,13 +4,13 @@ const std = @import("std");
 const aegis = @import("aegis");
 const Project = @import("Project.zig");
 const Model = @import("Model.zig");
-const Compiled = @import("compiled/Compiled.zig");
+const Compiled = @import("Compiled.zig");
 const answers = @import("compiled/Answers.zig");
 const Ast = std.zig.Ast;
 const Facts = @This();
 
 project: *const Project,
-/// What the program's compiled roots established (`compiled/Compiled.zig`), one per root and
+/// What the program's compiled roots established (`Compiled.zig`), one per root and
 /// target: a local's or parameter's type is what they gave it, and one of a function none holds
 /// is not reached. None given: the types are read from the source.
 compiled: []const *const Compiled = &.{},

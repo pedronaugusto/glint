@@ -7,7 +7,7 @@
 //! inputs; a file outside it keeps its absolute path.
 const std = @import("std");
 const aegis = @import("aegis");
-pub const Dwarf = @import("zig-0.17/Dwarf.zig");
+pub const Dwarf = @import("compiled/zig-0.17/Dwarf.zig");
 const Compiled = @This();
 
 pub const none = Dwarf.none;

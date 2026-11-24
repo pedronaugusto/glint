@@ -1,6 +1,6 @@
 //! Selected rules share one frozen project and one fact resolver.
 const std = @import("std");
-const Compiled = @import("compiled/Compiled.zig");
+const Compiled = @import("Compiled.zig");
 const Project = @import("Project.zig");
 const Facts = @import("Facts.zig");
 const rules = @import("Rule.zig");

@@ -8,7 +8,7 @@ pub const layers = [_]Layer{
     .{ .name = "front end and selection", .patterns = &.{ "src/File.zig", "src/Constructs.zig", "src/Rule.zig", "src/names.zig", "src/Completion.zig" } },
     .{ .name = "bindings and comments", .patterns = &.{ "src/Model.zig", "src/Suppression.zig" } },
     .{ .name = "project", .patterns = &.{"src/Project.zig"} },
-    .{ .name = "compiled", .patterns = &.{ "src/compiled/Compiled.zig", "src/compiled/zig-0.17/**" } },
+    .{ .name = "compiled", .patterns = &.{ "src/Compiled.zig", "src/compiled/zig-0.17/**" } },
     .{ .name = "facts and diagnostics", .patterns = &.{ "src/Facts.zig", "src/compiled/Answers.zig", "src/PackageRules.zig", "src/Report.zig", "src/Fix.zig" } },
     .{ .name = "rule API", .patterns = &.{"src/RuleContext.zig"} },
     .{ .name = "built-in rules", .patterns = &.{

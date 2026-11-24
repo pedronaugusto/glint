@@ -1,6 +1,6 @@
 //! Filesystem front end for explicit inputs. No globs, build execution or hidden cache.
 const std = @import("std");
-const Compiled = @import("compiled/Compiled.zig");
+const Compiled = @import("Compiled.zig");
 const Project = @import("Project.zig");
 const Rule = @import("Rule.zig");
 const Report = @import("Report.zig");
