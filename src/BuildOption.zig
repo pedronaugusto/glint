@@ -17,7 +17,7 @@ const Written = @import("Written.zig");
 pub fn check(c: *Context, rule: Rule) Context.Error!void {
     if (!std.mem.endsWith(u8, c.project.at(c.file).input.name, "build.zig")) return;
     const tree = &c.project.at(c.file).file.tree;
-    const calls = try Facts.calls.in(c.facts, c.file);
+    const calls = try c.callsIn(c.file);
     var reads_optimize = false;
     var reads_target = false;
     for (calls) |call| {

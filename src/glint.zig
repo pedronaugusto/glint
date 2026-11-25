@@ -32,6 +32,7 @@ test {
     _ = @import("Rule.zig");
     _ = @import("Suppression.zig");
     _ = @import("Runner.zig");
+    _ = RuleContext;
     _ = Fix;
     _ = @import("Facts.zig");
     _ = @import("Compiled.zig");

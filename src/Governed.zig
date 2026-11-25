@@ -103,13 +103,13 @@ pub fn declarations(self: *Context, source: []const u8, path: []const u8) Contex
     // What it keeps in its memo stays for the run.
     const rule_memory = self.keep();
     defer self.allocator = rule_memory;
-    const memo = try self.facts.memo(Lookups);
+    const memo = try self.memo(Lookups);
     memo.asked += 1;
     if (memo.found.getPtr(source)) |paths| if (paths.get(path)) |known| return known;
     const found = try lookup(self, source, path);
     // A walk the fact budget cut short may have missed a declaration: it is unknown, and asked
     // again.
-    if (found != .decls and self.facts.budgetSpent()) return .{ .unknown = .budget };
+    if (found != .decls and self.budgetSpent()) return .{ .unknown = .budget };
     const answer = found;
     const paths = try memo.found.getOrPut(self.allocator, source);
     if (!paths.found_existing) {
@@ -177,7 +177,7 @@ pub fn sitesLeaving(self: *Context, governed: []const Governed, out: *std.ArrayL
                 // Every builtin that names a field by a string (`fieldBuiltin`) is a member
                 // reference to it.
                 const by = fieldBuiltin(tree, node) orelse continue;
-                const named = try self.facts.fieldName(self.file, by.name);
+                const named = try self.fieldName(self.file, by.name);
                 switch (named) {
                     // `@field(h, "f")`, `@offsetOf(T, "f")`: the member its holder has, as a
                     // member access reaches it (`reach`).
@@ -240,7 +240,7 @@ fn literalSite(self: *Context, governed: []const Governed, renamed: []const []co
     const tree = &self.project.at(self.file).file.tree;
     const spelled = try Model.identifier(self.allocator, tree.tokenSlice(label));
     if (!spelledAny(self, governed, renamed, spelled, label)) return;
-    switch (try self.facts.literalDeclarations(self.file, literal, spelled)) {
+    switch (try self.literalDeclarations(self.file, literal, spelled)) {
         .unknown => |why| try leave(self, unread, value, why),
         // One per part of a place a build picks, each with its origin: one site at most.
         .decls => |found| {
@@ -273,7 +273,7 @@ pub fn fieldBuiltin(tree: *const Ast, node: Ast.Node.Index) ?FieldBuiltin {
 /// pointer its place gives it points at (`Facts.castTypeIn`).
 pub fn fieldHolder(self: *Context, node: Ast.Node.Index, by: FieldBuiltin) Context.Error!Facts.Value {
     if (by.holder) |holder| return self.resolveIn(self.file, holder);
-    const made = try self.facts.castTypeIn(null, self.file, node);
+    const made = try self.castType(self.file, node);
     return if (made == .pointer) made.pointer.child.* else made;
 }
 
@@ -287,7 +287,7 @@ fn fieldSites(self: *Context, governed: []const Governed, renamed: []const []con
     // A name of the fields or tags of the very type the holder is, or holds, is a field's or a
     // tag's: Zig forbids a declaration of one name with them in a container, so it reaches no
     // declaration, but it does reach a governed field among them.
-    const own = if (by.holder) |holder| try self.facts.fieldNameOwn(self.file, holder, by.name) else false;
+    const own = if (by.holder) |holder| try self.fieldNameOwn(self.file, holder, by.name) else false;
     if (own) for (governed) |g| {
         if (isField(self, g)) break;
     } else return;
@@ -299,12 +299,12 @@ fn fieldSites(self: *Context, governed: []const Governed, renamed: []const []con
         // An alias names a declaration, never a field.
         const aliases: []const []const u8 = if (own) &.{} else names;
         for ([_][]const []const u8{ &.{g.name}, aliases }) |list| for (list) |name| {
-            if (!self.facts.mayName(named, name) or (self.inTest(site) and g.target.production)) continue;
+            if (!self.mayName(named, name) or (self.inTest(site) and g.target.production)) continue;
             if (value == .unknown) return leave(self, unread, node, value.unknown);
             var options: std.ArrayList(Facts.Container) = .empty;
             try containers(self, value, &options);
             for (options.items) |container| {
-                const decl = self.facts.member(container, name) orelse continue;
+                const decl = self.member(container, name) orelse continue;
                 switch (try paired(self, decl)) {
                     .pair => |pair| try append(self, governed, renamed, site, node, name, &pair, out),
                     .unknown => |why| return leave(self, unread, node, why),
@@ -362,7 +362,7 @@ pub fn namedStd(self: *Context, node: Ast.Node.Index, types: []const Facts.Conta
         }
     }
     if (!all.governed and all.unknown == null) return .no;
-    const call = (try Facts.calls.at(self.facts, self.file, node)) orelse return .no;
+    const call = (try self.callAt(self.file, node)) orelse return .no;
     const callee = switch (call.callee) {
         .function => |function| function,
         .choice => |each| if (each.len != 0) each[0] else return .no,
@@ -580,11 +580,11 @@ pub fn aliasNames(self: *Context, comptime among: AliasScope, decls: []const Fac
     // What it keeps in its memo stays for the run.
     const rule_memory = self.keep();
     defer self.allocator = rule_memory;
-    const found = try self.facts.memo(Aliases(among));
+    const found = try self.memo(Aliases(among));
     if (!found.built) {
         found.built = true;
         for (self.project.sources) |*source| {
-            if (source.file.status != .parsed or !try self.facts.program(source.id)) continue;
+            if (source.file.status != .parsed or !try self.program(source.id)) continue;
             if (among == .unreported and source.input.selected) continue;
             try aliasesIn(self, among, found, source);
         }
@@ -592,9 +592,9 @@ pub fn aliasNames(self: *Context, comptime among: AliasScope, decls: []const Fac
     // std's own aliases of a std target (`ArrayListUnmanaged = ArrayList`, `ArrayListAligned =
     // array_list.Aligned`): in the target's file, or a std file that imports it, each once.
     for (decls) |decl| {
-        if (!try self.facts.standard(decl.file)) continue;
+        if (!try self.standard(decl.file)) continue;
         try stdAliasesIn(self, among, found, decl.file);
-        for (self.project.imports) |edge| if (edge.target == decl.file and try self.facts.standard(edge.from)) try stdAliasesIn(self, among, found, edge.from);
+        for (self.project.imports) |edge| if (edge.target == decl.file and try self.standard(edge.from)) try stdAliasesIn(self, among, found, edge.from);
     }
     const start = out.items.len;
     for (decls) |decl| if (found.by_origin.get(decl)) |names| try out.appendSlice(self.allocator, names.items);
@@ -643,7 +643,7 @@ fn aliasesIn(self: *Context, comptime among: AliasScope, found: *Aliases(among),
         // each value its initializer may give names a declaration (`std.debug.print`,
         // `@field(ns, "print")`, `if (debug) std.debug.print else quiet`). A call's result
         // or a literal is a value of its own, never an alias, and is not resolved here.
-        const leaves = switch (try Facts.accesses.valuesOf(self.facts, source.id, init)) {
+        const leaves = switch (try self.valuesOf(source.id, init)) {
             .leaves => |each| each,
             .unknown => continue,
         };
@@ -651,7 +651,7 @@ fn aliasesIn(self: *Context, comptime among: AliasScope, found: *Aliases(among),
         const spelled = try self.allocator.alloc(?[]const u8, leaves.len);
         var named = true;
         for (leaves, spelled) |leaf, *name| {
-            const path = try Facts.accesses.pathOf(self.facts, source.id, leaf);
+            const path = try self.pathOf(source.id, leaf);
             named = path.root != .none;
             for (path.steps) |step| named = named and (step.kind == .field or step.kind == .root);
             if (!named) break;
@@ -665,7 +665,7 @@ fn aliasesIn(self: *Context, comptime among: AliasScope, found: *Aliases(among),
         // takes it, is what the alias calls; any other declaration it names (a type's, a
         // constant's) is reached by its origin.
         var unknown = false;
-        switch (try self.facts.declaration(decl)) {
+        switch (try self.declaration(decl)) {
             .function => |function| try aliasOf(self, found, function, decl, d.name),
             .alternatives => |each| for (each) |one| switch (one) {
                 .function => |function| try aliasOf(self, found, function, decl, d.name),
@@ -675,7 +675,7 @@ fn aliasesIn(self: *Context, comptime among: AliasScope, found: *Aliases(among),
             },
             .unknown => unknown = true,
             // Each declaration it may name, through a choice of holders a build decides.
-            else => switch (try self.facts.origins(decl)) {
+            else => switch (try self.origins(decl)) {
                 .decls => |reached| for (reached) |each| try aliasOf(self, found, each, decl, d.name),
                 .unknown => unknown = true,
             },
@@ -689,7 +689,7 @@ fn aliasesIn(self: *Context, comptime among: AliasScope, found: *Aliases(among),
 fn stdAliasesIn(self: *Context, comptime among: AliasScope, found: *Aliases(among), file: Project.FileId) Context.Error!void {
     const source = self.project.at(file);
     if (source.file.status != .parsed) return;
-    if ((try found.std_files.getOrPut(self.facts.gpa, file)).found_existing) return;
+    if ((try found.std_files.getOrPut(self.runAllocator(), file)).found_existing) return;
     try aliasesIn(self, among, found, source);
 }
 
@@ -751,17 +751,17 @@ fn matches(self: *Context, g: Governed, decl: Facts.Decl) bool {
 /// resolve.
 fn walk(self: *Context, roots: []const Project.FileId, path: []const u8, public_only: bool) Context.Error!Declared {
     var current: std.ArrayList(Facts.Container) = .empty;
-    for (roots) |root| try current.append(self.allocator, self.facts.rootOf(root));
+    for (roots) |root| try current.append(self.allocator, self.rootOf(root));
     var found: std.ArrayList(Facts.Decl) = .empty;
     var names = std.mem.splitScalar(u8, path, '.');
     while (names.next()) |name| {
         found.clearRetainingCapacity();
         for (current.items) |container| {
-            const decl = self.facts.member(container, name) orelse continue;
+            const decl = self.member(container, name) orelse continue;
             // A field has no `pub`: every field of a container a program reaches is its to name.
             const record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
             if (public_only and !record.public and record.kind != .field) continue;
-            try found.append(self.allocator, switch (try self.facts.origin(decl)) {
+            try found.append(self.allocator, switch (try self.origin(decl)) {
                 .decl => |origin| origin,
                 .none => decl,
                 .unknown => |why| return .{ .unknown = why },
@@ -770,7 +770,7 @@ fn walk(self: *Context, roots: []const Project.FileId, path: []const u8, public_
         if (found.items.len == 0) return .none;
         if (names.peek() == null) break;
         current.clearRetainingCapacity();
-        for (found.items) |decl| try containers(self, try self.facts.declaration(decl), &current);
+        for (found.items) |decl| try containers(self, try self.declaration(decl), &current);
     }
     return .{ .decls = try found.toOwnedSlice(self.allocator) };
 }
@@ -781,7 +781,7 @@ fn containers(self: *Context, value: Facts.Value, out: *std.ArrayList(Facts.Cont
         .container, .instance => |c| try out.append(self.allocator, c),
         .pointer => |inner| try containers(self, inner.child.*, out),
         .alternatives => |each| for (each) |one| try containers(self, one, out),
-        .function => |decl| if (try self.facts.template(decl)) |made| try containers(self, made, out),
+        .function => |decl| if (try self.template(decl)) |made| try containers(self, made, out),
         else => {},
     }
 }
@@ -791,7 +791,7 @@ const Reached = union(enum) { decls: []const Facts.Decl, unknown: Facts.Unknown 
 /// What a site refers to: its declaration through aliases, or the member of each container its
 /// receiver may be.
 fn reach(self: *Context, node: Ast.Node.Index, tag: Ast.Node.Tag, spelled: []const u8, governed: []const Governed) Context.Error!Reached {
-    if (tag == .enum_literal) switch (try self.facts.literalDeclarations(self.file, node, spelled)) {
+    if (tag == .enum_literal) switch (try self.literalDeclarations(self.file, node, spelled)) {
         .unknown => |why| return .{ .unknown = why },
         // One per part of a place a build picks, each with its origin.
         .decls => |found| {
@@ -803,7 +803,7 @@ fn reach(self: *Context, node: Ast.Node.Index, tag: Ast.Node.Tag, spelled: []con
             return .{ .decls = decls.items };
         },
     };
-    const definition = if (tag == .identifier or tag == .field_access) try self.facts.definition(self.file, node) else try self.facts.reflected(self.file, node);
+    const definition = if (tag == .identifier or tag == .field_access) try self.definition(self.file, node) else try self.reflected(self.file, node);
     switch (definition) {
         .decl => |decl| return switch (try paired(self, decl)) {
             .pair => |pair| .{ .decls = try self.allocator.dupe(Facts.Decl, &pair) },
@@ -827,7 +827,7 @@ fn reach(self: *Context, node: Ast.Node.Index, tag: Ast.Node.Tag, spelled: []con
     try containers(self, receiver, &options);
     var decls: std.ArrayList(Facts.Decl) = .empty;
     for (options.items) |container| {
-        const decl = self.facts.member(container, spelled) orelse continue;
+        const decl = self.member(container, spelled) orelse continue;
         switch (try paired(self, decl)) {
             .pair => |pair| try decls.appendSlice(self.allocator, &pair),
             .unknown => |why| return .{ .unknown = why },
@@ -840,7 +840,7 @@ fn reach(self: *Context, node: Ast.Node.Index, tag: Ast.Node.Tag, spelled: []con
 /// value does not resolve is its own site: its value is a site of its own where it is written.
 /// One in a file the run does not check is unknown: what it names is checked nowhere.
 fn paired(self: *Context, decl: Facts.Decl) Context.Error!union(enum) { pair: [2]Facts.Decl, unknown: Facts.Unknown } {
-    return switch (try self.facts.origin(decl)) {
+    return switch (try self.origin(decl)) {
         .decl => |origin| .{ .pair = .{ decl, origin } },
         .none => .{ .pair = .{ decl, decl } },
         .unknown => |why| if (self.project.at(decl.file).input.selected) .{ .pair = .{ decl, decl } } else .{ .unknown = why },
@@ -879,7 +879,7 @@ fn refuted(self: *Context, node: Ast.Node.Index, tag: Ast.Node.Tag, spelled: []c
             continue;
         }
         for (g.decls) |decl| {
-            const value = try self.facts.declaration(decl);
+            const value = try self.declaration(decl);
             if (value != .function and value != .scalar and value != .primitive) return false;
             const call = called orelse continue;
             if (value != .function) return false;
@@ -951,7 +951,7 @@ pub fn mayCallStd(c: *Context, node: Ast.Node.Index, path: []const u8) Context.E
 const Callees = union(enum) { none, some, every, unknown: Facts.Unknown };
 
 fn stdCallees(c: *Context, node: Ast.Node.Index, path: []const u8) Context.Error!Callees {
-    const call = (try Facts.calls.at(c.facts, c.file, node)) orelse return .none;
+    const call = (try c.callAt(c.file, node)) orelse return .none;
     const decls = switch (try declarations(c, "std", path)) {
         .decls => |decls| decls,
         .none => return .none,

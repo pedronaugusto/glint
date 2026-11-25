@@ -73,7 +73,7 @@ fn checkSwitches(context: *glint.RuleContext, list: []const Allowed) glint.RuleC
         const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(index));
         if (context.inTest(tree.nodeMainToken(node))) continue;
         const full = tree.fullSwitch(node) orelse continue;
-        switch (try isValue(context, try context.facts.resolve(context.file, full.ast.condition), value_type)) {
+        switch (try isValue(context, try context.resolveIn(context.file, full.ast.condition), value_type)) {
             .no => continue,
             .unknown => |why| try found.append(context.allocator, .{ .node = node, .what = .{ .unshown = why } }),
             .yes => if (!namesAlternatives(tree, full)) try found.append(context.allocator, .{ .node = node, .what = .{ .read = "a switch on a resolved value names no `.alternatives` prong: a choice of values, or a tag it does not name, falls to its default; read it part by part (Facts.valueParts, joined by Facts.Join), or allow it with the row that proves its default is the safe answer" } }),
@@ -102,8 +102,8 @@ fn checkSwitches(context: *glint.RuleContext, list: []const Allowed) glint.RuleC
 fn valueType(context: *glint.RuleContext) glint.RuleContext.Error!?ValueContainer {
     for (context.project.sources) |*source| {
         if (!inFile(source.input.name, "src/Facts.zig")) continue;
-        const decl = context.facts.member(context.facts.rootOf(source.id), "Value") orelse return null;
-        return switch (try context.facts.declaration(decl)) {
+        const decl = context.member(context.rootOf(source.id), "Value") orelse return null;
+        return switch (try context.declaration(decl)) {
             .container => |container| container,
             else => null,
         };
@@ -182,7 +182,7 @@ fn checkTables(context: *glint.RuleContext, list: []const Allowed) glint.RuleCon
         var buffer: [1]std.zig.Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
         // A function a runtime value holds returns no type and makes no std struct of its own.
-        const callee = try context.facts.resolve(context.file, call.ast.fn_expr);
+        const callee = try context.resolveIn(context.file, call.ast.fn_expr);
         if (callee == .fn_type or (callee == .pointer and callee.pointer.child.* == .fn_type)) continue;
         const map = for (text_maps) |each| {
             if (call.ast.params.len != each[1]) continue;
@@ -351,7 +351,7 @@ fn correction(context: *glint.RuleContext, tree: *const std.zig.Ast, node: std.z
 /// A name `node` spells that a declaration may have: a valid identifier, not `_` or a primitive
 /// (`type`, `u8`, `true`, `null`), or a path of them (`debug.print`).
 fn declarationName(context: *glint.RuleContext, node: std.zig.Ast.Node.Index) glint.RuleContext.Error!?[]const u8 {
-    return switch (try context.facts.fieldName(context.file, node)) {
+    return switch (try context.fieldName(context.file, node)) {
         .name => |name| if (namesDeclaration(name)) name else null,
         .names => |names| for (names) |name| {
             if (namesDeclaration(name)) break name;
@@ -410,7 +410,7 @@ fn shape(context: *glint.RuleContext, tree: *const std.zig.Ast, node: std.zig.As
 /// The tag an enum literal names, where it is one that writes a value.
 fn tagRead(context: *glint.RuleContext, tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) glint.RuleContext.Error!?Read {
     if (tree.nodeTag(node) != .enum_literal) return null;
-    const name = switch (try context.facts.fieldName(context.file, node)) {
+    const name = switch (try context.fieldName(context.file, node)) {
         .name => |name| name,
         else => return null,
     };
@@ -427,7 +427,7 @@ fn nodeTagOf(context: *glint.RuleContext, tree: *const std.zig.Ast, node: std.zi
     var buffer: [1]std.zig.Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, column).?; // unreachable: heldCall gives calls
     if (call.ast.params.len != 1) return null;
-    switch (try context.facts.fieldName(context.file, call.ast.params[0])) {
+    switch (try context.fieldName(context.file, call.ast.params[0])) {
         .name => |name| if (!std.mem.eql(u8, name, "tag")) return null,
         .names, .each_of, .computed => return null,
     }
@@ -438,7 +438,7 @@ fn nodeTagOf(context: *glint.RuleContext, tree: *const std.zig.Ast, node: std.zi
 /// of a `for` over it.
 fn columnOf(context: *glint.RuleContext, tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) glint.RuleContext.Error!?std.zig.Ast.Node.Index {
     if (tree.nodeTag(node) == .array_access) return heldCall(context, tree, tree.nodeData(node).node_and_node[0]);
-    const decl = switch (try context.facts.definition(context.file, node)) {
+    const decl = switch (try context.definition(context.file, node)) {
         .decl => |decl| decl,
         .none, .unknown => return null,
     };
@@ -459,7 +459,7 @@ fn columnOf(context: *glint.RuleContext, tree: *const std.zig.Ast, node: std.zig
 fn heldCall(context: *glint.RuleContext, tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) glint.RuleContext.Error!?std.zig.Ast.Node.Index {
     var buffer: [1]std.zig.Ast.Node.Index = undefined;
     if (tree.fullCall(&buffer, node) != null) return node;
-    const decl = switch (try context.facts.definition(context.file, node)) {
+    const decl = switch (try context.definition(context.file, node)) {
         .decl => |decl| decl,
         .none, .unknown => return null,
     };

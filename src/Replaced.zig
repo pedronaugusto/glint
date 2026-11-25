@@ -27,18 +27,18 @@ const Entries = struct { built: bool = false, all: std.ArrayList(Entry) = .empty
 pub fn entries(c: *Context, rule: []const u8) Context.Error![]const Entry {
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
-    const found = try c.facts.memo(Entries);
+    const found = try c.memo(Entries);
     if (!found.built) {
         found.built = true;
         for (c.project.sources) |*source| {
             if (source.input.kind == .zon) continue;
-            if (c.facts.member(c.facts.rootOf(source.id), "lint_rules") == null) continue;
-            const rules = try PackageRules.of(c.facts, source.id);
+            if (c.member(c.rootOf(source.id), "lint_rules") == null) continue;
+            const rules = try c.packageRules(source.id);
             for (rules.replacements) |replacement| {
                 const same = for (found.all.items) |known| {
                     if (known.replacement.file == replacement.file and known.replacement.node == replacement.node) break true;
                 } else false;
-                if (!same) try found.all.append(c.facts.gpa, .{ .replacement = replacement, .package = rules.package });
+                if (!same) try found.all.append(c.runAllocator(), .{ .replacement = replacement, .package = rules.package });
             }
         }
     }
@@ -158,7 +158,7 @@ fn answerArgument(c: *Context, entry: Entry, node: Ast.Node.Index) Context.Error
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, parent) orelse return false;
     if (std.mem.findScalar(Ast.Node.Index, call.ast.params, at) == null) return false;
-    const callees: []const Facts.Decl = switch ((try Facts.calls.at(c.facts, c.file, parent) orelse return false).callee) {
+    const callees: []const Facts.Decl = switch ((try c.callAt(c.file, parent) orelse return false).callee) {
         .function => |one| &.{one},
         .choice => |each| each,
         .any => return false,
@@ -257,7 +257,7 @@ fn atComptime(c: *Context, node: Ast.Node.Index) bool {
 
 /// The function, or else the container-level declaration, that holds `node`.
 fn holderOf(c: *Context, node: Ast.Node.Index) ?Facts.Decl {
-    if (c.facts.functionHolding(c.file, node)) |function| return function;
+    if (c.functionHolding(c.file, node)) |function| return function;
     const model = &c.project.at(c.file).model;
     var at: ?Ast.Node.Index = node;
     while (at) |each| : (at = model.parentOf(each)) {
@@ -334,7 +334,7 @@ fn inStruct(c: *Context, tree: *const Ast, node: Ast.Node.Index) bool {
 /// error union of it, through any number of them (`[2]?std.Io.File`). Unknown where the type, or
 /// what it holds by value, is.
 fn heldBy(c: *Context, value: Facts.Value, target: Facts.Decl) Context.Error!Facts.Is {
-    const made = try c.facts.declaration(target);
+    const made = try c.declaration(target);
     const want = switch (made) {
         .container, .instance => |container| container,
         else => return .no,
@@ -401,7 +401,7 @@ fn dropInFix(c: *Context, entry: Entry, drop_in: PackageRules.Replacement.DropIn
 fn importsLeftUnused(c: *Context, edits: []const Report.Edit) Context.Error![]const Report.Edit {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
-    const root = c.facts.rootOf(c.file);
+    const root = c.rootOf(c.file);
     var out: std.ArrayList(Report.Edit) = .empty;
     for (model.declarations, 0..) |record, i| {
         if (record.kind != .variable or record.scope != root.scope or record.public) continue;
@@ -448,14 +448,14 @@ const Spelled = struct { path: []const u8, import: ?Report.Edit };
 fn answerSpelling(c: *Context, entry: Entry, answer: Facts.Decl) Context.Error!?Spelled {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
-    const root = c.facts.rootOf(c.file);
+    const root = c.rootOf(c.file);
     // An import the file makes, of a file of the package the answer is reached from.
     for (model.declarations) |record| {
         if (record.kind != .variable or record.scope != root.scope) continue;
         const spelling = importSpelling(c, tree, record.node) orelse continue;
         const target = c.project.imported(c.file, spelling) orelse continue;
         if (!entry.package.eql(PackageRules.Identity.of(c.project, target))) continue;
-        const inner = (try pathTo(c, c.facts.rootOf(target), answer, 0)) orelse continue;
+        const inner = (try pathTo(c, c.rootOf(target), answer, 0)) orelse continue;
         return .{ .path = try c.allocator.print("{s}.{s}", .{ record.name, inner }), .import = null };
     }
     // The one module name the package's other files of this program import it by.
@@ -464,7 +464,7 @@ fn answerSpelling(c: *Context, entry: Entry, answer: Facts.Decl) Context.Error!?
     for (c.project.imports) |edge| {
         if (!edge.in.inProgram() or std.mem.endsWith(u8, edge.spelling, ".zig") or std.mem.endsWith(u8, edge.spelling, ".zon")) continue;
         if (!here.eql(PackageRules.Identity.of(c.project, edge.from)) or !entry.package.eql(PackageRules.Identity.of(c.project, edge.target))) continue;
-        const inner = (try pathTo(c, c.facts.rootOf(edge.target), answer, 0)) orelse continue;
+        const inner = (try pathTo(c, c.rootOf(edge.target), answer, 0)) orelse continue;
         if (found) |known| {
             if (!std.mem.eql(u8, known.spelling, edge.spelling)) return null;
         } else found = .{ .spelling = edge.spelling, .path = inner };
@@ -521,7 +521,7 @@ fn pathTo(c: *Context, container: Facts.Container, answer: Facts.Decl, depth: u8
     if (depth == 2) return null;
     for (model.declarations, 0..) |record, i| {
         if (record.scope != container.scope or !record.public or record.kind != .variable) continue;
-        const value = try c.facts.declaration(.{ .file = container.file, .index = @fromBackingInt(@intCast(i)) });
+        const value = try c.declaration(.{ .file = container.file, .index = @fromBackingInt(@intCast(i)) });
         const inner = switch (value) {
             .container => |held| held,
             // A namespace a build chooses is no one path every build spells.
@@ -551,7 +551,7 @@ fn aliasOf(c: *Context, site: Governed.Site, sites: []const Governed.Site) ?Alia
     if (record.kind != .variable or record.public or record.exported) return null;
     const variable = tree.fullVarDecl(record.node) orelse return null;
     if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
-    if (c.facts.functionHolding(c.file, record.node) != null) return null;
+    if (c.functionHolding(c.file, record.node) != null) return null;
     const init = variable.ast.init_node.unwrap() orelse return null;
     for (sites) |each| if (each.node == init and !each.through_alias and each.index == site.index) return .{ .decl = decl, .init = init };
     return null;
@@ -625,7 +625,7 @@ pub fn debugPrints(c: *Context) Context.Error!void {
 /// under any rule, whose target is it. Assertion metrics count calls of them (Metrics.zig).
 pub fn assertions(c: *Context) Context.Error![]const Facts.Decl {
     _ = try entries(c, "");
-    const all = try c.facts.memo(Entries);
+    const all = try c.memo(Entries);
     var found: std.ArrayList(Facts.Decl) = .empty;
     for (all.all.items) |entry| {
         const replaced = for (entry.replacement.declarations()) |decl| {

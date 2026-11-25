@@ -263,10 +263,10 @@ fn selected(self: *const Context, selection: []const rules.Rule) bool {
 fn priorityRules(self: *Context) RunError!void {
     if (!self.config.has(.Z011)) return;
     const tree = &self.project.at(self.file).file.tree;
-    for (try Facts.calls.in(self.facts, self.file)) |call| {
+    for (try self.callsIn(self.file)) |call| {
         const token = if (tree.nodeTag(call.callee_expr) == .field_access) tree.nodeData(call.callee_expr).node_and_token[1] else tree.nodeMainToken(call.callee_expr);
         // An alias that is itself deprecated; one not followed leaves the callee to decide.
-        switch (try self.facts.definition(self.file, call.callee_expr)) {
+        switch (try self.definition(self.file, call.callee_expr)) {
             .decl => |alias| if (deprecated(self, alias)) {
                 try self.atDefinition(.Z011, token, "call uses a deprecated declaration", alias);
                 continue;
@@ -293,7 +293,7 @@ fn amendedPolicies(self: *Context) RunError!void {
     if (self.config.has(.Z012)) for (source.model.declarations, 0..) |decl, i| {
         if (decl.kind != .field and !decl.public and !decl.exported) continue;
         // On the surface a consumer reaches: from the roots the package exports (8f).
-        if (!try self.facts.exportedSurface(self.file, decl.scope)) continue;
+        if (!try self.exportedSurface(self.file, decl.scope)) continue;
         const signature: Signature = .{ .site = decl.token, .scope = decl.scope };
         switch (decl.kind) {
             .function => {
@@ -481,7 +481,7 @@ fn privateType(self: *Context, given: Signature, file: Project.FileId, written: 
         const model = &self.project.at(file).model;
         const scope = scopeOf(model, node) orelse return;
         // A tuple's fields are no declarations: they are read here, reached or not.
-        const named = try self.facts.onSurface(file, scope);
+        const named = try self.onSurface(file, scope);
         for (container.ast.members) |member| if (model.containerField(tree, member)) |field| {
             if (named and !field.ast.tuple_like) continue;
             if (field.ast.type_expr.unwrap()) |t| try privateType(self, signature, file, t, depth + 1);
@@ -490,7 +490,7 @@ fn privateType(self: *Context, given: Signature, file: Project.FileId, written: 
     }
     switch (tree.nodeTag(node)) {
         .identifier, .field_access => {
-            const definition = switch (try self.facts.definition(file, node)) {
+            const definition = switch (try self.definition(file, node)) {
                 .decl => |definition| definition,
                 // A primitive, a member no holder declares, a name that does not resolve.
                 .none, .unknown => return,
@@ -500,7 +500,7 @@ fn privateType(self: *Context, given: Signature, file: Project.FileId, written: 
             // A type parameter is the caller's own; a public declaration callers reach is named
             // by its path.
             if (decl.kind == .parameter) return;
-            if ((decl.public or decl.exported) and try self.facts.onSurface(definition.file, decl.scope)) return;
+            if ((decl.public or decl.exported) and try self.onSurface(definition.file, decl.scope)) return;
             // A type for certain: a constant whose value is a container written in place.
             if (decl.kind != .variable) return;
             const variable = held.file.tree.fullVarDecl(decl.node) orelse return;
@@ -512,7 +512,7 @@ fn privateType(self: *Context, given: Signature, file: Project.FileId, written: 
             // A container around the signature is named through whatever names the signature,
             // as `@This()` is.
             if (definition.file == self.file and encloses(&held.model, scope, signature.scope)) return;
-            if (try self.facts.aliasedOnSurface(definition.file, scope)) return;
+            if (try self.aliasedOnSurface(definition.file, scope)) return;
             const holder = held.model.privateHolder(scope) orelse return;
             const message = try self.allocator.print("public signature exposes private type '{s}'", .{held.model.declarations[@backingInt(holder)].name});
             try self.atDefinition(.Z012, signature.site, message, .{ .file = definition.file, .index = holder });
@@ -533,7 +533,7 @@ fn publicValue(self: *Context, signature: Signature, index: Model.Declaration.Id
     const variable = source.file.tree.fullVarDecl(decl.node) orelse return;
     if (variable.ast.type_node.unwrap()) |t| return privateType(self, signature, self.file, t, 0);
     const init = Facts.ungrouped(&source.file.tree, variable.ast.init_node.unwrap() orelse return);
-    if (try self.facts.definition(self.file, init) != .none) return;
+    if (try self.definition(self.file, init) != .none) return;
     try privateType(self, signature, self.file, init, 0);
 }
 
@@ -634,7 +634,7 @@ fn syntaxRules(self: *Context) RunError!void {
                     },
                     // A primitive is the type or a value of it alike (`comptime R: u8`'s `R`):
                     // the expression says which (`Facts.isValue`).
-                    .primitive => if (try self.facts.isValue(self.file, expr)) {
+                    .primitive => if (try self.isValue(self.file, expr)) {
                         if (!try interfaceName(self, decl, name)) try self.at(.Z006, decl.token, "value binding should use snake_case");
                     } else if (names.acronymIssue(name)) try self.at(.Z032, decl.token, "treat acronyms in type names as ordinary words, for example XmlParser"),
                     .container, .error_set, .pointer, .array, .optional, .error_union, .fn_type => {
@@ -670,7 +670,7 @@ fn syntaxRules(self: *Context) RunError!void {
 /// Whether `node` is a call whose callee, every one it may be, is a function declared to return
 /// `type`.
 fn callsTypeFunction(self: *Context, node: Ast.Node.Index) RunError!bool {
-    const call = (try Facts.calls.at(self.facts, self.file, node)) orelse return false;
+    const call = (try self.callAt(self.file, node)) orelse return false;
     const definition = switch (call.callee) {
         .function => |function| function,
         .choice, .any => return false,
@@ -708,7 +708,7 @@ fn interfaceName(self: *Context, decl: Model.Declaration, name: []const u8) RunE
 /// or through an alias of it), by the declaration the name refers to: every binding gives it a
 /// type. `anytype` (its declaration's node the prototype) is not one.
 fn typeParameter(self: *Context, node: Ast.Node.Index) RunError!bool {
-    const named = switch (try self.facts.definition(self.file, node)) {
+    const named = switch (try self.definition(self.file, node)) {
         .decl => |decl| decl,
         .none, .unknown => return false,
     };
@@ -743,7 +743,7 @@ fn genericReads(self: *Context, name: []const u8) RunError!bool {
             if (tag != .field_access) continue;
             const data = tree.nodeData(@fromBackingInt(@intCast(i))).node_and_token;
             if (!std.mem.eql(u8, tree.tokenSlice(data[1]), name)) continue;
-            const holder = switch (try self.facts.definition(each.id, data[0])) {
+            const holder = switch (try self.definition(each.id, data[0])) {
                 .decl => |decl| decl,
                 .none, .unknown => continue,
             };
@@ -764,7 +764,7 @@ fn genericReads(self: *Context, name: []const u8) RunError!bool {
 fn contextRules(self: *Context) RunError!void {
     if (!self.config.has(.Z016)) return;
     const tree = &self.project.at(self.file).file.tree;
-    for (try Facts.calls.in(self.facts, self.file)) |call| {
+    for (try self.callsIn(self.file)) |call| {
         const args = switch (call.args) {
             .known => |args| args,
             .unknown => continue,

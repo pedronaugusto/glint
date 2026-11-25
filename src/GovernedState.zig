@@ -36,18 +36,18 @@ const Entries = struct { built: bool = false, all: std.ArrayList(Entry) = .empty
 pub fn entries(c: *Context, package: []const u8) Context.Error![]const Entry {
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
-    const found = try c.facts.memo(Entries);
+    const found = try c.memo(Entries);
     if (!found.built) {
         found.built = true;
         for (c.project.sources) |*source| {
             if (source.input.kind == .zon) continue;
-            if (c.facts.member(c.facts.rootOf(source.id), "lint_rules") == null) continue;
-            const rules = try PackageRules.of(c.facts, source.id);
+            if (c.member(c.rootOf(source.id), "lint_rules") == null) continue;
+            const rules = try c.packageRules(source.id);
             for (rules.governance) |governance| {
                 const same = for (found.all.items) |known| {
                     if (known.governance.file == governance.file and known.governance.node == governance.node) break true;
                 } else false;
-                if (!same) try found.all.append(c.facts.gpa, .{ .governance = governance, .package = rules.package });
+                if (!same) try found.all.append(c.runAllocator(), .{ .governance = governance, .package = rules.package });
             }
         }
     }
@@ -158,7 +158,7 @@ fn writtenName(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Erro
     var buffer: [2]Ast.Node.Index = undefined;
     const args = Facts.builtinArgs(tree, node, &buffer);
     if (args.len != 2) return false;
-    return switch (try c.facts.fieldName(c.file, args[1])) {
+    return switch (try c.fieldName(c.file, args[1])) {
         .name => true,
         .each_of, .names, .computed => false,
     };
@@ -189,7 +189,7 @@ fn governedIn(c: *Context, node: Ast.Node.Index, name: []const u8, cast: bool, t
     if (!cast and operand != null) return if (unknown) |why| .{ .unknown = why } else .none;
     // A cast to an integer makes a number, never one of `types`: its operand alone is read.
     if (among(&to_integer, name)) return if (unknown) |why| .{ .unknown = why } else .none;
-    const result = try c.facts.castTypeIn(null, c.file, outermost(c, tree, node));
+    const result = try c.castType(c.file, outermost(c, tree, node));
     if (madeType(result, types)) |found| return .{ .found = found };
     if (unknown orelse Governed.unknownIn(result)) |why| return .{ .unknown = why };
     return .none;
@@ -277,7 +277,7 @@ pub fn exits(c: *Context, definition: Rule.Definition) Context.Error!void {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(raw));
         const token = tree.nodeMainToken(node);
         if (c.inTest(token)) continue;
-        const call = (try Facts.calls.at(c.facts, c.file, node)) orelse continue;
+        const call = (try c.callAt(c.file, node)) orelse continue;
         const callee = switch (call.callee) {
             .function => |function| function,
             .choice, .any => continue,
@@ -333,7 +333,7 @@ fn bareUse(c: *Context, tree: *const Ast, model: *const Model, value: Ast.Node.I
             // Only a cast into a type that cannot hold every value of the exit's: a widening
             // loses nothing, and a width either side's build decides is not read (hygiene).
             const from = intType(try c.resolveIn(c.file, value)) orelse return null;
-            const into = intType(try c.facts.castTypeIn(null, c.file, parent)) orelse return null;
+            const into = intType(try c.castType(c.file, parent)) orelse return null;
             if (holdsAll(into, from)) return null;
             return "a narrowing cast";
         },

@@ -153,7 +153,7 @@ pub fn run(gpa: std.mem.Allocator, project: *const Project, options: Options) Ru
         }
         if (file.status == .parsed and source.model.lowered_coverage == .budget_exhausted) try runner.runError("its lowering ran out of budget, so no rule read all of it");
         if (file.status == .parsed and file.zir == null) try runner.runError("its semantic lowering was not asked for, so the rules that read it did not run");
-        var context: Context = .{ .allocator = scratch.allocator(), .backing = gpa, .project = project, .file = runner.file, .config = runner.config, .facts = &runner.facts, .definitions = definitions, .sink = &runner.sink, .compiled = options.project_rules };
+        var context: Context = .{ .allocator = scratch.allocator(), .backing = gpa, .project = project, .file = runner.file, .config = runner.config, .held = Context.hold(&runner.facts), .definitions = definitions, .sink = &runner.sink, .compiled = options.project_rules };
         try Builtins.check(&context);
         if (config.metrics) {
             const counts = try Metrics.count(&context);

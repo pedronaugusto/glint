@@ -106,7 +106,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
             if (args.len != 1) continue;
             // The mode is a compile-time value, read as the program fixes it: written (`.optimized`),
             // through a constant holding it, or by its full name (`std.builtin.FloatMode.optimized`).
-            if (try c.facts.comptimeValue(null, c.file, args[0])) |mode| {
+            if (try c.comptimeValue(c.file, args[0])) |mode| {
                 if (mode == .tag and std.mem.eql(u8, mode.tag.name, "optimized"))
                     try c.at(rule, token, "@setFloatMode(.optimized): float results no build checks; only a measured hot loop validated at its boundary");
                 continue;
@@ -116,7 +116,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
             var root = args[0];
             while (tree.nodeTag(root) == .field_access) root = tree.nodeData(root).node_and_token[0];
             const value = try c.resolveIn(c.file, args[0]);
-            try c.unknownAt(rule, token, if (c.facts.comptimeParameter(c.file, root)) .generic else if (value == .unknown) value.unknown else .unsupported);
+            try c.unknownAt(rule, token, if (c.comptimeParameter(c.file, root)) .generic else if (value == .unknown) value.unknown else .unsupported);
         }
     }
     const model = &c.project.at(c.file).model;
@@ -155,7 +155,7 @@ fn ownerRecovery(c: *Context, tree: *const Ast, node: Ast.Node.Index, name: []co
     if (from == .optional) from = from.optional.*;
     if (from != .pointer or from.pointer.size != .one) return false;
     if (from.pointer.child.* != .primitive or !std.mem.eql(u8, from.pointer.child.primitive, "anyopaque")) return false;
-    const made = try c.facts.castTypeIn(null, c.file, node);
+    const made = try c.castType(c.file, node);
     return made == .pointer and made.pointer.size == .one;
 }
 
@@ -312,7 +312,7 @@ const Binding = union(enum) { binding: []const u8, none, unknown: Facts.Unknown 
 fn namespaceBinding(c: *Context, value: Facts.Value) Context.Error!Binding {
     for (Facts.valueParts(&value)) |part| switch (part) {
         .container => |container| {
-            if (container.scope != c.facts.rootOf(container.file).scope) continue;
+            if (container.scope != c.rootOf(container.file).scope) continue;
             if (try bindingOf(c, container.file)) |binding| return .{ .binding = binding };
         },
         .unknown => |why| return .{ .unknown = why },
@@ -323,7 +323,7 @@ fn namespaceBinding(c: *Context, value: Facts.Value) Context.Error!Binding {
 
 /// Which raw binding a std file is, if one: `c`, `os.linux` or `os.windows`, or a file of theirs.
 fn bindingOf(c: *Context, file: Project.FileId) Context.Error!?[]const u8 {
-    if (!try c.facts.standard(file)) return null;
+    if (!try c.standard(file)) return null;
     // std's files are named as the run found them: on Windows with `\` between their parts.
     const name = try slashed(c.allocator, c.project.at(file).input.name);
     for ([_]struct { []const u8, []const u8 }{ .{ "std/c.zig", "c" }, .{ "std/os/linux.zig", "os.linux" }, .{ "std/os/windows.zig", "os.windows" } }) |each| {
@@ -350,7 +350,7 @@ fn atRuntime(c: *const Context, node: Ast.Node.Index) Context.Error!bool {
                 var buffer: [1]Ast.Node.Index = undefined;
                 const proto = tree.fullFnProto(&buffer, tree.nodeData(parent).node_and_node[0]) orelse return true;
                 const result = proto.ast.return_type.unwrap() orelse return true;
-                return !try c.facts.typeIsType(c.file, result);
+                return !try c.typeIsType(c.file, result);
             },
             else => {
                 var buffer: [2]Ast.Node.Index = undefined;

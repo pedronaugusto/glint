@@ -5,6 +5,7 @@ const Ast = std.zig.Ast;
 const Facts = @import("Facts.zig");
 const answers = @import("compiled/Answers.zig");
 const Model = @import("Model.zig");
+const PackageRules = @import("PackageRules.zig");
 const rules = @import("Rule.zig");
 const Report = @import("Report.zig");
 const RuleContext = @This();
@@ -17,7 +18,9 @@ backing: std.mem.Allocator = std.heap.page_allocator,
 project: *const Project,
 file: Project.FileId,
 config: rules.Config,
-facts: *Facts,
+/// The run's facts, behind this context: a rule asks through its methods, the one door, and none
+/// of them hands Facts out, so a rule that reaches Facts itself does not compile (`hold`).
+held: *Held,
 definitions: []const rules.Definition,
 sink: *Sink,
 /// The run's compiled rules: the facts they declare are the ones `Taint` solves together.
@@ -25,13 +28,23 @@ compiled: []const Rule = &.{},
 
 pub const Error = Facts.ResolveError || Project.QueryError || error{ AmbiguousSuppression, InvalidSelection };
 
+/// Facts as a context holds them: opaque to every rule.
+pub const Held = opaque {};
+/// The run's facts, held for a context: what its runner gives `held`.
+pub fn hold(run: *Facts) *Held {
+    return @ptrCast(run);
+}
+fn facts(self: *const RuleContext) *Facts {
+    return @ptrCast(@alignCast(self.held));
+}
+
 /// Makes `allocator` the run's own (`Facts.gpa`) and returns the one it was: what a function
 /// that fills a `Facts.memo` computes, its callees' memory among it, is kept for the run, as a
 /// rule's own memory for one file is given back when the rule is done with the file. Restored
 /// on the way out: `const rule_memory = c.keep(); defer c.allocator = rule_memory;`.
 pub fn keep(self: *RuleContext) std.mem.Allocator {
     const own = self.allocator;
-    self.allocator = self.facts.gpa;
+    self.allocator = self.facts().gpa;
     return own;
 }
 /// Where a rule's findings go. Its owner embeds it in its own state and gets that back from
@@ -75,13 +88,164 @@ pub fn resolve(self: *RuleContext, node: Project.NodeId) Error!Facts.Value {
 
 /// `resolve`, of a node of `file`.
 pub fn resolveIn(self: *RuleContext, file: Project.FileId, node: Ast.Node.Index) Error!Facts.Value {
-    if (self.facts.compiled.len != 0) {
-        const tree = &self.project.at(file).file.tree;
-        if (try answers.site(self.project, self.facts.compiled, file, tree.firstToken(node))) |reach| {
-            if (reach == .not_reached) return .{ .unknown = .not_reached };
-        }
-    }
-    return self.facts.resolve(file, node);
+    if (!try self.reached(file, node)) return .{ .unknown = .not_reached };
+    return self.facts().resolve(file, node);
+}
+/// Whether a node of `file` is in code a compiled root holds, or there are none (a plain run,
+/// which reads every file as reached). Unknown reachability (no function or declaration holds
+/// the node) is reached: the source answers, as it does without compiled roots.
+fn reached(self: *const RuleContext, file: Project.FileId, node: Ast.Node.Index) Error!bool {
+    const compiled = self.facts().compiled;
+    if (compiled.len == 0) return true;
+    const tree = &self.project.at(file).file.tree;
+    const reach = try answers.site(self.project, compiled, file, tree.firstToken(node)) orelse return true;
+    return reach != .not_reached;
+}
+
+// The facts a rule reads, each through this context. A site query (what a node resolves to,
+// names, casts to, holds, or fixes at compile time) answers not reached where no compiled root holds
+// the node, as `resolve` does; a query of a declaration, a container or a file reads it as
+// Facts does, its site having been asked first.
+
+/// The declaration a name or member access at `node` refers to (`Facts.definition`).
+pub fn definition(self: *const RuleContext, file: Project.FileId, node: Ast.Node.Index) Error!Facts.Named {
+    if (!try self.reached(file, node)) return .{ .unknown = .not_reached };
+    return self.facts().definition(file, node);
+}
+/// The declaration a reflective builtin at `node` names (`Facts.reflected`).
+pub fn reflected(self: *const RuleContext, file: Project.FileId, node: Ast.Node.Index) Error!Facts.Named {
+    if (!try self.reached(file, node)) return .{ .unknown = .not_reached };
+    return self.facts().reflected(file, node);
+}
+/// The declarations a literal's `name` may be, by the type its place gives it
+/// (`Facts.literalDeclarations`).
+pub fn literalDeclarations(self: *const RuleContext, file: Project.FileId, node: Ast.Node.Index, name: []const u8) Error!Facts.Definitions {
+    if (!try self.reached(file, node)) return .{ .unknown = .not_reached };
+    return self.facts().literalDeclarations(file, node, name);
+}
+/// The type a cast at `node` makes, by its place (`Facts.castTypeIn`, outside any binding).
+pub fn castType(self: *const RuleContext, file: Project.FileId, node: Ast.Node.Index) Error!Facts.Value {
+    if (!try self.reached(file, node)) return .{ .unknown = .not_reached };
+    return self.facts().castTypeIn(null, file, node);
+}
+/// The compile-time value at `node`, null where it is not fixed there or not reached
+/// (`Facts.comptimeValue`, outside any binding).
+pub fn comptimeValue(self: *const RuleContext, file: Project.FileId, node: Ast.Node.Index) Error!?Facts.Comptime {
+    if (!try self.reached(file, node)) return null;
+    return self.facts().comptimeValue(null, file, node);
+}
+/// The field name a builtin's argument spells (`Facts.fieldName`).
+pub fn fieldName(self: *const RuleContext, file: Project.FileId, node: Ast.Node.Index) Error!Facts.FieldName {
+    return self.facts().fieldName(file, node);
+}
+/// Whether `name` is a field of `holder`'s own type (`Facts.fieldNameOwn`).
+pub fn fieldNameOwn(self: *const RuleContext, file: Project.FileId, holder: Ast.Node.Index, name: Ast.Node.Index) Error!bool {
+    return self.facts().fieldNameOwn(file, holder, name);
+}
+/// Whether a field name may be `name` (`Facts.mayName`).
+pub fn mayName(self: *const RuleContext, named: Facts.FieldName, name: []const u8) bool {
+    return self.facts().mayName(named, name);
+}
+/// Whether the expression at `node` is a value, not a type (`Facts.isValue`).
+pub fn isValue(self: *const RuleContext, file: Project.FileId, node: Ast.Node.Index) Error!bool {
+    return self.facts().isValue(file, node);
+}
+/// Whether the type written at `node` is `type` (`Facts.typeIsType`).
+pub fn typeIsType(self: *const RuleContext, file: Project.FileId, node: Ast.Node.Index) Error!bool {
+    return self.facts().typeIsType(file, node);
+}
+/// Whether `node` names a `comptime` parameter (`Facts.comptimeParameter`).
+pub fn comptimeParameter(self: *const RuleContext, file: Project.FileId, node: Ast.Node.Index) bool {
+    return self.facts().comptimeParameter(file, node);
+}
+/// The function whose body holds `node` (`Facts.functionHolding`).
+pub fn functionHolding(self: *const RuleContext, file: Project.FileId, node: Ast.Node.Index) ?Facts.Decl {
+    return self.facts().functionHolding(file, node);
+}
+/// The value a declaration gives (`Facts.declaration`).
+pub fn declaration(self: *const RuleContext, decl: Facts.Decl) Error!Facts.Value {
+    return self.facts().declaration(decl);
+}
+/// The declaration an alias chain from `decl` ends at (`Facts.origin`).
+pub fn origin(self: *const RuleContext, decl: Facts.Decl) Error!Facts.Named {
+    return self.facts().origin(decl);
+}
+/// Every declaration an alias chain from `decl` may end at (`Facts.origins`).
+pub fn origins(self: *const RuleContext, decl: Facts.Decl) Error!Facts.Definitions {
+    return self.facts().origins(decl);
+}
+/// The value a function returns, as a template of its result (`Facts.template`).
+pub fn template(self: *const RuleContext, decl: Facts.Decl) Error!?Facts.Value {
+    return self.facts().template(decl);
+}
+/// The expressions a function returns (`Facts.returnedValues`).
+pub fn returnedValues(self: *const RuleContext, function: Facts.Decl) Error!?[]const Ast.Node.Index {
+    return self.facts().returnedValues(function);
+}
+/// The member `name` of a container (`Facts.member`).
+pub fn member(self: *const RuleContext, container: Facts.Container, name: []const u8) ?Facts.Decl {
+    return self.facts().member(container, name);
+}
+/// A file's root container (`Facts.rootOf`).
+pub fn rootOf(self: *const RuleContext, file: Project.FileId) Facts.Container {
+    return self.facts().rootOf(file);
+}
+/// Whether a file is std's (`Facts.standard`).
+pub fn standard(self: *const RuleContext, file: Project.FileId) Error!bool {
+    return self.facts().standard(file);
+}
+/// Whether a file is the program's own (`Facts.program`).
+pub fn program(self: *const RuleContext, file: Project.FileId) Error!bool {
+    return self.facts().program(file);
+}
+/// Whether a scope is on the module's public surface (`Facts.onSurface`).
+pub fn onSurface(self: *const RuleContext, file: Project.FileId, scope: Model.Scope.Id) Error!bool {
+    return self.facts().onSurface(file, scope);
+}
+/// Whether a scope is exported on the surface (`Facts.exportedSurface`).
+pub fn exportedSurface(self: *const RuleContext, file: Project.FileId, scope: Model.Scope.Id) Error!bool {
+    return self.facts().exportedSurface(file, scope);
+}
+/// Whether a scope is on the surface through an alias (`Facts.aliasedOnSurface`).
+pub fn aliasedOnSurface(self: *const RuleContext, file: Project.FileId, scope: Model.Scope.Id) Error!bool {
+    return self.facts().aliasedOnSurface(file, scope);
+}
+/// The run's one `T`, kept across files (`Facts.memo`).
+pub fn memo(self: *const RuleContext, comptime T: type) Error!*T {
+    return self.facts().memo(T);
+}
+/// The run's allocator: what a `memo` holds is made on it (`keep`).
+pub fn runAllocator(self: *const RuleContext) std.mem.Allocator {
+    return self.facts().gpa;
+}
+/// Whether the run's fact budget is spent (`Facts.budgetSpent`).
+pub fn budgetSpent(self: *const RuleContext) bool {
+    return self.facts().budgetSpent();
+}
+/// The calls a file makes (`Facts.calls.in`).
+pub fn callsIn(self: *const RuleContext, file: Project.FileId) Error![]const Facts.calls.Call {
+    return Facts.calls.in(self.facts(), file);
+}
+/// The call at `node`, if one is there (`Facts.calls.at`).
+pub fn callAt(self: *const RuleContext, file: Project.FileId, node: Ast.Node.Index) Error!?Facts.calls.Call {
+    return Facts.calls.at(self.facts(), file, node);
+}
+/// The values an expression may hold (`Facts.accesses.valuesOf`).
+pub fn valuesOf(self: *const RuleContext, file: Project.FileId, node: Ast.Node.Index) Error!Facts.accesses.Values {
+    if (!try self.reached(file, node)) return .{ .unknown = .not_reached };
+    return Facts.accesses.valuesOf(self.facts(), file, node);
+}
+/// The access path an expression spells (`Facts.accesses.pathOf`).
+pub fn pathOf(self: *const RuleContext, file: Project.FileId, node: Ast.Node.Index) Error!Facts.accesses.Path {
+    return Facts.accesses.pathOf(self.facts(), file, node);
+}
+/// Whether two expressions are the same place (`Facts.accesses.samePlace`).
+pub fn samePlace(self: *const RuleContext, file: Project.FileId, a: Ast.Node.Index, b: Ast.Node.Index) Error!Facts.Is {
+    return Facts.accesses.samePlace(self.facts(), file, a, b);
+}
+/// The rules a package root declares (`PackageRules.of`).
+pub fn packageRules(self: *const RuleContext, root: Project.FileId) Error!*const PackageRules.Rules {
+    return PackageRules.of(self.facts(), root);
 }
 /// Whether `decl`'s parameters, past the first `skip` (a method's receiver), can take the
 /// arguments of `call` (written in the checked file), by what Zig allows: as many, none a
@@ -106,7 +270,7 @@ pub fn accepts(self: *RuleContext, decl: Facts.Decl, call: Ast.full.Call, skip: 
         };
         const given_type = !literal and try self.isType(argument);
         if (!literal and !given_type) continue;
-        const kind = try self.facts.resolve(decl.file, written);
+        const kind = try self.facts().resolve(decl.file, written);
         // A type given where the parameter takes a value: turned away only where every build's
         // parameter type does.
         if (given_type) {
@@ -139,11 +303,11 @@ fn isType(self: *RuleContext, node: Ast.Node.Index) Error!bool {
     if (tree.fullCall(&call_buffer, node)) |call| {
         // A callee that does not resolve may make anything: its call is no type shown, so it
         // turns no candidate away (`accepts` rejects only on a type it sees given).
-        const decl = switch (try self.facts.definition(self.file, call.ast.fn_expr)) {
+        const decl = switch (try self.facts().definition(self.file, call.ast.fn_expr)) {
             .decl => |found| found,
             .none, .unknown => return false,
         };
-        const function = switch (try self.facts.origin(decl)) {
+        const function = switch (try self.facts().origin(decl)) {
             .decl => |found| found,
             .none, .unknown => return false,
         };
@@ -164,7 +328,7 @@ fn isType(self: *RuleContext, node: Ast.Node.Index) Error!bool {
         .optional_type, .error_union => return true,
         // A type in every build's reading of the name.
         .identifier, .field_access => {
-            const value = try self.facts.resolve(self.file, node);
+            const value = try self.facts().resolve(self.file, node);
             var each: Facts.Join = .{};
             for (Facts.valueParts(&value)) |part| each.add(part, switch (part) {
                 .container => true,
@@ -275,14 +439,111 @@ pub fn spanOf(self: *const RuleContext, file: Project.FileId, token: std.zig.Ast
     const line = held.line(named.start);
     return .{ .file = file, .start = named.start, .end = named.end, .line = line + 1, .column = held.column(named.start) };
 }
-pub fn atDefinition(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.TokenIndex, message: []const u8, definition: Facts.Decl) Error!void {
-    return self.atDefinitionFixed(rule, token, message, definition, &.{});
+pub fn atDefinition(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.TokenIndex, message: []const u8, target: Facts.Decl) Error!void {
+    return self.atDefinitionFixed(rule, token, message, target, &.{});
 }
-/// A site at `token` naming `definition`, with its deterministic fix.
-pub fn atDefinitionFixed(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.TokenIndex, message: []const u8, definition: Facts.Decl, fix: []const Report.Edit) Error!void {
-    const named = self.project.at(definition.file).model.declarations[@backingInt(definition.index)].token;
-    const related = [_]Report.Span{self.spanOf(definition.file, named)};
+/// A site at `token` naming `target`, with its deterministic fix.
+pub fn atDefinitionFixed(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.TokenIndex, message: []const u8, target: Facts.Decl, fix: []const Report.Edit) Error!void {
+    const named = self.project.at(target.file).model.declarations[@backingInt(target.index)].token;
+    const related = [_]Report.Span{self.spanOf(target.file, named)};
     const site_tree = try self.project.syntax(try self.source());
     const site = site_tree.tokenToSpan(token);
     try self.emitFixed(rule, site.start, site.end, message, &related, fix);
+}
+
+test "a rule reaches Facts only through the context: no field or method hands Facts out" {
+    // A rule writing `c.facts.resolve(...)` does not compile: the context holds Facts opaque,
+    // and nothing public of it gives Facts back.
+    try std.testing.expect(@typeInfo(Held) == .@"opaque");
+    inline for (@typeInfo(RuleContext).@"struct".fields) |field| {
+        try std.testing.expect(!handsFacts(field.type));
+    }
+    inline for (@typeInfo(RuleContext).@"struct".decls) |decl| {
+        const T = @TypeOf(@field(RuleContext, decl.name));
+        if (@typeInfo(T) == .@"fn") {
+            if (@typeInfo(T).@"fn".return_type) |returned| try std.testing.expect(!handsFacts(returned));
+        }
+    }
+}
+/// Whether a type is, or wraps in an error union or optional, a pointer to Facts.
+fn handsFacts(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |p| p.child == Facts,
+        .optional => |o| handsFacts(o.child),
+        .error_union => |e| handsFacts(e.payload),
+        else => false,
+    };
+}
+
+const reach_tests = struct {
+    const Compiled = @import("Compiled.zig");
+    const Runner = @import("Runner.zig");
+    const syntactic: rules.Rule = @fromBackingInt(1000); // safe: a test's own extension identity.
+    const typed: rules.Rule = @fromBackingInt(1001); // safe: a test's own extension identity.
+    /// Each `marker` written: a ban that reads the syntax alone.
+    fn written(c: *RuleContext) Error!void {
+        const tree = &c.project.at(c.file).file.tree;
+        for (0..tree.nodes.len) |i| {
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: a test's few nodes
+            if (tree.nodeTag(node) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "marker")) continue;
+            try c.at(syntactic, tree.nodeMainToken(node), "marker written");
+        }
+    }
+    /// Each `marker` by what it resolves to: a ban that needs the site's declaration.
+    fn resolved(c: *RuleContext) Error!void {
+        const tree = &c.project.at(c.file).file.tree;
+        for (0..tree.nodes.len) |i| {
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: a test's few nodes
+            if (tree.nodeTag(node) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "marker")) continue;
+            switch (try c.resolveIn(c.file, node)) {
+                .unknown => |why| try c.unknownAt(typed, tree.nodeMainToken(node), why),
+                else => try c.at(typed, tree.nodeMainToken(node), "marker resolved"),
+            }
+        }
+    }
+};
+test "with compiled roots, a syntactic ban reports in unreached code and a ban that needs facts counts it not reached" {
+    const gpa = std.testing.allocator;
+    const bytes = try reach_tests.Compiled.Dwarf.sampleForTests(gpa);
+    defer gpa.free(bytes);
+    var compiled = try reach_tests.Compiled.init(gpa, try reach_tests.Compiled.Dwarf.readBytesForTests(bytes), "/pkg");
+    defer compiled.deinit();
+    // Lines as the sample compiles them: `first`, at 5, is held; `second`, at 6, is not.
+    const source =
+        \\// s
+        \\const std = @import("std");
+        \\pub const List = struct {
+        \\    len: usize,
+        \\    pub fn first(n: usize) usize { return n + marker; }
+        \\    pub fn second() usize { return marker; }
+        \\};
+        \\const marker: usize = 1;
+        \\
+    ;
+    var project = try Project.init(gpa, &.{.{ .name = "src/s.zig", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    const project_rules = [_]Rule{
+        .{ .definition = .{ .id = reach_tests.syntactic, .name = "WRITTEN", .group = .family_policy, .purpose = "a ban read from the syntax", .version = 1 }, .check = reach_tests.written },
+        .{ .definition = .{ .id = reach_tests.typed, .name = "RESOLVED", .group = .family_policy, .purpose = "a ban read from the site's declaration", .version = 1 }, .check = reach_tests.resolved },
+    };
+    const config: rules.Config = .{ .enabled = .empty, .selections = &.{ .{ .rule = reach_tests.syntactic, .level = .gate }, .{ .rule = reach_tests.typed, .level = .gate } } };
+    var report = try reach_tests.Runner.run(gpa, &project, .{ .config = config, .project_rules = &project_rules, .compiled = &.{&compiled} });
+    defer report.deinit();
+    try std.testing.expect(report.complete);
+    var by_rule = [_]usize{ 0, 0 };
+    for (report.diagnostics) |d| {
+        if (std.mem.eql(u8, d.name, "WRITTEN")) by_rule[0] += 1 else if (std.mem.eql(u8, d.name, "RESOLVED")) by_rule[1] += 1;
+    }
+    // The syntactic ban: both `marker`s, reached or not.
+    try std.testing.expectEqual(@as(usize, 2), by_rule[0]);
+    // The ban that needs facts: the reached one is a finding, the other is not reached.
+    try std.testing.expectEqual(@as(usize, 1), by_rule[1]);
+    try std.testing.expectEqual(@as(usize, 1), report.not_reached.len);
+    try std.testing.expectEqualStrings("RESOLVED", report.not_reached[0].name);
+    try std.testing.expectEqual(@as(usize, 1), report.not_reached[0].sites);
+    // Without roots every file is reached: both resolve.
+    var plain = try reach_tests.Runner.run(gpa, &project, .{ .config = config, .project_rules = &project_rules });
+    defer plain.deinit();
+    try std.testing.expectEqual(@as(usize, 4), plain.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 0), plain.not_reached.len);
 }

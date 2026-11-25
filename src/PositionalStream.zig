@@ -24,7 +24,7 @@ const Written = @import("Written.zig");
 
 pub fn check(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
-    for (try Facts.calls.in(c.facts, c.file)) |call| {
+    for (try c.callsIn(c.file)) |call| {
         const token = tree.nodeMainToken(call.node);
         switch (try Governed.mayCallStd(c, call.node, "Io.File.writer")) {
             .no => continue,
@@ -68,7 +68,7 @@ fn streamOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
     // A chain of `const`s and calls handing one another the value ends long before this.
     if (depth > 8) return .{ .unknown = .budget };
     const tree = &c.project.at(file).file.tree;
-    const leaves = switch (try Facts.accesses.valuesOf(c.facts, file, node)) {
+    const leaves = switch (try c.valuesOf(file, node)) {
         .leaves => |leaves| leaves,
         .unknown => |why| return .{ .unknown = why },
     };
@@ -101,7 +101,7 @@ fn callStream(c: *Context, file: Project.FileId, at: Ast.Node.Index, depth: u8) 
         .no => {},
         .unknown => |why| found = .{ .unknown = why },
     };
-    const call = (try Facts.calls.at(c.facts, file, at)) orelse return found;
+    const call = (try c.callAt(file, at)) orelse return found;
     const callees: []const Facts.Decl = switch (call.callee) {
         .function => |function| &.{function},
         .choice => |each| each,
@@ -109,8 +109,8 @@ fn callStream(c: *Context, file: Project.FileId, at: Ast.Node.Index, depth: u8) 
         .any => |why| return if (found == .none) .{ .unknown = why } else found,
     };
     for (callees) |callee| {
-        if (!try c.facts.program(callee.file)) continue;
-        const returned = (try c.facts.returnedValues(callee)) orelse continue;
+        if (!try c.program(callee.file)) continue;
+        const returned = (try c.returnedValues(callee)) orelse continue;
         for (returned) |value| {
             const stream = try streamOf(c, callee.file, value, depth + 1);
             switch (stream) {
@@ -127,7 +127,7 @@ fn callStream(c: *Context, file: Project.FileId, at: Ast.Node.Index, depth: u8) 
 /// knows the calls no unknown callee can make), another's by its callees against std's.
 fn mayCallStdIn(c: *Context, file: Project.FileId, at: Ast.Node.Index, path: []const u8) Context.Error!Governed.Is {
     if (file == c.file) return Governed.mayCallStd(c, at, path);
-    const call = (try Facts.calls.at(c.facts, file, at)) orelse return .no;
+    const call = (try c.callAt(file, at)) orelse return .no;
     const decls = switch (try Governed.declarations(c, "std", path)) {
         .decls => |decls| decls,
         .none => return .no,

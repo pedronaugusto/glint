@@ -182,7 +182,7 @@ const Walk = struct {
             for (statements) |statement| {
                 if (tree.nodeTag(statement) != .assign) continue;
                 const written = tree.nodeData(statement).node_and_node[0];
-                if (try Facts.accesses.samePlace(self.c.facts, self.c.file, written, target) == .yes) return true;
+                if (try self.c.samePlace(self.c.file, written, target) == .yes) return true;
             }
         }
         return false;

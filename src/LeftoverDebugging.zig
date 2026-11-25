@@ -31,7 +31,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
     // std's formatted panic, `std.debug.panic(format, args)`: the same panic, its message the
     // format. Read by its form first, then by its callee: a call glint cannot name is no pass
     // only where it is written so (`Context.unknownAt`).
-    for (try Facts.calls.in(c.facts, c.file)) |call| {
+    for (try c.callsIn(c.file)) |call| {
         var buffer: [1]Ast.Node.Index = undefined;
         const written = tree.fullCall(&buffer, call.node) orelse continue;
         if (written.ast.params.len != 2 or !marksUnfinished(tree, written.ast.params[0])) continue;

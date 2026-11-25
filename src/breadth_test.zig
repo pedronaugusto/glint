@@ -152,7 +152,7 @@ pub fn runWith(gpa: std.mem.Allocator, project: *const Project, file: Project.Fi
     collecting = &collector;
     defer collecting = before;
     const definitions = [_]rules.Definition{projectRule(check).definition};
-    var context: Context = .{ .allocator = a, .backing = gpa, .project = project, .file = file, .config = collector.config, .facts = &facts, .definitions = &definitions, .sink = &sink };
+    var context: Context = .{ .allocator = a, .backing = gpa, .project = project, .file = file, .config = collector.config, .held = Context.hold(&facts), .definitions = &definitions, .sink = &sink };
     try check(&context, test_id);
     return collector.found;
 }

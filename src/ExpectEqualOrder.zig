@@ -13,7 +13,7 @@ const Written = @import("Written.zig");
 
 pub fn check(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
-    for (try Facts.calls.in(c.facts, c.file)) |call| {
+    for (try c.callsIn(c.file)) |call| {
         const args = switch (call.args) {
             .known => |args| args,
             .unknown => continue,
