@@ -1,6 +1,6 @@
 //! Owned findings, reports and run errors. Rendering cannot alter model results.
 const std = @import("std");
-const release = @import("version.zig");
+const release = @import("release");
 const Project = @import("Project.zig");
 const rules = @import("Rule.zig");
 const Report = @This();

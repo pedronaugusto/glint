@@ -1,9 +1,5 @@
 const std = @import("std");
 const zon = @import("build.zig.zon");
-comptime {
-    // src/version.zig carries the version glint reports about itself (SARIF's driver version).
-    if (!std.mem.eql(u8, zon.version, @import("src/version.zig").version)) @compileError("src/version.zig names " ++ @import("src/version.zig").version ++ "; build.zig.zon names " ++ zon.version);
-}
 
 /// What a project that depends on glint builds: the `glint` module, the `glint`
 /// program, and `addLinter` and `addLint` for a project's own linter.
@@ -15,6 +11,7 @@ pub fn build(b: *std.Build) void {
     const module = b.addModule("glint", .{ .root_source_file = b.path("src/glint.zig"), .target = target, .optimize = optimize });
     module.addImport("aegis", aegis);
     module.addImport("ensign", b.dependency("ensign", .{ .target = target, .optimize = optimize }).module("ensign"));
+    module.addImport("release", release(b));
 
     const executable = b.addExecutable(.{ .name = "glint", .root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -220,13 +217,25 @@ pub fn dev(b: *std.Build, tools: type) void {
     tools.preflight.addConsumerCheck(b, p, .{ .package = "glint", .program = p.path("ci/consumer.zig"), .modules = &.{"glint"}, .packages = &packages });
 }
 
+/// glint's version, as its manifest names it, for what glint reports about itself (SARIF's
+/// `tool.driver.version`): made once, in `b`, the build of the package whose module imports it.
+/// The options carry the package's hash too, so two glint packages of one version in one
+/// compilation (a consumer's two pins, each its own commit) make options files of different
+/// contents: identical ones would be one cached file in two modules, which Zig refuses.
+fn release(b: *std.Build) *std.Build.Module {
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", zon.version);
+    options.addOption([]const u8, "package", b.pkg_hash);
+    return options.createModule();
+}
+
 /// `b` is the development build.
 fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) []const std.Build.Module.Import {
-    const p = b.dependency("glint", .{ .target = target, .optimize = optimize }).builder;
-    const module = b.createModule(.{ .root_source_file = p.path("src/glint.zig"), .target = target, .optimize = optimize });
+    // The package's own `glint` module, its one `release` among it, never a copy beside it.
+    const package = b.dependency("glint", .{ .target = target, .optimize = optimize });
+    const p = package.builder;
+    const module = package.module("glint");
     const aegis_dependency = p.dependency("aegis", .{ .target = target, .optimize = optimize });
-    module.addImport("aegis", aegis_dependency.module("aegis"));
-    module.addImport("ensign", p.dependency("ensign", .{ .target = target, .optimize = optimize }).module("ensign"));
     return b.allocator.dupe(std.Build.Module.Import, &.{ .{ .name = "glint", .module = module }, .{ .name = "aegis_sources", .module = aegisSources(b, p, module, aegis_dependency, target, .{}) } }) catch @panic("OOM");
 }
 
@@ -298,6 +307,8 @@ fn mapOwnModules(p: *std.Build, run: *std.Build.Step.Run, aegis_dependency: *std
         .{ "glint=", p.path("src/glint.zig") },
         .{ "ensign=", ensign_dependency.path("src/ensign.zig") },
         .{ "xenoglyph=", xenoglyph_dependency.path("src/xenoglyph.zig") },
+        // The package's version options, the one its `glint` module imports.
+        .{ "release=", (p.modules.get("glint").?.import_table.get("release") orelse @panic("glint's module imports release")).root_source_file.? },
     }) |mapping| {
         run.addArg("--module");
         run.addPrefixedFileArg(mapping[0], mapping[1]);
