@@ -13,7 +13,6 @@ const Ast = std.zig.Ast;
 const Context = @import("RuleContext.zig");
 const Report = @import("Report.zig");
 const Rule = @import("Rule.zig").Rule;
-const Facts = @import("Facts.zig");
 const Governed = @import("Governed.zig");
 const Written = @import("Written.zig");
 

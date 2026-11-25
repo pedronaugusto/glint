@@ -20,6 +20,9 @@ gpa: std.mem.Allocator,
 /// An allocator that frees, beside `gpa`: what a query makes and drops within its own work (a
 /// site's checking reach, `reachedFromSite`) is made on it, so dropping it gives the memory back.
 backing: std.mem.Allocator = std.heap.page_allocator,
+/// What a rule's context holds of these facts: never Facts itself, so a rule asks through the
+/// context's methods, the one door (`RuleContext.hold`).
+door: Door = .{},
 cache: std.AutoHashMapUnmanaged(Settled, Value) = .empty,
 /// What a node gives in a reading (`resolveIn`), by the reading's address and the node.
 bound: std.AutoHashMapUnmanaged(Bound, Value) = .empty,
@@ -237,6 +240,9 @@ pub const Reflected = struct { of: *const Value, at: enum { info, pointer, size,
 /// ban, while the `extern` declaration itself is where P007's seams govern it.
 /// Whether something is so: yes, no, or unknown and why.
 pub const Is = union(enum) { yes, no, unknown: Unknown };
+/// The handle a rule's context holds: Facts are reached from it only by the context, which gets
+/// them back from the field (`@fieldParentPtr`); it carries nothing a rule can read.
+pub const Door = struct { mark: u8 = 0 };
 pub const Unknown = enum {
     invalid_front_end,
     unresolved,

@@ -20,7 +20,7 @@ file: Project.FileId,
 config: rules.Config,
 /// The run's facts, behind this context: a rule asks through its methods, the one door, and none
 /// of them hands Facts out, so a rule that reaches Facts itself does not compile (`hold`).
-held: *Held,
+held: *Facts.Door,
 definitions: []const rules.Definition,
 sink: *Sink,
 /// The run's compiled rules: the facts they declare are the ones `Taint` solves together.
@@ -28,14 +28,13 @@ compiled: []const Rule = &.{},
 
 pub const Error = Facts.ResolveError || Project.QueryError || error{ AmbiguousSuppression, InvalidSelection };
 
-/// Facts as a context holds them: opaque to every rule.
-pub const Held = opaque {};
-/// The run's facts, held for a context: what its runner gives `held`.
-pub fn hold(run: *Facts) *Held {
-    return @ptrCast(run);
+/// The run's facts, held for a context: what its runner gives `held`, their door, from which only
+/// this file gets them back.
+pub fn hold(run: *Facts) *Facts.Door {
+    return &run.door;
 }
 fn facts(self: *const RuleContext) *Facts {
-    return @ptrCast(@alignCast(self.held));
+    return @alignCast(@fieldParentPtr("door", self.held));
 }
 
 /// Makes `allocator` the run's own (`Facts.gpa`) and returns the one it was: what a function
@@ -452,14 +451,14 @@ pub fn atDefinitionFixed(self: *RuleContext, rule: rules.Rule, token: std.zig.As
 }
 
 test "a rule reaches Facts only through the context: no field or method hands Facts out" {
-    // A rule writing `c.facts.resolve(...)` does not compile: the context holds Facts opaque,
-    // and nothing public of it gives Facts back.
-    try std.testing.expect(@typeInfo(Held) == .@"opaque");
-    inline for (@typeInfo(RuleContext).@"struct".fields) |field| {
-        try std.testing.expect(!handsFacts(field.type));
+    // A rule writing `c.facts.resolve(...)` does not compile: the context holds only Facts'
+    // door, which carries nothing a rule reads, and nothing public of it gives Facts back.
+    try std.testing.expectEqual(@as(usize, 1), @typeInfo(Facts.Door).@"struct".field_names.len);
+    inline for (@typeInfo(RuleContext).@"struct".field_types) |field| {
+        try std.testing.expect(!handsFacts(field));
     }
-    inline for (@typeInfo(RuleContext).@"struct".decls) |decl| {
-        const T = @TypeOf(@field(RuleContext, decl.name));
+    inline for (@typeInfo(RuleContext).@"struct".decl_names) |name| {
+        const T = @TypeOf(@field(RuleContext, name));
         if (@typeInfo(T) == .@"fn") {
             if (@typeInfo(T).@"fn".return_type) |returned| try std.testing.expect(!handsFacts(returned));
         }
@@ -473,77 +472,4 @@ fn handsFacts(comptime T: type) bool {
         .error_union => |e| handsFacts(e.payload),
         else => false,
     };
-}
-
-const reach_tests = struct {
-    const Compiled = @import("Compiled.zig");
-    const Runner = @import("Runner.zig");
-    const syntactic: rules.Rule = @fromBackingInt(1000); // safe: a test's own extension identity.
-    const typed: rules.Rule = @fromBackingInt(1001); // safe: a test's own extension identity.
-    /// Each `marker` written: a ban that reads the syntax alone.
-    fn written(c: *RuleContext) Error!void {
-        const tree = &c.project.at(c.file).file.tree;
-        for (0..tree.nodes.len) |i| {
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: a test's few nodes
-            if (tree.nodeTag(node) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "marker")) continue;
-            try c.at(syntactic, tree.nodeMainToken(node), "marker written");
-        }
-    }
-    /// Each `marker` by what it resolves to: a ban that needs the site's declaration.
-    fn resolved(c: *RuleContext) Error!void {
-        const tree = &c.project.at(c.file).file.tree;
-        for (0..tree.nodes.len) |i| {
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: a test's few nodes
-            if (tree.nodeTag(node) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "marker")) continue;
-            switch (try c.resolveIn(c.file, node)) {
-                .unknown => |why| try c.unknownAt(typed, tree.nodeMainToken(node), why),
-                else => try c.at(typed, tree.nodeMainToken(node), "marker resolved"),
-            }
-        }
-    }
-};
-test "with compiled roots, a syntactic ban reports in unreached code and a ban that needs facts counts it not reached" {
-    const gpa = std.testing.allocator;
-    const bytes = try reach_tests.Compiled.Dwarf.sampleForTests(gpa);
-    defer gpa.free(bytes);
-    var compiled = try reach_tests.Compiled.init(gpa, try reach_tests.Compiled.Dwarf.readBytesForTests(bytes), "/pkg");
-    defer compiled.deinit();
-    // Lines as the sample compiles them: `first`, at 5, is held; `second`, at 6, is not.
-    const source =
-        \\// s
-        \\const std = @import("std");
-        \\pub const List = struct {
-        \\    len: usize,
-        \\    pub fn first(n: usize) usize { return n + marker; }
-        \\    pub fn second() usize { return marker; }
-        \\};
-        \\const marker: usize = 1;
-        \\
-    ;
-    var project = try Project.init(gpa, &.{.{ .name = "src/s.zig", .bytes = source }}, &.{}, .{});
-    defer project.deinit();
-    const project_rules = [_]Rule{
-        .{ .definition = .{ .id = reach_tests.syntactic, .name = "WRITTEN", .group = .family_policy, .purpose = "a ban read from the syntax", .version = 1 }, .check = reach_tests.written },
-        .{ .definition = .{ .id = reach_tests.typed, .name = "RESOLVED", .group = .family_policy, .purpose = "a ban read from the site's declaration", .version = 1 }, .check = reach_tests.resolved },
-    };
-    const config: rules.Config = .{ .enabled = .empty, .selections = &.{ .{ .rule = reach_tests.syntactic, .level = .gate }, .{ .rule = reach_tests.typed, .level = .gate } } };
-    var report = try reach_tests.Runner.run(gpa, &project, .{ .config = config, .project_rules = &project_rules, .compiled = &.{&compiled} });
-    defer report.deinit();
-    try std.testing.expect(report.complete);
-    var by_rule = [_]usize{ 0, 0 };
-    for (report.diagnostics) |d| {
-        if (std.mem.eql(u8, d.name, "WRITTEN")) by_rule[0] += 1 else if (std.mem.eql(u8, d.name, "RESOLVED")) by_rule[1] += 1;
-    }
-    // The syntactic ban: both `marker`s, reached or not.
-    try std.testing.expectEqual(@as(usize, 2), by_rule[0]);
-    // The ban that needs facts: the reached one is a finding, the other is not reached.
-    try std.testing.expectEqual(@as(usize, 1), by_rule[1]);
-    try std.testing.expectEqual(@as(usize, 1), report.not_reached.len);
-    try std.testing.expectEqualStrings("RESOLVED", report.not_reached[0].name);
-    try std.testing.expectEqual(@as(usize, 1), report.not_reached[0].sites);
-    // Without roots every file is reached: both resolve.
-    var plain = try reach_tests.Runner.run(gpa, &project, .{ .config = config, .project_rules = &project_rules });
-    defer plain.deinit();
-    try std.testing.expectEqual(@as(usize, 4), plain.diagnostics.len);
-    try std.testing.expectEqual(@as(usize, 0), plain.not_reached.len);
 }

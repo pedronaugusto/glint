@@ -88,6 +88,7 @@ closed construct list. In short, for a configuration written for 0.7:
 - `cli.Configuration.profile` is the profile's name (`"core"`, `"reviewed"`, `"none"`), not an enum: any other, 0.7's `"family"` and `"aegis"` among them, is refused as a profile glint does not have.
 - `Fix.apply(a, project, report)` takes no options: `--fix` applies the findings' fixes and drops a suppression's rule that met no site, and rewrites no older suppression form (`Fix.Options` is gone, below).
 - `Report.Metrics.Kind` counts `.std_assert` and `.replacement` (a declaration a package names in `std.debug.assert`'s place): `Report.Metrics.Kind.debug`, `Report.Metrics.Kind.debug_check`, `Report.Metrics.Kind.invariant` and `Report.Metrics.Kind.never` named aegis's assertions, which aegis now declares as `.with` answers.
+- A rule reaches the run's facts only through its context: `RuleContext.facts` is gone, and a `RuleContext` is built with `held` (`RuleContext.hold(&facts)`) where it took `facts`. Every query a rule asks is a `RuleContext` method (`c.resolveIn`, `c.definition`, `c.castType`, `c.comptimeValue`, `c.valuesOf`, ...); with compiled roots, those that answer a site's resolved declaration answer `.not_reached` where no root reaches it, and a syntactic finding stands in every file.
 
 ### Removed
 

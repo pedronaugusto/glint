@@ -505,3 +505,75 @@ test "the rules a package declares join the run's rules: selectable by id, and a
     config.set(@fromBackingInt(2005), true);
     try std.testing.expectError(error.InvalidSelection, run(std.testing.allocator, &project, .{ .config = config }));
 }
+
+const reach_tests = struct {
+    const syntactic: rules.Rule = @fromBackingInt(1000); // safe: a test's own extension identity.
+    const typed: rules.Rule = @fromBackingInt(1001); // safe: a test's own extension identity.
+    /// Each `marker` written: a ban that reads the syntax alone.
+    fn written(c: *Context) Context.Error!void {
+        const tree = &c.project.at(c.file).file.tree;
+        for (0..tree.nodes.len) |i| {
+            const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: a test's few nodes
+            if (tree.nodeTag(node) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "marker")) continue;
+            try c.at(syntactic, tree.nodeMainToken(node), "marker written");
+        }
+    }
+    /// Each `marker` by what it resolves to: a ban that needs the site's declaration.
+    fn resolved(c: *Context) Context.Error!void {
+        const tree = &c.project.at(c.file).file.tree;
+        for (0..tree.nodes.len) |i| {
+            const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: a test's few nodes
+            if (tree.nodeTag(node) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "marker")) continue;
+            switch (try c.resolveIn(c.file, node)) {
+                .unknown => |why| try c.unknownAt(typed, tree.nodeMainToken(node), why),
+                else => try c.at(typed, tree.nodeMainToken(node), "marker resolved"),
+            }
+        }
+    }
+};
+test "with compiled roots, a syntactic ban reports in unreached code and a ban that needs facts counts it not reached" {
+    const gpa = std.testing.allocator;
+    const bytes = try Compiled.Dwarf.sampleForTests(gpa);
+    defer gpa.free(bytes);
+    var compiled = try Compiled.init(gpa, try Compiled.Dwarf.readBytesForTests(bytes), "/pkg");
+    defer compiled.deinit();
+    // Lines as the sample compiles them: `first`, at 5, is held; `second`, at 6, is not.
+    const text =
+        \\// s
+        \\// two
+        \\pub const List = struct {
+        \\    len: usize,
+        \\    pub fn first(n: usize) usize { return n + marker; }
+        \\    pub fn second() usize { return marker; }
+        \\};
+        \\const marker: usize = 1;
+        \\
+    ;
+    var project = try Project.init(gpa, &.{.{ .name = "src/s.zig", .bytes = text }}, &.{}, .{});
+    defer project.deinit();
+    const project_rules = [_]Context.Rule{
+        .{ .definition = .{ .id = reach_tests.syntactic, .name = "WRITTEN", .group = .family_policy, .purpose = "a ban read from the syntax", .version = 1 }, .check = reach_tests.written },
+        .{ .definition = .{ .id = reach_tests.typed, .name = "RESOLVED", .group = .family_policy, .purpose = "a ban read from the site's declaration", .version = 1 }, .check = reach_tests.resolved },
+    };
+    const config: rules.Config = .{ .enabled = .empty, .selections = &.{ .{ .rule = reach_tests.syntactic, .level = .gate }, .{ .rule = reach_tests.typed, .level = .gate } } };
+    var report = try run(gpa, &project, .{ .config = config, .project_rules = &project_rules, .compiled = &.{&compiled} });
+    defer report.deinit();
+    for (report.errors) |e| std.debug.print("run error: {s}\n", .{e.why});
+    try std.testing.expect(report.complete);
+    var by_rule = [_]usize{ 0, 0 };
+    for (report.diagnostics) |d| {
+        if (std.mem.eql(u8, d.name, "WRITTEN")) by_rule[0] += 1 else if (std.mem.eql(u8, d.name, "RESOLVED")) by_rule[1] += 1;
+    }
+    // The syntactic ban: both `marker`s, reached or not.
+    try std.testing.expectEqual(@as(usize, 2), by_rule[0]);
+    // The ban that needs facts: the reached one is a finding, the other is not reached.
+    try std.testing.expectEqual(@as(usize, 1), by_rule[1]);
+    try std.testing.expectEqual(@as(usize, 1), report.not_reached.len);
+    try std.testing.expectEqualStrings("RESOLVED", report.not_reached[0].name);
+    try std.testing.expectEqual(@as(usize, 1), report.not_reached[0].sites);
+    // Without roots every file is reached: both resolve.
+    var plain = try run(gpa, &project, .{ .config = config, .project_rules = &project_rules });
+    defer plain.deinit();
+    try std.testing.expectEqual(@as(usize, 4), plain.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 0), plain.not_reached.len);
+}

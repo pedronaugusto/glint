@@ -7,7 +7,6 @@
 const Ast = @import("std").zig.Ast;
 const Context = @import("RuleContext.zig");
 const Rule = @import("Rule.zig").Rule;
-const Facts = @import("Facts.zig");
 const Governed = @import("Governed.zig");
 const Written = @import("Written.zig");
 
