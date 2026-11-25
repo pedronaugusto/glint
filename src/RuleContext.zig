@@ -90,6 +90,12 @@ pub fn resolveIn(self: *RuleContext, file: Project.FileId, node: Ast.Node.Index)
     if (!try self.reached(file, node)) return .{ .unknown = .not_reached };
     return self.facts().resolve(file, node);
 }
+/// What an `@import` node of `file` names: the run's mapping, read in every file, reached or
+/// not. Which module or file a name maps to is the run's, not the compiler's answer at a site
+/// (a file-scope `@import` is comptime-only, a node no compiled root holds).
+pub fn imported(self: *RuleContext, file: Project.FileId, node: Ast.Node.Index) Error!Facts.Value {
+    return self.facts().resolve(file, node);
+}
 /// Whether a node of `file` is in code a compiled root holds, or there are none (a plain run,
 /// which reads every file as reached). Unknown reachability (no function or declaration holds
 /// the node) is reached: the source answers, as it does without compiled roots.

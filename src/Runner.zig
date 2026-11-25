@@ -537,10 +537,11 @@ test "with compiled roots, a syntactic ban reports in unreached code and a ban t
     defer gpa.free(bytes);
     var compiled = try Compiled.init(gpa, try Compiled.Dwarf.readBytesForTests(bytes), "/pkg");
     defer compiled.deinit();
-    // Lines as the sample compiles them: `first`, at 5, is held; `second`, at 6, is not.
+    // Lines as the sample compiles them: `first`, at 5, is held; `second`, at 6, is not. The
+    // file-scope import no root holds (comptime-only) still names its mapped file: no run error.
     const text =
         \\// s
-        \\// two
+        \\const other = @import("o.zig");
         \\pub const List = struct {
         \\    len: usize,
         \\    pub fn first(n: usize) usize { return n + marker; }
@@ -549,7 +550,7 @@ test "with compiled roots, a syntactic ban reports in unreached code and a ban t
         \\const marker: usize = 1;
         \\
     ;
-    var project = try Project.init(gpa, &.{.{ .name = "src/s.zig", .bytes = text }}, &.{}, .{});
+    var project = try Project.init(gpa, &.{ .{ .name = "src/s.zig", .bytes = text }, .{ .name = "src/o.zig", .bytes = "// o\n" } }, &.{}, .{});
     defer project.deinit();
     const project_rules = [_]Context.Rule{
         .{ .definition = .{ .id = reach_tests.syntactic, .name = "WRITTEN", .group = .family_policy, .purpose = "a ban read from the syntax", .version = 1 }, .check = reach_tests.written },
@@ -558,7 +559,7 @@ test "with compiled roots, a syntactic ban reports in unreached code and a ban t
     const config: rules.Config = .{ .enabled = .empty, .selections = &.{ .{ .rule = reach_tests.syntactic, .level = .gate }, .{ .rule = reach_tests.typed, .level = .gate } } };
     var report = try run(gpa, &project, .{ .config = config, .project_rules = &project_rules, .compiled = &.{&compiled} });
     defer report.deinit();
-    for (report.errors) |e| std.debug.print("run error: {s}\n", .{e.why});
+    try std.testing.expectEqual(@as(usize, 0), report.errors.len);
     try std.testing.expect(report.complete);
     var by_rule = [_]usize{ 0, 0 };
     for (report.diagnostics) |d| {

@@ -787,7 +787,7 @@ fn unmappedImports(self: *Context) RunError!void {
         var b: [2]Ast.Node.Index = undefined;
         const args = Facts.builtinArgs(tree, node, &b);
         if (args.len != 1 or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import")) continue;
-        const value = try self.resolveIn(self.file, node);
+        const value = try self.imported(self.file, node);
         // Zig's own per-build file, and a module whose bytes a build step makes (external): no gap.
         if (value != .unknown or value.unknown == .zig_own or value.unknown == .external) continue;
         if (underBranch(tree, model, node)) continue;
