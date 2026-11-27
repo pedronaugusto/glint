@@ -14,6 +14,10 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 - `cli.configure` reads a configuration document (`--config`, a repository's glint.json) as glint does: `cli.Configured` holds its profile's rules, code options and rule settings by name, and `cli.ConfigureError` says why a document is refused. A caller reads glint.json through it rather than parsing `cli.Configuration` itself.
 
+### Fixed
+
+- P012 reads a `@panic` message written as string literals joined by `++` as the one text the compiler makes of them: `@panic("TO" ++ "DO")` was not reported.
+
 ## [0.8.0] - 2026-11-25
 
 ### Breaking

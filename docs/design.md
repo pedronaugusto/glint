@@ -94,7 +94,7 @@ nothing unasked. The configuration keys a rule reads are named in its row with t
 | P013 | policy metric, off by default | A function with more parameters than `max_parameters` (default 7), or deeper `if`/`while`/`for`/`switch` nesting than `max_nesting` (default 5). |
 | P010 | ban, off by default | An unwrap that can trap needs a written reason: `.?` and `orelse unreachable`, outside test blocks. |
 | P011 | ban, off by default | `undefined` outside a test needs a written reason. |
-| P012 | ban, off by default | Debugging left in the code needs a written reason: `@breakpoint()`, and a `@panic` whose message marks it unfinished. |
+| P012 | ban, off by default | Debugging left in the code needs a written reason: `@breakpoint()`, and a `@panic` (or std's `debug.panic`) whose message marks it unfinished: a string literal, or literals joined by `++`, starting with `todo`, `fixme`, `unimplemented` or `not implemented`. |
 | P014 | ban | Standard output or standard error written through a positional writer: a call whose every callee is std's `Io.File.writer`, whose receiver is a call whose every callee is std's `Io.File.stdout` or `Io.File.stderr`, as written or as the value of a `const` in the same file it names, through parentheses, `try`, `orelse`, `catch` and an `if`'s or a `switch`'s results. A receiver that is a stream in one branch is reported. A `var`, a parameter and a field are not followed. Test code is read too. The answer is `writerStreaming`, or ensign's streaming stdout and stderr. |
 
 ### Rules a package declares
