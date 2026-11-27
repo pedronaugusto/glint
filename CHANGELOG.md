@@ -10,6 +10,10 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 - `glint.Unknown` has a new tag, `Unknown.not_reached`: code no compiled root holds (`--compiled`), counted as outside like `Unknown.external`. An exhaustive switch over `glint.Unknown` names it.
 - **New rule:** Z058, a ban on by default: a file opened write-only, then `stat` or a read through the same handle in the same function. A read fails on every system, and Windows refuses the stat too, as the handle lacks read-attributes access. Write-only is std's `createFile`/`createFileAbsolute` given literal options with no `.read = true`, or `openFile`/`openFileAbsolute` a literal `.mode = .write_only`. The fix: `.read = true` (`.mode = .read_write`), or `length()` for the size.
 
+### Added
+
+- `cli.configure` reads a configuration document (`--config`, a repository's glint.json) as glint does: `cli.Configured` holds its profile's rules, code options and rule settings by name, and `cli.ConfigureError` says why a document is refused. A caller reads glint.json through it rather than parsing `cli.Configuration` itself.
+
 ## [0.8.0] - 2026-11-25
 
 ### Breaking

@@ -14,7 +14,7 @@ const Facts = @import("Facts.zig");
 const PackageRules = @import("PackageRules.zig");
 const Runner = @import("Runner.zig");
 const Rule = @import("Rule.zig");
-const configure = @import("configure.zig").configure;
+const configure = @import("cli.zig").configure;
 const Compiled = @import("Compiled.zig");
 const Dwarf = Compiled.Dwarf;
 

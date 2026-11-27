@@ -1,8 +1,8 @@
 # glint design
 
-glint is a linter for Zig. It reads source with Zig's own parser and lowering (std.zig.Ast and AstGen/ZIR),
-resolves what each reference names, and reports two kinds of rule. Lines marked **Pending** wait on a branch
-that is still being merged; their wording is not final.
+glint is a linter for Zig, practical as Clippy is: it proves nothing. It reads source with Zig's own parser and
+lowering (std.zig.Ast and AstGen/ZIR), binds each name lexically, takes the types of what a site reads from the
+DWARF the compiler wrote for the package's builds (below), and reports two kinds of rule.
 
 ## What glint claims
 
@@ -20,8 +20,10 @@ A rule is one of two kinds, and says which:
   defect.
 
 A run ends in one of three ways: findings, reports, or a run error. There is no "undecided" result and no
-partial pass: what glint cannot read is a run error that names the file and what to do (below), never a site
-counted as unknown. Soundness is relative to the claim: every claim glint makes is one it can decide.
+partial pass: what glint cannot read is a run error that names the file and what to do (below). A site a ban
+cannot answer from what the run holds is counted per rule, by its reason (outside the ban's language, or not
+reached by any compiled root), and never filled in: it is no finding and no pass. Hygiene says nothing there.
+Soundness is relative to the claim: every claim glint makes is one it can decide.
 
 ## Who defends what
 
@@ -207,6 +209,7 @@ a failure is reported by name.
 | `computed_import` | outside | An `@import` whose name is computed as it compiles. |
 | `absent` | outside | Code this build does not compile: an import of a module the build does not have; a parameter no function of a reflected choice has; an element past the end of a tuple literal; a switch prong's capture naming no kind the subject may be; `field_types` of a type with no field; a part of a choice Zig refuses the access on. |
 | `external` | outside | Bytes a build step makes (translate-c's output, a Run step's file), and a call through a pointer `@extern` gives: foreign code glint never holds. The `extern` declaration itself is P007's, governed by its seams. |
+| `not_reached` | outside | Where compiled roots are given (`--compiled`), a site whose enclosing declaration no root holds: a function no root's build reaches, or one only another target's build compiles. The compiler established nothing of it. |
 | `erased_callee` | outside | A call through a function value whose targets the program has only as it runs: one a field, a parameter or a `var` holds (or a capture of one), or a call's result whose functions are not read. A `const` naming functions, a call each of whose returns names functions, and a call on a receiver a `const` holds whose initializer is a literal of named functions (`StaticStringMap.initComptime(.{ .{ "x", f }, ... }).get(k)`) are the choice of those functions, each read as a callee. |
 
 **Soundness suite.** Each rule's `expected.zon` lists the cases glint does not pass yet (`open`) and, for a
@@ -241,6 +244,32 @@ is parsed as ZON and never lowered: it is data, no rule runs on it, and an `@imp
 expression, read by the readers an untyped `.{ ... }` literal written in place goes through. A declared type
 gives it its type (`const k: K = @import("k.zon")` is a `K`).
 
+**Types from the compiler.** Given the binaries the package's build compiled (`--compiled BINARY`, repeated:
+a root built with Zig's self-hosted x86_64 backend, `-fno-llvm -fno-lld`, its files named relative to the
+package; roots are x86_64-linux only), a site's types are the compiler's:
+
+- The reader (`src/compiled/zig-0.17/Dwarf.zig`, one directory per Zig version) reads the ELF's `.debug_info`,
+  `.debug_abbrev`, string sections and line programs' file tables as untrusted input: every count and offset
+  checked, a file that breaks one refused whole, and a fuzz target over it. It names std.dwarf's constants and
+  nothing of the compiler, and yields glint's records: declarations with their container (`ZIG_parent`), each
+  instance's locals and parameters with their types and comptime values, types with their members, inlined
+  calls.
+- The join (`Compiled.zig`) keys a declaration by its file and the line of its first token, as the AST gives
+  it. A site is answered within its enclosing declaration: a local or parameter by the types the instances of
+  its function gave it. A site whose enclosing declaration no root holds is not reached.
+- What a rule sees: a rule reaches the run's facts only through its `RuleContext` (`Facts.Door`, recovered by
+  `@fieldParentPtr`, so a rule naming Facts does not compile), and not reached lives in one place, the
+  context's site query, which answers `.not_reached`. A ban counts it per rule in the report, with the roots it
+  read; hygiene says nothing. A syntactic finding stands in every file, reached or not. What the run maps is no
+  site question: an `@import`'s module or file is read in every file, as a file-scope import is comptime-only
+  and in no root's DWARF.
+- Without roots, every file is reached and Facts reads the types the source writes, as 0.8 did. The direction
+  is the compiler's types alone: a type function's instance read through its members' and results' types, and
+  Facts' own reading removed (`docs/design.md` says so when it is built).
+
+The soundness suite runs in compiled mode too (`-Dsoundness-compiled`): each case compiled as a plain object
+and as its tests, both read. In CI its leg is sharded and recorded by preflight's planner like the plain suite.
+
 **Test code** is lexical: inside a `test` block, or an input `test_inputs` names. A file or helper reached only
 from tests is production code.
 
@@ -273,8 +302,9 @@ which is the two kinds. From zlint: scopes, references and node links over the A
 - That a program is safe, cannot panic, or keeps any property at run time. ReleaseSafe, aegis's types, the
   testing allocator and fuzzing carry those.
 - Anything about what the program computes: no flow, no ranges, no lifetimes beyond P009's shape, no taint.
-- Anything about generic or comptime code beyond its syntax: glint never evaluates comptime code or runs the
-  build.
+- Anything about generic or comptime code beyond its syntax and what the compiler wrote of its instances:
+  glint never evaluates comptime code, infers a type, or runs the build.
+- Anything about code no compiled root holds, where roots are given: it is not reached, counted, never filled.
 - Anything about a module no CI target provides: glint reads the modules the run maps. A file only another
   target's build reaches is linted where that target's modules are mapped, and nowhere else.
 - That a hygiene rule's silence means the construct is absent. Only a ban's silence is a claim.

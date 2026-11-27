@@ -53,7 +53,7 @@ pub const layers = [_]Layer{
         "src/Metrics.zig",
     } },
     .{ .name = "rules", .patterns = &.{"src/Runner.zig"} },
-    .{ .name = "filesystem CLI", .patterns = &.{ "src/cli.zig", "src/configure.zig", "src/Result.zig" } },
+    .{ .name = "filesystem CLI", .patterns = &.{ "src/cli.zig", "src/Result.zig" } },
     .{ .name = "public", .patterns = &.{"src/glint.zig"} },
     .{ .name = "entry", .patterns = &.{ "src/main.zig", "src/BuildGate.zig" } },
 };
