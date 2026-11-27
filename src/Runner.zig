@@ -550,7 +550,7 @@ test "with compiled roots, a syntactic ban reports in unreached code and a ban t
         \\const marker: usize = 1;
         \\
     ;
-    var project = try Project.init(gpa, &.{ .{ .name = "src/s.zig", .bytes = text }, .{ .name = "src/o.zig", .bytes = "// o\n" } }, &.{}, .{});
+    var project = try Project.init(gpa, &.{ .{ .name = "src/s.zig", .bytes = text }, .{ .name = "src/o.zig", .bytes = "// o\n" } }, &.{.{ .from = 0, .target = 1, .spelling = "o.zig" }}, .{});
     defer project.deinit();
     const project_rules = [_]Context.Rule{
         .{ .definition = .{ .id = reach_tests.syntactic, .name = "WRITTEN", .group = .family_policy, .purpose = "a ban read from the syntax", .version = 1 }, .check = reach_tests.written },
