@@ -7,7 +7,9 @@
 //! std's `mem.bytesAsValue` and
 //! `mem.bytesAsSlice`, a reinterpretation by another name; and any member of std's raw OS and C
 //! bindings (`std.c`, `std.os.linux`, `std.os.windows`, and `std.posix.system`, one of them by
-//! target), which the program reaches past std's checked layer. Production code only; an
+//! target), which the program reaches past std's checked layer; and an import of a module a build
+//! step makes (translate-c's C bindings, a Run step's output), which glint reads none of.
+//! Production code only; an
 //! operation the program runs only as it compiles has none of these dangers, but for assembly,
 //! `@extern` and `@ptrFromInt`, whose symbol or address the program uses where it runs. Zig's two
 //! interface idioms are not read, as neither has an alternative: `@fieldParentPtr`, bare or as the
@@ -138,6 +140,23 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
     try lengthless(c, rule);
     try reinterpreted(c, rule);
     try rawBindings(c, rule);
+    try externalImports(c, rule);
+}
+
+/// An import of a module whose bytes a build step makes (`Project.Input.external`: translate-c's
+/// C bindings, a Run step's output): glint reads none of it, so what the program reaches through
+/// it, a C function among it, is no site of its own. The import is the one site, which a seam
+/// declaration answers. Production code only.
+fn externalImports(c: *Context, rule: Rule) Context.Error!void {
+    const held = c.project.at(c.file);
+    const tree = &held.file.tree;
+    for (held.model.import_nodes) |node| {
+        const token = tree.nodeMainToken(node);
+        if (!std.mem.eql(u8, tree.tokenSlice(token), "@import") or c.inTest(token)) continue;
+        const value = try c.imported(c.file, node);
+        if (value != .unknown or value.unknown != .external) continue;
+        try c.at(rule, token, "an import of a module a build step makes (translate-c's C bindings, a Run step's output), which glint reads none of: only at the package's seam");
+    }
 }
 
 fn pointerCast(name: []const u8) bool {

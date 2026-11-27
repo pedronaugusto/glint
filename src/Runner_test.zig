@@ -1139,6 +1139,12 @@ test "an external module is read as nothing glint has: its import, its members, 
         var report = try glint.run(std.testing.allocator, &project, .{ .config = config });
         defer report.deinit();
         try std.testing.expectEqual(external, report.complete);
-        if (external) try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: nothing of the module is read
+        // Nothing of the module is read: the one finding is P007's, the import itself, a seam's to
+        // answer.
+        if (external) {
+            try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len);
+            try std.testing.expectEqualStrings("P007", report.diagnostics[0].name);
+            try std.testing.expectEqual(@as(u32, 1), report.diagnostics[0].span.line);
+        }
     }
 }

@@ -8,10 +8,15 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 - A rule reaches the run's facts only through its context: `RuleContext.facts` is gone, and a `RuleContext` is built with `held` (`RuleContext.hold(&facts)`) where it took `facts`. Every query a rule asks is a `RuleContext` method (`c.resolveIn`, `c.definition`, `c.castType`, `c.comptimeValue`, `c.valuesOf`, ...); with compiled roots, those that answer a site's resolved declaration answer `.not_reached` where no root reaches it, and a syntactic finding stands in every file.
 - `glint.Unknown` has a new tag, `Unknown.not_reached`: code no compiled root holds (`--compiled`), counted as outside like `Unknown.external`. An exhaustive switch over `glint.Unknown` names it.
-- **New rule:** Z058, a ban on by default: a file opened write-only, then `stat` or a read through the same handle in the same function. A read fails on every system, and Windows refuses the stat too, as the handle lacks read-attributes access. Write-only is std's `createFile`/`createFileAbsolute` given literal options with no `.read = true`, or `openFile`/`openFileAbsolute` a literal `.mode = .write_only`. The fix: `.read = true` (`.mode = .read_write`), or `length()` for the size.
+
+### Changed
+
+- P007 reports an `@import` of an external module (`--external NAME`, `Project.Input.external`: translate-c's C bindings, a Run step's output), one site a seam answers: glint reads none of it, so C reached through it was no site and passed. A package that imports one declares it in a seam with its reason.
+- Z057 and P014 are hygiene, no longer bans, and so is the new Z058: each names forms it does not follow (an alias the syntax does not show; a `var`, a parameter or a field; options that are no literal), and a ban never misses. Each reports what it shows and its silence claims nothing: under the family's policy they report where they failed the run, and P014's site whose value glint does not know is silent where it was counted or a run error.
 
 ### Added
 
+- **New rule:** Z058, hygiene on by default: a file opened write-only, then `stat` or a read through the same handle in the same function. A read fails on every system, and Windows refuses the stat too, as the handle lacks read-attributes access. Write-only is std's `createFile`/`createFileAbsolute` given literal options with no `.read = true`, or `openFile`/`openFileAbsolute` a literal `.mode = .write_only`. The fix: `.read = true` (`.mode = .read_write`), or `length()` for the size.
 - `cli.configure` reads a configuration document (`--config`, a repository's glint.json) as glint does: `cli.Configured` holds its profile's rules, code options and rule settings by name, and `cli.ConfigureError` says why a document is refused. A caller reads glint.json through it rather than parsing `cli.Configuration` itself.
 
 ### Fixed

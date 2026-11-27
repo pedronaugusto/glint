@@ -767,3 +767,15 @@ test "P007 reads a call through a function field's captured payload as one throu
     const unwrapped = try runEdited(.P007, captured_field_program, "if (observer.boundary) |boundary| boundary(observer);", "observer.boundary.?(observer);");
     try std.testing.expectEqual(unwrapped.findings, captured.findings);
 }
+
+test "P007 reports an import of an external module once, a seam's to answer; one in a test block is not read" {
+    // `cmod` is translate-c's output: glint reads none of it, so the C reached through it is no
+    // site of its own (counted outside); the import is the one site.
+    const cmod: sources.Extra = .{ .name = "<external cmod>", .bytes = "", .external = true };
+    const extra = &(std_files ++ [_]sources.Extra{cmod});
+    const imports = &(std_imports ++ [_]sources.ExtraImport{.{ .spelling = "cmod", .target = std_files.len }});
+    const found = try runWith(.P007, "const cmod = @import(\"cmod\");\npub fn pid() c_int {\n    return cmod.getpid();\n}\n", extra, imports);
+    try std.testing.expectEqualSlices(u32, &.{1}, found.lines[0..found.findings]);
+    const tested = try runWith(.P007, "pub fn one() u8 {\n    return 1;\n}\ntest {\n    _ = @import(\"cmod\").getpid();\n}\n", extra, imports);
+    try std.testing.expectEqual(@as(usize, 0), tested.findings);
+}

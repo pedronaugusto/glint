@@ -26,7 +26,9 @@
 //! every public declaration referenced, and a case it refuses fails the run at its path, or is
 //! open where its rule's `open` list names it (a refused case never passes). A case's
 //! `stubs/<name>.zig` is a module named `<name>` the compiler is given and glint is not: a module
-//! a program has that glint is not handed. A case's `module/module.zig` is a module named
+//! a program has that glint is not handed. A case's `external/<name>.zig` is a module named
+//! `<name>` the compiler is given and glint is told is external (`--external <name>`): bytes a
+//! build step makes, translate-c's output among them. A case's `module/module.zig` is a module named
 //! `module` both are given, the files of `module/` selected: a package's published code, the case
 //! a package of its own where a `build.zig.zon` stands beside it. A case's files share what is beside them (a `dep.zig` its hole and twin import), which a file
 //! of one compilation may belong to one module alone, so each kind of file is a compilation of
@@ -554,10 +556,12 @@ fn program(a: std.mem.Allocator, io: std.Io, tools: Tools, scratch: []const u8, 
     });
 }
 
-/// The `.zig` files of `case`'s `stubs` directory, sorted; none where it has none.
+/// The `.zig` files of `case`'s `stubs` and `external` directories, sorted, and its module's root;
+/// none where it has none.
 fn stubsOf(a: std.mem.Allocator, io: std.Io, case: []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     try out.appendSlice(a, try zigFiles(a, io, try std.Io.Dir.path.join(a, &.{ case, "stubs" })));
+    try out.appendSlice(a, try zigFiles(a, io, try std.Io.Dir.path.join(a, &.{ case, "external" })));
     for (try moduleFiles(a, io, case)) |file| if (std.mem.eql(u8, std.Io.Dir.path.basename(file), "module.zig")) try out.append(a, file);
     return out.items;
 }
@@ -821,6 +825,8 @@ fn judge(gpa: std.mem.Allocator, io: std.Io, store: *glint.Project.Store, rule: 
     for (compiled_objects) |object| try args.appendSlice(a, &.{ "--compiled", object });
     if (job.before) |before| try args.append(a, before);
     const own = try moduleFiles(a, io, std.Io.Dir.path.dirname(job.absolute) orelse ".");
+    // A module a build step makes: its name glint is told, its bytes never.
+    for (try zigFiles(a, io, try std.Io.Dir.path.join(a, &.{ std.Io.Dir.path.dirname(job.absolute) orelse ".", "external" }))) |file| try args.appendSlice(a, &.{ "--external", std.Io.Dir.path.stem(file) });
     for (own) |file| if (std.mem.eql(u8, std.Io.Dir.path.basename(file), "module.zig")) try args.appendSlice(a, &.{ "--module", try std.fmt.allocPrint(a, "module={s}", .{file}), "--exported", file });
     // A case's file is its own package's root, and a module's root its published one: the
     // public surface a rule reading it (Z012) reads is what these reach.

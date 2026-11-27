@@ -67,14 +67,15 @@ vocabulary, the configuration, run errors, and what glint does not claim.
 - **Bans**: discarded errors (Z026), project-declared bans (P006), operations Zig leaves unchecked (P007:
   unsafe builtins and casts, `extern`, `asm`, many-item pointer arithmetic, `std.c`, `std.os.linux`,
   `std.os.windows`), and every rule a package declares as a ban (aegis's A001, A007, A008, A009, A011, A013,
-  A015, and A012 and A021 where selected), and standard output or error written through a positional writer
-  (P014). Off by default: an unwrap that can trap (P010), `undefined` outside a test (P011), leftover
+  A015, and A012 and A021 where selected), and an external module imported (P007: translate-c's C, a Run
+  step's output). Off by default: an unwrap that can trap (P010), `undefined` outside a test (P011), leftover
   debugging (P012).
 - **Hygiene**: naming, syntax the next Zig refuses (Z003, Z034), line and function length, deprecated calls,
   private types in public signatures, unused imports, dead declarations, an assertion of `a and b`, debug
   prints, identifying integers of one type that may stand for one another (P008), a pointer into the frame
   returned (P009), a call handed the place a compound assignment updates (Z057), a stat or read on a file
-  opened write-only (Z058), and the breadth rules Z035-Z056 (same operands, constant conditions, narrow
+  opened write-only (Z058), standard output or error written through a positional writer (P014), and the
+  breadth rules Z035-Z056 (same operands, constant conditions, narrow
   arithmetic widened, large stack arrays, NaN and inexact float comparisons, and more).
 - **Not in scope**: proving that a program cannot panic, tracking input or overflow, or the lifetime of a
   pointer. Those belong to ReleaseSafe, to aegis's types, and to each package's fuzzing and testing allocator.

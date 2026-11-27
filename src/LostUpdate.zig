@@ -11,7 +11,8 @@
 //! - the name the left side starts with, where that name's declaration writes a pointer type and
 //!   the left side reaches through it (`p: *S` and `p.n += f(p)`, `s: []u32` and
 //!   `s[i] += f(s)`).
-//! A ban: a call handed the place is reported whether or not it writes there. An alias the
+//! Hygiene: a call handed the place is reported whether or not it writes there, and what the
+//! syntax does not show is silent, so the silence claims nothing. An alias the
 //! syntax does not show is not read: a pointer copied into another name, a method's receiver, and
 //! an address held in a field of an argument (`x += f(.{ .p = &x })`, excluded: an aggregate's
 //! fields are not searched).

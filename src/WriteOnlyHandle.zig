@@ -10,7 +10,8 @@
 //! are not. Not read: options that are no literal (a name, a call's result), a `.read` or `.mode`
 //! the literal sets to anything but a literal, a callee that does not resolve to std's, a `var`
 //! the function assigns again, and a handle that leaves the local (handed to a call, stored in a
-//! field, returned): what is done with it there is not this function's to read.
+//! field, returned): what is done with it there is not this function's to read. Hygiene: what
+//! it does not read is silent, so its silence claims nothing.
 const std = @import("std");
 const Ast = std.zig.Ast;
 const Context = @import("RuleContext.zig");

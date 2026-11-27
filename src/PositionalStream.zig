@@ -1,18 +1,17 @@
-//! Ban: standard output or standard error written through a positional writer. std's
+//! Hygiene: standard output or standard error written through a positional writer. std's
 //! `Io.File.writer` writes its file at an offset it keeps, from 0, which a stream refuses or, where
 //! the stream is a file (output redirected, `>>` among them), writes over what is there; the
 //! streaming writer (`Io.File.writerStreaming`) writes where the stream is. Read: a call whose
 //! every callee is std's `Io.File.writer` (`Governed.stdCall`, through aliases), whose receiver is
 //! a call whose every callee is std's `Io.File.stdout` or `Io.File.stderr`, as written or as the
 //! value of a local or file-level `const` it names, or what a function of the program it calls
-//! returns (`callStream`, eight calls deep, past which the run is refused by name), followed
+//! returns (`callStream`, eight calls deep), followed
 //! through what gives a value (`Facts.accesses.valuesOf`: parentheses, `try`, `orelse`, an `if`'s
 //! or a `switch`'s results).
-//! A receiver that may be a stream in one branch is reported. A `var` and a parameter are not
-//! followed. Test code is read too: a test's child program writes its streams as any other. A
-//! call that may be the writer, or a receiver that may be a stream, where what it reads is unknown
-//! is no pass: glint's own failure makes the run incomplete, and a generic position is counted
-//! outside the ban (`Context.unknownAt`).
+//! A receiver that may be a stream in one branch is reported. A `var`, a parameter and a field are
+//! not followed, so the rule reports what it shows and its silence claims nothing: a call or a
+//! receiver whose value is unknown, or past the eight calls, is silent. Test code is read too: a
+//! test's child program writes its streams as any other.
 const std = @import("std");
 const Ast = std.zig.Ast;
 const Context = @import("RuleContext.zig");
@@ -29,27 +28,21 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         switch (try Governed.mayCallStd(c, call.node, "Io.File.writer")) {
             .no => continue,
             .yes => {},
-            .unknown => |why| {
-                try c.unknownAt(rule, token, why);
-                continue;
-            },
+            // Hygiene: what glint does not know is no report.
+            .unknown => continue,
         }
         const args = switch (call.args) {
             .known => |args| args,
-            .unknown => |why| {
-                try c.unknownAt(rule, token, why);
-                continue;
-            },
+            // Hygiene: what glint does not know is no report.
+            .unknown => continue,
         };
         // `file.writer(io, buffer)` binds the file first; `Io.File.writer(file, io, buffer)` passes it.
         if (args.len != 3) continue;
         const stream = try streamOf(c, c.file, args[0], 0);
         switch (stream) {
             .none => continue,
-            .unknown => |why| {
-                try c.unknownAt(rule, token, why);
-                continue;
-            },
+            // Hygiene: what glint does not know is no report.
+            .unknown => continue,
             .stdout, .stderr => {},
         }
         try c.at(rule, token, if (stream == .stdout)
@@ -167,15 +160,14 @@ test "breadth: positional stream: stdout or stderr through writer reported, as w
     try breadth.expectFindings(check, "const std = @import(\"std\"); fn other(file: std.Io.File) std.Io.File { return file; } pub fn f(io: std.Io, file: std.Io.File, b: []u8) void { _ = other(file).writer(io, b); }", 0);
 }
 
-test "positional stream: a writer call on a value only a binding types is counted outside the ban; one on what glint does not resolve stops the run" {
-    // `out`'s type is the caller's: a generic position, never a verdict.
-    try breadth.expectUnknowns(check, "const std = @import(\"std\"); pub fn f(io: std.Io, out: anytype, b: []u8) void { _ = out.writer(io, b); }", 0, 0, 1);
-    // A name nothing declares: glint's own failure, by name.
-    try breadth.expectUnknowns(check, "const std = @import(\"std\"); pub fn f(io: std.Io, b: []u8) void { _ = nowhere.writer(io, b); }", 0, 1, 0);
+test "positional stream: hygiene, silent where what a writer call reads is unknown" {
+    // `out`'s type is the caller's, and a name nothing declares: no report, nothing counted.
+    try breadth.expectUnknowns(check, "const std = @import(\"std\"); pub fn f(io: std.Io, out: anytype, b: []u8) void { _ = out.writer(io, b); }", 0, 0, 0);
+    try breadth.expectUnknowns(check, "const std = @import(\"std\"); pub fn f(io: std.Io, b: []u8) void { _ = nowhere.writer(io, b); }", 0, 0, 0);
     // Standard output handed up through functions of the program: eight calls deep it is read
-    // and reported; nine, past the bound, the run is refused by name (`budget`), never passed.
+    // and reported; nine, past the bound, it is silent.
     try breadth.expectUnknowns(check, "const std = @import(\"std\"); fn s0() std.Io.File { return .stdout(); } fn s1() std.Io.File { return s0(); } fn s2() std.Io.File { return s1(); } fn s3() std.Io.File { return s2(); } fn s4() std.Io.File { return s3(); } fn s5() std.Io.File { return s4(); } fn s6() std.Io.File { return s5(); } fn s7() std.Io.File { return s6(); } pub fn f(io: std.Io, b: []u8) void { _ = s7().writer(io, b); }", 1, 0, 0);
-    try breadth.expectUnknowns(check, "const std = @import(\"std\"); fn s0() std.Io.File { return .stdout(); } fn s1() std.Io.File { return s0(); } fn s2() std.Io.File { return s1(); } fn s3() std.Io.File { return s2(); } fn s4() std.Io.File { return s3(); } fn s5() std.Io.File { return s4(); } fn s6() std.Io.File { return s5(); } fn s7() std.Io.File { return s6(); } fn s8() std.Io.File { return s7(); } pub fn f(io: std.Io, b: []u8) void { _ = s8().writer(io, b); }", 0, 1, 0);
+    try breadth.expectUnknowns(check, "const std = @import(\"std\"); fn s0() std.Io.File { return .stdout(); } fn s1() std.Io.File { return s0(); } fn s2() std.Io.File { return s1(); } fn s3() std.Io.File { return s2(); } fn s4() std.Io.File { return s3(); } fn s5() std.Io.File { return s4(); } fn s6() std.Io.File { return s5(); } fn s7() std.Io.File { return s6(); } fn s8() std.Io.File { return s7(); } pub fn f(io: std.Io, b: []u8) void { _ = s8().writer(io, b); }", 0, 0, 0);
     // A member another name spells is no writer call: nothing to decide.
     try breadth.expectUnknowns(check, "const std = @import(\"std\"); pub fn f(out: anytype) void { _ = out.flush(); }", 0, 0, 0);
 }
