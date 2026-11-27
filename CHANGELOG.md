@@ -8,6 +8,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 - A rule reaches the run's facts only through its context: `RuleContext.facts` is gone, and a `RuleContext` is built with `held` (`RuleContext.hold(&facts)`) where it took `facts`. Every query a rule asks is a `RuleContext` method (`c.resolveIn`, `c.definition`, `c.castType`, `c.comptimeValue`, `c.valuesOf`, ...); with compiled roots, those that answer a site's resolved declaration answer `.not_reached` where no root reaches it, and a syntactic finding stands in every file.
 - `glint.Unknown` has a new tag, `Unknown.not_reached`: code no compiled root holds (`--compiled`), counted as outside like `Unknown.external`. An exhaustive switch over `glint.Unknown` names it.
+- **New rule:** Z058, a ban on by default: a file opened write-only, then `stat` or a read through the same handle in the same function. A read fails on every system, and Windows refuses the stat too, as the handle lacks read-attributes access. Write-only is std's `createFile`/`createFileAbsolute` given literal options with no `.read = true`, or `openFile`/`openFileAbsolute` a literal `.mode = .write_only`. The fix: `.read = true` (`.mode = .read_write`), or `length()` for the size.
 
 ## [0.8.0] - 2026-11-25
 
