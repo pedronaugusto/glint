@@ -7,6 +7,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 ### Breaking
 
 - A rule reaches the run's facts only through its context: `RuleContext.facts` is gone, and a `RuleContext` is built with `held` (`RuleContext.hold(&facts)`) where it took `facts`. Every query a rule asks is a `RuleContext` method (`c.resolveIn`, `c.definition`, `c.castType`, `c.comptimeValue`, `c.valuesOf`, ...); with compiled roots, those that answer a site's resolved declaration answer `.not_reached` where no root reaches it, and a syntactic finding stands in every file.
+- `glint.Unknown` has a new tag, `Unknown.not_reached`: code no compiled root holds (`--compiled`), counted as outside like `Unknown.external`. An exhaustive switch over `glint.Unknown` names it.
 
 ## [0.8.0] - 2026-11-25
 
