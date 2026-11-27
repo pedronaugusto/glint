@@ -340,7 +340,7 @@ test "a build script reads a module's name as the build runner binds it: a depen
     try std.testing.expect(std.mem.find(u8, output.written(), "main.zig:2") != null);
     try std.testing.expectEqual(null, std.mem.find(u8, output.written(), "build.zig:3:24: P006: disallowed"));
     try std.testing.expectEqual(null, std.mem.find(u8, output.written(), "helper.zig:2:24: P006: disallowed"));
-    try std.testing.expect(std.mem.count(u8, output.written(), "(missing_mapping)") == 2);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, output.written(), "(missing_mapping)"));
     // With the dependency's build script named, the build runner's `lib.fsync` is its own: no
     // ban's, and read.
     const script = try std.mem.concat(a, u8, &.{ "lib=", joined[5] });

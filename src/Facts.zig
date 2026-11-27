@@ -15283,8 +15283,8 @@ test "a function's value in a private alias or table is followed for every reade
     const a, const b, const c, const d = .{ found[0].?, found[1].?, found[2].?, found[3].? };
     try std.testing.expect(try facts.callSites(a) != null and try facts.callSites(b) != null);
     try std.testing.expectEqual(@as(usize, 3), (try facts.callSites(a)).?.len);
-    try std.testing.expect(try facts.callSites(c) == null);
-    try std.testing.expect(try facts.callSites(d) == null);
+    try std.testing.expectEqual(null, try facts.callSites(c));
+    try std.testing.expectEqual(null, try facts.callSites(d));
 }
 
 test "a member of a holder of no known type is read over every field the run declares so named, and a file the run cannot parse may declare one" {

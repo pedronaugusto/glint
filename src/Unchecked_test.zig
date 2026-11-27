@@ -657,7 +657,7 @@ test "one suppression names each rule it covers on its line, one site each" {
     // Neither rule refused: aegis's `.replaces` entries name std declarations this fixture's std
     // need not have (std.crypto's), and refuse apart, under their own rules.
     for (report.errors) |e| for ([_][]const u8{ "P007", "P008" }) |rule| {
-        try std.testing.expect(std.mem.find(u8, e.why, rule) == null);
+        try std.testing.expectEqual(null, std.mem.find(u8, e.why, rule));
     };
 }
 

@@ -1187,7 +1187,7 @@ test "a drop-in answer is read with whether it takes the call's arguments as its
     try std.testing.expectEqual(@as(usize, 3), rules.replacements.len);
     try std.testing.expect(rules.replacements[0].drop_in.?.message);
     try std.testing.expect(!rules.replacements[1].drop_in.?.message);
-    try std.testing.expect(rules.replacements[2].drop_in == null);
+    try std.testing.expectEqual(null, rules.replacements[2].drop_in);
 }
 
 test "the run's rule table: every package's declared rules once, ordered by id, given ids from the first package id; one id declared by two packages is refused" {
