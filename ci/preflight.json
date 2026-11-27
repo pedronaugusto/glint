@@ -161,7 +161,8 @@
       "configure",
       "parseConfigured",
       "initWithLowering",
-      "settleRules"
+      "settleRules",
+      "Dwarf.parse"
     ]
   },
   "sources": [

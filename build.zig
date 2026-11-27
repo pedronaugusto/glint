@@ -97,7 +97,14 @@ pub fn dev(b: *std.Build, tools: type) void {
         test_step.dependOn(&b.addRunArtifact(tests).step);
         check.dependOn(&tests.step);
     }
-    const library_tests = b.addTest(.{ .root_module = module, .filters = if (filter) |f| &.{f} else &.{} });
+    // The library's own tests: glint's module with shakedown beside its imports, so the fuzz
+    // properties sit next to the private parsers they drive. A test's import is never reached by
+    // a build of the module, so a project that depends on glint needs no shakedown.
+    const library_root = b.createModule(.{ .root_source_file = p.path("src/glint.zig"), .target = target, .optimize = optimize });
+    var library_imports = module.import_table.iterator();
+    while (library_imports.next()) |entry| library_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    library_root.addImport("shakedown", shakedown);
+    const library_tests = b.addTest(.{ .root_module = library_root, .filters = if (filter) |f| &.{f} else &.{} });
     test_step.dependOn(&b.addRunArtifact(library_tests).step);
     // The soundness suite: every case under test/soundness/ on the glint just built, std from
     // this Zig and aegis as glint pins it, each case compiled by this Zig first.

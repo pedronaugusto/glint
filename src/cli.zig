@@ -10,6 +10,7 @@ const Fix = @import("Fix.zig");
 const Suppression = @import("Suppression.zig");
 const Result = @import("Result.zig");
 const aegis = @import("aegis");
+const configure = @import("configure.zig").configure;
 const ensign = @import("ensign");
 const release = @import("release");
 
@@ -837,30 +838,6 @@ test "a configuration naming a profile glint does not have is refused, saying th
     try std.testing.expectEqualStrings("profile `strict` is not one glint has: `core`, `none` or `reviewed`", w.buffered());
 }
 
-test "fuzz: the configuration JSON" {
-    const Target = struct {
-        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
-            var buffer: [4096]u8 = undefined;
-            const bytes = buffer[0..smith.slice(&buffer)];
-            var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-            defer arena.deinit();
-            // A document refused for its JSON is the answer: the CLI says so. Its rule names are
-            // resolved later, against the run's rules (`resolve`).
-            _ = configure(arena.allocator(), bytes) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => return,
-            };
-        }
-    };
-    try std.testing.fuzz({}, Target.one, .{ .corpus = &.{
-        "{\"profile\": \"reviewed\", \"rules\": [{\"id\": \"Z026\", \"level\": \"gate\"}]}",
-        "{\"profile\": \"reviewed\", \"max_line_length\": 120, \"disallowed\": [{\"source\": \"std\", \"declaration\": \"debug.print\", \"reason\": \"r\", \"replacement\": \"x\"}]}",
-        "{\"function_exceptions\": [{\"function\": \"f\", \"lines\": 200, \"reason\": \"r\"}]}",
-        "{\"profile\": \"reviewed\", \"max_parameters\": 4, \"max_nesting\": 3, \"max_stack_array\": 4096, \"rules\": [{\"id\": \"P013\", \"level\": \"report\"}]}",
-        "{",
-    } });
-}
-
 test "CLI invalid selections and unknown formats fail" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
@@ -889,24 +866,7 @@ test "a configuration's limits reach the rules that read them: P013's parameters
 }
 
 /// Strict JSON policy, containing code options only. Callers own file selection.
-pub const Configuration = struct {
-    /// `core`, `none` or `reviewed`; any other is refused.
-    profile: []const u8 = "core",
-    rules: []const Setting = &.{},
-    max_line_length: u32 = 100,
-    max_function_lines: u32 = 120,
-    max_parameters: u32 = 7,
-    max_nesting: u32 = 5,
-    max_stack_array: u64 = 64 * 1024,
-    function_exceptions: []const Rule.Config.FunctionException = &.{},
-    disallowed: []const Rule.Config.Disallowed = &.{},
-    strict_suppressions: bool = false,
-    metrics: bool = false,
-    fact_budget: usize = 100_000,
-    seams: []const Rule.Config.Seam = &.{},
-    test_inputs: []const Rule.Config.TestInput = &.{},
-    pub const Setting = struct { id: []const u8, level: Rule.Config.Level };
-};
+pub const Configuration = @import("configure.zig").Configuration;
 fn select(a: std.mem.Allocator, config: *Rule.Config, id: Rule.Rule, level: Rule.Config.Level) !void {
     const selections = try a.alloc(Rule.Config.Selection, config.selections.len + 1);
     @memcpy(selections[0..config.selections.len], config.selections);
@@ -917,33 +877,6 @@ fn select(a: std.mem.Allocator, config: *Rule.Config, id: Rule.Rule, level: Rule
     };
     selections[config.selections.len] = .{ .rule = id, .level = level };
     config.selections = selections;
-}
-const ConfigureError = std.json.ParseError(std.json.Scanner) || error{InvalidSelection};
-const Configured = struct { config: Rule.Config, package_defaults: bool, settings: []const Configuration.Setting, refused_profile: ?[]const u8 = null };
-/// A configuration's profile and code options; its rule settings are named, for `resolve`.
-fn configure(a: std.mem.Allocator, bytes: []const u8) ConfigureError!Configured {
-    const document = try std.json.parseFromSliceLeaky(Configuration, a, bytes, .{});
-    const profile = std.meta.stringToEnum(enum { core, none, reviewed }, document.profile) orelse
-        return .{ .config = .{}, .package_defaults = false, .settings = &.{}, .refused_profile = document.profile };
-    var config: Rule.Config = switch (profile) {
-        .core => .{},
-        .none => Rule.Config.none(),
-        .reviewed => Rule.Config.reviewed(),
-    };
-    config.max_line_length = document.max_line_length;
-    config.max_function_lines = document.max_function_lines;
-    config.max_parameters = document.max_parameters;
-    config.max_nesting = document.max_nesting;
-    config.max_stack_array = document.max_stack_array;
-    config.function_exceptions = document.function_exceptions;
-    config.disallowed = document.disallowed;
-    config.strict_suppressions = document.strict_suppressions;
-    config.metrics = document.metrics;
-    config.fact_budget = document.fact_budget;
-    config.seams = document.seams;
-    config.test_inputs = document.test_inputs;
-    try config.validate();
-    return .{ .config = config, .package_defaults = profile != .none, .settings = document.rules };
 }
 
 test "the packages' rules on by default run unless a profile of none or --only says otherwise, and a package rule's name resolves once the packages' rules are read" {
